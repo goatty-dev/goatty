@@ -602,6 +602,11 @@ impl TerminalView {
             });
             return viewer;
         }
+        // A selecting drag ends here (the grid's mouse handlers go away with
+        // it, so its auto-scroll would never stop); nothing gets copied.
+        self.selecting = false;
+        self.drag_pos = None;
+        self.autoscroll = None;
         self.session.terminal.selection_clear();
         self.hover = None;
         let session = self.session.clone();

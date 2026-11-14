@@ -80,6 +80,9 @@ actions!(
         ScrollToTop,
         ScrollToBottom,
         SelectAll,
+        /// The next control (Tab): toolbar, search field, text.
+        FocusNextControl,
+        FocusPreviousControl,
     ]
 );
 
@@ -112,8 +115,51 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("home", ScrollToTop, c),
         KeyBinding::new("end", ScrollToBottom, c),
         KeyBinding::new("ctrl-a", SelectAll, c),
+        KeyBinding::new("tab", FocusNextControl, c),
+        KeyBinding::new("shift-tab", FocusPreviousControl, c),
     ]
 }
+
+/// The viewer's tab stops in order. The terminal window has no shared focus
+/// pool (that's the settings window's, `ui::focus`), so the viewer keeps its
+/// own handles and moves between them itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The Command / All output switch: one stop, Left/Right pick.
+    Source,
+    PrevCommand,
+    NextCommand,
+    Wrap,
+    Refresh,
+    Close,
+    /// The search field (its own handle).
+    Search,
+    PrevMatch,
+    NextMatch,
+    Case,
+    Regex,
+    OnlyMatching,
+    Copy,
+    /// The text (the view's own handle).
+    Text,
+}
+
+const STOPS: [Stop; 14] = [
+    Stop::Source,
+    Stop::PrevCommand,
+    Stop::NextCommand,
+    Stop::Wrap,
+    Stop::Refresh,
+    Stop::Close,
+    Stop::Search,
+    Stop::PrevMatch,
+    Stop::NextMatch,
+    Stop::Case,
+    Stop::Regex,
+    Stop::OnlyMatching,
+    Stop::Copy,
+    Stop::Text,
+];
 
 pub enum OutputEvent {
     Close,
@@ -230,6 +276,10 @@ pub struct OutputView {
     drag: Option<Drag>,
     input: Entity<TextInput>,
     focus: FocusHandle,
+    /// One handle per [`Stop`] (the search field's and the text's unused).
+    stops: Vec<FocusHandle>,
+    /// The text got focus from Tab (it shows a ring), not from a click.
+    text_focus_visible: bool,
     font: Font,
     font_size: Pixels,
     line_height: f32,
@@ -296,6 +346,8 @@ impl OutputView {
             drag: None,
             input,
             focus: cx.focus_handle(),
+            stops: STOPS.iter().map(|_| cx.focus_handle()).collect(),
+            text_focus_visible: false,
             font,
             font_size,
             line_height,
@@ -326,6 +378,8 @@ impl OutputView {
         }
         self.source = source;
         self.selection = None;
+        // A refresh scheduled for the old source would read a new transcript under a pinned index.
+        self.refresh_task = None;
         self.follow = follows(source, &self.transcript);
         self.reveal = (!self.follow).then_some(Reveal::Top);
         self.rebuild();
@@ -360,20 +414,26 @@ impl OutputView {
         }));
     }
 
-    /// Whether new output changes what's shown: the last command while it
-    /// runs, or all output while scrolled to the bottom.
+    /// Whether new output changes what's shown: the last command (output
+    /// can also be a short command that started and finished between two
+    /// wakes, so "running" isn't enough), or all output while scrolled to
+    /// the bottom. A pinned command never changes.
     fn live(&self) -> bool {
         match self.source {
-            Source::Last => self.transcript.running || self.session.terminal.command_running(),
+            Source::Last => true,
             Source::All => self.follow,
             Source::Command(_) => false,
         }
     }
 
-    /// Read the terminal again, keeping the place and the current match.
+    /// Read the terminal again, keeping the place and the current match. A
+    /// pinned command keeps the transcript its index is into: once the
+    /// scrollback is full, old commands drop out and indices shift.
     fn refresh(&mut self, cx: &mut Context<'_, Self>) {
         self.last_refresh = Instant::now();
-        self.transcript = Arc::new(self.session.terminal.transcript());
+        if !matches!(self.source, Source::Command(_)) {
+            self.transcript = Arc::new(self.session.terminal.transcript());
+        }
         self.refresh_cost = self.last_refresh.elapsed();
         let current = self.current.and_then(|i| self.matches.get(i).cloned());
         self.rebuild();
@@ -412,8 +472,11 @@ impl OutputView {
         };
         self.max_width = self.shown.iter().map(|&i| display_width(&t.lines[i].text)).max().unwrap_or(0);
         self.version += 1;
+        // A refresh can rewrite a line in place (a running command's last
+        // line): drop a selection whose ends aren't on that text any more.
+        let valid = |p: Pos| self.range.contains(&p.line) && t.lines[p.line].text.is_char_boundary(p.byte);
         if let Some(sel) = self.selection
-            && !self.range.contains(&sel.anchor.line)
+            && !(valid(sel.anchor) && valid(sel.head))
         {
             self.selection = None;
         }
@@ -586,9 +649,19 @@ impl OutputView {
 
     fn scroll_rows(&mut self, delta: f32, cx: &mut Context<'_, Self>) {
         self.top = (self.top + delta).clamp(0., self.max_top());
-        self.follow = self.top >= self.max_top();
+        self.set_follow(self.top >= self.max_top(), cx);
         self.reveal = None;
         cx.notify();
+    }
+
+    /// Back at the end of all output: read what arrived while scrolled up,
+    /// which wasn't read then.
+    fn set_follow(&mut self, follow: bool, cx: &mut Context<'_, Self>) {
+        let resumed = follow && !self.follow;
+        self.follow = follow;
+        if resumed && self.source == Source::All {
+            self.refresh(cx);
+        }
     }
 
     fn scroll_cols(&mut self, delta: Pixels, cx: &mut Context<'_, Self>) {
@@ -635,6 +708,7 @@ impl OutputView {
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.focus.focus(window, cx);
+        self.text_focus_visible = false;
         for (bar, vertical) in [(self.geom.vbar, true), (self.geom.hbar, false)] {
             let Some(bar) = bar else { continue };
             if !bar.track.contains(&ev.position) {
@@ -692,7 +766,7 @@ impl OutputView {
                 if room > px(0.) {
                     let t = ((p.y - grab - bar.track.origin.y) / room).clamp(0., 1.);
                     self.top = t * self.max_top();
-                    self.follow = t >= 1.;
+                    self.set_follow(t >= 1., cx);
                     self.reveal = None;
                 }
             }
@@ -732,8 +806,11 @@ impl OutputView {
         }
         let Some(ch) = k.key_char.as_ref().filter(|c| !c.chars().any(char::is_control)) else { return };
         let text = format!("{}{ch}", self.input.read(cx).text());
-        self.input.update(cx, |i, cx| i.set_text(text, cx));
+        // `set_text` doesn't emit `Changed`: search here.
+        self.input.update(cx, |i, cx| i.set_text(text.clone(), cx));
         self.input.focus_handle(cx).focus(window, cx);
+        self.query.text = text;
+        self.search_changed(cx);
         cx.stop_propagation();
     }
 
@@ -1063,6 +1140,66 @@ impl OutputView {
         None
     }
 
+    fn has_prev_command(&self) -> bool {
+        match self.source {
+            Source::All => self.transcript.last_command().is_some(),
+            _ => self.block().is_some_and(|b| b > 0),
+        }
+    }
+
+    fn has_next_command(&self) -> bool {
+        self.source != Source::All && self.block().is_some_and(|b| Some(b) < self.transcript.last_command())
+    }
+
+    fn stop_handle(&self, stop: Stop, cx: &App) -> FocusHandle {
+        match stop {
+            Stop::Search => self.input.focus_handle(cx),
+            Stop::Text => self.focus.clone(),
+            _ => self.stops[stop as usize].clone(),
+        }
+    }
+
+    /// Disabled controls (no previous command, no matches) are skipped.
+    fn stop_enabled(&self, stop: Stop) -> bool {
+        match stop {
+            Stop::PrevCommand => self.has_prev_command(),
+            Stop::NextCommand => self.has_next_command(),
+            Stop::PrevMatch | Stop::NextMatch => !self.matches.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// Tab / Shift+Tab: the next or previous enabled control, around.
+    fn move_focus(&mut self, step: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let order: Vec<Stop> = STOPS.iter().copied().filter(|&s| self.stop_enabled(s)).collect();
+        let n = order.len() as isize;
+        let next = match order.iter().position(|&s| self.stop_handle(s, cx).is_focused(window)) {
+            Some(i) => (i as isize + step).rem_euclid(n),
+            None if step > 0 => 0,
+            None => n - 1,
+        };
+        let stop = order[next as usize];
+        self.text_focus_visible = stop == Stop::Text;
+        self.stop_handle(stop, cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Make `el` the tab stop `stop`, with a ring while focused from the
+    /// keyboard. A border, not the settings window's spread shadow: on the
+    /// toolbar's see-through buttons a shadow fills the whole button and
+    /// looks like "on".
+    fn stop<E: InteractiveElement + Styled>(&self, el: E, stop: Stop, ui: Ui) -> E {
+        el.track_focus(&self.stops[stop as usize])
+            .border_2()
+            .border_color(ui.accent.opacity(0.))
+            .focus_visible(move |s| s.border_color(ui.accent))
+    }
+
+    /// Left/Right on the source switch pick the other source.
+    fn on_source_switch(&self, window: &Window) -> bool {
+        self.stops[Stop::Source as usize].is_focused(window)
+    }
+
     fn toolbar(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
         let view = cx.entity().downgrade();
@@ -1074,21 +1211,25 @@ impl OutputView {
         };
         let is_command = self.source != Source::All;
         let (caption, caption_badge) = self.caption();
-        let has_prev = match self.source {
-            Source::All => self.transcript.last_command().is_some(),
-            _ => self.block().is_some_and(|b| b > 0),
+        let (has_prev, has_next) = (self.has_prev_command(), self.has_next_command());
+        let tinted = |id: &'static str,
+                      stop: Stop,
+                      icon: Icon,
+                      tip: &'static str,
+                      active: bool,
+                      f: fn(&mut Self, &mut Window, &mut Context<'_, Self>)| {
+            self.stop(icon_button_tinted(id, icon, tip, active.then_some(ui.accent_text), ui, on(f)), stop, ui)
+                .aria_toggled(if active { gpui::Toggled::True } else { gpui::Toggled::False })
+                .when(active, |d| d.bg(ui.accent_soft))
         };
-        let has_next = is_command && self.block().is_some_and(|b| Some(b) < self.transcript.last_command());
-        let tinted =
-            |id: &'static str, icon: Icon, tip: &'static str, active: bool, f: fn(&mut Self, &mut Window, &mut Context<'_, Self>)| {
-                icon_button_tinted(id, icon, tip, active.then_some(ui.accent_text), ui, on(f))
-                    .aria_toggled(if active { gpui::Toggled::True } else { gpui::Toggled::False })
-                    .when(active, |d| d.bg(ui.accent_soft))
-            };
-        let nav =
-            |id: &'static str, icon: Icon, tip: &'static str, enabled: bool, f: fn(&mut Self, &mut Window, &mut Context<'_, Self>)| {
-                icon_button(id, icon, tip, ui, on(f)).when(!enabled, |d| d.opacity(0.4))
-            };
+        let nav = |id: &'static str,
+                   stop: Stop,
+                   icon: Icon,
+                   tip: &'static str,
+                   enabled: bool,
+                   f: fn(&mut Self, &mut Window, &mut Context<'_, Self>)| {
+            self.stop(icon_button(id, icon, tip, ui, on(f)), stop, ui).when(!enabled, |d| d.opacity(0.4))
+        };
         let (count, count_bad) = self.match_label().map_or((None, false), |(l, bad)| (Some(l), bad));
         let row = || div().flex().flex_wrap().items_center().gap(px(6.)).min_w_0();
         let _ = window;
@@ -1106,19 +1247,47 @@ impl OutputView {
             .font_family(cx.global::<crate::settings::AppSettings>().ui_font.clone())
             .child(
                 row()
-                    .child(segmented("output-source", &[(true, "Command"), (false, "All output")], &is_command, ui, {
-                        let view = view.clone();
-                        move |command, _, cx| {
-                            let _ = view.update(cx, |v, cx| v.show(if command { Source::Last } else { Source::All }, cx));
-                        }
-                    }))
-                    .child(nav("output-prev-command", Icon::ChevronUp, "Previous command (Ctrl+Up)", has_prev, |v, _, cx| {
-                        v.step_command(-1, cx)
-                    }))
+                    .child(
+                        self.stop(
+                            div()
+                                .id("output-source-switch")
+                                .role(Role::RadioGroup)
+                                .aria_label("Show")
+                                .rounded_full()
+                                .tooltip(tooltip("What to show (Left/Right to switch)")),
+                            Stop::Source,
+                            ui,
+                        )
+                        .child(segmented(
+                            "output-source",
+                            &[(true, "Command"), (false, "All output")],
+                            &is_command,
+                            ui,
+                            {
+                                let view = view.clone();
+                                move |command, _, cx| {
+                                    let _ = view.update(cx, |v, cx| v.show(if command { Source::Last } else { Source::All }, cx));
+                                }
+                            },
+                        )),
+                    )
+                    .child(nav(
+                        "output-prev-command",
+                        Stop::PrevCommand,
+                        Icon::ChevronUp,
+                        "Previous command (Ctrl+Up)",
+                        has_prev,
+                        |v, _, cx| v.step_command(-1, cx),
+                    ))
                     .when(is_command, |d| {
-                        d.child(nav("output-next-command", Icon::ChevronDown, "Next command (Ctrl+Down)", has_next, |v, _, cx| {
-                            v.step_command(1, cx)
-                        }))
+                        d.child(nav(
+                            "output-next-command",
+                            Stop::NextCommand,
+                            Icon::ChevronDown,
+                            "Next command (Ctrl+Down)",
+                            has_next,
+                            |v, _, cx| v.step_command(1, cx),
+                        ))
                     })
                     .child(
                         div()
@@ -1131,14 +1300,24 @@ impl OutputView {
                             .child(caption),
                     )
                     .when_some(caption_badge, |d, (label, tone)| d.child(badge(label, tone, ui)))
-                    .child(tinted("output-wrap", Icon::WrapText, "Wrap long lines (Alt+Z)", self.wrap, |v, _, cx| v.toggle_wrap(cx)))
-                    .child(icon_button("output-refresh", Icon::Refresh, "Read the terminal again", ui, on(|v, _, cx| v.refresh(cx))))
-                    .child(icon_button(
-                        "output-close",
-                        Icon::Close,
-                        "Back to the terminal (Esc)",
+                    .child(tinted("output-wrap", Stop::Wrap, Icon::WrapText, "Wrap long lines (Alt+Z)", self.wrap, |v, _, cx| {
+                        v.toggle_wrap(cx)
+                    }))
+                    .child(self.stop(
+                        icon_button("output-refresh", Icon::Refresh, "Read the terminal again", ui, on(|v, _, cx| v.refresh(cx))),
+                        Stop::Refresh,
                         ui,
-                        on(|_, _, cx| cx.emit(OutputEvent::Close)),
+                    ))
+                    .child(self.stop(
+                        icon_button(
+                            "output-close",
+                            Icon::Close,
+                            "Back to the terminal (Esc)",
+                            ui,
+                            on(|_, _, cx| cx.emit(OutputEvent::Close)),
+                        ),
+                        Stop::Close,
+                        ui,
                     )),
             )
             .child(
@@ -1172,35 +1351,54 @@ impl OutputView {
                     )
                     .child(nav(
                         "output-prev-match",
+                        Stop::PrevMatch,
                         Icon::ChevronUp,
                         "Previous match (Shift+Enter)",
                         !self.matches.is_empty(),
                         |v, w, cx| v.step_match(-1, w, cx),
                     ))
-                    .child(nav("output-next-match", Icon::ChevronDown, "Next match (Enter)", !self.matches.is_empty(), |v, w, cx| {
-                        v.step_match(1, w, cx)
-                    }))
-                    .child(tinted("output-case", Icon::CaseSensitive, "Match case (Alt+C)", self.query.case_sensitive, |v, _, cx| {
-                        v.toggle(|v| &mut v.query.case_sensitive, cx)
-                    }))
-                    .child(tinted("output-regex", Icon::Regex, "Regular expression (Alt+R)", self.query.regex, |v, _, cx| {
+                    .child(nav(
+                        "output-next-match",
+                        Stop::NextMatch,
+                        Icon::ChevronDown,
+                        "Next match (Enter)",
+                        !self.matches.is_empty(),
+                        |v, w, cx| v.step_match(1, w, cx),
+                    ))
+                    .child(tinted(
+                        "output-case",
+                        Stop::Case,
+                        Icon::CaseSensitive,
+                        "Match case (Alt+C)",
+                        self.query.case_sensitive,
+                        |v, _, cx| v.toggle(|v| &mut v.query.case_sensitive, cx),
+                    ))
+                    .child(tinted("output-regex", Stop::Regex, Icon::Regex, "Regular expression (Alt+R)", self.query.regex, |v, _, cx| {
                         v.toggle(|v| &mut v.query.regex, cx)
                     }))
                     .child(
-                        button_with(
-                            "output-only-matching",
-                            Some(Icon::ListFilter),
-                            "Only matching lines",
-                            if self.only_matching { ButtonKind::Primary } else { ButtonKind::Ghost },
+                        self.stop(
+                            button_with(
+                                "output-only-matching",
+                                Some(Icon::ListFilter),
+                                "Only matching lines",
+                                if self.only_matching { ButtonKind::Primary } else { ButtonKind::Ghost },
+                                ui,
+                                on(|v, _, cx| v.toggle(|v| &mut v.only_matching, cx)),
+                            ),
+                            Stop::OnlyMatching,
                             ui,
-                            on(|v, _, cx| v.toggle(|v| &mut v.only_matching, cx)),
                         )
                         .aria_toggled(if self.only_matching { gpui::Toggled::True } else { gpui::Toggled::False })
                         .tooltip(tooltip("Hide the lines without a match, like grep (Alt+L)")),
                     )
                     .child(
-                        button_with("output-copy", Some(Icon::Copy), "Copy", ButtonKind::Normal, ui, on(|v, w, cx| v.copy(w, cx)))
-                            .tooltip(tooltip("Copy the selection, or every line shown")),
+                        self.stop(
+                            button_with("output-copy", Some(Icon::Copy), "Copy", ButtonKind::Normal, ui, on(|v, w, cx| v.copy(w, cx))),
+                            Stop::Copy,
+                            ui,
+                        )
+                        .tooltip(tooltip("Copy the selection, or every line shown")),
                     ),
             )
     }
@@ -1234,8 +1432,22 @@ impl Render for OutputView {
             .on_action(cx.listener(|v, _: &PageDown, _, cx| v.scroll_rows((v.geom.visible_rows.floor() - 1.).max(1.), cx)))
             .on_action(cx.listener(|v, _: &ScrollToTop, _, cx| v.scroll_rows(-f32::MAX / 4., cx)))
             .on_action(cx.listener(|v, _: &ScrollToBottom, _, cx| v.scroll_rows(f32::MAX / 4., cx)))
-            .on_action(cx.listener(|v, _: &ScrollLeft, _, cx| v.scroll_cols(-v.geom.cell.width * 4., cx)))
-            .on_action(cx.listener(|v, _: &ScrollRight, _, cx| v.scroll_cols(v.geom.cell.width * 4., cx)))
+            .on_action(cx.listener(|v, _: &ScrollLeft, w, cx| {
+                if v.on_source_switch(w) {
+                    v.show(Source::Last, cx);
+                } else {
+                    v.scroll_cols(-v.geom.cell.width * 4., cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ScrollRight, w, cx| {
+                if v.on_source_switch(w) {
+                    v.show(Source::All, cx);
+                } else {
+                    v.scroll_cols(v.geom.cell.width * 4., cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &FocusNextControl, w, cx| v.move_focus(1, w, cx)))
+            .on_action(cx.listener(|v, _: &FocusPreviousControl, w, cx| v.move_focus(-1, w, cx)))
             .on_action(cx.listener(|v, _: &SelectAll, _, cx| {
                 if let (Some(&a), Some(&b)) = (v.shown.first(), v.shown.last()) {
                     let len = v.transcript.lines[b].text.len();
@@ -1265,6 +1477,10 @@ impl Render for OutputView {
                     .on_mouse_up(MouseButton::Left, cx.listener(|v, _: &MouseUpEvent, _, cx| v.end_drag(cx)))
                     .on_scroll(cx.listener(Self::on_scroll))
                     .child(TextArea { view: view.clone() })
+                    .when(self.text_focus_visible && self.focus.is_focused(window), |d| {
+                        // Over the text, which paints its own background.
+                        d.child(div().absolute().inset_0().border_2().border_color(ui.accent))
+                    })
                     .when_some(empty, |d, (title, body, show_all)| {
                         d.child(
                             div()

@@ -2,7 +2,7 @@
 //! a cheap, thread-safe handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use rio_vt::ansi::CursorShape;
@@ -15,7 +15,7 @@ use rio_vt::performer::handler::Processor;
 use rio_vt::selection::{Selection, SelectionType};
 
 use crate::listener::Listener;
-use crate::marks::{Mark, MarkScanner};
+use crate::marks::{Mark, MarkScanner, ShellState};
 use crate::{Palette, TermMode, UiEvent};
 
 /// Grid size in cells plus the pixel size (for TIOCSWINSZ / XTWINOPS).
@@ -49,8 +49,9 @@ pub(crate) struct Inner {
     size: Arc<AtomicU32>,
     /// For the marks rio-vt doesn't report (see `marks`).
     ui: flume::Sender<UiEvent>,
-    /// The shell said a command runs (OSC 133;C) and hasn't said it ended.
-    pub(crate) running: AtomicBool,
+    /// What the shell last said ([`ShellState`] as a byte). Changed with
+    /// the terminal locked (in `feed`), so it matches the grid under the lock.
+    pub(crate) shell: AtomicU8,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -94,8 +95,7 @@ impl Terminal {
         let palette: SharedPalette = Arc::new(parking_lot::RwLock::new(palette));
         let listener = Listener { replies: rtx, ui: utx.clone(), answer_queries, palette: palette.clone(), size: packed.clone() };
         let term = Crosswords::new(size.to_crosswords(), CursorShape::Block, listener, WindowId::from(0), 0, DEFAULT_SCROLLBACK);
-        let inner =
-            Inner { term: Mutex::new(term), parser: Mutex::new(Parser::default()), size: packed, ui: utx, running: AtomicBool::new(false) };
+        let inner = Inner { term: Mutex::new(term), parser: Mutex::new(Parser::default()), size: packed, ui: utx, shell: AtomicU8::new(0) };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
 
@@ -158,7 +158,7 @@ impl Terminal {
         match mark {
             Mark::PromptStart => {
                 t.grid[row].semantic_prompt = SemanticPrompt::Prompt;
-                self.inner.running.store(false, Ordering::Relaxed);
+                self.set_shell(ShellState::Prompt);
             }
             Mark::PromptContinuation => {
                 if t.grid[row].semantic_prompt == SemanticPrompt::None {
@@ -180,10 +180,11 @@ impl Terminal {
                         }
                     }
                 }
-                self.inner.running.store(true, Ordering::Relaxed);
+                self.set_shell(ShellState::Running);
             }
+            Mark::Restore(state) => self.set_shell(state),
             Mark::CommandFinished(exit) => {
-                self.inner.running.store(false, Ordering::Relaxed);
+                self.set_shell(ShellState::Finished);
                 let _ = self.inner.ui.send(UiEvent::CommandFinished { exit });
             }
         }
@@ -192,7 +193,16 @@ impl Terminal {
     /// Whether the shell reported a command that hasn't finished yet (needs
     /// shell integration).
     pub fn command_running(&self) -> bool {
-        self.inner.running.load(Ordering::Relaxed)
+        self.shell_state() == ShellState::Running
+    }
+
+    /// Read it with the terminal locked to match the grid.
+    pub(crate) fn shell_state(&self) -> ShellState {
+        ShellState::from_u8(self.inner.shell.load(Ordering::Relaxed))
+    }
+
+    fn set_shell(&self, state: ShellState) {
+        self.inner.shell.store(state.to_u8(), Ordering::Relaxed);
     }
 
     pub fn resize(&self, size: TermSize) {

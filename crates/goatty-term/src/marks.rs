@@ -29,12 +29,42 @@ pub(crate) enum Mark {
     /// `OSC 133 ; D`: the command ended, with its exit status if the shell
     /// reported one.
     CommandFinished(Option<i32>),
+    /// `OSC 133 ; C ; goatty=run|done`: goatty's own reattach snapshot
+    /// restoring the shell's state, without marking rows or reporting a
+    /// finished command.
+    Restore(ShellState),
+}
+
+/// What the shell last said about its command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellState {
+    /// At a prompt (or nothing said yet).
+    #[default]
+    Prompt,
+    /// A command runs (`C`).
+    Running,
+    /// The command finished (`D`) and no prompt followed yet.
+    Finished,
+}
+
+impl ShellState {
+    pub(crate) fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Running,
+            2 => Self::Finished,
+            _ => Self::Prompt,
+        }
+    }
 }
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 /// The longest OSC prefix we look at: `133;D;-2147483648` plus a bit.
-const KEEP: usize = 24;
+const KEEP: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -134,7 +164,12 @@ fn parse(payload: &[u8]) -> Option<Mark> {
     match kind {
         b'A' => Some(Mark::PromptStart),
         b'P' => Some(if params.any(|p| p == b"k=c" || p == b"k=s") { Mark::PromptContinuation } else { Mark::PromptStart }),
-        b'C' => Some(Mark::CommandStart),
+        b'C' => Some(match params.next() {
+            Some(b"goatty=prompt") => Mark::Restore(ShellState::Prompt),
+            Some(b"goatty=run") => Mark::Restore(ShellState::Running),
+            Some(b"goatty=done") => Mark::Restore(ShellState::Finished),
+            _ => Mark::CommandStart,
+        }),
         b'D' => Some(finished(rest)),
         _ => None,
     }
@@ -185,6 +220,8 @@ mod tests {
             assert!(before.ends_with(b"\x07") || before.ends_with(b"\x1b\\"), "{end}");
         }
         assert_eq!(all_marks(b"\x1b]133;P;k=i\x07"), [(12, Mark::PromptStart)]);
+        let restore: Vec<Mark> = all_marks(b"\x1b]133;C;goatty=run\x07\x1b]133;C;goatty=done\x07").into_iter().map(|(_, m)| m).collect();
+        assert_eq!(restore, [Mark::Restore(ShellState::Running), Mark::Restore(ShellState::Finished)]);
         assert!(all_marks(b"\x1b]133;Ab\x07\x1b]133;\x07").is_empty());
     }
 

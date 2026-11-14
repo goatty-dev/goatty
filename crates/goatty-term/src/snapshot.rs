@@ -18,6 +18,7 @@ use rio_vt::crosswords::grid::row::SemanticPrompt;
 use rio_vt::crosswords::pos::{Column, Line};
 use rio_vt::crosswords::style::Style;
 
+use crate::marks::ShellState;
 use crate::terminal::Term;
 use crate::{TermMode, Terminal};
 
@@ -32,8 +33,8 @@ impl Terminal {
     }
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
-        let running = self.command_running();
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), running))
+        // The shell state changes with the terminal locked: read it locked.
+        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_state()))
     }
 
     /// Catch-up snapshot for a client terminal that already mirrors this
@@ -43,25 +44,26 @@ impl Terminal {
     /// (rio's `ED 2` on the primary screen pushes the viewport up) and the
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
-        self.with_term(resync)
+        self.with_term(|t| resync(t, self.shell_state()))
     }
 }
 
-fn resync(t: &mut Term) -> Vec<u8> {
+fn resync(t: &mut Term, shell: ShellState) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
     // region, origin mode, and the alt-screen switch in whichever direction.
     out.push_str("\x1b[0m\x1b[r\x1b[?6l");
     out.push_str(if mode.contains(TermMode::ALT_SCREEN) { "\x1b[?1049h" } else { "\x1b[?1049l" });
-    out.push_str(&String::from_utf8_lossy(&t.contents_formatted()));
+    write_screen(t, true, &mut out);
+    write_shell_state(shell, &mut out);
     // Mouse protocols are one setting in rio: reset, then set what's active.
     out.push_str("\x1b[?1000l\x1b[?1005l\x1b[?1006l");
     write_modes(t, mode, &mut out);
     out.into_bytes()
 }
 
-fn serialize(t: &Term, max_history: usize, running: bool) -> Vec<u8> {
+fn serialize(t: &Term, max_history: usize, shell: ShellState) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
@@ -72,32 +74,8 @@ fn serialize(t: &Term, max_history: usize, running: bool) -> Vec<u8> {
     // active, `t.grid` *is* the alt grid (rio swaps them), so history replay
     // is only possible on the primary screen.
     if !alt {
-        let history = t.history_size().min(max_history);
-        let cols = t.columns();
-        let mut current = Style::default();
-        let mut wrapping = false;
-        for h in (1..=history).rev() {
-            let line = Line(-(h as i32));
-            if !wrapping {
-                write_mark(t, line, &mut out);
-            }
-            // A soft-wrapped row is written in full and without a newline,
-            // so the client wraps it too (at whatever width it has).
-            let wraps = t.grid[line][Column(cols - 1)].wrapline();
-            let written = write_row(t, line, cols, wraps, &mut current, &mut out);
-            if wrapping && written == 0 {
-                // Move past the pending wrap, or the newline stays on the row above.
-                out.push(' ');
-            }
-            wrapping = wraps;
-            if !wraps {
-                out.push_str("\x1b[0m\r\n");
-                current = Style::default();
-            }
-        }
-        if wrapping {
-            out.push_str("\x1b[0m\r\n");
-        }
+        let history = t.history_size().min(max_history) as i32;
+        write_rows(t, -history..0, true, &mut out);
         // Push the history off-screen: the last history line must scroll
         // past the top, i.e. (screen_lines - 1) more newlines.
         for _ in 0..t.screen_lines().saturating_sub(1) {
@@ -107,23 +85,70 @@ fn serialize(t: &Term, max_history: usize, running: bool) -> Vec<u8> {
         out.push_str("\x1b[?1049h");
     }
 
-    // Visible screen + cursor position/visibility.
-    out.push_str(&String::from_utf8_lossy(&t.contents_formatted()));
-    // The screen's prompt marks, then back to where the cursor is.
-    let marked: Vec<usize> = (0..t.screen_lines()).filter(|&r| t.grid[Line(r as i32)].semantic_prompt != SemanticPrompt::None).collect();
-    if !marked.is_empty() {
-        out.push_str("\x1b7");
-        for r in marked {
-            let _ = write!(out, "\x1b[{};1H", r + 1);
-            write_mark(t, Line(r as i32), &mut out);
-        }
-        out.push_str("\x1b8");
-    }
-    if running {
-        out.push_str("\x1b]133;C\x07");
-    }
+    // The screen is blank here: clearing it would push a blank screen
+    // into the client's history.
+    write_screen(t, false, &mut out);
+    write_shell_state(shell, &mut out);
     write_modes(t, mode, &mut out);
     out.into_bytes()
+}
+
+/// The visible screen like rio's `contents_formatted` (reset, clear, rows,
+/// cursor position and visibility), but with prompt marks and soft wraps.
+/// `clear`: erase the client's screen first (on the primary screen rio
+/// pushes it into history, which resync wants).
+fn write_screen(t: &Term, clear: bool, out: &mut String) {
+    out.push_str(if clear { "\x1b[0m\x1b[2J\x1b[H" } else { "\x1b[0m\x1b[H" });
+    let cols = t.columns();
+    let last = (0..t.screen_lines() as i32)
+        .rev()
+        .find(|&r| last_content_col(t, Line(r), cols).is_some() || t.grid[Line(r)].semantic_prompt != SemanticPrompt::None);
+    if let Some(last) = last {
+        write_rows(t, 0..last + 1, false, out);
+    }
+    out.push_str("\x1b[0m");
+    let pos = t.grid.cursor.pos;
+    let _ = write!(out, "\x1b[{};{}H", pos.row.0.max(0) + 1, pos.col.0 + 1);
+    out.push_str(if t.mode().contains(TermMode::SHOW_CURSOR) { "\x1b[?25h" } else { "\x1b[?25l" });
+}
+
+/// Write `lines` with their styles and prompt marks. A soft-wrapped row is
+/// written in full and without a newline, so the client wraps it too (at
+/// whatever width it has); a marked row always starts a line of its own.
+/// `newline_after_last`: end with a newline (the scrollback) or not (the
+/// screen, which would scroll).
+fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, out: &mut String) {
+    let cols = t.columns();
+    let mut current = Style::default();
+    let mut wrapping = false;
+    for r in lines.clone() {
+        let line = Line(r);
+        let last = r + 1 == lines.end;
+        if !wrapping {
+            write_mark(t, line, out);
+        }
+        let next_marked = !last && t.grid[Line(r + 1)].semantic_prompt != SemanticPrompt::None;
+        let wraps = !last && !next_marked && t.grid[line][Column(cols - 1)].wrapline();
+        let written = write_row(t, line, cols, wraps, &mut current, out);
+        if wrapping && written == 0 {
+            // Move past the pending wrap, or the newline stays on the row above.
+            out.push(' ');
+        }
+        wrapping = wraps;
+        if !wraps && (!last || newline_after_last) {
+            out.push_str("\x1b[0m\r\n");
+            current = Style::default();
+        }
+    }
+}
+
+/// The shell's state for the client's viewer: running, finished, or at a prompt.
+fn write_shell_state(shell: ShellState, out: &mut String) {
+    out.push_str(match shell {
+        ShellState::Prompt => "\x1b]133;C;goatty=prompt\x07",
+        ShellState::Running => "\x1b]133;C;goatty=run\x07",
+        ShellState::Finished => "\x1b]133;C;goatty=done\x07",
+    });
 }
 
 /// The OSC 133 mark that gives the row at the cursor `line`'s mark.
@@ -168,20 +193,22 @@ fn write_modes(t: &Term, mode: TermMode, out: &mut String) {
     }
 }
 
+/// The last column that shows something: a glyph, or a blank with a
+/// visible style (rio-vt's rule: a blank with only a foreground doesn't).
+fn last_content_col(t: &Term, line: Line, cols: usize) -> Option<usize> {
+    let row = &t.grid[line];
+    (0..cols).rev().find(|&c| {
+        let sq = row[Column(c)];
+        let ch = sq.c();
+        (ch != ' ' && ch != '\0') || t.grid.style_of(&sq).renders_on_blank()
+    })
+}
+
 /// Write a row's text with its styles; `full` keeps trailing blanks.
 /// Returns how many cells it wrote.
 fn write_row(t: &Term, line: Line, cols: usize, full: bool, current: &mut Style, out: &mut String) -> usize {
     let row = &t.grid[line];
-    // Trim trailing blanks with default style.
-    let last = if full {
-        Some(cols - 1)
-    } else {
-        (0..cols).rev().find(|&c| {
-            let sq = row[Column(c)];
-            let ch = sq.c();
-            (ch != ' ' && ch != '\0') || t.grid.style_of(&sq).renders_on_blank()
-        })
-    };
+    let last = if full { Some(cols - 1) } else { last_content_col(t, line, cols) };
     let Some(last) = last else { return 0 };
     let mut c = 0;
     while c <= last {
@@ -251,6 +278,70 @@ mod tests {
         assert!(tb.running);
         assert_eq!(tb.lines[1].text, "0123456789abcdefghij");
         assert_eq!(text_of(&a), text_of(&b));
+    }
+
+    fn reattached(a: &Terminal, size: TermSize) -> Terminal {
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&a.reattach_snapshot());
+        b
+    }
+
+    #[test]
+    fn roundtrip_keeps_wrapped_rows_on_the_screen() {
+        let size = TermSize::new(10, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        a.feed(b"0123456789abcdefghijX\r\nnext");
+        let b = reattached(&a, size);
+        assert_eq!(a.transcript().lines, b.transcript().lines);
+        assert_eq!(b.transcript().lines[0].text, "0123456789abcdefghijX");
+        assert_eq!(text_of(&a), text_of(&b));
+    }
+
+    #[test]
+    fn roundtrip_of_a_running_command_keeps_its_output() {
+        let size = TermSize::new(20, 6);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        a.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07one\r\ntwo\r\nthree");
+        let b = reattached(&a, size);
+        let tb = b.transcript();
+        assert!(tb.running);
+        let c = &tb.commands[tb.last_command().unwrap()];
+        assert_eq!(tb.text(c.output.clone()), "one\ntwo\nthree");
+        assert_eq!(a.transcript().commands, tb.commands);
+    }
+
+    #[test]
+    fn roundtrip_keeps_a_prompt_after_output_without_a_newline() {
+        let size = TermSize::new(10, 3);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        // zsh's PROMPT_SP wraps the partial line into the prompt's row.
+        a.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07printf x\r\n\x1b]133;C\x07x\x1b]133;D;0\x07\x1b[7m%\x1b[0m         \r");
+        a.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a\r\nb\r\nc\r\nd\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let b = reattached(&a, size);
+        let (ta, tb) = (a.transcript(), b.transcript());
+        assert_eq!(ta.commands, tb.commands);
+        assert_eq!(tb.command_line(1), Some("$ ls"));
+    }
+
+    #[test]
+    fn resync_restores_the_shell_state() {
+        let size = TermSize::new(20, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        let start = b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n";
+        a.feed(start);
+        b.feed(start);
+        // The client misses the command starting.
+        a.feed(b"\x1b]133;C\x07zz");
+        b.feed(&a.resync_snapshot());
+        assert!(b.command_running());
+        // ...and later it finishing, with the next prompt.
+        a.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        b.feed(&a.resync_snapshot());
+        assert!(!b.command_running());
+        // The old screen is in the client's history now; the last command is still the right one.
+        let tb = b.transcript();
+        assert_eq!(tb.command_line(tb.last_command().unwrap()), Some("$ sleep 9"));
     }
 
     #[test]

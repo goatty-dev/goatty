@@ -16,6 +16,7 @@ use rio_vt::crosswords::grid::row::SemanticPrompt;
 use rio_vt::crosswords::pos::{Column, Line, Pos};
 use rio_vt::crosswords::style::StyleFlags;
 
+use crate::marks::ShellState;
 use crate::terminal::Term;
 use crate::{CellFlags, Palette, Rgb, TermMode, Terminal};
 
@@ -59,6 +60,9 @@ pub struct Transcript {
     pub commands: Vec<CommandBlock>,
     /// The shell reported a command that hasn't finished: the last block.
     pub running: bool,
+    /// The last block's command finished but no prompt followed yet (the
+    /// moment between the two, or a shell that exited after it).
+    pub awaiting_prompt: bool,
     /// A full-screen program (alternate screen) is showing: the lines are
     /// its screen, not the scrollback.
     pub alt_screen: bool,
@@ -76,7 +80,7 @@ impl Transcript {
     pub fn last_command(&self) -> Option<usize> {
         let n = self.commands.len();
         let last = n.checked_sub(1)?;
-        let candidate = if self.running { last } else { last.checked_sub(1)? };
+        let candidate = if self.running || self.awaiting_prompt { last } else { last.checked_sub(1)? };
         (!self.commands[candidate].prompt.is_empty()).then_some(candidate)
     }
 
@@ -108,12 +112,12 @@ impl Terminal {
     /// wide, see `vtbench`).
     pub fn transcript(&self) -> Transcript {
         let palette = self.palette();
-        let running = self.command_running();
-        self.with_term(|t| build(t, &palette, running))
+        // The state changes with the terminal locked, so read it locked too.
+        self.with_term(|t| build(t, &palette, self.shell_state()))
     }
 }
 
-fn build(t: &Term, pal: &Palette, running: bool) -> Transcript {
+fn build(t: &Term, pal: &Palette, shell: ShellState) -> Transcript {
     let colors = *t.colors();
     let default_bg = pal.background;
     let cols = t.columns();
@@ -183,7 +187,13 @@ fn build(t: &Term, pal: &Palette, running: bool) -> Transcript {
         lines.pop();
     }
     let commands = blocks(&lines, &starts);
-    Transcript { lines, commands, running, alt_screen: t.mode().contains(TermMode::ALT_SCREEN) }
+    Transcript {
+        lines,
+        commands,
+        running: shell == ShellState::Running,
+        awaiting_prompt: shell == ShellState::Finished,
+        alt_screen: t.mode().contains(TermMode::ALT_SCREEN),
+    }
 }
 
 /// Drop trailing blanks that look like nothing (no background, underline or
@@ -317,6 +327,17 @@ mod tests {
         assert!(!tr.running);
         assert_eq!(tr.last_command(), Some(3));
         assert_eq!(tr.command_line(3), Some("~ $ echo hi"));
+    }
+
+    #[test]
+    fn a_finished_command_before_its_next_prompt_is_the_last_one() {
+        let t = term(40, 10);
+        command(&t, "ls", "a\r\n");
+        let tr = t.transcript();
+        assert!(tr.awaiting_prompt && !tr.running);
+        assert_eq!(tr.last_command(), Some(0));
+        command(&t, "pwd", "/\r\n");
+        assert_eq!(t.transcript().last_command(), Some(1));
     }
 
     #[test]
