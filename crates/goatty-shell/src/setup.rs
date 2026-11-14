@@ -57,6 +57,9 @@ pub enum Request {
     NameGeneration { number: u32, name: Option<String> },
     /// The generated files a generation changed, as unified diffs. Reply: `Diff`.
     GenerationDiff { number: u32 },
+    /// The PATH a new shell gets, where each folder came from, and what
+    /// became of the folders in `shell.path` (starts a shell). Reply: `Path`.
+    Path,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +70,7 @@ pub enum Reply {
     Done,
     Generations { list: Vec<history::Entry> },
     Diff { files: Vec<generation::FileDiff> },
+    Path(Box<crate::path_report::Report>),
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -244,6 +248,7 @@ impl HostService {
                 Ok(Reply::Done)
             }
             Request::GenerationDiff { number } => Ok(Reply::Diff { files: history::file_diff(dirs_of(self)?, number)? }),
+            Request::Path => Ok(Reply::Path(Box::new(self.path_report()))),
         }
     }
 }

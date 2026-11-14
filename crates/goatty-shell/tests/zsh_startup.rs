@@ -904,6 +904,41 @@ fn added_folders_join_path_in_order() {
     assert!(!path.iter().any(|p| p.ends_with("missing")), "missing folders are skipped: {path:?}");
 }
 
+/// The PATH page's marks: each folder is attributed to the startup step
+/// that added it.
+#[test]
+fn path_marks_tell_where_folders_came_from() {
+    use goatty_shell::path_report::{COMMAND, attribute, parse_marks};
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    for d in ["env-bin", "profile-bin", "mine", "additions-bin"] {
+        std::fs::create_dir_all(sb.home.join(d)).unwrap();
+    }
+    sb.file(".zshenv", "path+=(~/env-bin)\n");
+    sb.file(".zprofile", "path+=(~/profile-bin)\n");
+    std::fs::create_dir_all(sb.dirs.user_zshrc().parent().unwrap()).unwrap();
+    std::fs::write(sb.dirs.user_zshrc(), "path+=(~/additions-bin)\n").unwrap();
+    let mut settings = no_highlighting();
+    // ~/profile-bin is on PATH already: the setting changes nothing.
+    settings.shell.path = vec!["~/mine".into(), "~/profile-bin".into()];
+    let launch = sb.launch_with(settings, None);
+    let out = sb.run(&launch, COMMAND);
+    let text = stdout(&out);
+    let mut steps = parse_marks(&text).unwrap_or_else(|| panic!("no marks: {text}"));
+    steps.insert(0, ("inherited".into(), sb.home.join("sysbin").to_string_lossy().into_owned()));
+    let found = attribute(&steps);
+    let step = |d: &Path| {
+        let d = d.to_string_lossy();
+        found.iter().find(|(f, _)| *f == d).map(|(_, s)| *s).unwrap_or_else(|| panic!("{d} not in {found:?}"))
+    };
+    assert_eq!(step(&sb.home.join("sysbin")), "inherited");
+    assert_eq!(step(&sb.home.join("env-bin")), "zshenv");
+    assert_eq!(step(&sb.home.join("profile-bin")), "zprofile");
+    assert_eq!(step(&sb.home.join("mine")), "settings");
+    assert_eq!(step(&sb.dirs.bin_dir()), "tools");
+    assert_eq!(step(&sb.home.join("additions-bin")), "additions");
+}
+
 /// A reload request that arrives while the prompt is being drawn (after
 /// precmd, before the line editor reads input) must still reload an idle
 /// shell right away, not wait for the next command. The user's additions

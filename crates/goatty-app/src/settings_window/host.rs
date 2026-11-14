@@ -188,6 +188,15 @@ impl HostLink {
         }
     }
 
+    /// The PATH a new shell on the host gets, and where each folder came
+    /// from (starts a shell to ask it).
+    pub fn path_report(&self) -> Result<goatty_shell::path_report::Report> {
+        match self.shell(setup::Request::Path)? {
+            setup::Reply::Path(r) => Ok(*r),
+            other => bail!("unexpected reply from the host: {other:?}"),
+        }
+    }
+
     /// Ask the host's running managed shells to reload. Returns how many were asked.
     pub fn reload_shells(&self) -> Result<u32> {
         Ok(match self {

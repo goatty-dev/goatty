@@ -30,7 +30,11 @@ impl SettingsWindow {
         let h = &h.loaded.value;
         let plugin = |id: &str| d.plugins.get(id) != h.plugins.get(id);
         match page {
-            Page::Shell => d.shell != h.shell,
+            Page::Shell => {
+                let without_path = |s: &goatty_config::ShellSettings| goatty_config::ShellSettings { path: Vec::new(), ..s.clone() };
+                without_path(&d.shell) != without_path(&h.shell)
+            }
+            Page::Path => d.shell.path != h.shell.path,
             Page::Prompt => d.prompt != h.prompt || plugin("starship"),
             Page::History => d.history != h.history || plugin("fzf") || plugin("fzf-tab"),
             Page::Aliases => {
@@ -623,6 +627,7 @@ impl Render for SettingsWindow {
                 Page::Shortcuts => self.shortcuts_page(ui, window, cx),
                 Page::Hosts => self.hosts_page(ui, cx),
                 Page::Shell => self.shell(ui, cx),
+                Page::Path => self.path_page(ui, window, cx),
                 Page::Prompt => self.prompt(ui, window, cx),
                 Page::History => self.history(ui, cx),
                 Page::Aliases => self.aliases_page(ui, window, cx),

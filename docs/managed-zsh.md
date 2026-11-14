@@ -79,7 +79,7 @@ XDG variables are respected. History stays in the file plain zsh would use (`${Z
 | `shell.zsh.user_env` (`.zshenv`, `.zprofile`) | on | |
 | `shell.zsh.user_rc` (`.zshrc`) | off | `GOATTY_ZSH_USER_RC=0/1` |
 | `shell.zsh.integration` | on | |
-| `shell.path`: folders added to the end of PATH (before goatty's `bin/`), `~/…` = home, missing ones skipped; also the palette's "Shell: Add a folder to PATH…" | none | |
+| `shell.path`: folders added to the end of PATH (before goatty's `bin/`), `~/…` = home, missing ones skipped; edited on Settings → PATH and with the palette's "Shell: Add a folder to PATH…" | none | |
 | `prompt.style` (`rich`/`lean`/`classic`/`rainbow`), `prompt.symbols` (`nerd`/`emoji`/`text`/`none`), `prompt.show` (`all`/`essential`) | rich, nerd, all | |
 | `prompt.two_line`, `prompt.newline_before`, `prompt.transient`, `prompt.duration_threshold_ms` (0 = never) | on, off, off, 2000 | |
 | `prompt.separator`, `prompt.heads`, `prompt.tails` (Classic/Rainbow), `prompt.frame`, `prompt.connection` (two lines) | angled, sharp, flat, none, none | |
@@ -175,6 +175,10 @@ The GUI talks to the host through `goatty_shell::setup` (protocol v9 `Shell`, JS
 Settings → Diagnostics (or `goatty --settings=diagnostics`, or "Shell diagnostics" in the palette) shows the same report as `goattyd shell status` for the window's host: the program and configuration, the startup time, each feature with where it came from (system path or goatty's copy and its version), what the startup printed to stderr, the user's own startup files, and an Install button for missing tools. "Copy report" puts it on the clipboard for a bug report.
 
 `goattyd shell status` prints the configuration, then starts the managed shell the way a session would (login + interactive, no TTY), runs `goatty-status`, and lists each feature with where it came from and the startup time. Anything the startup printed to stderr is shown. Inside a shell, `goatty-status` prints the same feature table.
+
+## PATH
+
+Settings → PATH (`goatty --settings=path`) edits `shell.path` (add, browse on this computer, reorder, remove) and shows the PATH a new shell gets, each folder with where it came from. Interactive startups note `$PATH` after each step in `_goatty_path_marks` (`step<TAB>PATH`): `etc-zshenv`, `zshenv`, `etc-zprofile`, `zprofile`, `etc-zshrc`, `settings` (`shell.path`), `tools` (goatty's `bin/`), `plugins`, `zshrc`, `additions`. `goatty_shell::path_report` (the `path` request) starts the managed shell like Diagnostics does, prints the marks and the final PATH, and gives each folder the first step whose PATH has it; folders already there before the first step are inherited from goattyd's environment. It also checks each `shell.path` folder on the host: used, missing or not a folder (skipped), already on PATH from an earlier step (the setting changes nothing), or removed again by something later. A goattyd from before this gets an "update it" note instead.
 
 ## Startup cost
 

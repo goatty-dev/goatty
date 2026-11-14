@@ -53,10 +53,25 @@ impl Probe {
 
 /// Start the managed shell from `launch` and collect `goatty-status`.
 pub fn probe(launch: &Launch, timeout: Duration) -> Result<Probe> {
+    let ran = run(launch, "goatty-status", timeout)?;
+    Ok(Probe { elapsed: ran.elapsed, features: parse_status(&ran.report), stderr: ran.stderr })
+}
+
+/// What a managed shell printed after its startup.
+pub struct Ran {
+    pub elapsed: Duration,
+    /// What `command` printed.
+    pub report: String,
+    pub stderr: String,
+}
+
+/// Start the managed shell from `launch` (login + interactive, no TTY), run
+/// `command` once the startup is done, and collect what it printed.
+pub fn run(launch: &Launch, command: &str, timeout: Duration) -> Result<Ran> {
     if !launch.managed {
         bail!("{} doesn't run goatty's managed configuration", launch.program);
     }
-    let script = format!("builtin print -r -- '{SENTINEL}'; goatty-status");
+    let script = format!("builtin print -r -- '{SENTINEL}'; {command}");
     let start = Instant::now();
     let mut child = Command::new(&launch.program)
         .args(["-l", "-i", "-c", &script])
@@ -93,7 +108,7 @@ pub fn probe(launch: &Launch, timeout: Duration) -> Result<Probe> {
     let Some((_, report)) = stdout.split_once(SENTINEL) else {
         bail!("the shell exited ({status}) before reporting its status\n{}", stderr.trim_end());
     };
-    Ok(Probe { elapsed, features: parse_status(report), stderr })
+    Ok(Ran { elapsed, report: report.to_owned(), stderr })
 }
 
 /// Parse `goatty-status` lines: `name<TAB>ok<TAB>detail`, `name<TAB>missing`, `name<TAB>off`.

@@ -135,7 +135,7 @@ fn apply(link: &HostLink, change: &Change) -> Result<Done> {
 }
 
 /// `shell.path` only reaches goatty's managed zsh.
-fn managed_zsh(s: &HostSettings) -> bool {
+pub(crate) fn managed_zsh(s: &HostSettings) -> bool {
     s.shell.managed && s.shell.program.as_deref().is_none_or(|p| p == "zsh" || p.ends_with("/zsh"))
 }
 
@@ -147,7 +147,7 @@ fn change(link: HostLink, change: Change, cx: &mut App) {
         cx.update(|cx| {
             let label = link.label();
             let reload = link.clone();
-            let settings = |t: Toast| t.action("Shell settings", |_, cx| settings_window::open_at(cx, Some(Page::Shell))).key(KEY);
+            let settings = |t: Toast| t.action("PATH settings", |_, cx| settings_window::open_at(cx, Some(Page::Path))).key(KEY);
             let t = match (result, &change) {
                 (Ok(Done::Changed { active: false }), Change::Add(dir)) => {
                     let body = format!(

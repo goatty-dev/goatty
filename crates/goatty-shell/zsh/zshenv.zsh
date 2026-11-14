@@ -8,6 +8,11 @@
 # .zshrc next. The end of .zshrc restores the user's ZDOTDIR for good, so
 # .zlogin, .zlogout and any zsh started later behave like plain zsh.
 
+# PATH after each startup step (interactive shells), so goatty's PATH page
+# can tell where each folder came from: step<TAB>$PATH. Anything new here
+# came from the system's zshenv.
+[[ -o interactive ]] && typeset -ga _goatty_path_marks=("etc-zshenv"$'\t'"$PATH")
+
 if (( ${+GOATTY_ORIG_ZDOTDIR} )); then
   typeset -g _goatty_user_zdotdir=$GOATTY_ORIG_ZDOTDIR
 else
@@ -53,6 +58,7 @@ _goatty_zdotdir_user
 if (( _goatty_user_env )) && _goatty_user_file .zshenv; then
   builtin source -- "$REPLY"
 fi
+[[ -o interactive ]] && _goatty_path_marks+=("zshenv"$'\t'"$PATH")
 
 if [[ -o interactive ]]; then
   _goatty_zdotdir_capture
