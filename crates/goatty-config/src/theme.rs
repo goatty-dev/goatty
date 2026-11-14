@@ -4,7 +4,9 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// An sRGB color, `#rrggbb` in JSON.
+/// An opaque sRGB color, always written as `#rrggbb`. Reading also takes
+/// `#rgb`, `rgb()`, `hsl()`, `hsv()`, `oklch()` and `oklab()`
+/// ([`Color::parse`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Color(pub u32);
 
@@ -19,9 +21,12 @@ impl Color {
         (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
     }
 
+    /// Read a color as settings files and `goatty settings set` write it:
+    /// hex (`#rrggbb`, `rrggbb`, `#rgb`, an alpha is ignored) or a CSS
+    /// function (`rgb()`, `hsl()`, `hsv()`, `oklch()`, `oklab()`; see
+    /// [`crate::colorspace::parse_css_color`], which also says what was lost).
     pub fn parse(s: &str) -> Option<Self> {
-        let hex = s.strip_prefix('#').unwrap_or(s);
-        (hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| Self(u32::from_str_radix(hex, 16).unwrap_or(0)))
+        crate::colorspace::parse_css_color(s).map(|p| p.color)
     }
 }
 
@@ -46,7 +51,8 @@ impl Serialize for Color {
 impl<'de> Deserialize<'de> for Color {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        Color::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("{s:?} is not a #rrggbb color")))
+        Color::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("{s:?} is not a color (#rrggbb, rgb(), hsl(), hsv(), oklch() or oklab())")))
     }
 }
 
@@ -102,6 +108,39 @@ impl ColorSlot {
             Self::Ansi(i) => format!("bright {}", ANSI[(i as usize - 8) % 8]),
         }
     }
+
+    /// The colors this slot should stay readable against, for the color
+    /// editor's contrast check (#70). Text on the background wants WCAG's
+    /// 4.5:1. The chromatic ANSI colors and the cursor warn below 3:1 (large
+    /// text and UI parts): many well-liked themes keep their ANSI colors
+    /// between 3 and 4.5, and a warning on every theme would stop meaning
+    /// anything. Black, white and bright black/white are often backdrops or
+    /// dimmed on purpose: their ratio is shown without a warning.
+    pub fn contrast_checks(self) -> Vec<ContrastCheck> {
+        let check = |against, edited_is_text, min| ContrastCheck { against, edited_is_text, min };
+        match self {
+            Self::Foreground => vec![check(Self::Background, true, Some(4.5))],
+            Self::Background => vec![check(Self::Foreground, false, Some(4.5))],
+            Self::SelectionForeground => vec![check(Self::SelectionBackground, true, Some(4.5))],
+            Self::SelectionBackground => vec![check(Self::SelectionForeground, false, Some(4.5)), check(Self::Background, false, None)],
+            Self::Cursor => vec![check(Self::Background, true, Some(3.0))],
+            Self::Accent => vec![check(Self::Background, true, None)],
+            Self::Ansi(0 | 7 | 8 | 15) => vec![check(Self::Background, true, None), check(Self::Foreground, true, None)],
+            Self::Ansi(_) => vec![check(Self::Background, true, Some(3.0))],
+        }
+    }
+}
+
+/// One readability check of a theme color (see [`ColorSlot::contrast_checks`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContrastCheck {
+    /// The other color.
+    pub against: ColorSlot,
+    /// The edited color is drawn on `against` (text, cursor), rather than
+    /// being the backdrop for it.
+    pub edited_is_text: bool,
+    /// Warn below this WCAG 2 contrast ratio; `None` only shows the ratio.
+    pub min: Option<f32>,
 }
 
 impl ThemeColors {
@@ -467,7 +506,24 @@ mod tests {
         assert_eq!(serde_json::to_string(&Color(0x0a0b0c)).unwrap(), "\"#0a0b0c\"");
         assert_eq!(serde_json::from_str::<Color>("\"#FFaa00\"").unwrap(), Color(0xffaa00));
         assert!(serde_json::from_str::<Color>("\"red\"").is_err());
-        assert!(serde_json::from_str::<Color>("\"#fff\"").is_err());
+        assert!(serde_json::from_str::<Color>("\"12 34 56\"").is_err(), "bare numbers could mean any model");
+        // Read leniently (#71), always written as #rrggbb.
+        for (text, want) in [("#fff", 0xffffff), ("rgb(255 170 0)", 0xffaa00), ("hsl(40deg 100% 50%)", 0xffaa00), ("#ffaa0080", 0xffaa00)] {
+            let c = serde_json::from_str::<Color>(&format!("{text:?}")).unwrap();
+            assert_eq!(c, Color(want), "{text}");
+            assert_eq!(serde_json::to_string(&c).unwrap(), format!("\"#{want:06x}\""));
+        }
+    }
+
+    #[test]
+    fn every_slot_has_a_contrast_check_against_another_slot() {
+        for slot in ColorSlot::all() {
+            let checks = slot.contrast_checks();
+            assert!(!checks.is_empty(), "{slot:?}");
+            assert!(checks.iter().all(|c| c.against != slot), "{slot:?}");
+        }
+        assert_eq!(ColorSlot::Foreground.contrast_checks()[0].min, Some(4.5));
+        assert_eq!(ColorSlot::Ansi(0).contrast_checks()[0].min, None, "black is often a backdrop");
     }
 
     #[test]
