@@ -7,6 +7,10 @@
 //! pane, and a click opens it (see `links`). Pastes go through
 //! `goatty_term::paste::check` first (#29); a paste that needs a second
 //! look becomes [`TerminalEvent::ConfirmPaste`] and the workspace asks.
+//!
+//! Find (Ctrl+Shift+F) and "View the last command's output" (Ctrl+Shift+L)
+//! cover the grid with an [`OutputView`]; output keeps flowing into the
+//! terminal underneath, and Esc brings it back.
 
 use std::cell::{Cell as StdCell, RefCell};
 use std::path::{Path, PathBuf};
@@ -20,10 +24,10 @@ use goatty_term::input::{Key, Mods, MouseAction, MouseButton, encode_key, encode
 use goatty_term::paste::{self, PasteRisk};
 use goatty_term::{CursorKind, Frame, Link, SelectKind, TermMode, UiEvent};
 use gpui::{
-    App, ClipboardItem, Context, CursorStyle, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font, InteractiveElement, IntoElement,
-    KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseButton as GMouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, StatefulInteractiveElement, Styled, Task, Window, canvas, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, Font,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseButton as GMouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, canvas, div, prelude::FluentBuilder, px,
 };
 
 use super::element::{Geom, TerminalElement, hsla};
@@ -32,8 +36,10 @@ use super::keys::{mods, terminal_key};
 use super::links::{self, Place, Target};
 use super::stats::Stats;
 use crate::actions::{
-    Copy, CopyOrInterrupt, DecreaseFontSize, IncreaseFontSize, Paste, ResetFontSize, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT,
+    Copy, CopyOrInterrupt, DecreaseFontSize, Find, IncreaseFontSize, Paste, ResetFontSize, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT,
+    ViewLastOutput,
 };
+use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::Session;
 use crate::settings::{AppSettings, palette};
 use crate::toast::{self, Toast};
@@ -149,13 +155,19 @@ pub struct TerminalView {
     /// unless the press turned into a selection.
     pressed_link: Option<Target>,
     hostname: Option<String>,
+    /// The output viewer, while it covers the grid.
+    viewer: Option<(Entity<OutputView>, Subscription)>,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl Focusable for TerminalView {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus.clone()
+    /// The output viewer's while it's open, so focusing the pane focuses it.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.viewer {
+            Some((v, _)) => v.focus_handle(cx),
+            None => self.focus.clone(),
+        }
     }
 }
 
@@ -167,6 +179,7 @@ impl TerminalView {
         cx.observe_global::<AppSettings>(|view, cx| {
             let app = cx.global::<AppSettings>().clone();
             view.apply_settings(&app);
+            view.sync_viewer_font(cx);
             cx.notify();
         })
         .detach();
@@ -255,6 +268,7 @@ impl TerminalView {
             hover: None,
             pressed_link: None,
             hostname: links::hostname(),
+            viewer: None,
         };
         view.apply_settings(&app);
         view
@@ -289,6 +303,13 @@ impl TerminalView {
             self.link_click = s.links.open_on;
             self.hover = None;
         }
+    }
+
+    /// The viewer draws the pane's font at the pane's (zoomed) size.
+    fn sync_viewer_font(&self, cx: &mut Context<'_, Self>) {
+        let Some((viewer, _)) = &self.viewer else { return };
+        let (font, size, lh) = (self.font.clone(), self.font_size, self.line_height);
+        viewer.update(cx, |v, cx| v.set_font(font, size, lh, cx));
     }
 
     /// Title for a window or tab: the application's title plus host and
@@ -339,6 +360,9 @@ impl TerminalView {
         if bytes != self.seen_bytes {
             self.seen_bytes = bytes;
             cx.emit(TerminalEvent::Activity(Activity::Output));
+            if let Some((viewer, _)) = &self.viewer {
+                viewer.update(cx, |v, cx| v.output_arrived(cx));
+            }
         }
         // Host and link state (reconnecting…) are part of the title, so
         // re-check even without a Title event.
@@ -565,6 +589,58 @@ impl TerminalView {
         }
     }
 
+    // ---- output viewer ----------------------------------------------------------
+
+    /// Open the viewer on `source`, or switch the open one to it.
+    fn open_viewer(&mut self, source: output_view::Source, window: &mut Window, cx: &mut Context<'_, Self>) -> Entity<OutputView> {
+        if let Some((viewer, _)) = &self.viewer {
+            let viewer = viewer.clone();
+            viewer.update(cx, |v, cx| {
+                if v.source() != source {
+                    v.show(source, cx);
+                }
+            });
+            return viewer;
+        }
+        // A selecting drag ends here (the grid's mouse handlers go away with
+        // it, so its auto-scroll would never stop); nothing gets copied.
+        self.selecting = false;
+        self.drag_pos = None;
+        self.autoscroll = None;
+        self.session.terminal.selection_clear();
+        self.hover = None;
+        let session = self.session.clone();
+        let (font, size, lh) = (self.font.clone(), self.font_size, self.line_height);
+        let viewer = cx.new(|cx| OutputView::new(session, source, font, size, lh, window, cx));
+        let sub = cx.subscribe_in(&viewer, window, |this, _, ev: &OutputEvent, window, cx| match ev {
+            OutputEvent::Close => this.close_viewer(window, cx),
+        });
+        self.viewer = Some((viewer.clone(), sub));
+        cx.notify();
+        viewer
+    }
+
+    fn close_viewer(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.viewer.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    /// Find: all output with the search field focused (again: back to it).
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let source = match &self.viewer {
+            Some((v, _)) => v.read(cx).source(),
+            None => output_view::Source::All,
+        };
+        let viewer = self.open_viewer(source, window, cx);
+        viewer.update(cx, |v, cx| v.focus_search(window, cx));
+    }
+
+    fn view_last_output(&mut self, _: &ViewLastOutput, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.open_viewer(output_view::Source::Last, window, cx);
+    }
+
     fn scroll_page_up(&mut self, _: &ScrollPageUp, _window: &mut Window, cx: &mut Context<'_, Self>) {
         self.session.terminal.scroll(self.geom.get().rows as i32);
         cx.notify();
@@ -583,6 +659,7 @@ impl TerminalView {
         self.zoom =
             if delta == 0.0 { 0.0 } else { (base + self.zoom + delta).clamp(FontSettings::MIN_SIZE, FontSettings::MAX_SIZE) - base };
         self.font_size = px(base + self.zoom);
+        self.sync_viewer_font(cx);
         cx.notify();
         let size = base + self.zoom;
         let toast = if delta != 0.0 && self.zoom == before {
@@ -846,6 +923,22 @@ impl Render for TerminalView {
         });
         let link_spans = self.hover_shown().map(|(spans, _)| spans).unwrap_or_default();
         let ui = Ui::get(cx);
+        if let Some((viewer, _)) = &self.viewer {
+            // The viewer covers the grid; the pane's shortcuts that make
+            // sense there stay (the workspace's bubble up as usual).
+            return div()
+                .id("terminal-pane")
+                .size_full()
+                .key_context(TERMINAL_CONTEXT)
+                .track_focus(&self.focus)
+                .on_action(cx.listener(Self::find))
+                .on_action(cx.listener(Self::view_last_output))
+                .on_action(cx.listener(Self::increase_font_size))
+                .on_action(cx.listener(Self::decrease_font_size))
+                .on_action(cx.listener(Self::reset_font_size))
+                .child(viewer.clone())
+                .into_any_element();
+        }
         div()
             .id("terminal-pane")
             .size_full()
@@ -862,6 +955,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::view_last_output))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(GMouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(GMouseButton::Middle, cx.listener(Self::on_mouse_down))
@@ -934,6 +1029,7 @@ impl Render for TerminalView {
                         .child(div().flex_shrink_0().text_color(ui.muted).child(action)),
                 )
             })
+            .into_any_element()
     }
 }
 

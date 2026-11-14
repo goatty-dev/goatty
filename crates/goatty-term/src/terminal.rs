@@ -2,11 +2,12 @@
 //! a cheap, thread-safe handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::grid::Scroll;
+use rio_vt::crosswords::grid::row::SemanticPrompt;
 use rio_vt::crosswords::pos::{Column, Line, Pos, Side};
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::WindowId;
@@ -14,7 +15,7 @@ use rio_vt::performer::handler::Processor;
 use rio_vt::selection::{Selection, SelectionType};
 
 use crate::listener::Listener;
-use crate::marks::{Mark, MarkScanner};
+use crate::marks::{Mark, MarkScanner, ShellState};
 use crate::{Palette, TermMode, UiEvent};
 
 /// Grid size in cells plus the pixel size (for TIOCSWINSZ / XTWINOPS).
@@ -48,6 +49,12 @@ pub(crate) struct Inner {
     size: Arc<AtomicU32>,
     /// For the marks rio-vt doesn't report (see `marks`).
     ui: flume::Sender<UiEvent>,
+    /// What the shell last said ([`ShellState`] as a byte). Changed with
+    /// the terminal locked (in `feed`), so it matches the grid under the lock.
+    pub(crate) shell: AtomicU8,
+    /// Commands started (OSC 133;C) since this terminal was created: tells
+    /// commands apart where indices shift (the scrollback drops old ones).
+    pub(crate) started: AtomicU64,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -56,7 +63,13 @@ pub(crate) struct Inner {
 struct Parser {
     vt: Processor,
     marks: MarkScanner,
+    /// The marks found in the chunk being fed (kept for its allocation).
+    found: Vec<(usize, Mark)>,
 }
+
+/// How far up from where a command starts (OSC 133;C) to look for its
+/// prompt's first row. A prompt plus a long multi-line command fits.
+const MAX_PROMPT_ROWS: i32 = 200;
 
 /// Shared handle to one terminal state machine. Cheap to clone.
 #[derive(Clone)]
@@ -85,7 +98,14 @@ impl Terminal {
         let palette: SharedPalette = Arc::new(parking_lot::RwLock::new(palette));
         let listener = Listener { replies: rtx, ui: utx.clone(), answer_queries, palette: palette.clone(), size: packed.clone() };
         let term = Crosswords::new(size.to_crosswords(), CursorShape::Block, listener, WindowId::from(0), 0, DEFAULT_SCROLLBACK);
-        let inner = Inner { term: Mutex::new(term), parser: Mutex::new(Parser::default()), size: packed, ui: utx };
+        let inner = Inner {
+            term: Mutex::new(term),
+            parser: Mutex::new(Parser::default()),
+            size: packed,
+            ui: utx,
+            shell: AtomicU8::new(0),
+            started: AtomicU64::new(0),
+        };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
 
@@ -120,14 +140,18 @@ impl Terminal {
     /// (false while the application holds a synchronized update, mode 2026).
     pub fn feed(&self, bytes: &[u8]) -> bool {
         let mut parser = self.inner.parser.lock();
-        let ui = &self.inner.ui;
-        parser.marks.scan(bytes, |mark| {
-            let _ = ui.send(match mark {
-                Mark::CommandFinished(exit) => UiEvent::CommandFinished { exit },
-            });
-        });
+        let parser = &mut *parser;
+        parser.found.clear();
+        parser.marks.scan(bytes, |end, mark| parser.found.push((end, mark)));
         let mut term = self.inner.term.lock();
-        parser.vt.advance(&mut *term, bytes);
+        // Up to each mark, then the mark at the cursor it was printed at.
+        let mut at = 0;
+        for &(end, mark) in &parser.found {
+            parser.vt.advance(&mut *term, &bytes[at..end]);
+            at = end;
+            self.apply_mark(&mut term, mark);
+        }
+        parser.vt.advance(&mut *term, &bytes[at..]);
         if term.synchronized_output() {
             if term.sync_update_expired(rio_vt::time::Instant::now()) {
                 term.end_sync_update();
@@ -136,6 +160,73 @@ impl Terminal {
             return false;
         }
         true
+    }
+
+    /// Mark the cursor's row for a prompt mark, or note the shell's state.
+    fn apply_mark(&self, t: &mut Term, mark: Mark) {
+        let row = t.grid.cursor.pos.row;
+        match mark {
+            Mark::PromptStart => {
+                t.grid[row].semantic_prompt = SemanticPrompt::Prompt;
+                self.set_shell(ShellState::Prompt);
+            }
+            Mark::PromptContinuation => {
+                if t.grid[row].semantic_prompt == SemanticPrompt::None {
+                    t.grid[row].semantic_prompt = SemanticPrompt::PromptContinuation;
+                }
+            }
+            Mark::CommandStart => {
+                // The rows between the prompt's first row and here are the
+                // rest of the prompt and the command line: mark them, so the
+                // output is everything after them up to the next prompt.
+                let top = -(t.history_size() as i32);
+                let stop = (row.0 - MAX_PROMPT_ROWS).max(top);
+                let prompt = (stop..row.0).rev().find(|&r| t.grid[Line(r)].semantic_prompt == SemanticPrompt::Prompt);
+                if let Some(prompt) = prompt {
+                    for r in prompt + 1..row.0 {
+                        let line = &mut t.grid[Line(r)];
+                        if line.semantic_prompt == SemanticPrompt::None {
+                            line.semantic_prompt = SemanticPrompt::PromptContinuation;
+                        }
+                    }
+                }
+                self.set_shell(ShellState::Running);
+                self.inner.started.fetch_add(1, Ordering::Relaxed);
+            }
+            Mark::Restore(state, started) => {
+                // The session's own count: after an attach both count the
+                // same `C`s, so a resync changes it only for commands this
+                // client missed (not for the marks the snapshot replays).
+                if let Some(n) = started {
+                    self.inner.started.store(n, Ordering::Relaxed);
+                }
+                self.set_shell(state);
+            }
+            Mark::CommandFinished(exit) => {
+                self.set_shell(ShellState::Finished);
+                let _ = self.inner.ui.send(UiEvent::CommandFinished { exit });
+            }
+        }
+    }
+
+    /// Whether the shell reported a command that hasn't finished yet (needs
+    /// shell integration).
+    pub fn command_running(&self) -> bool {
+        self.shell_state() == ShellState::Running
+    }
+
+    /// Read it with the terminal locked to match the grid.
+    pub(crate) fn shell_state(&self) -> ShellState {
+        ShellState::from_u8(self.inner.shell.load(Ordering::Relaxed))
+    }
+
+    /// Commands started so far (see `Inner::started`).
+    pub(crate) fn commands_started(&self) -> u64 {
+        self.inner.started.load(Ordering::Relaxed)
+    }
+
+    fn set_shell(&self, state: ShellState) {
+        self.inner.shell.store(state.to_u8(), Ordering::Relaxed);
     }
 
     pub fn resize(&self, size: TermSize) {

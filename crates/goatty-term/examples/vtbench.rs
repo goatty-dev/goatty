@@ -59,4 +59,25 @@ fn main() {
         t.snapshot_into(&mut f);
     }
     println!("snapshot 200x60: {:.1} µs/frame", start.elapsed().as_secs_f64() * 1e6 / n as f64);
+    // The output viewer's transcript of a full scrollback (copies every cell
+    // under the lock, once per open and per refresh of a live view).
+    for kind in ["ascii", "sgr"] {
+        let (t, _ch) = Terminal::new(size, true, Arc::new(Palette::default()));
+        let cycle = |cmd: &str| format!("\x1b]133;A\x07$ \x1b]133;B\x07{cmd}\r\n\x1b]133;C\x07");
+        let data = corpus(kind);
+        for (i, chunk) in data.chunks(64 * 1024).enumerate() {
+            t.feed(cycle(&format!("cmd {i}")).as_bytes());
+            t.feed(chunk);
+            t.feed(b"\x1b]133;D;0\x07");
+        }
+        let rows = t.history_size() + 60;
+        let n = 20;
+        let start = Instant::now();
+        let mut lines = 0;
+        for _ in 0..n {
+            lines = t.transcript().lines.len();
+        }
+        let ms = start.elapsed().as_secs_f64() * 1e3 / n as f64;
+        println!("transcript {kind}: {rows} rows ({lines} lines) in {ms:.1} ms");
+    }
 }

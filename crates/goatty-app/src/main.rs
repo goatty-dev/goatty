@@ -14,6 +14,7 @@ mod commands;
 mod connect;
 mod fonts;
 mod hosts;
+mod output_view;
 mod paste_confirm;
 mod session;
 mod settings;

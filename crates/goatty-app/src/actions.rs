@@ -30,6 +30,10 @@ actions!(
         ScrollPageUp,
         /// Scroll forward one screen.
         ScrollPageDown,
+        /// The output viewer on all output, with the search field focused.
+        Find,
+        /// The output viewer on the last (or running) command's output.
+        ViewLastOutput,
         IncreaseFontSize,
         DecreaseFontSize,
         /// Back to the font size from the settings.
@@ -109,6 +113,8 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "paste" => Box::new(Paste),
         "scroll_page_up" => Box::new(ScrollPageUp),
         "scroll_page_down" => Box::new(ScrollPageDown),
+        "find" => Box::new(Find),
+        "view_last_output" => Box::new(ViewLastOutput),
         "increase_font_size" => Box::new(IncreaseFontSize),
         "decrease_font_size" => Box::new(DecreaseFontSize),
         "reset_font_size" => Box::new(ResetFontSize),
@@ -185,6 +191,7 @@ pub fn apply_keybindings(overrides: &BTreeMap<String, Option<String>>, cx: &mut 
     cx.bind_keys(terminal);
     cx.bind_keys(crate::ui::text_input::bindings());
     cx.bind_keys(crate::ui::color_picker::bindings());
+    cx.bind_keys(crate::output_view::bindings());
     cx.bind_keys(crate::settings_window::bindings());
     cx.bind_keys(crate::welcome::bindings());
     cx.bind_keys(crate::paste_confirm::bindings());

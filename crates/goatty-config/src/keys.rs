@@ -26,7 +26,7 @@ pub struct ActionInfo {
 }
 
 /// Action groups in display order.
-pub const GROUPS: &[&str] = &["Clipboard", "Scrolling", "Text size", "goatty", "Notifications", "Tabs", "Panes"];
+pub const GROUPS: &[&str] = &["Clipboard", "Scrolling", "Output", "Text size", "goatty", "Notifications", "Tabs", "Panes"];
 
 pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "copy", label: "Copy the selection", group: "Clipboard" },
@@ -34,6 +34,8 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "paste", label: "Paste", group: "Clipboard" },
     ActionInfo { name: "scroll_page_up", label: "Scroll back one screen", group: "Scrolling" },
     ActionInfo { name: "scroll_page_down", label: "Scroll forward one screen", group: "Scrolling" },
+    ActionInfo { name: "find", label: "Find in the output", group: "Output" },
+    ActionInfo { name: "view_last_output", label: "View the last command's output", group: "Output" },
     ActionInfo { name: "increase_font_size", label: "Bigger text", group: "Text size" },
     ActionInfo { name: "decrease_font_size", label: "Smaller text", group: "Text size" },
     ActionInfo { name: "reset_font_size", label: "Reset text size", group: "Text size" },
@@ -92,6 +94,9 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl-v", "paste"),
     ("shift-pageup", "scroll_page_up"),
     ("shift-pagedown", "scroll_page_down"),
+    // The output viewer: everything, searched, or the last command's output.
+    ("ctrl-shift-f", "find"),
+    ("ctrl-shift-l", "view_last_output"),
     // Ctrl with the plus key, with or without Shift, on any layout:
     // US Ctrl+= / Ctrl+Shift+= type "=" / "+", German Ctrl++ / Ctrl+Shift++
     // type "+" / "*". The keypad's + matches "+" too.

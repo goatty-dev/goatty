@@ -21,6 +21,7 @@ pub mod process;
 pub mod pty;
 pub mod snapshot;
 mod terminal;
+pub mod transcript;
 
 pub use colors::{Palette, Rgb};
 pub use frame::{Cell, CellFlags, Cursor, CursorKind, Frame};
@@ -29,3 +30,4 @@ pub use listener::UiEvent;
 /// Terminal mode bits (DECCKM, mouse reporting, alt screen, ...).
 pub use rio_vt::crosswords::Mode as TermMode;
 pub use terminal::{DEFAULT_SCROLLBACK, SelectKind, TermSize, Terminal, TerminalChannels};
+pub use transcript::{CommandBlock, Span, Transcript, TranscriptLine};

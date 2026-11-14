@@ -703,7 +703,8 @@ impl Workspace {
         let events =
             cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| this.on_terminal_event(id, ev, window, cx));
         let focus = view.focus_handle(cx);
-        let focused = cx.on_focus(&focus, window, move |this, window, cx| this.pane_focused(id, window, cx));
+        // Focus inside counts too: the output viewer covers the pane.
+        let focused = cx.on_focus_in(&focus, window, move |this, window, cx| this.pane_focused(id, window, cx));
         Pane { id, view, _subscriptions: [events, focused] }
     }
 

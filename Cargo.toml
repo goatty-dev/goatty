@@ -37,6 +37,10 @@ ttf-parser = "0.25"
 # takes `image::Frame`s (already in the tree through gpui, same version).
 image = { version = "0.25", default-features = false }
 serde_json = "1"
+# The output viewer (goatty-app): search with regular expressions, and column
+# widths for wrapping (both already in the tree through gpui).
+regex = "1"
+unicode-width = "0.2"
 # Settings documents: report the path of an invalid value.
 serde_path_to_error = "0.1"
 # Settings preview: diffs of generated shell config.

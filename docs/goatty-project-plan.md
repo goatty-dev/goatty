@@ -384,6 +384,8 @@ Recommended starting behavior on Windows/Linux:
 | `Ctrl+R` | Open searchable command history |
 | `Ctrl+Shift+P` | Open command palette |
 | `Ctrl+Shift+T` | New tab |
+| `Ctrl+Shift+F` | Find in the output (the output viewer on all output) |
+| `Ctrl+Shift+L` | View the last command's output |
 
 Use `Cmd` equivalents for the conventional copy/paste shortcuts on macOS, with a discoverable keymap. Make shortcuts configurable.
 
@@ -395,6 +397,8 @@ Additional behavior:
 - Searchable scrollback.
 - Clickable URLs and file paths with configurable handling.
 - Copy command, copy output, rerun command and open working directory actions when command boundaries are known.
+
+> **Update (14 Nov 2026):** searchable scrollback and "copy output" are the output viewer: it covers the pane with the last command's output (found through the OSC 133 marks, live while the command runs) or all output, unwrapped with sideways scrolling or wrapped, with search, "Only matching lines", selection and copy. See `architecture.md`.
 
 The fundamental terminal behavior must remain intact: when there is no selection, `Ctrl+C` must send the interrupt character to the foreground process. In full-screen applications, key handling must not steal input unexpectedly.
 

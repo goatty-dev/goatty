@@ -1,7 +1,13 @@
-//! OSC 133 shell-integration marks, which rio-vt doesn't handle (it logs
-//! them as unknown OSCs). [`MarkScanner`] watches the same bytes the parser
-//! gets and reports the marks goatty uses. For now that is only "command
-//! finished" (`OSC 133 ; D [; status]`), which tabs show as activity (#122).
+//! OSC 133 shell-integration marks, which rio-vt parses but doesn't act on.
+//! [`MarkScanner`] watches the same bytes the parser gets and reports the
+//! marks goatty uses, each with where it ends in the chunk, so
+//! [`Terminal::feed`](crate::Terminal::feed) can apply it at the cursor
+//! position the mark was printed at:
+//!   * `A` (prompt starts) and `P` (prompt, `k=c`/`k=s`: a continuation line)
+//!     mark grid rows, which the [transcript](crate::transcript) uses to find
+//!     each command's output,
+//!   * `C` (command output starts) and `D [; status]` (command finished): the
+//!     shell's state, and activity markers on tabs (#122).
 //!
 //! The scanner keeps its state between chunks, so a mark split across two
 //! reads is still found. Outside escape sequences it only runs `memchr` for
@@ -14,15 +20,52 @@ use memchr::{memchr, memchr2};
 /// A shell-integration mark found in the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mark {
+    /// `OSC 133 ; A`, or `P` without `k=c`/`k=s`: a prompt starts here.
+    PromptStart,
+    /// `OSC 133 ; P ; k=c` or `k=s`: another line of the same prompt.
+    PromptContinuation,
+    /// `OSC 133 ; C`: the command runs; its output starts here.
+    CommandStart,
     /// `OSC 133 ; D`: the command ended, with its exit status if the shell
     /// reported one.
     CommandFinished(Option<i32>),
+    /// `OSC 133 ; C ; goatty=prompt|run|done [; n=<started>]`: goatty's own
+    /// reattach/resync snapshot restoring the shell's state and how many
+    /// commands started, without marking rows or reporting a finished
+    /// command.
+    Restore(ShellState, Option<u64>),
+}
+
+/// What the shell last said about its command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellState {
+    /// At a prompt (or nothing said yet).
+    #[default]
+    Prompt,
+    /// A command runs (`C`).
+    Running,
+    /// The command finished (`D`) and no prompt followed yet.
+    Finished,
+}
+
+impl ShellState {
+    pub(crate) fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Running,
+            2 => Self::Finished,
+            _ => Self::Prompt,
+        }
+    }
 }
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
-/// The longest OSC prefix we look at: `133;D;-2147483648` plus a bit.
-const KEEP: usize = 24;
+/// The longest OSC prefix we look at: `133;C;goatty=prompt;n=<u64::MAX>`.
+const KEEP: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -50,8 +93,9 @@ impl Default for MarkScanner {
 }
 
 impl MarkScanner {
-    /// Scan the next chunk of output and call `on` for each mark.
-    pub(crate) fn scan(&mut self, bytes: &[u8], mut on: impl FnMut(Mark)) {
+    /// Scan the next chunk of output and call `on` for each mark, with the
+    /// index in `bytes` just past its terminator.
+    pub(crate) fn scan(&mut self, bytes: &[u8], mut on: impl FnMut(usize, Mark)) {
         let mut i = 0;
         while i < bytes.len() {
             match self.state {
@@ -83,7 +127,7 @@ impl MarkScanner {
                     if let Some(&b) = bytes.get(i) {
                         i += 1;
                         if b == BEL {
-                            self.finish(&mut on);
+                            self.finish(i, &mut on);
                         } else {
                             self.state = State::OscEsc;
                         }
@@ -91,8 +135,8 @@ impl MarkScanner {
                 }
                 State::OscEsc => {
                     if bytes[i] == b'\\' {
-                        self.finish(&mut on);
                         i += 1;
+                        self.finish(i, &mut on);
                     } else {
                         // The OSC was cut off; this ESC starts something new.
                         self.state = State::Esc;
@@ -102,26 +146,51 @@ impl MarkScanner {
         }
     }
 
-    fn finish(&mut self, on: &mut impl FnMut(Mark)) {
+    fn finish(&mut self, end: usize, on: &mut impl FnMut(usize, Mark)) {
         self.state = State::Ground;
         if let Some(mark) = parse(&self.buf[..self.len]) {
-            on(mark);
+            on(end, mark);
         }
     }
 }
 
-/// `133;D` or `133;D;<status>[;more…]`.
+/// `133;<letter>[;params…]`.
 fn parse(payload: &[u8]) -> Option<Mark> {
-    let rest = payload.strip_prefix(b"133;D")?;
+    let rest = payload.strip_prefix(b"133;")?;
+    let (&kind, rest) = rest.split_first()?;
+    if !rest.is_empty() && rest[0] != b';' {
+        return None;
+    }
+    let mut params = rest.split(|&b| b == b';').skip(1);
+    match kind {
+        b'A' => Some(Mark::PromptStart),
+        b'P' => Some(if params.any(|p| p == b"k=c" || p == b"k=s") { Mark::PromptContinuation } else { Mark::PromptStart }),
+        b'C' => {
+            let state = match params.next() {
+                Some(b"goatty=prompt") => ShellState::Prompt,
+                Some(b"goatty=run") => ShellState::Running,
+                Some(b"goatty=done") => ShellState::Finished,
+                _ => return Some(Mark::CommandStart),
+            };
+            let started = params.find_map(|p| p.strip_prefix(b"n=")).and_then(|n| std::str::from_utf8(n).ok()).and_then(|n| n.parse().ok());
+            Some(Mark::Restore(state, started))
+        }
+        b'D' => Some(finished(rest)),
+        _ => None,
+    }
+}
+
+/// The rest of `133;D`: nothing, or `;<status>[;more…]`.
+fn finished(rest: &[u8]) -> Mark {
     let status = match rest {
         [] => None,
         [b';', status @ ..] => {
             let status = status.split(|&b| b == b';').next().unwrap_or_default();
             std::str::from_utf8(status).ok().and_then(|s| s.parse().ok())
         }
-        _ => return None,
+        _ => None,
     };
-    Some(Mark::CommandFinished(status))
+    Mark::CommandFinished(status)
 }
 
 #[cfg(test)]
@@ -132,9 +201,35 @@ mod tests {
         let mut s = MarkScanner::default();
         let mut out = Vec::new();
         for c in chunks {
-            s.scan(c, |m| out.push(m));
+            s.scan(c, |_, m| out.push(m));
         }
+        out.retain(|m| matches!(m, Mark::CommandFinished(_)));
         out
+    }
+
+    fn all_marks(bytes: &[u8]) -> Vec<(usize, Mark)> {
+        let mut s = MarkScanner::default();
+        let mut out = Vec::new();
+        s.scan(bytes, |end, m| out.push((end, m)));
+        out
+    }
+
+    #[test]
+    fn finds_every_mark_and_where_it_ends() {
+        let stream: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x1b\\out\r\n\x1b]133;D;0\x07\x1b]133;P;k=s\x07";
+        let found = all_marks(stream);
+        let kinds: Vec<Mark> = found.iter().map(|(_, m)| *m).collect();
+        assert_eq!(kinds, [Mark::PromptStart, Mark::CommandStart, Mark::CommandFinished(Some(0)), Mark::PromptContinuation]);
+        for (end, _) in &found {
+            let before = &stream[..*end];
+            assert!(before.ends_with(b"\x07") || before.ends_with(b"\x1b\\"), "{end}");
+        }
+        assert_eq!(all_marks(b"\x1b]133;P;k=i\x07"), [(12, Mark::PromptStart)]);
+        let restore: Vec<Mark> = all_marks(b"\x1b]133;C;goatty=run\x07\x1b]133;C;goatty=done\x07").into_iter().map(|(_, m)| m).collect();
+        assert_eq!(restore, [Mark::Restore(ShellState::Running, None), Mark::Restore(ShellState::Finished, None)]);
+        let max = format!("\x1b]133;C;goatty=prompt;n={}\x07", u64::MAX);
+        assert_eq!(all_marks(max.as_bytes()), [(max.len(), Mark::Restore(ShellState::Prompt, Some(u64::MAX)))]);
+        assert!(all_marks(b"\x1b]133;Ab\x07\x1b]133;\x07").is_empty());
     }
 
     #[test]
@@ -147,8 +242,8 @@ mod tests {
     }
 
     #[test]
-    fn ignores_other_marks_and_oscs() {
-        assert!(marks(&[b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07"]).is_empty());
+    fn ignores_other_oscs() {
+        assert!(all_marks(b"\x1b]133;B\x07\x1b]133;E;ls\x07").is_empty());
         assert!(marks(&[b"\x1b]0;133;D\x07\x1b]1337;D\x07\x1b[31m133;D\x07"]).is_empty());
         assert!(marks(&[b"\x1b]133;Done\x07"]).is_empty());
     }
