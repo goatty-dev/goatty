@@ -474,10 +474,18 @@ impl PtyShell {
         while self.prompts() < n {
             match self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => self.out.extend(chunk),
-                Err(e) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let exit = self.pty.try_wait();
                     panic!(
-                        "waiting for prompt {n} (err={e:?}, exit={exit:?}, prompts={}):\n{:?}",
+                        "pty closed while waiting for prompt {n} (exit={exit:?}, prompts={}):\n{:?}",
+                        self.prompts(),
+                        String::from_utf8_lossy(&self.out)
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let exit = self.pty.try_wait();
+                    panic!(
+                        "waiting for prompt {n} (timeout, exit={exit:?}, prompts={}):\n{:?}",
                         self.prompts(),
                         String::from_utf8_lossy(&self.out)
                     );
@@ -520,7 +528,15 @@ impl PtyShell {
         while !self.out[start..].windows(needle.len()).any(|w| w == needle) {
             match self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => self.out.extend(chunk),
-                Err(_) => panic!("waiting for {:?}:\n{}", String::from_utf8_lossy(needle), String::from_utf8_lossy(&self.out)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "pty closed ({:?}) while waiting for {:?}:\n{}",
+                    self.pty.try_wait(),
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(&self.out)
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("waiting for {:?}:\n{}", String::from_utf8_lossy(needle), String::from_utf8_lossy(&self.out))
+                }
             }
         }
     }
@@ -553,6 +569,7 @@ fn reloads_on_request() {
     let n = sh.prompts();
     assert_eq!(svc.reload_shells(), 1);
     sh.wait_for_prompts(n + 1);
+    sh.wait_for_idle();
     sh.run("print -r -- X=${x:-unset} P=$$");
     assert!(sh.text().contains(&format!("X=unset P={pid}")), "{}", sh.text());
 
@@ -560,11 +577,13 @@ fn reloads_on_request() {
     sh.run("y=1");
     let n = sh.prompts();
     let offset = sh.out.len();
-    sh.pty.write(b"/bin/sleep 0.5\r").unwrap();
+    sh.pty.write(b"while [[ ! -e $HOME/busy-done ]]; do /bin/sleep 0.02; done\r").unwrap();
     sh.wait_for_from(offset, b"\x1b]133;C");
-    std::thread::sleep(Duration::from_millis(100));
-    svc.reload_shells();
+    assert_eq!(svc.reload_shells(), 1);
+    assert_eq!(sh.prompts(), n, "no reload while a command is running");
+    sb.file("busy-done", "");
     sh.wait_for_prompts(n + 1);
+    sh.wait_for_idle();
     sh.run("print -r -- Y=${y:-unset}");
     assert!(sh.text().contains("Y=unset"), "{}", sh.text());
 
@@ -573,13 +592,18 @@ fn reloads_on_request() {
     // sleep, and assert it stayed untouched after that.
     sh.run("z=1");
     let n = sh.prompts();
+    let offset = sh.out.len();
     sh.pty.write(b"print -r -- typed").unwrap();
-    sh.wait_for(b"typed");
-    svc.reload_shells();
+    sh.wait_for_from(offset, b"typed");
+    assert_eq!(svc.reload_shells(), 1);
     let deadline = Instant::now() + Duration::from_secs(3);
     while sh.prompts() == n && Instant::now() < deadline {
-        if let Ok(chunk) = sh.rx.recv_timeout(Duration::from_millis(50)) {
-            sh.out.extend(chunk);
+        match sh.rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => sh.out.extend(chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("pty closed ({:?}) while typing:\n{}", sh.pty.try_wait(), sh.text());
+            }
         }
     }
     assert_eq!(sh.prompts(), n, "no reload while typing");
@@ -590,8 +614,9 @@ fn reloads_on_request() {
     // Background jobs: only a reminder, the shell keeps its state.
     sh.run("w=1; /bin/sleep 30 &");
     let n = sh.prompts();
-    svc.reload_shells();
+    assert_eq!(svc.reload_shells(), 1);
     sh.wait_for_prompts(n + 1);
+    sh.wait_for_idle();
     sh.run("print -r -- W=${w:-unset}; kill %1");
     let text = sh.text();
     assert!(text.contains("once your jobs are done") && text.contains("W=1"), "{text}");
@@ -881,6 +906,7 @@ fn reloads_when_signaled_while_the_prompt_draws() {
     assert_eq!(svc.reload_shells(), 1);
     // That prompt, then the reloaded shell's.
     sh.wait_for_prompts(n + 2);
+    sh.wait_for_idle();
     sh.run("print -r -- X=${x:-unset} P=$$");
     assert!(sh.text().contains(&format!("X=unset P={pid}")), "{}", sh.text());
     sh.pty.write(b"exit\r").unwrap();
