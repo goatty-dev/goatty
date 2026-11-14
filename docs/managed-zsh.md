@@ -128,7 +128,7 @@ fzf is goatty's one fuzzy finder (#165), split over two built-in plugins:
 
 ## Shell integration
 
-`integration.zsh` emits OSC 133 `A` (prompt start) and `B` (input start) inside `PS1`, re-added on every prompt if a theme rebuilt it. It emits `C` from `preexec`, then `D;<status>` and OSC 7 (`file://host/percent-encoded/path`) from `precmd`. zsh restores `$?` for every hook, so hook order doesn't affect the status. rio-vt consumes OSC 133 silently and parses OSC 7. Surfacing these in the UI (command blocks, cwd titles) is #28.
+`integration.zsh` emits OSC 133 `A` (prompt start) and `B` (input start) inside `PS1`, re-added on every prompt if a theme rebuilt it. It emits `C` from `preexec`, then `D;<status>` and OSC 7 (`file://host/percent-encoded/path`) from `precmd`. zsh restores `$?` for every hook, so hook order doesn't affect the status. rio-vt parses OSC 7; goatty-term applies the OSC 133 marks itself: they mark prompt rows (so the output viewer finds each command's output), say whether a command runs, and finished commands show as tab activity.
 
 ## Installing tools
 

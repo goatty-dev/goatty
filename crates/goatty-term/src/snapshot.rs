@@ -6,11 +6,15 @@
 //!   * scrollback (replayed as lines so they scroll into the client history),
 //!   * the alternate screen switch (so `vim` exiting restores correctly),
 //!   * input-affecting modes (DECCKM, keypad, bracketed paste, mouse, focus),
-//!   * the window title.
+//!   * the window title,
+//!   * the OSC 133 prompt marks on rows and soft wraps in the scrollback,
+//!     so the client's [transcript](crate::transcript) finds the same
+//!     commands and unwrapped lines.
 
 use std::fmt::Write as _;
 
 use rio_vt::crosswords::formatter::write_sgr;
+use rio_vt::crosswords::grid::row::SemanticPrompt;
 use rio_vt::crosswords::pos::{Column, Line};
 use rio_vt::crosswords::style::Style;
 
@@ -28,7 +32,8 @@ impl Terminal {
     }
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY)))
+        let running = self.command_running();
+        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), running))
     }
 
     /// Catch-up snapshot for a client terminal that already mirrors this
@@ -56,7 +61,7 @@ fn resync(t: &mut Term) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn serialize(t: &Term, max_history: usize) -> Vec<u8> {
+fn serialize(t: &Term, max_history: usize, running: bool) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
@@ -70,10 +75,28 @@ fn serialize(t: &Term, max_history: usize) -> Vec<u8> {
         let history = t.history_size().min(max_history);
         let cols = t.columns();
         let mut current = Style::default();
+        let mut wrapping = false;
         for h in (1..=history).rev() {
-            write_row(t, Line(-(h as i32)), cols, &mut current, &mut out);
+            let line = Line(-(h as i32));
+            if !wrapping {
+                write_mark(t, line, &mut out);
+            }
+            // A soft-wrapped row is written in full and without a newline,
+            // so the client wraps it too (at whatever width it has).
+            let wraps = t.grid[line][Column(cols - 1)].wrapline();
+            let written = write_row(t, line, cols, wraps, &mut current, &mut out);
+            if wrapping && written == 0 {
+                // Move past the pending wrap, or the newline stays on the row above.
+                out.push(' ');
+            }
+            wrapping = wraps;
+            if !wraps {
+                out.push_str("\x1b[0m\r\n");
+                current = Style::default();
+            }
+        }
+        if wrapping {
             out.push_str("\x1b[0m\r\n");
-            current = Style::default();
         }
         // Push the history off-screen: the last history line must scroll
         // past the top, i.e. (screen_lines - 1) more newlines.
@@ -86,8 +109,30 @@ fn serialize(t: &Term, max_history: usize) -> Vec<u8> {
 
     // Visible screen + cursor position/visibility.
     out.push_str(&String::from_utf8_lossy(&t.contents_formatted()));
+    // The screen's prompt marks, then back to where the cursor is.
+    let marked: Vec<usize> = (0..t.screen_lines()).filter(|&r| t.grid[Line(r as i32)].semantic_prompt != SemanticPrompt::None).collect();
+    if !marked.is_empty() {
+        out.push_str("\x1b7");
+        for r in marked {
+            let _ = write!(out, "\x1b[{};1H", r + 1);
+            write_mark(t, Line(r as i32), &mut out);
+        }
+        out.push_str("\x1b8");
+    }
+    if running {
+        out.push_str("\x1b]133;C\x07");
+    }
     write_modes(t, mode, &mut out);
     out.into_bytes()
+}
+
+/// The OSC 133 mark that gives the row at the cursor `line`'s mark.
+fn write_mark(t: &Term, line: Line, out: &mut String) {
+    match t.grid[line].semantic_prompt {
+        SemanticPrompt::None => {}
+        SemanticPrompt::Prompt => out.push_str("\x1b]133;A\x07"),
+        SemanticPrompt::PromptContinuation => out.push_str("\x1b]133;P;k=c\x07"),
+    }
 }
 
 /// Modes that change how the client must encode input, plus the title.
@@ -123,15 +168,21 @@ fn write_modes(t: &Term, mode: TermMode, out: &mut String) {
     }
 }
 
-fn write_row(t: &Term, line: Line, cols: usize, current: &mut Style, out: &mut String) {
+/// Write a row's text with its styles; `full` keeps trailing blanks.
+/// Returns how many cells it wrote.
+fn write_row(t: &Term, line: Line, cols: usize, full: bool, current: &mut Style, out: &mut String) -> usize {
     let row = &t.grid[line];
     // Trim trailing blanks with default style.
-    let last = (0..cols).rev().find(|&c| {
-        let sq = row[Column(c)];
-        let ch = sq.c();
-        (ch != ' ' && ch != '\0') || t.grid.style_of(&sq).renders_on_blank()
-    });
-    let Some(last) = last else { return };
+    let last = if full {
+        Some(cols - 1)
+    } else {
+        (0..cols).rev().find(|&c| {
+            let sq = row[Column(c)];
+            let ch = sq.c();
+            (ch != ' ' && ch != '\0') || t.grid.style_of(&sq).renders_on_blank()
+        })
+    };
+    let Some(last) = last else { return 0 };
     let mut c = 0;
     while c <= last {
         let sq = row[Column(c)];
@@ -150,6 +201,7 @@ fn write_row(t: &Term, line: Line, cols: usize, current: &mut Style, out: &mut S
         }
         c += if sq.is_wide() { 2 } else { 1 };
     }
+    last + 1
 }
 
 #[cfg(test)]
@@ -180,6 +232,25 @@ mod tests {
         let ha = a.history_size();
         let hb = b.history_size();
         assert_eq!(ha, hb, "history should be replayed");
+    }
+
+    #[test]
+    fn roundtrip_keeps_prompt_marks_and_wrapped_lines() {
+        let size = TermSize::new(10, 4);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        let cycle =
+            |cmd: &str, out: &str| format!("\x1b]133;A\x07$ \x1b]133;B\x07{cmd}\r\n\x1b]133;C\x07{out}\x1b]133;D;0\x07").into_bytes();
+        a.feed(&cycle("ls", "0123456789abcdefghij\r\nshort\r\n"));
+        a.feed(&cycle("pwd", "/home\r\n"));
+        a.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07zz");
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&a.reattach_snapshot());
+        let (ta, tb) = (a.transcript(), b.transcript());
+        assert_eq!(ta.lines, tb.lines);
+        assert_eq!(ta.commands, tb.commands);
+        assert!(tb.running);
+        assert_eq!(tb.lines[1].text, "0123456789abcdefghij");
+        assert_eq!(text_of(&a), text_of(&b));
     }
 
     #[test]

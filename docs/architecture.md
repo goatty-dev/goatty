@@ -98,6 +98,11 @@ settings_window/
   hosts.rs     the Hosts page: open hosts in a tab or window, add/remove hosts, plain SSH per host, `~/.ssh/config` discovery
   profile.rs   files (copy path, open folder), problems, export/import, generations (summary, details: every change, file diff, name), reset
   about.rs     version, connection, links, "copy for a bug report"
+output_view/
+  mod.rs       the output viewer over a pane (Ctrl+Shift+F: all output, searched; Ctrl+Shift+L: the last command's): sources (last/running command, an earlier one, all), search with highlights and "Only matching lines", wrap toggle, selection and copy, live refresh while a command runs; owned by `TerminalView`
+  element.rs   its text area as one element: visible rows only, line numbers, backgrounds, matches, selection, scrollbars
+  layout.rs    columns and wrapping (pure, unit-tested): character widths, wrap points (after a space when it's worth it), column windows for sideways scrolling, row ↔ line mapping
+  search.rs    plain or regex search through `regex`, case-insensitive by default (pure, unit-tested)
 toast/
   mod.rs       Toast (level, title, body, buttons, key, lifetime) and the API: show/show_in/update/dismiss/dismiss_all/press_primary, routed to a window's layer (terminal windows, and the settings window while it's active); every toast is recorded in the history
   stack.rs     one window's toasts without UI: replace by key, eviction, pausable timers, the newest main button (unit-tested with explicit clocks)
@@ -152,6 +157,8 @@ Foreground program: `goatty_term::process::ForegroundWatch` checks the PTY's for
 
 Links (#27): `goatty_term::Terminal::link_at(col, row)` finds the OSC 8 hyperlink, URL or path candidate under a cell, on the whole wrapped line, only when asked (mouse move / modifier change / new output while hovering), so idle and flood frames pay nothing. `terminal/links.rs` resolves it (relative paths against the OSC 7 directory, which rio-vt only accepts from this host) and the view underlines it, shows the target at the bottom of the pane, and opens it on Ctrl+click (`links.open_on`).
 
+Output viewer: `goatty_term::Terminal::transcript` copies the scrollback and screen as logical lines (soft wraps joined) with resolved colors, split into commands by the prompt marks. `Terminal::feed` applies each OSC 133 mark at the cursor it was printed at (it splits the chunk at the marks): `A` marks the row `Prompt`, `C` marks the rows between that prompt and the cursor `PromptContinuation`, using rio-vt's per-row `semantic_prompt`, which travels with the row into the scrollback and through reflow. A command's output is the lines after its prompt lines up to the next prompt; without shell integration only "All output" works. Reattach snapshots replay the marks and the scrollback's soft wraps, so a reattached client finds the same commands. The viewer covers the pane (`TerminalView` renders it instead of the grid and forwards output to it); a live view reads the transcript again at most every 250 ms (`stage0-findings.md` has the cost).
+
 Paste (#29): every paste goes through `goatty_term::paste::check` (runs commands without bracketed paste, control or invisible characters, `curl … | sh`, > 256 KiB, multiline); `paste.confirm` decides which of those ask first.
 
 Feedback: anything that finishes without a visible result (a palette command, a background request, later plugins) reports through `crate::toast`: `toast::show(cx, Toast::success(…))`, or `Toast::loading` first and `toast::update` with the result. Give repeated feedback a `key` so it replaces itself (in the history too: a key keeps one entry there). Toasts never take focus: from the keyboard, `dismiss_notifications`, `press_notification_button` and `show_recent_notifications` (bindable, unbound by default, since Escape belongs to the terminal) dismiss them, press the newest one's main button, or list them again. In the settings window, short results are toasts; its bar is for unapplied host changes and the outcome of a preview, apply, rollback or profile import.
@@ -166,7 +173,8 @@ Input: GPUI dispatches a bound action before the view's raw `on_key_down`. Short
 | IME / compose (#21)                    | `terminal/view.rs`: implement `EntityInputHandler`, register it in the element's paint |
 | Box drawing (#24)                      | `terminal/element.rs` (+ a new `terminal/boxdraw.rs`)                 |
 | Kitty keyboard (#22)                   | `goatty-term/src/input.rs`, fed from `terminal/keys.rs`               |
-| Shell integration, terminal side (#28) | `goatty-term` listener (OSC 7 → `UiEvent`), `goatty-term/src/marks.rs` (OSC 133, which rio-vt ignores → `UiEvent::CommandFinished`) + daemon `SessionInfo`; the zsh side is in `goatty-shell/zsh/integration.zsh` |
+| Shell integration, terminal side (#28) | `goatty-term` listener (OSC 7 → `UiEvent`), `goatty-term/src/marks.rs` (OSC 133, which rio-vt doesn't act on → row marks, `UiEvent::CommandFinished`, `Terminal::command_running`), `goatty-term/src/transcript.rs` (commands and their output) + daemon `SessionInfo`; the zsh side is in `goatty-shell/zsh/integration.zsh` |
+| Output viewer features (export, more sources) | `output_view/mod.rs`; what counts as a command's output: `goatty-term/src/transcript.rs` |
 | Managed zsh features, tool versions    | `goatty-shell/zsh/zshrc.zsh` (load order matters, see `managed-zsh.md`); the tools are built-in plugins: `goatty-shell/plugins/<id>/plugin.toml` (+ `builtins.rs` to list a new one) |
 | Syncing the shell setup to hosts (#159) | what gets copied and the trust rule: `goatty-shell/src/sync.rs` (pure, unit- and end-to-end-tested); when goatty asks: `shell_sync.rs`; per-host choice: `SshSettings::sync_mode`; answers: `goatty_config::sync_state` |
 | First-run setup, shell diagnostics     | host side: `goatty-shell/src/setup.rs` (new operations go in its `Request`/`Reply`, no protocol bump); GUI: `welcome.rs`, `shell_setup.rs`, `settings_window/diagnostics.rs` |

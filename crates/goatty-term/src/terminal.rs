@@ -2,11 +2,12 @@
 //! a cheap, thread-safe handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::grid::Scroll;
+use rio_vt::crosswords::grid::row::SemanticPrompt;
 use rio_vt::crosswords::pos::{Column, Line, Pos, Side};
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::WindowId;
@@ -48,6 +49,8 @@ pub(crate) struct Inner {
     size: Arc<AtomicU32>,
     /// For the marks rio-vt doesn't report (see `marks`).
     ui: flume::Sender<UiEvent>,
+    /// The shell said a command runs (OSC 133;C) and hasn't said it ended.
+    pub(crate) running: AtomicBool,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -56,7 +59,13 @@ pub(crate) struct Inner {
 struct Parser {
     vt: Processor,
     marks: MarkScanner,
+    /// The marks found in the chunk being fed (kept for its allocation).
+    found: Vec<(usize, Mark)>,
 }
+
+/// How far up from where a command starts (OSC 133;C) to look for its
+/// prompt's first row. A prompt plus a long multi-line command fits.
+const MAX_PROMPT_ROWS: i32 = 200;
 
 /// Shared handle to one terminal state machine. Cheap to clone.
 #[derive(Clone)]
@@ -85,7 +94,8 @@ impl Terminal {
         let palette: SharedPalette = Arc::new(parking_lot::RwLock::new(palette));
         let listener = Listener { replies: rtx, ui: utx.clone(), answer_queries, palette: palette.clone(), size: packed.clone() };
         let term = Crosswords::new(size.to_crosswords(), CursorShape::Block, listener, WindowId::from(0), 0, DEFAULT_SCROLLBACK);
-        let inner = Inner { term: Mutex::new(term), parser: Mutex::new(Parser::default()), size: packed, ui: utx };
+        let inner =
+            Inner { term: Mutex::new(term), parser: Mutex::new(Parser::default()), size: packed, ui: utx, running: AtomicBool::new(false) };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
 
@@ -120,14 +130,18 @@ impl Terminal {
     /// (false while the application holds a synchronized update, mode 2026).
     pub fn feed(&self, bytes: &[u8]) -> bool {
         let mut parser = self.inner.parser.lock();
-        let ui = &self.inner.ui;
-        parser.marks.scan(bytes, |mark| {
-            let _ = ui.send(match mark {
-                Mark::CommandFinished(exit) => UiEvent::CommandFinished { exit },
-            });
-        });
+        let parser = &mut *parser;
+        parser.found.clear();
+        parser.marks.scan(bytes, |end, mark| parser.found.push((end, mark)));
         let mut term = self.inner.term.lock();
-        parser.vt.advance(&mut *term, bytes);
+        // Up to each mark, then the mark at the cursor it was printed at.
+        let mut at = 0;
+        for &(end, mark) in &parser.found {
+            parser.vt.advance(&mut *term, &bytes[at..end]);
+            at = end;
+            self.apply_mark(&mut term, mark);
+        }
+        parser.vt.advance(&mut *term, &bytes[at..]);
         if term.synchronized_output() {
             if term.sync_update_expired(rio_vt::time::Instant::now()) {
                 term.end_sync_update();
@@ -136,6 +150,49 @@ impl Terminal {
             return false;
         }
         true
+    }
+
+    /// Mark the cursor's row for a prompt mark, or note the shell's state.
+    fn apply_mark(&self, t: &mut Term, mark: Mark) {
+        let row = t.grid.cursor.pos.row;
+        match mark {
+            Mark::PromptStart => {
+                t.grid[row].semantic_prompt = SemanticPrompt::Prompt;
+                self.inner.running.store(false, Ordering::Relaxed);
+            }
+            Mark::PromptContinuation => {
+                if t.grid[row].semantic_prompt == SemanticPrompt::None {
+                    t.grid[row].semantic_prompt = SemanticPrompt::PromptContinuation;
+                }
+            }
+            Mark::CommandStart => {
+                // The rows between the prompt's first row and here are the
+                // rest of the prompt and the command line: mark them, so the
+                // output is everything after them up to the next prompt.
+                let top = -(t.history_size() as i32);
+                let stop = (row.0 - MAX_PROMPT_ROWS).max(top);
+                let prompt = (stop..row.0).rev().find(|&r| t.grid[Line(r)].semantic_prompt == SemanticPrompt::Prompt);
+                if let Some(prompt) = prompt {
+                    for r in prompt + 1..row.0 {
+                        let line = &mut t.grid[Line(r)];
+                        if line.semantic_prompt == SemanticPrompt::None {
+                            line.semantic_prompt = SemanticPrompt::PromptContinuation;
+                        }
+                    }
+                }
+                self.inner.running.store(true, Ordering::Relaxed);
+            }
+            Mark::CommandFinished(exit) => {
+                self.inner.running.store(false, Ordering::Relaxed);
+                let _ = self.inner.ui.send(UiEvent::CommandFinished { exit });
+            }
+        }
+    }
+
+    /// Whether the shell reported a command that hasn't finished yet (needs
+    /// shell integration).
+    pub fn command_running(&self) -> bool {
+        self.inner.running.load(Ordering::Relaxed)
     }
 
     pub fn resize(&self, size: TermSize) {

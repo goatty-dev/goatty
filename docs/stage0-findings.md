@@ -38,6 +38,15 @@ rio-vt is not the bottleneck: these numbers are above what a PTY delivers.
 
 The ASCII gap is mostly run-to-run noise (single runs range from 620 to 710 MB/s either way). The scan only runs `memchr` between escape sequences.
 
+The output viewer reads a `Transcript` (every cell of the scrollback and screen, joined into logical lines and resolved to colors) with the terminal locked, once when it opens and at most every 250 ms while it follows live output. `vtbench`, a full 10,000-row scrollback 200 columns wide with a prompt mark every 64 KiB:
+
+| Workload | Per transcript |
+|---|---|
+| Plain ASCII | 11.3 ms |
+| Heavy SGR | 12.8 ms |
+
+Resolving each cell's colors was most of it (32 ms before runs of the same style shared one lookup). A live view waits at least ten times the last read's cost between reads, so it holds the lock no more than a tenth of the time.
+
 ### End-to-end in the window (`scripts/bench.sh`, same workload in every terminal)
 
 | Terminal | `seq 1 3000000` (23 MB) | Colored flood (100 MB) |
