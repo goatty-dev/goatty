@@ -36,7 +36,7 @@ pub use diagnostics::progress_card;
 pub use host::{GenRow, HostLink, HostLinkGlobal};
 
 use crate::settings::AppSettings;
-use crate::ui::color_picker::{ColorPicker, ColorPickerEvent};
+use crate::ui::color_picker::{ColorPicker, ColorPickerEvent, ContrastRef};
 use crate::ui::icons::Icon;
 use crate::ui::text_input::{TextInput, TextInputEvent};
 
@@ -619,14 +619,22 @@ impl SettingsWindow {
         self.flush_color(cx);
         self.edit_slot = slot;
         let color = cx.global::<AppSettings>().colors.get(slot);
-        self.picker.update(cx, |p, cx| p.open(color, cx));
+        let refs = contrast_refs(slot, &cx.global::<AppSettings>().colors);
+        self.picker.update(cx, |p, cx| {
+            p.open(color, cx);
+            p.set_contrast(refs, cx);
+        });
         cx.notify();
     }
 
     /// The colors changed under the picker: follow them.
     fn sync_picker(&mut self, cx: &mut Context<'_, Self>) {
         let color = cx.global::<AppSettings>().colors.get(self.edit_slot);
-        self.picker.update(cx, |p, cx| p.sync(color, cx));
+        let refs = contrast_refs(self.edit_slot, &cx.global::<AppSettings>().colors);
+        self.picker.update(cx, |p, cx| {
+            p.sync(color, cx);
+            p.set_contrast(refs, cx);
+        });
         cx.notify();
     }
 
@@ -1219,4 +1227,17 @@ fn dirs_home() -> std::path::PathBuf {
 /// Connection-or-local, for the window: set once by `app::run`.
 pub fn set_host_link(cx: &mut App, link: Option<HostLink>) {
     cx.set_global(HostLinkGlobal(link));
+}
+
+/// What the picker compares `slot`'s color with, from the theme's colors.
+fn contrast_refs(slot: ColorSlot, colors: &goatty_config::ThemeColors) -> Vec<ContrastRef> {
+    slot.contrast_checks()
+        .into_iter()
+        .map(|c| ContrastRef {
+            label: c.against.label().into(),
+            color: colors.get(c.against),
+            edited_is_text: c.edited_is_text,
+            min: c.min,
+        })
+        .collect()
 }

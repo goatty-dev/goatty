@@ -72,7 +72,7 @@ fn json(v: &Value, fallback: &str) -> Result<Vec<Imported>, String> {
 
 fn windows_terminal(v: &Value, fallback: &str) -> Result<Imported, String> {
     // `#RRGGBBAA` is allowed; the alpha is ignored.
-    let get = |k: &str| v.get(k).and_then(Value::as_str).and_then(|s| Color::parse(s.get(..7).unwrap_or(s)));
+    let get = |k: &str| v.get(k).and_then(Value::as_str).and_then(Color::parse);
     const NAMES: [&str; 16] = [
         "black",
         "red",
@@ -215,16 +215,31 @@ fn iterm(text: &str, fallback: &str) -> Result<Imported, String> {
     })
 }
 
+/// One color dict of an `.itermcolors` file. Its `Color Space` says how to
+/// read the components:
+/// - `P3` (what recent iTerm2 versions save): Display P3, converted to sRGB.
+/// - `sRGB`: as is.
+/// - `Calibrated`, `Device`, or none (older presets): read as sRGB. These are
+///   relative to the Mac's display or Generic RGB profile, so there's no
+///   exact sRGB answer, and reading them as sRGB is what other terminals and
+///   the published hex values of these presets do.
 fn iterm_color(dict: &str) -> Option<Color> {
-    let component = |name: &str| -> Option<f64> {
+    let value = |name: &str, tags: &[&str]| -> Option<&str> {
         let k = dict.find(&format!("<key>{name}</key>"))?;
-        let after = &dict[k..];
-        let open = after.find("<real>").map(|i| (i, 6, "</real>")).or_else(|| after.find("<integer>").map(|i| (i, 9, "</integer>")))?;
-        let body = &after[open.0 + open.1..];
-        body[..body.find(open.2)?].trim().parse().ok()
+        let after = dict[k..].split_once("</key>")?.1.trim_start();
+        tags.iter().find_map(|tag| {
+            let body = after.strip_prefix(&format!("<{tag}>"))?;
+            Some(body[..body.find(&format!("</{tag}>"))?].trim())
+        })
     };
-    let to = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-    Some(Color((to(component("Red Component")?) << 16) | (to(component("Green Component")?) << 8) | to(component("Blue Component")?)))
+    let component = |name: &str| -> Option<f32> { value(name, &["real", "integer"])?.parse().ok() };
+    let rgb = [component("Red Component")?, component("Green Component")?, component("Blue Component")?];
+    Some(match value("Color Space", &["string"]) {
+        Some(space) if space.eq_ignore_ascii_case("P3") || space.eq_ignore_ascii_case("Display P3") => {
+            crate::colorspace::display_p3_to_srgb(rgb)
+        }
+        _ => crate::colorspace::from_rgbf(rgb),
+    })
 }
 
 #[cfg(test)]
@@ -317,6 +332,55 @@ base0F: "a3685a"
         assert_eq!(t.colors.foreground, Color(0xffffff));
         assert_eq!(t.colors.selection_background, Color(0x333333));
         assert_eq!(t.colors.cursor, Color(0xffffff), "no cursor color: the foreground");
+    }
+
+    fn iterm_entry(key: &str, space: Option<&str>, [r, g, b]: [f64; 3]) -> String {
+        let space = space.map(|s| format!("\t\t<key>Color Space</key>\n\t\t<string>{s}</string>\n")).unwrap_or_default();
+        format!(
+            "\t<key>{key}</key>\n\t<dict>\n\t\t<key>Alpha Component</key>\n\t\t<real>1</real>\n\t\t<key>Blue Component</key>\n\t\t<real>{b}</real>\n{space}\t\t<key>Green Component</key>\n\t\t<real>{g}</real>\n\t\t<key>Red Component</key>\n\t\t<real>{r}</real>\n\t</dict>\n"
+        )
+    }
+
+    #[test]
+    fn iterm_color_spaces() {
+        let color = |space: Option<&str>, rgb| iterm_color(&iterm_entry("x", space, rgb)).unwrap();
+        // sRGB, calibrated, device and unmarked colors are taken as they are.
+        for space in [Some("sRGB"), Some("Calibrated"), Some("Device"), None] {
+            assert_eq!(color(space, [0.4, 0.5, 0.6]), Color(0x668099), "{space:?}");
+        }
+        // Display P3 is converted: the same numbers are a different sRGB color.
+        assert_eq!(color(Some("P3"), [0.4, 0.5, 0.6]), Color(0x5f809c));
+        assert_eq!(color(Some("P3"), [1.0, 1.0, 1.0]), Color(0xffffff));
+        // P3's pure red doesn't fit in sRGB: the most saturated red that does.
+        let red = color(Some("P3"), [1.0, 0.0, 0.0]);
+        assert!(red.rgb().0 >= 0xf0 && red.rgb().1 < 0x60 && red.rgb().2 < 0x60, "{red}");
+
+        // A whole preset saved in P3.
+        let mut plist = String::from("<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n");
+        for i in 0..16 {
+            plist += &iterm_entry(&format!("Ansi {i} Color"), Some("P3"), [0.4, 0.5, 0.6]);
+        }
+        plist += &iterm_entry("Background Color", Some("P3"), [0.0, 0.0, 0.0]);
+        plist += &iterm_entry("Foreground Color", Some("P3"), [1.0, 1.0, 1.0]);
+        plist += "</dict>\n</plist>\n";
+        let t = &import(&plist, "P3 preset").unwrap()[0];
+        assert_eq!(t.colors.ansi[3], Color(0x5f809c));
+        assert_eq!(t.colors.foreground, Color(0xffffff));
+    }
+
+    #[test]
+    fn css_colors_in_imported_files() {
+        // Windows Terminal and goatty theme files may carry alpha or CSS colors.
+        let wt = wt_scheme("A").replace("\"#C50F1F\"", "\"#C50F1F80\"").replace("\"#13A10E\"", "\"rgb(19 161 14)\"");
+        let t = &import(&wt, "f").unwrap()[0];
+        assert_eq!((t.colors.ansi[1], t.colors.ansi[2]), (Color(0xc50f1f), Color(0x13a10e)));
+        let mut colors = crate::find_theme("nord").unwrap().colors;
+        colors.foreground = Color(0xff8000);
+        let json =
+            serde_json::to_string(&ThemeFile { name: "Mine".into(), colors }).unwrap().replace("\"#ff8000\"", "\"hsl(30 100% 50%)\"");
+        assert_eq!(import(&json, "x").unwrap()[0].colors.foreground, Color(0xff8000));
+        // Written back, it's hex again.
+        assert!(serde_json::to_string(&import(&json, "x").unwrap()[0].colors).unwrap().contains("\"#ff8000\""));
     }
 
     #[test]

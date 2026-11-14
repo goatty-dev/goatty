@@ -1,11 +1,14 @@
-//! Color spaces and text formats for the color picker (and anything else
-//! that takes a color from a user): HSV, HSL, Oklab/Oklch conversions and a
-//! lenient parser that understands what people paste.
+//! Color spaces and text formats for the color picker, the settings files
+//! and anything else that takes a color from a user: HSV, HSL, Oklab/Oklch
+//! conversions, Display P3, WCAG contrast, and a lenient parser that
+//! understands what people paste or write.
 //!
 //! Everything works on opaque sRGB [`Color`]s (themes have no alpha). An
 //! alpha component in pasted text (`#rrggbbaa`, `rgb(… / 50%)`) is accepted
 //! and ignored. Out-of-gamut Oklab/Oklch values are mapped into sRGB by
 //! lowering chroma (keeping lightness and hue), like CSS Color 4 suggests.
+//! [`ParsedColor`] says when either happened, so `goatty settings validate`
+//! can point it out.
 
 use crate::Color;
 
@@ -169,7 +172,12 @@ fn linear_to_srgb(x: f32) -> f32 {
 
 impl Oklab {
     pub fn from_rgbf([r, g, b]: Rgbf) -> Self {
-        let (r, g, b) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+        Self::from_linear([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)])
+    }
+
+    /// From linear-light sRGB (channels may lie outside 0..=1: a color
+    /// from a wider gamut).
+    fn from_linear([r, g, b]: [f32; 3]) -> Self {
         let l = (0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
         let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
         let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
@@ -288,6 +296,44 @@ impl Oklch {
     pub fn to_color(self) -> Color {
         from_rgbf(self.to_rgbf())
     }
+
+    /// In sRGB without gamut mapping: out-of-gamut channels are clamped.
+    /// Cheaper than [`Oklch::to_rgbf`], for painting many colors that are
+    /// (nearly) inside sRGB already.
+    pub fn to_rgbf_clamped(self) -> Rgbf {
+        self.linear_at(self.c.max(0.0)).map(|x| linear_to_srgb(x.clamp(0.0, 1.0)))
+    }
+}
+
+// ---- Display P3 -----------------------------------------------------------------
+
+/// A Display P3 color (P3 primaries, D65 white, the sRGB transfer curve;
+/// what macOS apps such as iTerm2 save as "P3") as the nearest sRGB color.
+/// Colors outside sRGB keep their lightness and hue and lose chroma.
+pub fn display_p3_to_srgb([r, g, b]: Rgbf) -> Color {
+    let (r, g, b) = (srgb_to_linear(r.clamp(0.0, 1.0)), srgb_to_linear(g.clamp(0.0, 1.0)), srgb_to_linear(b.clamp(0.0, 1.0)));
+    // Linear P3 → linear sRGB (both D65; CSS Color 4's matrices combined).
+    let lin =
+        [1.224_940_2 * r - 0.224_940_18 * g, -0.042_056_955 * r + 1.042_056_9 * g, -0.019_637_555 * r - 0.078_636_05 * g + 1.098_273_6 * b];
+    if in_gamut(lin) {
+        return from_rgbf(lin.map(|x| linear_to_srgb(x.clamp(0.0, 1.0))));
+    }
+    Oklab::from_linear(lin).to_color()
+}
+
+// ---- Contrast ---------------------------------------------------------------------
+
+/// WCAG 2 relative luminance, 0.0 (black) to 1.0 (white).
+pub fn relative_luminance(c: Color) -> f32 {
+    let [r, g, b] = to_rgbf(c);
+    0.2126 * srgb_to_linear(r) + 0.7152 * srgb_to_linear(g) + 0.0722 * srgb_to_linear(b)
+}
+
+/// WCAG 2 contrast ratio between two colors, 1.0 (same) to 21.0 (black on
+/// white). Symmetric. Text wants 4.5 or more, large text and UI parts 3.
+pub fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 // ---- Text formats ----------------------------------------------------------------
@@ -440,7 +486,8 @@ impl Num {
     }
 }
 
-fn parse_hex(s: &str) -> Option<Color> {
+/// A hex color and whether it had a (non-opaque) alpha.
+fn parse_hex(s: &str) -> Option<(Color, bool)> {
     let (digits, prefixed) = match s.strip_prefix('#').or_else(|| s.strip_prefix("0x")) {
         Some(d) => (d, true),
         None => (s, false),
@@ -451,9 +498,34 @@ fn parse_hex(s: &str) -> Option<Color> {
     let v = |i: usize| u8::from_str_radix(&digits[i..i + 1], 16).ok().map(|n| n * 17);
     let w = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
     match (digits.len(), prefixed) {
-        (3 | 4, _) if digits.len() == 3 || prefixed => Some(rgb8(v(0)?, v(1)?, v(2)?)),
-        (6 | 8, _) if digits.len() == 6 || prefixed => Some(rgb8(w(0)?, w(2)?, w(4)?)),
+        (3 | 4, _) if digits.len() == 3 || prefixed => Some((rgb8(v(0)?, v(1)?, v(2)?), digits.len() == 4 && v(3)? != 255)),
+        (6 | 8, _) if digits.len() == 6 || prefixed => Some((rgb8(w(0)?, w(2)?, w(4)?), digits.len() == 8 && w(6)? != 255)),
         _ => None,
+    }
+}
+
+/// A color read from text, and what reading it lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedColor {
+    pub color: Color,
+    /// The text had an alpha below 1, which is ignored.
+    pub dropped_alpha: bool,
+    /// A component was outside its range (`rgb(300 0 0)`, `hsl(0 120% 50%)`)
+    /// or the color is outside sRGB (`oklch(0.7 0.4 150)`): it was clamped
+    /// or gamut-mapped.
+    pub out_of_range: bool,
+}
+
+impl ParsedColor {
+    /// What was lost, as a sentence about `text`, or `None` when nothing was.
+    pub fn loss(&self, text: &str) -> Option<String> {
+        let text = text.trim();
+        match (self.dropped_alpha, self.out_of_range) {
+            (false, false) => None,
+            (true, false) => Some(format!("the alpha of {text:?} is ignored (themes are opaque); it reads as {}", self.color)),
+            (false, true) => Some(format!("{text:?} is outside sRGB; it reads as {}", self.color)),
+            (true, true) => Some(format!("{text:?} is outside sRGB and its alpha is ignored; it reads as {}", self.color)),
+        }
     }
 }
 
@@ -463,19 +535,30 @@ fn parse_hex(s: &str) -> Option<Color> {
 /// numbers like `12, 200, 99` that mean `hint` (RGB when `hint` is
 /// [`ColorFormat::Hex`]).
 pub fn parse_color(input: &str, hint: ColorFormat) -> Option<Color> {
+    parse(input, Some(hint)).map(|p| p.color)
+}
+
+/// Read a color written in a file or on a command line: hex or a CSS
+/// function as in [`parse_color`], but not bare numbers (they could mean
+/// any model).
+pub fn parse_css_color(input: &str) -> Option<ParsedColor> {
+    parse(input, None)
+}
+
+fn parse(input: &str, hint: Option<ColorFormat>) -> Option<ParsedColor> {
     let s = input.trim().trim_end_matches(';').trim().to_ascii_lowercase();
     if s.is_empty() {
         return None;
     }
-    if let Some(c) = parse_hex(&s) {
-        return Some(c);
+    if let Some((color, dropped_alpha)) = parse_hex(&s) {
+        return Some(ParsedColor { color, dropped_alpha, out_of_range: false });
     }
     let (name, args) = match s.find('(') {
         Some(i) => (s[..i].trim(), s[i + 1..].strip_suffix(')')?),
         None => ("", s.as_str()),
     };
     let format = match name {
-        "" => hint,
+        "" => hint?,
         "rgb" | "rgba" => ColorFormat::Rgb,
         "hsl" | "hsla" => ColorFormat::Hsl,
         "hsv" | "hsb" | "hsva" => ColorFormat::Hsv,
@@ -489,13 +572,70 @@ pub fn parse_color(input: &str, hint: ColorFormat) -> Option<Color> {
         return None;
     }
     let [a, b, c] = [toks[0], toks[1], toks[2]];
-    Some(match format {
-        ColorFormat::Hex | ColorFormat::Rgb => from_rgbf([a.channel(), b.channel(), c.channel()]),
-        ColorFormat::Hsl => Hsl::new(a.degrees(), b.fraction(true), c.fraction(true)).to_color(),
-        ColorFormat::Hsv => Hsv::new(a.degrees(), b.fraction(true), c.fraction(true)).to_color(),
-        ColorFormat::Oklch => Oklch::new(a.lightness(), b.chroma(), c.degrees()).to_color(),
-        ColorFormat::Oklab => Oklab { l: a.lightness().clamp(0.0, 1.0), a: b.chroma(), b: c.chroma() }.to_color(),
-    })
+    let dropped_alpha = toks.get(3).is_some_and(|alpha| alpha.fraction(false) < 1.0 - 1e-4);
+    let outside = |x: f32| !(-1e-4..=1.0 + 1e-4).contains(&x);
+    let (color, out_of_range) = match format {
+        ColorFormat::Hex | ColorFormat::Rgb => {
+            let rgb = [a.channel(), b.channel(), c.channel()];
+            // Channels are written in steps of 1/255: allow half a step.
+            (from_rgbf(rgb), rgb.iter().any(|&x| !(-0.002..=1.002).contains(&x)))
+        }
+        ColorFormat::Hsl | ColorFormat::Hsv => {
+            let (s, l) = (b.fraction(true), c.fraction(true));
+            let color =
+                if format == ColorFormat::Hsl { Hsl::new(a.degrees(), s, l).to_color() } else { Hsv::new(a.degrees(), s, l).to_color() };
+            (color, outside(s) || outside(l))
+        }
+        ColorFormat::Oklch | ColorFormat::Oklab => {
+            let o = if format == ColorFormat::Oklch {
+                Oklch { l: a.lightness(), c: b.chroma(), h: c.degrees() }
+            } else {
+                Oklch::from(Oklab { l: a.lightness(), a: b.chroma(), b: c.chroma() })
+            };
+            let out_of_range = if outside(o.l) || o.c < 0.0 {
+                true
+            } else if o.l <= 0.0 || o.l >= 1.0 {
+                // Pure black and white take any chroma: CSS reads it as zero there.
+                false
+            } else {
+                // Outside sRGB by more than a rounding step (what the picker's
+                // own `oklch()` text, rounded to 4 decimals, may be).
+                let encode = |x: f32| x.signum() * linear_to_srgb(x.abs());
+                o.linear_at(o.c).iter().any(|&x| !(-1.0 / 255.0..=1.0 + 1.0 / 255.0).contains(&encode(x)))
+            };
+            (Oklch::new(o.l, o.c, o.h).to_color(), out_of_range)
+        }
+    };
+    Some(ParsedColor { color, dropped_alpha, out_of_range })
+}
+
+/// Colors in `value` (a JSON subtree at `path`, such as a settings file's
+/// `theme.overrides` or a theme file's `colors`) that lose something when
+/// read: `(path, what)` for `goatty settings validate`.
+pub fn lossy_colors(value: &serde_json::Value, path: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    fn walk(v: &serde_json::Value, path: String, out: &mut Vec<(String, String)>) {
+        match v {
+            serde_json::Value::String(s) => {
+                if let Some(loss) = parse_css_color(s).and_then(|p| p.loss(s)) {
+                    out.push((path, loss));
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    walk(item, format!("{path}.{i}"), out);
+                }
+            }
+            serde_json::Value::Object(m) => {
+                for (k, item) in m {
+                    walk(item, if path.is_empty() { k.clone() } else { format!("{path}.{k}") }, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(value, path.to_string(), &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -660,6 +800,80 @@ mod tests {
         ] {
             assert_eq!(parse_color(text, ColorFormat::Rgb), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn contrast_ratios() {
+        assert!((contrast_ratio(Color(0x000000), Color(0xffffff)) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(Color(0x123456), Color(0x123456)) - 1.0).abs() < 1e-6);
+        // WCAG's classic: #777 on white just misses 4.5:1.
+        let r = contrast_ratio(Color(0x777777), Color(0xffffff));
+        assert!((r - 4.478).abs() < 0.01, "{r}");
+        assert_eq!(contrast_ratio(Color(0x777777), Color(0xffffff)), contrast_ratio(Color(0xffffff), Color(0x777777)));
+    }
+
+    #[test]
+    fn display_p3_converts_to_srgb() {
+        assert_eq!(display_p3_to_srgb([1.0, 1.0, 1.0]), Color(0xffffff));
+        assert_eq!(display_p3_to_srgb([0.0, 0.0, 0.0]), Color(0x000000));
+        assert_eq!(display_p3_to_srgb([0.5, 0.5, 0.5]), Color(0x808080), "grays stay put");
+        // Inside sRGB: the plain matrix conversion.
+        assert!(close(display_p3_to_srgb([0.4, 0.5, 0.6]), Color(0x5f809c), 1), "{}", display_p3_to_srgb([0.4, 0.5, 0.6]));
+        // P3's red is outside sRGB: still a red, as saturated as sRGB allows.
+        let red = display_p3_to_srgb([1.0, 0.0, 0.0]);
+        let o = Oklch::from_color(red);
+        assert!((o.h - 29.0).abs() < 3.0 && red.rgb().0 >= 0xf0 && red.rgb().1 < 0x60, "{red} {o:?}");
+    }
+
+    #[test]
+    fn css_colors_report_what_they_lose() {
+        let p = |s: &str| parse_css_color(s).unwrap_or_else(|| panic!("{s:?} doesn't parse"));
+        for s in [
+            "#1a2b3c",
+            "#1a2b3cff",
+            "#abcf",
+            "rgb(255 128 0)",
+            "rgb(255 128 0 / 1)",
+            "rgba(1, 2, 3, 100%)",
+            "hsl(0 100% 50%)",
+            "oklch(1 0.2 10)",
+            "oklch(0 0 0)",
+        ] {
+            assert_eq!(p(s).loss(s), None, "{s}");
+        }
+        assert!(p("#1a2b3c80").dropped_alpha);
+        assert!(p("#abc8").dropped_alpha);
+        assert!(p("rgb(1 2 3 / 50%)").dropped_alpha);
+        assert!(p("rgba(1, 2, 3, 0.5)").dropped_alpha);
+        assert!(p("rgb(300 0 0)").out_of_range);
+        assert!(p("hsl(0 120% 50%)").out_of_range);
+        let wild = p("oklch(0.7 0.4 150)");
+        assert!(wild.out_of_range && !wild.dropped_alpha);
+        assert!(wild.loss("oklch(0.7 0.4 150)").unwrap().contains(&wild.color.to_string()));
+        // Bare numbers mean nothing without a model.
+        assert_eq!(parse_css_color("255 128 0"), None);
+        assert_eq!(parse_css_color("red"), None);
+        // Whatever the picker writes reads back without a loss.
+        for c in samples() {
+            for f in ColorFormat::ALL {
+                let text = f.format(c);
+                assert_eq!(p(&text).loss(&text), None, "{f:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn lossy_colors_walks_objects_and_arrays() {
+        let v = serde_json::json!({
+            "foreground": "rgb(300 0 0)",
+            "background": "#000000",
+            "ansi": ["#000000", "#ff000080"],
+            "unrelated": 5
+        });
+        let mut found = lossy_colors(&v, "theme.overrides");
+        found.sort();
+        let paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["theme.overrides.ansi.1", "theme.overrides.foreground"]);
     }
 
     #[test]

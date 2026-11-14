@@ -95,6 +95,26 @@ impl ThemeLibrary {
         lib
     }
 
+    /// Colors in the user theme files that read with a loss (see
+    /// [`crate::colorspace::lossy_colors`]), for `goatty settings validate`.
+    pub fn lossy_colors(&self) -> Vec<Issue> {
+        let Some(dir) = &self.dir else { return Vec::new() };
+        let mut out = Vec::new();
+        for t in &self.user {
+            let file = format!("themes/{}.json", t.id);
+            let Ok(text) = std::fs::read_to_string(dir.join(format!("{}.json", t.id))) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            if let Some(colors) = v.get("colors") {
+                out.extend(
+                    crate::colorspace::lossy_colors(colors, "colors")
+                        .into_iter()
+                        .map(|(path, what)| Issue::new(&file, format!("{path}: {what}"))),
+                );
+            }
+        }
+        out
+    }
+
     /// Every theme: built-ins (replaced by a user theme of the same id),
     /// then the other user themes.
     pub fn all(&self) -> Vec<ThemeEntry> {

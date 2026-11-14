@@ -832,6 +832,16 @@ impl ClientSettings {
         Self::ENV_KEYS.iter().find(|(n, _)| *n == name).map_or(&[], |(_, k)| k)
     }
 
+    /// Theme colors in the settings file `text` that read with a loss: an
+    /// ignored alpha, or a value outside sRGB that was clamped or
+    /// gamut-mapped. They load fine (and are written back as `#rrggbb`);
+    /// `goatty settings validate` points them out.
+    pub fn lossy_colors(text: &str) -> Vec<Issue> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
+        let Some(overrides) = v.pointer("/theme/overrides") else { return Vec::new() };
+        crate::colorspace::lossy_colors(overrides, "theme.overrides").into_iter().map(|(path, what)| Issue::new(path, what)).collect()
+    }
+
     /// Checks that need this machine (installed fonts, programs on PATH),
     /// made after the `GOATTY_*` overrides: things that parse but won't
     /// work as written. Nothing is changed; goatty already falls back.
@@ -881,6 +891,28 @@ const GENERIC_FONTS: &[&str] = &["monospace", "sans-serif", "serif", "system-ui"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_colors_take_css_and_are_written_as_hex() {
+        use crate::store;
+        use crate::theme::{Color, ColorSlot};
+        let l = store::set_key::<ClientSettings>("", "theme.overrides.foreground", "rgb(255 128 0)").unwrap();
+        assert_eq!(l.value.theme.overrides.get(ColorSlot::Foreground), Some(Color(0xff8000)));
+        assert!(store::to_json(&l.value, &l.unknown).contains("\"#ff8000\""));
+        let l = store::set_key::<ClientSettings>("", "theme.overrides.background", "oklch(0 0 0)").unwrap();
+        assert_eq!(l.value.theme.overrides.get(ColorSlot::Background), Some(Color(0)));
+        assert!(store::set_key::<ClientSettings>("", "theme.overrides.background", "255 128 0").is_err(), "bare numbers are ambiguous");
+        assert!(store::set_key::<ClientSettings>("", "theme.overrides.background", "reddish").is_err());
+
+        let text =
+            r##"{"theme": {"overrides": {"foreground": "#ff800080", "cursor": "hsl(30, 100%, 50%)", "ansi": ["oklch(0.7 0.4 150)"]}}}"##;
+        let l = store::parse::<ClientSettings>(text);
+        assert!(l.issues.is_empty(), "{:?}", l.issues);
+        assert_eq!(l.value.theme.overrides.get(ColorSlot::Cursor), Some(Color(0xff8000)));
+        let mut lossy: Vec<String> = ClientSettings::lossy_colors(text).into_iter().map(|i| i.path).collect();
+        lossy.sort();
+        assert_eq!(lossy, ["theme.overrides.ansi.0", "theme.overrides.foreground"]);
+    }
 
     fn with(vars: &[(&str, &str)]) -> ClientSettings {
         let mut s = ClientSettings::default();

@@ -108,7 +108,7 @@ ui/
   controls.rs  toggle, segmented, stepper, button, rows
   text_input.rs single-line text field (IME-aware; adapted from GPUI's example)
   prompt_preview.rs draws a prompt from `PromptSettings::layout` with sample values (Prompt page, style cards, welcome window)
-  color_picker.rs color picker widget: `Entity<ColorPicker>` emitting `Changed`/`Committed`; `Pick` (float state), `Wheel` geometry, painting, drag handling
+  color_picker.rs color picker widget: `Entity<ColorPicker>` emitting `Changed`/`Committed`; `Pick` (float state), `Wheel` (HSV) and `Disc` (OKLCH, a generated bitmap) geometry, painting, drag and arrow-key handling (`Knob`s are tab stops), lighter/darker nudges, the contrast row (`ContrastRef`, filled per slot by the settings window)
 workspace/
   mod.rs       root view per window: tabs of split panes, each tab on its own host (`Spawner`), connecting tabs (connect screen until the session is there), a saved layout per goattyd, spawning/closing panes, window title, closes with the last pane; command palette, paste confirmations, toast layer
   layout.rs    a tab's split tree (pure, unit-tested): n-ary splits with weights, split/remove/normalize, layout → leaf rects + dividers, neighbor, resize

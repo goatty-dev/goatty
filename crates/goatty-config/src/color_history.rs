@@ -47,7 +47,7 @@ impl ColorHistory {
     }
 
     /// Read the history at `path`. Unreadable files and entries that aren't
-    /// `#rrggbb` are skipped.
+    /// colors are skipped.
     pub fn load(path: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(path) else { return Self::default() };
         let Ok(value) = serde_json::from_str::<Value>(&text) else { return Self::default() };

@@ -2015,6 +2015,7 @@ dependencies = [
  "goatty-term",
  "gpui",
  "gpui_platform",
+ "image",
  "log",
  "parking_lot 0.13.0",
  "serde",

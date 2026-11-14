@@ -311,6 +311,8 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
             let lib = ThemeLibrary::load_default();
             problems.extend(lib.issues.iter().map(ToString::to_string));
             problems.extend(lib.check(&loaded.value.theme).iter().map(ToString::to_string));
+            problems.extend(ClientSettings::lossy_colors(&text).iter().map(ToString::to_string));
+            problems.extend(lib.lossy_colors().iter().map(ToString::to_string));
             // Without a window there's no font list: only programs are checked.
             problems.extend(loaded.value.check_environment(&[], crate::settings::has_program).iter().map(ToString::to_string));
             // Keystrokes goatty can't read are already in `issues`; this
@@ -333,6 +335,12 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
             let loaded = store::set_key::<ClientSettings>(&read_or_empty(&path)?, &key, &value).map_err(anyhow::Error::msg)?;
             store::save(&path, &loaded.value, &loaded.unknown)?;
             println!("{key} = {}", store::get_key(&loaded.value, &key).map(|v| v.to_string()).unwrap_or_default());
+            // Colors are stored as #rrggbb: say what a CSS color lost on the way.
+            if key.starts_with("theme.overrides")
+                && let Some(loss) = goatty_config::colorspace::parse_css_color(&value).and_then(|p| p.loss(&value))
+            {
+                eprintln!("note: {loss}");
+            }
             Ok(())
         }
         SettingsCmd::Unset { key } => {

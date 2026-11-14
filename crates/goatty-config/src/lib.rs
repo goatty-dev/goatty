@@ -57,7 +57,8 @@ pub use host::{HistorySettings, HostSettings, PluginConfig, ShellSettings, UserA
 pub use prompt::{PromptSettings, PromptStyle};
 pub use store::{Document, FileStamp, Issue, Loaded};
 pub use theme::{
-    Color, ColorSlot, DEFAULT_LIGHT_THEME, DEFAULT_THEME, THEMES, Theme, ThemeColors, ThemeOverrides, ThemeSettings, find_theme,
+    Color, ColorSlot, ContrastCheck, DEFAULT_LIGHT_THEME, DEFAULT_THEME, THEMES, Theme, ThemeColors, ThemeOverrides, ThemeSettings,
+    find_theme,
 };
 pub use themes::{ThemeEntry, ThemeLibrary};
 
