@@ -15,7 +15,9 @@ use std::rc::Rc;
 
 use gpui::{Action, App, Global, SharedString, Window};
 
+use super::input::{Ask, Field};
 use crate::actions;
+use crate::settings::AppSettings;
 use crate::settings_window::{self, Page};
 use crate::toast::{self, Toast};
 
@@ -23,8 +25,7 @@ use crate::toast::{self, Toast};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
     Builtin,
-    /// A plugin, by its manifest id.
-    #[cfg_attr(not(test), expect(dead_code, reason = "plugins register commands from Stage 5 (#77)"))]
+    /// A plugin, by its manifest id (its `[[command]]`s, see `crate::plugin_commands`).
     Plugin(SharedString),
 }
 
@@ -151,13 +152,18 @@ impl CommandRegistry {
         }
     }
 
+    /// Remove every plugin's commands (the active host changed).
+    pub fn unregister_plugins(&mut self) {
+        self.commands.retain(|c| c.source == Source::Builtin);
+    }
+
     /// Remove every command from `source` (a plugin was unloaded).
-    #[cfg_attr(not(test), expect(dead_code, reason = "plugins register commands from Stage 5 (#77)"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "plugin commands are replaced all at once"))]
     pub fn unregister_source(&mut self, source: &Source) {
         self.commands.retain(|c| &c.source != source);
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "plugins register commands from Stage 5 (#77)"))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "only tests look commands up by id"))]
     pub fn get(&self, id: &str) -> Option<&Rc<Command>> {
         self.commands.iter().find(|c| c.id == id)
     }
@@ -251,8 +257,39 @@ pub fn builtins() -> Vec<Command> {
         .keywords(&["directory", "files"]),
         Command::action("ssh.connect", "SSH", "Connect to a host…", "connect_to_host")
             .keywords(&["remote", "server", "hosts", "goattyd", "open"]),
+        Command::handler("ssh.connect_custom", "SSH", "Connect to a custom host…", crate::hosts::ask_connect).keywords(&[
+            "remote",
+            "address",
+            "user@host",
+            "ip",
+            "server",
+            "type",
+            "enter",
+        ]),
+        Command::handler("ssh.add_host", "SSH", "Add a host to the list…", crate::hosts::ask_add_host).keywords(&[
+            "remote",
+            "server",
+            "new",
+            "save",
+            "plain ssh",
+            "name",
+        ]),
         Command::action("shell.reload", "Shell", "Reload running shells", "reload_shells")
             .keywords(&["restart", "refresh", "zsh", "apply", "source"]),
+        Command::handler("shell.add_to_path", "Shell", "Add a folder to PATH…", crate::shell_path::ask_add).keywords(&[
+            "path",
+            "bin",
+            "directory",
+            "export",
+            "programs",
+            "environment",
+        ]),
+        Command::handler("shell.remove_from_path", "Shell", "Remove a folder from PATH…", crate::shell_path::ask_remove).keywords(&[
+            "path",
+            "bin",
+            "directory",
+            "delete",
+        ]),
         Command::handler("shell.sync", "Shell", "Sync shell setup to this host", |_, cx| crate::shell_sync::sync_now(cx))
             .keywords(&["copy", "mirror", "remote", "plugins", "aliases", "prompt", "dotfiles", "same"]),
         Command::action("terminal.copy", "Terminal", "Copy the selection", "copy").keywords(&["clipboard"]),
@@ -279,6 +316,12 @@ pub fn builtins() -> Vec<Command> {
         Command::action("view.zoom_in", "View", "Bigger text", "increase_font_size").keywords(&["zoom in", "font size", "larger"]),
         Command::action("view.zoom_out", "View", "Smaller text", "decrease_font_size").keywords(&["zoom out", "font size"]),
         Command::action("view.zoom_reset", "View", "Reset text size", "reset_font_size").keywords(&["zoom", "font size", "default"]),
+        Command::handler("view.set_text_size", "View", "Set the text size…", ask_text_size).keywords(&[
+            "font size",
+            "zoom",
+            "pixels",
+            "px",
+        ]),
         Command::action("tab.new", "Tabs", "New tab", "new_tab").keywords(&["open", "create", "session"]),
         Command::action("tab.close", "Tabs", "Close the tab", "close_tab").keywords(&["kill", "exit"]),
         Command::action("tab.next", "Tabs", "Next tab", "next_tab").keywords(&["switch"]),
@@ -334,6 +377,22 @@ pub fn builtins() -> Vec<Command> {
         ]),
         Command::handler("app.quit", "goatty", "Quit", |_, cx| cx.quit()).keywords(&["exit", "close"]),
     ]
+}
+
+/// "View: Set the text size…": ask for a size and save it in the settings.
+fn ask_text_size(window: &mut Window, cx: &mut App) {
+    use goatty_config::FontSettings;
+    let now = cx.global::<AppSettings>().client.font.size;
+    let field =
+        Field::number("size", "Text size in pixels", Some(f64::from(FontSettings::MIN_SIZE)), Some(f64::from(FontSettings::MAX_SIZE)))
+            .initial(now.to_string())
+            .help(format!("Now {now} px; saved in settings.json for every window"));
+    let ask = Ask::new("Set the text size", vec![field], |answers, _, cx| {
+        let Ok(size) = answers["size"].parse::<f32>() else { return };
+        AppSettings::update(cx, |s| s.font.size = size);
+        toast::show(cx, Toast::success(format!("Text size {size} px")).key("view.zoom"));
+    });
+    super::ask(window, cx, ask);
 }
 
 /// Fill the registry with the built-ins.

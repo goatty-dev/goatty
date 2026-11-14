@@ -487,6 +487,14 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Type `line` at the prompt and press Enter: a command the user
+    /// picked in the palette (a plugin's). Sent as a paste, so nothing in
+    /// it acts as a key.
+    pub fn run_line(&mut self, line: &str, cx: &mut Context<'_, Self>) {
+        self.paste_text(line, cx);
+        self.send(b"\r");
+    }
+
     // ---- links --------------------------------------------------------------
 
     /// Re-detect the link under the mouse. Returns whether what's shown

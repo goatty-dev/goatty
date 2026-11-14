@@ -35,7 +35,7 @@
 //! host (`settings_window::set_host_link`).
 
 mod gestures;
-mod icons;
+pub(crate) mod icons;
 mod layout;
 pub mod saved;
 mod sidebar;
@@ -1276,7 +1276,30 @@ impl Workspace {
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_recent(window, cx);
         let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
+        self.show_palette(palette, window, cx);
+    }
+
+    /// Ask for `ask`'s input in the palette (replacing an open one); see
+    /// `command_palette::ask`.
+    pub fn open_ask(&mut self, ask: crate::command_palette::Ask, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.close_recent(window, cx);
+        self.palette = None;
+        let palette = cx.new(|cx| CommandPalette::asking(ask, window, cx));
+        self.show_palette(palette, window, cx);
+    }
+
+    /// The focused pane's terminal, for commands that act on it.
+    pub fn focused_terminal(&self) -> Option<Entity<TerminalView>> {
+        self.focused_view().cloned()
+    }
+
+    fn show_palette(&mut self, palette: Entity<CommandPalette>, window: &mut Window, cx: &mut Context<'_, Self>) {
         let sub = cx.subscribe_in(&palette, window, |this, _, ev: &PaletteEvent, window, cx| match ev {
+            PaletteEvent::Answered(then, answers) => {
+                let (then, answers) = (then.clone(), answers.clone());
+                this.close_palette(window, cx);
+                then(&answers, window, cx);
+            }
             PaletteEvent::Dismissed => this.close_palette(window, cx),
             PaletteEvent::Run(command) => {
                 let command = command.clone();

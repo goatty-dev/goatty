@@ -82,6 +82,7 @@ command_palette/
   mod.rs       the Ctrl+Shift+P overlay: ranking (fuzzy + keywords + recently used), list, keys; hosts once something is typed; `Scope::Hosts` (Ctrl+Shift+H, the host switcher): this computer and the hosts with user@host/OS/RTT when connected, plus a typed user@host; `Scope::Sessions`: a host's sessions (fetched in the background) and a new one, opened per `ssh.open_in` (Shift+Enter: the other way)
   registry.rs  Command (id, category, title, keywords, action or handler), CommandRegistry global, built-ins
   fuzzy.rs     fzf-style matcher: word starts, consecutive runs, gaps; any word order; highlight positions
+  input.rs     asking for input (#91): `Ask` (title, `Field`s, answer handler) and `ask(window, …)`; a `Field` is the plugin format's `CommandInput` (text/integer/number/path/folder/choice, label, placeholder, default, limits, pattern) plus an extra check and suggestions (choices, hosts, folders listed off the UI thread when the host is this computer); the palette shows one field at a time (Enter next, Esc back, Tab fills in) and emits `PaletteEvent::Answered`
 settings_window/
   mod.rs       the settings window: pages, navigation, host draft → preview → apply, themes, export/import, rollback
   host.rs      HostLink: the daemon connection or the local HostService
@@ -128,6 +129,8 @@ workspace/
   saved.rs     the window's layout as goattyd keeps it (JSON: tabs, split trees with session ids, names, focus, zoom, window size and state); `restore` claims and reattaches it
 close_confirm.rs  "Close this pane?" dialog when a program other than the shell still runs (`panes.confirm_close`, "Don't ask again")
 connect.rs     ConnectView, the connect screen in a tab: connects off the UI thread (local daemon or remote), turns RemoteProblem into questions (install / update and restart / plain SSH) and LocalProblem too (a local goattyd that's incompatible or an older build than the installed one: restarted right away without sessions, else asked), hands the tab its session or restored layout
+plugin_commands.rs  the active host's plugins' `[[command]]`s in the palette (`plugin.<id>.<cmd>`): catalog fetched off the UI thread when the host link changes or plugins change; picking one asks for its inputs and types the quoted line into the focused pane (a busy pane: offer to copy it)
+shell_path.rs  "Shell: Add/Remove a folder to/from PATH…": asks, then changes `shell.path` on the active tab's host through its goattyd
 hosts.rs       hosts to connect to: `ssh.hosts` + `~/.ssh/config` (`HostList` global, read in the background), palette commands, `pool` (one shared Connection per host), `open` → a connecting tab of the last active window or a new window (`ssh.open_in`)
 shell_setup.rs installing a host's built-in tools with progress (`install`), the per-host install offer toast after a tab connects (`offer`)
 shell_sync.rs  bringing this computer's shell setup to the host a tab connects to (`on_connect`: compare off the UI thread, ask with a toast once per change made here, or sync right away per `ssh.sync`/`ssh.hosts[].sync` and after a fresh goattyd install), the progress/result toast, "Sync shell setup to this host" (`sync_now`)
@@ -187,6 +190,7 @@ Input: GPUI dispatches a bound action before the view's raw `on_key_down`. Short
 | New theme import format                | `goatty-config/src/theme_import.rs` (detect + parse to `ThemeColors`) |
 | Settings migration                     | bump `Document::VERSION`, add `(from, fn(&mut Value))` to `migrations()` |
 | FDSTORE / shells across restarts (#131) | `goatty-daemon/src/server.rs` (restore), `goatty-client/src/service.rs` (unit options) |
+| A palette command that asks for input  | build a `command_palette::Ask` (fields from `input.rs`) in a `Command::handler` and call `command_palette::ask`; it runs deferred, so the handler may read the workspace. Plugins: `[[command]]` (`goatty-plugin/src/commands.rs`) |
 | Host list / switcher (#4)              | `hosts.rs` (entries, connection pool, `open`) + `command_palette` (`Scope::Hosts`/`Scope::Sessions`) + `settings_window/hosts.rs`; per-host data in `goatty-config` `SshSettings`; `~/.ssh/config` parsing in `goatty-client/src/ssh_config.rs` |
 | A plugin feature (new manifest field)  | `goatty-plugin/src/manifest.rs` (+ validation, permissions if it can run code), rendering in `goatty-plugin/src/zsh.rs`, document it in `docs/plugins.md` and the template |
 | A plugin operation (GUI/CLI)           | `goatty_plugin::api::Request`/`Reply` (no protocol bump), `HostService::plugin_request`, `settings_window/plugins.rs`, `plugins/cmd.rs` |

@@ -16,8 +16,14 @@
 //! ([`Scope::Sessions`], fetched off the UI thread, connecting first when
 //! needed): Enter opens one, or a new one, where `ssh.open_in` says (a new
 //! tab or window), Shift+Enter the other way. Escape goes back to the hosts.
+//!
+//! The palette also asks for input ([`input`], #91): a command (or any
+//! code) hands it an [`input::Ask`], and it shows one field at a time with
+//! a label, placeholder, live check and suggestions, then emits
+//! [`PaletteEvent::Answered`].
 
 pub mod fuzzy;
+pub mod input;
 pub mod registry;
 
 use std::ops::Range;
@@ -33,6 +39,7 @@ use gpui::{
     StyledText, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 
+pub use input::{Answers, Ask, Field, ask};
 pub use registry::{Command, CommandRegistry, register_builtins};
 
 use crate::hosts::{self, HostList, HostRef, OpenRequest};
@@ -61,7 +68,7 @@ const RECENT_BONUS: i32 = 8;
 /// specific: "sett" prefers "Settings: Open settings" over "Settings: Shell".
 const TITLE_BONUS: i32 = 10;
 
-actions!(command_palette, [SelectNext, SelectPrevious, SelectFirst, SelectLast, PageDown, PageUp, Dismiss, ConfirmOther]);
+actions!(command_palette, [SelectNext, SelectPrevious, SelectFirst, SelectLast, PageDown, PageUp, Dismiss, ConfirmOther, Complete]);
 
 /// Key bindings inside the palette. `toggle_keys` are the keystrokes bound
 /// to opening it, which close it again.
@@ -72,7 +79,7 @@ pub fn bindings(toggle_keys: &[String], cx: &App) -> Vec<KeyBinding> {
         KeyBinding::new("up", SelectPrevious, c),
         KeyBinding::new("ctrl-n", SelectNext, c),
         KeyBinding::new("ctrl-p", SelectPrevious, c),
-        KeyBinding::new("tab", SelectNext, c),
+        KeyBinding::new("tab", Complete, c),
         KeyBinding::new("shift-tab", SelectPrevious, c),
         KeyBinding::new("pagedown", PageDown, c),
         KeyBinding::new("pageup", PageUp, c),
@@ -160,6 +167,34 @@ pub enum PaletteEvent {
     Dismissed,
     /// Close and run this command.
     Run(Rc<Command>),
+    /// Close and call the asker's handler with the answers.
+    Answered(input::AnswerHandler, Answers),
+}
+
+/// Asking for input: the [`input::Ask`] and where it's at.
+struct Asking {
+    title: SharedString,
+    fields: Vec<Field>,
+    local: bool,
+    then: input::AnswerHandler,
+    step: usize,
+    answers: Answers,
+    /// Under the field: (text, is an error).
+    message: Option<(SharedString, bool)>,
+    /// Enter was pressed on this step, so "Required" shows too.
+    tried: bool,
+    /// The selected suggestion is what Enter answers (the user moved to
+    /// it, or the field only takes its choices); otherwise the text is.
+    picked: bool,
+    home: Option<PathBuf>,
+    /// Folder listing and existence check for the current text.
+    _work: Option<Task<()>>,
+}
+
+impl Asking {
+    fn field(&self) -> &Field {
+        &self.fields[self.step]
+    }
 }
 
 /// One ranked result.
@@ -309,6 +344,7 @@ pub struct CommandPalette {
     sessions: Vec<Rc<Command>>,
     status: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
+    asking: Option<Asking>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -359,6 +395,7 @@ impl CommandPalette {
             sessions: Vec::new(),
             status: None,
             _load: None,
+            asking: None,
             _subscriptions: vec![sub, hosts_changed],
         };
         this.load_commands(cx);
@@ -366,8 +403,36 @@ impl CommandPalette {
         this
     }
 
+    /// A palette that asks for `ask`'s fields.
+    pub fn asking(ask: Ask, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        let mut this = Self::new(Scope::All, window, cx);
+        this.asking = Some(Asking {
+            title: ask.title,
+            fields: ask.fields,
+            local: ask.local,
+            then: ask.then,
+            step: 0,
+            answers: Answers::new(),
+            message: None,
+            tried: false,
+            picked: false,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            _work: None,
+        });
+        if this.asking.as_ref().is_some_and(|a| a.fields.is_empty()) {
+            // Nothing to ask: answer right away (after the palette is set up).
+            cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.finish_ask(cx)).ok()).detach();
+        } else {
+            this.start_step(0, None, cx);
+        }
+        this
+    }
+
     /// The commands to list: the registry's and the hosts, or only the hosts.
     fn load_commands(&mut self, cx: &mut Context<'_, Self>) {
+        if self.asking.is_some() {
+            return;
+        }
         let registry = cx.try_global::<CommandRegistry>().map(|r| r.commands().to_vec()).unwrap_or_default();
         let hosts = hosts::current(cx).into_iter().map(|e| Rc::new(hosts::command(&e)));
         self.commands = match self.scope {
@@ -385,6 +450,10 @@ impl CommandPalette {
     }
 
     fn set_query(&mut self, query: &str, cx: &mut Context<'_, Self>) {
+        if self.asking.is_some() {
+            self.ask_changed(query, cx);
+            return;
+        }
         self.commands.truncate(self.listed);
         self.labels.truncate(self.listed);
         self.shortcuts.truncate(self.listed);
@@ -432,33 +501,48 @@ impl CommandPalette {
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.pick();
         // Wraps around, like VS Code.
         let n = self.hits.len().max(1);
         self.select((self.selected + 1) % n, cx);
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.pick();
         let n = self.hits.len().max(1);
         self.select((self.selected + n - 1) % n, cx);
     }
 
     fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.pick();
         self.select(0, cx);
     }
 
     fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.pick();
         self.select(self.hits.len().saturating_sub(1), cx);
     }
 
     fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.pick();
         self.select(self.selected + MAX_VISIBLE_ROWS - 1, cx);
     }
 
     fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.pick();
         self.select(self.selected.saturating_sub(MAX_VISIBLE_ROWS - 1), cx);
     }
 
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<'_, Self>) {
+        // A field back to the one before it.
+        if let Some(a) = &self.asking
+            && a.step > 0
+        {
+            let prev = a.step - 1;
+            let text = a.answers.get(&a.fields[prev].spec.id).cloned();
+            self.start_step(prev, text, cx);
+            return;
+        }
         // From a host's sessions back to the hosts.
         if matches!(self.scope, Scope::Sessions(_)) {
             self.show_scope(Scope::Hosts, cx);
@@ -468,11 +552,217 @@ impl CommandPalette {
     }
 
     fn confirm(&mut self, cx: &mut Context<'_, Self>) {
+        if self.asking.is_some() {
+            self.submit_answer(cx);
+            return;
+        }
         self.run_hit(self.selected, false, cx);
     }
 
     fn confirm_other(&mut self, _: &ConfirmOther, _: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.asking.is_some() {
+            self.submit_answer(cx);
+            return;
+        }
         self.run_hit(self.selected, true, cx);
+    }
+
+    /// Tab: while asking, fill in the selected (else the first)
+    /// suggestion; otherwise the next command.
+    fn complete(&mut self, _: &Complete, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.asking.is_none() {
+            self.select_next(&SelectNext, window, cx);
+            return;
+        }
+        let ix = if self.asking.as_ref().is_some_and(|a| a.picked) { self.selected } else { 0 };
+        self.fill_suggestion(ix, cx);
+    }
+
+    // ---- asking for input ----------------------------------------------------
+
+    /// The user chose a suggestion with the keyboard.
+    fn pick(&mut self) {
+        if let Some(a) = &mut self.asking {
+            a.picked = true;
+        }
+    }
+
+    /// Whether the selected row is drawn as selected.
+    fn shows_selection(&self) -> bool {
+        self.asking.as_ref().is_none_or(|a| a.picked)
+    }
+
+    /// Show field `step`, starting with `text` (else its default).
+    fn start_step(&mut self, step: usize, text: Option<String>, cx: &mut Context<'_, Self>) {
+        let Some(a) = &mut self.asking else { return };
+        a.step = step;
+        a.tried = false;
+        a.picked = false;
+        a.message = None;
+        a._work = None;
+        let spec = &a.fields[step].spec;
+        let text = text.or_else(|| spec.default.clone()).unwrap_or_default();
+        let placeholder = if spec.placeholder.is_empty() { format!("{}…", spec.label) } else { spec.placeholder.clone() };
+        let label = spec.label.clone();
+        self.input.update(cx, |input, cx| {
+            input.set_text(text.clone(), cx);
+            input.set_placeholder(placeholder, cx);
+            input.set_label(label);
+            // Typing replaces a suggested value.
+            input.select_all_text(cx);
+        });
+        self.ask_changed(&text, cx);
+    }
+
+    /// The field's text changed: check it, update the suggestions.
+    fn ask_changed(&mut self, text: &str, cx: &mut Context<'_, Self>) {
+        self.query = text.to_string();
+        let Some(a) = &mut self.asking else { return };
+        a.picked = a.field().strict();
+        let field = a.field().clone();
+        a.message = message_for(&field, text, a.tried);
+        if field.is_path() {
+            self.show_suggestions(Vec::new(), "", cx);
+            let Some(a) = &mut self.asking else { return };
+            if !a.local {
+                return;
+            }
+            let (home, text_owned, step) = (a.home.clone(), text.to_string(), a.step);
+            let folders = field.spec.kind == goatty_plugin::commands::InputKind::Folder;
+            // Only a value that passes the other checks is looked up.
+            let value = field.validate(text).ok().map(|v| input::trim_completed(&v).to_string());
+            let spec = field.spec.clone();
+            a._work = Some(cx.spawn(async move |this, cx| {
+                let t = text_owned.clone();
+                let (list, missing) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let list = input::list_folder(&t, home.as_deref(), folders);
+                        let missing = value.and_then(|v| input::missing_path(&spec, &v, home.as_deref()));
+                        (list, missing)
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.query != text_owned || this.asking.as_ref().is_none_or(|a| a.step != step) {
+                        return;
+                    }
+                    if let (Some(a), Some(m)) = (&mut this.asking, missing)
+                        && a.message.as_ref().is_none_or(|(_, err)| !err)
+                    {
+                        a.message = Some((m.into(), true));
+                    }
+                    this.show_suggestions(list, "", cx);
+                });
+            }));
+            return;
+        }
+        let list = field.suggestions.clone();
+        self.show_suggestions(list, text, cx);
+    }
+
+    /// List `list` under the field, filtered by `query` (fuzzy, by label
+    /// or value; everything for an empty query, in order).
+    fn show_suggestions(&mut self, list: Vec<input::Suggestion>, query: &str, cx: &mut Context<'_, Self>) {
+        self.commands = list
+            .into_iter()
+            .map(|s| {
+                let mut c = Command::handler(&s.value, "", &s.label, |_, _| {});
+                c.detail = s.detail.map(Into::into);
+                Rc::new(c)
+            })
+            .collect();
+        self.listed = self.commands.len();
+        self.labels = self.commands.iter().map(|c| SharedString::from(c.label())).collect();
+        self.shortcuts = vec![Vec::new(); self.commands.len()];
+        let values: Vec<[SharedString; 1]> = self.commands.iter().map(|c| [c.id.clone()]).collect();
+        let entries: Vec<Entry<'_>> = self
+            .labels
+            .iter()
+            .zip(&values)
+            .map(|(label, value)| Entry { label, title_start: 0, keywords: value, recent_rank: None, only_when_searched: false })
+            .collect();
+        self.hits = if query.trim().is_empty() {
+            (0..entries.len()).map(|index| Hit { index, positions: Vec::new(), recent: false }).collect()
+        } else {
+            rank(&entries, query)
+        };
+        self.select(0, cx);
+    }
+
+    /// Put suggestion `ix` into the field (Tab, or clicking a folder).
+    fn fill_suggestion(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
+        let Some(hit) = self.hits.get(ix) else { return };
+        let value = self.commands[hit.index].id.to_string();
+        self.input.update(cx, |input, cx| input.set_text(value.clone(), cx));
+        self.ask_changed(&value, cx);
+    }
+
+    /// Enter: check the answer, then the next field or done.
+    fn submit_answer(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(a) = &mut self.asking else { return };
+        let picked = a.picked.then(|| self.hits.get(self.selected).map(|h| self.commands[h.index].id.to_string())).flatten();
+        let field = a.field().clone();
+        let text = match picked {
+            Some(v) => v,
+            None if field.strict() => {
+                a.tried = true;
+                a.message = Some(("Pick one from the list".into(), true));
+                cx.notify();
+                return;
+            }
+            None => self.query.clone(),
+        };
+        let text = if field.is_path() { input::trim_completed(&text).to_string() } else { text };
+        let value = match field.validate(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                a.tried = true;
+                a.message = Some((e.into(), true));
+                cx.notify();
+                return;
+            }
+        };
+        if !(field.is_path() && a.local && field.spec.must_exist) || value.is_empty() {
+            self.accept(value, cx);
+            return;
+        }
+        let (home, step, spec) = (a.home.clone(), a.step, field.spec.clone());
+        a._work = Some(cx.spawn(async move |this, cx| {
+            let v = value.clone();
+            let missing = cx.background_executor().spawn(async move { input::missing_path(&spec, &v, home.as_deref()) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(a) = &mut this.asking else { return };
+                if a.step != step {
+                    return;
+                }
+                match missing {
+                    Some(m) => {
+                        a.tried = true;
+                        a.message = Some((m.into(), true));
+                        cx.notify();
+                    }
+                    None => this.accept(value, cx),
+                }
+            });
+        }));
+    }
+
+    /// Keep `value` for the current field and go on.
+    fn accept(&mut self, value: String, cx: &mut Context<'_, Self>) {
+        let Some(a) = &mut self.asking else { return };
+        a.answers.insert(a.field().spec.id.clone(), value);
+        let next = a.step + 1;
+        if next < a.fields.len() {
+            let text = a.answers.get(&a.fields[next].spec.id).cloned();
+            self.start_step(next, text, cx);
+        } else {
+            self.finish_ask(cx);
+        }
+    }
+
+    fn finish_ask(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(a) = &self.asking else { return };
+        cx.emit(PaletteEvent::Answered(a.then.clone(), a.answers.clone()));
     }
 
     /// Switch to `scope` with an empty query.
@@ -538,6 +828,17 @@ impl CommandPalette {
     }
 
     fn run_hit(&mut self, ix: usize, other_place: bool, cx: &mut Context<'_, Self>) {
+        // A suggestion: a folder completes, anything else is the answer.
+        if let Some(a) = &mut self.asking {
+            if a.field().is_path() {
+                self.fill_suggestion(ix, cx);
+            } else {
+                a.picked = true;
+                self.select(ix, cx);
+                self.submit_answer(cx);
+            }
+            return;
+        }
         let Some(hit) = self.hits.get(ix) else { return };
         let command = self.commands[hit.index].clone();
         match &self.scope {
@@ -587,7 +888,7 @@ impl CommandPalette {
             .filter_map(|ix| {
                 let hit = self.hits.get(ix)?;
                 let label = self.labels[hit.index].clone();
-                let selected = ix == self.selected;
+                let selected = ix == self.selected && self.shows_selection();
                 let matched = HighlightStyle { color: Some(ui.accent), font_weight: Some(FontWeight::BOLD), ..Default::default() };
                 let category = HighlightStyle { color: Some(ui.muted), ..Default::default() };
                 let matches = fuzzy::byte_ranges(&label, &hit.positions);
@@ -647,7 +948,9 @@ impl Render for CommandPalette {
         let ui = Ui::get(cx);
         let ui_font = cx.global::<AppSettings>().ui_font.clone();
         let rows = self.hits.len().min(MAX_VISIBLE_ROWS);
-        let list = if self.hits.is_empty() {
+        let list = if self.hits.is_empty() && self.asking.is_some() {
+            div().into_any_element()
+        } else if self.hits.is_empty() {
             let empty = match self.scope {
                 Scope::All => "No matching commands",
                 Scope::Hosts => "No hosts yet: type user@host, or add hosts in Settings → Hosts",
@@ -672,6 +975,7 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::page_up))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::confirm_other))
+            .on_action(cx.listener(Self::complete))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismissed)))
             .occlude()
             .w(px(WIDTH))
@@ -689,7 +993,19 @@ impl Render for CommandPalette {
             .rounded_lg()
             .shadow_lg()
             .overflow_hidden()
-            .child(div().p_2().child(self.input.clone()))
+            .when_some(self.asking.as_ref(), |d, a| d.child(ask_header(a, ui)))
+            .child(div().p_2().when(self.asking.is_some(), |d| d.pt_0()).child(self.input.clone()))
+            .when_some(self.asking.as_ref().and_then(|a| a.message.clone()), |d, (text, error)| {
+                d.child(
+                    div()
+                        .id("ask-message")
+                        .px_4()
+                        .text_xs()
+                        .text_color(if error { ui.danger } else { ui.muted })
+                        .when(error, |d| d.role(gpui::Role::Alert))
+                        .child(text),
+                )
+            })
             .child(list)
             .when_some(self.status.clone(), |d, (text, loading)| {
                 d.child(
@@ -705,7 +1021,16 @@ impl Render for CommandPalette {
                         .child(text),
                 )
             })
-            .when(matches!(self.scope, Scope::Sessions(_)), |d| {
+            .when_some(self.asking.as_ref(), |d, a| {
+                let last = a.step + 1 == a.fields.len();
+                let mut hint =
+                    format!("Enter: {} · Esc: {}", if last { "done" } else { "next" }, if a.step > 0 { "back" } else { "cancel" });
+                if !self.hits.is_empty() {
+                    hint.push_str(if a.field().strict() { " · ↑↓: pick" } else { " · ↑↓: pick · Tab: fill in" });
+                }
+                d.child(div().px_4().pt_1().border_t_1().border_color(ui.border).text_xs().text_color(ui.muted).child(hint))
+            })
+            .when(self.asking.is_none() && matches!(self.scope, Scope::Sessions(_)), |d| {
                 let open_in = cx.global::<AppSettings>().client.ssh.open_in;
                 let name = |o: OpenIn| match o {
                     OpenIn::Tab => "a new tab",
@@ -715,6 +1040,34 @@ impl Render for CommandPalette {
                 d.child(div().px_4().pt_1().border_t_1().border_color(ui.border).text_xs().text_color(ui.muted).child(hint))
             })
     }
+}
+
+/// What a field shows under it for `text`: the check's complaint, else its
+/// help. An empty field only complains once Enter was pressed (`tried`).
+fn message_for(field: &Field, text: &str, tried: bool) -> Option<(SharedString, bool)> {
+    let help = (!field.spec.help.is_empty()).then(|| (SharedString::from(field.spec.help.clone()), false));
+    // A strict field's text only filters its choices.
+    if field.strict() || (text.trim().is_empty() && !tried) {
+        return help;
+    }
+    match field.validate(text) {
+        Err(e) => Some((e.into(), true)),
+        Ok(_) => help,
+    }
+}
+
+/// The title of what's being asked, the field's label and the step.
+fn ask_header(a: &Asking, ui: Ui) -> impl IntoElement {
+    let steps = (a.fields.len() > 1).then(|| format!("{} of {}", a.step + 1, a.fields.len()));
+    div().px_4().pt_2().pb_1().flex().flex_col().gap_0p5().child(div().text_xs().text_color(ui.muted).child(a.title.clone())).child(
+        div()
+            .flex()
+            .justify_between()
+            .items_baseline()
+            .gap_2()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(a.field().spec.label.clone()))
+            .when_some(steps, |d, s| d.child(div().text_xs().text_color(ui.muted).child(s))),
+    )
 }
 
 fn placeholder(scope: &Scope) -> SharedString {
@@ -881,6 +1234,13 @@ mod tests {
         assert_eq!(top("quit"), "goatty: Quit");
         assert_eq!(top("ssh"), "SSH: Connect to a host…");
         assert_eq!(top("connect"), "SSH: Connect to a host…");
+        assert_eq!(top("custom host"), "SSH: Connect to a custom host…");
+        assert_eq!(top("user@host"), "SSH: Connect to a custom host…");
+        assert_eq!(top("add host"), "SSH: Add a host to the list…");
+        assert_eq!(top("add path"), "Shell: Add a folder to PATH…");
+        assert_eq!(top("path"), "Shell: Add a folder to PATH…");
+        assert_eq!(top("remove path"), "Shell: Remove a folder from PATH…");
+        assert_eq!(top("set text size"), "View: Set the text size…");
         assert!(rank(&e, "qqqq").is_empty());
     }
 }

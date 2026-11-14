@@ -79,6 +79,7 @@ XDG variables are respected. History stays in the file plain zsh would use (`${Z
 | `shell.zsh.user_env` (`.zshenv`, `.zprofile`) | on | |
 | `shell.zsh.user_rc` (`.zshrc`) | off | `GOATTY_ZSH_USER_RC=0/1` |
 | `shell.zsh.integration` | on | |
+| `shell.path`: folders added to the end of PATH (before goatty's `bin/`), `~/…` = home, missing ones skipped; also the palette's "Shell: Add a folder to PATH…" | none | |
 | `prompt.style` (`rich`/`lean`/`classic`/`rainbow`), `prompt.symbols` (`nerd`/`emoji`/`text`/`none`), `prompt.show` (`all`/`essential`) | rich, nerd, all | |
 | `prompt.two_line`, `prompt.newline_before`, `prompt.transient`, `prompt.duration_threshold_ms` (0 = never) | on, off, off, 2000 | |
 | `prompt.separator`, `prompt.heads`, `prompt.tails` (Classic/Rainbow), `prompt.frame`, `prompt.connection` (two lines) | angled, sharp, flat, none, none | |

@@ -17,11 +17,12 @@ Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatt
 | Config files | `[[file]]` (`lines` or `text`, optional `env` pointing at it) | a file in the generation, e.g. bat's `BAT_CONFIG_PATH` | `config-files` |
 | Completions | `zsh.fpath` (directories in the plugin) | `fpath` entries before compinit | – |
 | Shell code | `zsh.init` (a `.zsh` file in the plugin) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
+| Palette commands | `[[command]]` + `[[command.input]]` (typed inputs: label, placeholder, checks) | an entry in goatty's command palette that asks for its inputs, then types its quoted `run` line into the focused terminal | `commands` |
 | Needs a system program | `[requires] commands` | integration only when present (`plugin:x missing` otherwise) | – |
 
 Everything goatty writes itself is quoted: a setting value can never become shell syntax (`tests: values_cannot_escape_quotes` runs real zsh). The only code a plugin brings is its `zsh.init` file, which is shown in full before installing and re-checked against its approved checksum every time a configuration is built.
 
-Not yet: application plugins (goatty commands, UI) need a runtime goatty doesn't have (category `application` is rejected; WASM later, plan §7). Tracked: prompt modules (#96), other shells (#103), macOS and zip/tar.xz (#97), dependency resolution (#94), update notifications (#95), more first-party plugins (#99), index expiry (#100), installing an imported profile's plugins (#101), install progress (#102), publishing the repos (#93).
+Not yet: application plugins (UI, commands that run code inside goatty) need a runtime goatty doesn't have (category `application` is rejected; WASM later, plan §7). Tracked: prompt modules (#96), other shells (#103), macOS and zip/tar.xz (#97), dependency resolution (#94), update notifications (#95), more first-party plugins (#99), index expiry (#100), installing an imported profile's plugins (#101), install progress (#102), publishing the repos (#93).
 
 ## The manifest (`plugin.toml`)
 
@@ -111,6 +112,20 @@ when = "completion"
 load = "normal"                 # line-editor | prompt | normal (default) | last
 after = ["fzf"]                 # in the same slot, load after these plugins when they're there
 
+[[command]]                     # an entry in the command palette (#91)
+id = "tree"                     # palette id: plugin.eza.tree
+title = "Show a folder as a tree"
+keywords = ["list"]
+run = ["eza", "--tree", "--level={depth}", "{dir}"]   # first word: a package executable or required command
+
+[[command.input]]               # asked in order
+id = "dir"
+label = "Folder"
+type = "folder"                 # text | integer | number | path | folder | choice
+default = "."
+# placeholder, help, optional, min/max (integer, number), pattern + pattern_help (text),
+# choices = [{ value, label, help }] (choice), must_exist (path, folder)
+
 [permissions]
 binaries = "eza is a program: goatty downloads its official release …"
 shell-code = "…"
@@ -118,6 +133,14 @@ network = "…"                   # declare when the tool itself uses the networ
 ```
 
 Validation (`goatty_plugin::manifest::parse`) reports every problem with its path (`setting.icons.default: …`). It refuses unknown keys (typos), non-https URLs, malformed checksums, aliases for commands the plugin doesn't provide, environment variables that would change how everything behaves (`PATH`, `LD_*`, `ZDOTDIR`, `GOATTY_*`, …), files outside the plugin directory, symlinks, and files over 1 MiB (4 MiB per plugin).
+
+### Palette commands
+
+A `[[command]]` is an entry in goatty's command palette, shown as "<plugin name>: <title>" (id `plugin.<plugin>.<command>`). Picking it opens its `[[command.input]]`s in the palette one at a time: the label above the field, the placeholder in it, `default` filled in, `help` under it, and the check as you type (`Required`, `Must be a whole number`, `Must be between 1 and 9`, the `pattern_help` for a `pattern` that must match the whole value, `Pick one from the list`). Choices are listed to pick from; path and folder inputs list the folder being typed when the host is this computer (Tab fills in) and check `must_exist` there. Enter goes on, Esc goes back.
+
+With the answers, goatty types the `run` line into the focused terminal and presses Enter, so the user sees exactly what runs (it's in their history too). Each `run` word is a template with `{input}` (inside a word too: `--level={depth}`); goatty quotes every word for the shell, a whole-word `{input}` whose optional value is empty is left out, and a path or folder value starting with `~/` keeps the `~/` unquoted so the shell expands it. A value can't become shell syntax (`commands::tests::quoted_lines_survive_a_real_shell`). When another program runs in the focused pane, goatty doesn't type into it and offers to copy the line instead.
+
+The commands come from the plugins installed and enabled on the active tab's host, so a remote host's plugins bring their commands while a tab on it is active. Validation checks ids, that `run`'s first word is one of the plugin's executables or required commands (no template), that every `{x}` is an input, and each input's type-specific fields (`min` ≤ `max`, a valid `pattern`, `choices` only and always for `choice`, `default` passing the input's own check).
 
 ### Templates
 
@@ -155,6 +178,8 @@ Where a plugin's aliases, init code and package scripts go in the managed `.zshr
 Within a slot, a plugin loads after the ones its `zsh.after` names (when they're installed and on), otherwise built-in plugins first, then by id (`goatty_shell::plugins::load_order`; a cycle is broken, never hangs). An `after` naming a plugin in an earlier slot is always satisfied. In the generated block, the init code runs first, then each package's `source` script (found as `$_goatty_src[<pkg>]`), then the status is recorded.
 
 ## Permissions
+
+`commands` (palette commands) needs no reason: nothing runs until the user picks the command and fills in its inputs, and what runs is typed into their terminal. The plan lists each command with its `run` line.
 
 goatty doesn't take a plugin's word for what it does. Permissions are derived from the manifest's contents (`goatty_plugin::permissions::derived`): a `[[package]]` *is* the `binaries` permission. The author must explain the powerful ones (`binaries`, `shell-code`, `network`) in `[permissions]`; using one without a reason, or declaring one the manifest doesn't use, fails validation. The install plan lists each permission with its meaning, the author's reason and the concrete details (programs, alias names, variable names, files).
 
@@ -255,6 +280,7 @@ Every asset's sha256 was computed from the download and matched GitHub's per-ass
 
 ## Verified
 
+- Palette commands (#91): `goatty-plugin` `commands::tests` (parsing, validation messages, value checks per type, the `commands` permission, `~/` in paths, lines with hostile values run back unchanged by a real `sh`); the template's commented `[[command]]` example validates when uncommented; app `command_palette::input::tests` (field checks, home in paths, folder completion against a real directory) and ranking of the new built-ins. The palette's asking mode itself is GUI behaviour, checked by hand.
 - `goatty-plugin`: 22 unit tests: manifest validation (paths, schema versions, typos, protected variables, referenced files), schema resolution, templates, permission derivation, quoting checked by real zsh, bundles (symlinks, tampering), signing (wrong key, forged signature, changed data), index build/verify (tampered file, replayed sequence, re-signing).
 - Built-in plugins (#98): every manifest validates and pins URLs matching its versions, package ids match the old tool table; `plugins::tests::builtin_plugins_install_only_their_packages` (plan → install of a zsh-plugin package, no lock entry, `current` on re-plan, uninstall refused, download removed), `registry_plugins_cannot_shadow_builtins`, `builtins_are_active_unless_turned_off_and_ordered` (`after` within a slot, cycles); `zsh::tests::plugins_render_into_their_slots_in_order`; `packages::tests` (system copy wins, installs from before #98 found); `goatty-config` `version_1_tool_switches_move_to_plugins`; `tests/zsh_startup.rs::builtin_plugins_load_in_their_slots` in a real shell over a PTY (Atuin after fzf owns Ctrl+R, Atuin's setting reaches its init, a pre-#98 managed autosuggestions copy loads after its options are set, fallback prompt with Starship off).
 - `goatty-shell`: installs of plugin packages (no clobbering, raw binaries, zsh plugins), registry refresh from a directory and a tarball (tampered upstream keeps the old snapshot, wrong key, replay), plan → install → render → update → uninstall, stale approval refused, shell code re-checked after install, local plugins flagged, conflicts with built-in tools; `HostService` plugin requests including `host.json`; `tests/zsh_startup.rs::plugins_load_in_a_real_shell` (aliases with setting args, env, generated config file, init code seeing its settings, `goatty-status` with a missing command).

@@ -94,6 +94,7 @@ pub const INDEX: &[Entry] = &[
     e(Page::Shell, "Program", "Shell", "program bash fish login shell").keys(&["shell.program"]),
     e(Page::Shell, "Your dotfiles", "Use ~/.zshenv and ~/.zprofile", "dotfiles environment path").keys(&["shell.zsh.user_env"]),
     e(Page::Shell, "Your dotfiles", "Also use ~/.zshrc", "zshrc dotfiles").keys(&["shell.zsh.user_rc"]),
+    e(Page::Shell, "Folders on PATH", "Add a folder", "path bin directory folder add export programs").keys(&["shell.path"]),
     e(Page::Shell, "Integration", "Shell integration", "osc 133 osc 7 prompt marks directory").keys(&["shell.zsh.integration"]),
     e(Page::Prompt, "Prompt", "Starship", "prompt git").keys(&["plugins.starship.enabled"]),
     e(Page::Prompt, "Prompt", "Use my own starship.toml", "starship config").keys(&["plugins.starship.settings.prefer_user_config"]),

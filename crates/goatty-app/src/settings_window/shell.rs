@@ -5,7 +5,9 @@ use gpui::{AnyElement, Context, IntoElement, ParentElement, SharedString, Styled
 
 use super::kit::{self, group, opt, row, section};
 use super::{Page, SettingsWindow, builtin_bool_default};
-use crate::ui::controls::{Tone, banner, toggle};
+use crate::toast::{self, Toast};
+use crate::ui::controls::{ButtonKind, Tone, banner, button, icon_button, toggle};
+use crate::ui::focus;
 use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
 
@@ -140,8 +142,67 @@ impl SettingsWindow {
                         .desc(format!("Autosuggestions, syntax highlighting, fzf, fzf-tab and Starship · {on} of {} on", BUILTIN_TOOLS.len()))
                         .on_click("shell-plugins", self.listener_go(cx, Page::Plugins)),
                 );
-            vec![hero.into_any_element(), program_section.into_any_element(), dotfiles.into_any_element(), integration.into_any_element()]
+            let path = self.path_section(ui, &h.shell.path, off, cx);
+            vec![
+                hero.into_any_element(),
+                program_section.into_any_element(),
+                dotfiles.into_any_element(),
+                path.into_any_element(),
+                integration.into_any_element(),
+            ]
         })
+    }
+
+    /// Folders goatty's zsh adds to PATH (shell.path), and a field to add one.
+    fn path_section(&self, ui: Ui, path: &[String], off: bool, cx: &Context<'_, Self>) -> impl IntoElement {
+        let mut s = section(ui, "Folders on PATH").desc(if off {
+            "Only with goatty's managed zsh"
+        } else {
+            "Added after the system's folders, in this order"
+        });
+        for (i, dir) in path.iter().enumerate() {
+            let remove = dir.clone();
+            s = s.child(row(ui, dir.clone()).disabled(off).control(icon_button(
+                ("path-remove", i),
+                Icon::Trash,
+                format!("Remove {dir} from PATH"),
+                ui,
+                self.act_window(cx, move |v, window, cx| {
+                    // The row is going: focus waits on the Add button.
+                    focus::hand_over(&v.focus, focus::Handover::Control("path-add".into()), window, cx);
+                    let remove = remove.clone();
+                    v.edit_host(cx, move |h| h.shell.path.retain(|d| *d != remove));
+                }),
+            )));
+        }
+        let entry = self.path_entry.clone();
+        let add = self.act(cx, move |v, cx| {
+            let text = entry.read(cx).text().to_string();
+            v.add_path_entry(&text, cx);
+        });
+        s.child(
+            row(ui, "Add a folder")
+                .desc("A full path: /… or ~/… · Enter adds · also in the command palette: \"Add a folder to PATH\"")
+                .disabled(off)
+                .control(button("path-add", "Add", ButtonKind::Normal, ui, add))
+                .below(self.path_entry.clone()),
+        )
+        .footer("Folders that don't exist when a shell starts are skipped.")
+    }
+
+    /// Add `text` to shell.path, or say why it can't be.
+    pub(super) fn add_path_entry(&mut self, text: &str, cx: &mut Context<'_, Self>) {
+        if let Some(problem) = goatty_config::path_entry_problem(text) {
+            toast::show(cx, Toast::warning(format!("Can't add {:?} to PATH", text.trim())).body(problem).key("shell.path"));
+            return;
+        }
+        let dir = goatty_config::normalize_path_entry(text);
+        if self.host_value().is_some_and(|h| h.shell.path.contains(&dir)) {
+            toast::show(cx, Toast::info(format!("{dir} is on PATH already")).key("shell.path"));
+            return;
+        }
+        self.edit_host(cx, |h| h.shell.path.push(dir));
+        self.path_entry.update(cx, |input, cx| input.set_text("", cx));
     }
 
     // ---- History -----------------------------------------------------------------

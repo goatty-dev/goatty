@@ -68,6 +68,9 @@ pub struct Manifest {
     pub files: Vec<ConfigFile>,
     #[serde(default)]
     pub zsh: ZshIntegration,
+    /// Entries in goatty's command palette (see [`crate::commands`]).
+    #[serde(default, rename = "command", skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<crate::commands::PaletteCommand>,
     /// Why the plugin needs each permission it uses: `binaries = "..."`.
     /// See [`crate::permissions`].
     #[serde(default)]
@@ -864,6 +867,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
         }
     }
 
+    out.extend(crate::commands::check(m, &commands));
     for p in crate::permissions::check(m) {
         out.push(p);
     }
