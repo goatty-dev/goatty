@@ -335,11 +335,13 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
             let loaded = store::set_key::<ClientSettings>(&read_or_empty(&path)?, &key, &value).map_err(anyhow::Error::msg)?;
             store::save(&path, &loaded.value, &loaded.unknown)?;
             println!("{key} = {}", store::get_key(&loaded.value, &key).map(|v| v.to_string()).unwrap_or_default());
-            // Colors are stored as #rrggbb: say what a CSS color lost on the way.
-            if key.starts_with("theme.overrides")
-                && let Some(loss) = goatty_config::colorspace::parse_css_color(&value).and_then(|p| p.loss(&value))
-            {
-                eprintln!("note: {loss}");
+            // Colors are stored as #rrggbb: say what a CSS color lost on the way
+            // (`value` read as `set_key` reads it: JSON, else a string).
+            if key == "theme" || key.starts_with("theme.") {
+                let raw = serde_json::from_str(&value).unwrap_or_else(|_| serde_json::Value::String(value.clone()));
+                for (path, loss) in goatty_config::colorspace::lossy_colors(&raw, &key) {
+                    eprintln!("note: {path}: {loss}");
+                }
             }
             Ok(())
         }

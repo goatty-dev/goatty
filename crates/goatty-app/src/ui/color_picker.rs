@@ -682,11 +682,14 @@ impl ColorPicker {
 
     /// Take `p` from a drag or key, which may move a marker without
     /// changing the 8-bit color (the hue of a gray, say): keep that too.
+    /// Drops the OKLCH aim ([`Self::aim_at`] sets it again afterwards).
     fn take(&mut self, p: Pick, cx: &mut Context<'_, Self>) {
+        self.aim = None;
         if p.color() != self.pick.color() {
             self.set(p, None, cx);
         } else if p != self.pick {
             self.pick = p;
+            self.sync_fields(None, cx);
             cx.notify();
         }
     }
@@ -828,6 +831,8 @@ impl ColorPicker {
     fn on_any(&mut self, ev: &TextInputEvent, cx: &mut Context<'_, Self>) {
         match ev {
             TextInputEvent::Changed(text) => {
+                // Typing owns the commit now (Enter): a pending key commit would reset the field.
+                self.commit_gen += 1;
                 // Take it as soon as it reads as a color; leave the field alone while typing.
                 if let Some(c) = parse_color(text, self.model.hint()) {
                     self.status = None;
@@ -852,6 +857,7 @@ impl ColorPicker {
         let ch = self.model.channels()[i];
         match ev {
             TextInputEvent::Changed(text) => {
+                self.commit_gen += 1;
                 let t = text.trim().trim_end_matches(['%', '°']).trim_end_matches("deg").trim();
                 let Some(v) = t.parse::<f32>().ok().filter(|v| v.is_finite()) else { return };
                 let v = if ch.hue { v.rem_euclid(360.0) } else { v.clamp(0.0, ch.max) };
@@ -882,6 +888,8 @@ impl ColorPicker {
         if !self.focus.contains_focused(window, cx) {
             window.focus(&self.focus, cx);
         }
+        // The drag commits when it's released; a pending key commit is moot.
+        self.commit_gen += 1;
         self.drag = Some((knob, bounds));
         self.status = None;
         self.drag_to(pos, cx);
