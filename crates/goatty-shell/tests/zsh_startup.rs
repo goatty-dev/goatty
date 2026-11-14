@@ -252,6 +252,26 @@ fn default_startup_sources_user_env_not_rc() {
     assert_eq!(setup, &format!("goattyd shell install -- {}", want.join(" ")));
 }
 
+/// goatty's completion functions are on `fpath`, and one added after the
+/// completion dump was built is still found (the dump is dropped).
+#[test]
+fn completions_of_goatty_and_its_tools_load() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    use goatty_shell::completions;
+    completions::write(&sb.dirs, "goattyd", "#compdef goattyd\n_arguments '1:cmd:(list stop)'\n").unwrap();
+    let launch = sb.launch_with(no_highlighting(), None);
+    let probe = "print -r -- \"goattyd=${_comps[goattyd]-none} demo=${_comps[demo]-none}\"";
+    let out = sb.run(&launch, probe);
+    assert!(String::from_utf8_lossy(&out.stderr).trim().is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).contains("goattyd=_goattyd demo=none"), "{}", stdout(&out));
+    assert!(std::fs::read_dir(&sb.dirs.cache).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("zcompdump")));
+
+    completions::write(&sb.dirs, "demo", "#compdef demo\n_files\n").unwrap();
+    let out = sb.run(&launch, probe);
+    assert!(stdout(&out).contains("goattyd=_goattyd demo=_demo"), "{}", stdout(&out));
+}
+
 #[test]
 fn zdotdir_set_by_user_zshenv_and_user_rc() {
     let Some(zsh) = zsh() else { return };
@@ -455,10 +475,20 @@ impl PtyShell {
             match self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(chunk) => self.out.extend(chunk),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("pty closed ({:?}) while waiting for prompt {n}:\n{}", self.pty.try_wait(), String::from_utf8_lossy(&self.out))
+                    let exit = self.pty.try_wait();
+                    panic!(
+                        "pty closed while waiting for prompt {n} (exit={exit:?}, prompts={}):\n{:?}",
+                        self.prompts(),
+                        String::from_utf8_lossy(&self.out)
+                    );
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    panic!("waiting for prompt {n}:\n{}", String::from_utf8_lossy(&self.out))
+                    let exit = self.pty.try_wait();
+                    panic!(
+                        "waiting for prompt {n} (timeout, exit={exit:?}, prompts={}):\n{:?}",
+                        self.prompts(),
+                        String::from_utf8_lossy(&self.out)
+                    );
                 }
             }
         }

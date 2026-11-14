@@ -149,6 +149,14 @@ pub struct Package {
     /// Use a copy that's already on `PATH` instead of downloading one.
     #[serde(default = "yes")]
     pub prefer_system: bool,
+    /// A command that prints the tool's zsh completion function, like
+    /// `["starship", "completions", "zsh"]`: the first word is one of the
+    /// package's executables (its name, as in `bin/`), the rest its
+    /// arguments. goatty runs it after installing its own copy and keeps the
+    /// output as `_<name>` on the managed shell's `fpath`. Copies on the
+    /// system come with their own completions, so it doesn't run for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completions: Vec<String>,
     #[serde(rename = "asset")]
     pub assets: Vec<Asset>,
 }
@@ -682,6 +690,14 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
                 err(format!("{at}.bin"), format!("{:?} is provided twice", bin_name(b)));
             }
         }
+        if let Some(first) = p.completions.first() {
+            if !p.bin.iter().any(|b| bin_name(b) == first) {
+                err(format!("{at}.completions"), format!("{first:?} is not one of the package's executables"));
+            }
+            if p.completions.iter().any(|a| a.is_empty() || a.contains('\0')) {
+                err(format!("{at}.completions"), "empty or invalid argument".into());
+            }
+        }
         if p.assets.is_empty() {
             err(format!("{at}.asset"), "no downloads".into());
         }
@@ -1031,6 +1047,15 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
     fn alias_commands_must_be_provided() {
         let p = problems(&EXAMPLE.replace("command = \"eza\"", "command = \"rm\""));
         assert!(p[0].contains("neither a package executable"), "{p:?}");
+    }
+
+    #[test]
+    fn completions_run_a_package_executable() {
+        let ok = EXAMPLE.replace("bin = [\"eza\"]", "bin = [\"eza\"]\ncompletions = [\"eza\", \"--completions\", \"zsh\"]");
+        let m = parse(&ok, None).unwrap();
+        assert_eq!(m.packages[0].completions, ["eza", "--completions", "zsh"]);
+        let p = problems(&EXAMPLE.replace("bin = [\"eza\"]", "bin = [\"eza\"]\ncompletions = [\"sh\", \"-c\", \"x\"]"));
+        assert!(p.iter().any(|p| p.contains("package[0].completions") && p.contains("not one of the package's executables")), "{p:?}");
     }
 
     #[test]

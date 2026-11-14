@@ -39,6 +39,9 @@ pub struct PackageInstall<'a> {
     /// A zsh script relative to `root`: the package directory is linked as
     /// `plugins/<id>`.
     pub source: Option<&'a str>,
+    /// The command that prints the tool's zsh completions (`[[package]]
+    /// completions`); empty for none.
+    pub completions: &'a [String],
 }
 
 /// Verify and unpack a plugin package into `tools/<id>/<version>/`, link
@@ -46,7 +49,8 @@ pub struct PackageInstall<'a> {
 /// has a script to source. A `bin/` link that belongs to something else
 /// (another package, a user's file) is never replaced. Older versions of
 /// the package are removed (running processes keep their open files).
-/// Returns the activated links.
+/// The tool's completion function is generated last; a tool that can't
+/// print it is still installed (logged). Returns the activated links.
 pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> Result<Vec<PathBuf>> {
     let got = sha256_hex(archive);
     if !got.eq_ignore_ascii_case(p.sha256) {
@@ -121,6 +125,12 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+    if let Some((name, args)) = p.completions.split_first() {
+        let exe = dirs.bin_dir().join(name);
+        if let Err(e) = crate::completions::for_package(dirs, name, &exe, args) {
+            log::warn!("no zsh completions for {}: {e:#}", p.id);
+        }
+    }
     Ok(links)
 }
 
@@ -138,8 +148,9 @@ pub fn link_owner(dirs: &Dirs, name: &str) -> Option<String> {
     Some(owner.unwrap_or_else(|| "?".into()))
 }
 
-/// Remove a plugin package: its `bin/` links and `plugins/<id>` link (only
-/// those pointing into its own directory) and `tools/<id>/`. Returns
+/// Remove a plugin package: its `bin/` links and their completion functions,
+/// its `plugins/<id>` link (only those pointing into its own directory) and
+/// `tools/<id>/`. Returns
 /// whether there was anything to remove.
 pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool> {
     let mut had = false;
@@ -147,6 +158,7 @@ pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool>
         let name = goatty_plugin::manifest::bin_name(b);
         if link_owner(dirs, name).as_deref() == Some(id) {
             std::fs::remove_file(dirs.bin_dir().join(name)).with_context(|| format!("remove bin/{name}"))?;
+            crate::completions::remove(dirs, name)?;
             had = true;
         }
     }
@@ -205,6 +217,7 @@ mod tests {
             root: "p-1",
             bins: &[],
             source: Some("demo.zsh"),
+            completions: &[],
         };
         let links = install_package(&p, &archive, &dirs).unwrap();
         assert_eq!(links, [dirs.plugins_dir().join("demo")]);
@@ -222,14 +235,53 @@ mod tests {
     }
 
     #[test]
+    fn installs_and_removes_completions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let archive = targz(&[("t/tool", b"#!/bin/sh\n[ \"$1\" = zsh ] && printf '#compdef tool\\n'\n", 0o755)]);
+        let sha = sha256_hex(&archive);
+        let bins = vec!["tool".to_string()];
+        let completions = vec!["tool".to_string(), "zsh".to_string()];
+        let p = PackageInstall {
+            id: "tool",
+            version: "1",
+            sha256: &sha,
+            format: AssetFormat::TarGz,
+            root: "t",
+            bins: &bins,
+            source: None,
+            completions: &completions,
+        };
+        install_package(&p, &archive, &dirs).unwrap();
+        let f = crate::completions::file(&dirs, "tool");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "#compdef tool\n");
+
+        // A tool that can't print them is still installed.
+        let wrong = vec!["tool".to_string(), "bash".to_string()];
+        install_package(&PackageInstall { version: "2", completions: &wrong, ..p }, &archive, &dirs).unwrap();
+        assert!(dirs.bin_dir().join("tool").exists());
+
+        uninstall_package("tool", &bins, &dirs).unwrap();
+        assert!(!f.exists(), "removed with the package");
+    }
+
+    #[test]
     fn installs_plugin_packages_without_clobbering() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
         let archive = targz(&[("eza", b"#!/bin/sh\necho eza\n", 0o644)]);
         let sha = sha256_hex(&archive);
         let bins = vec!["eza".to_string()];
-        let p =
-            PackageInstall { id: "eza", version: "0.23.4", sha256: &sha, format: AssetFormat::TarGz, root: "", bins: &bins, source: None };
+        let p = PackageInstall {
+            id: "eza",
+            version: "0.23.4",
+            sha256: &sha,
+            format: AssetFormat::TarGz,
+            root: "",
+            bins: &bins,
+            source: None,
+            completions: &[],
+        };
         let links = install_package(&p, &archive, &dirs).unwrap();
         assert_eq!(links, [dirs.bin_dir().join("eza")]);
         assert_eq!(std::fs::metadata(&links[0]).unwrap().permissions().mode() & 0o777, 0o755);
@@ -253,6 +305,7 @@ mod tests {
             root: "",
             bins: &bins_raw,
             source: None,
+            completions: &[],
         };
         install_package(&r, raw, &dirs).unwrap();
         assert_eq!(std::fs::read(dirs.bin_dir().join("tool")).unwrap(), raw);

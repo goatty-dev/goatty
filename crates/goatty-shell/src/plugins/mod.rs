@@ -420,6 +420,7 @@ impl Plugins<'_> {
                         root: &a.root,
                         bins: &p.bin,
                         source: p.source.as_deref(),
+                        completions: &p.completions,
                     };
                     install::install_package(&pi, &bytes, self.dirs).with_context(|| format!("install {} {}", p.id, p.version))?;
                     fresh.push((p.id.clone(), p.bin.clone()));
