@@ -81,11 +81,29 @@ impl Transcript {
     /// The command whose output "the last command" means: the running one,
     /// else the newest one that ran (the block at the current prompt, still
     /// being typed, doesn't count). `None` without shell integration.
+    ///
+    /// A command whose prompt left the scrollback is the first block, with
+    /// no prompt: it still counts once a command has started (else that
+    /// block is output from before shell integration).
     pub fn last_command(&self) -> Option<usize> {
         let n = self.commands.len();
         let last = n.checked_sub(1)?;
         let candidate = if self.running || self.awaiting_prompt { last } else { last.checked_sub(1)? };
-        (!self.commands[candidate].prompt.is_empty()).then_some(candidate)
+        let prompt_evicted = candidate == 0 && self.commands_started > 0;
+        (!self.commands[candidate].prompt.is_empty() || prompt_evicted).then_some(candidate)
+    }
+
+    /// Which command [`last_command`](Self::last_command) is, as a value
+    /// that changes exactly when another command becomes the last one: not
+    /// when the scrollback drops older commands or its own prompt.
+    pub fn last_command_id(&self) -> Option<u64> {
+        self.last_command().map(|_| self.commands_started)
+    }
+
+    /// Whether `block`'s prompt left the scrollback (it is a command's
+    /// output, not output from before shell integration).
+    pub fn prompt_evicted(&self, block: usize) -> bool {
+        block == 0 && self.commands_started > 0 && self.commands.first().is_some_and(|c| c.prompt.is_empty())
     }
 
     /// The command line of a block: its last prompt line (the one typed at,
@@ -368,10 +386,39 @@ mod tests {
         }
         let after = t.transcript();
         assert!(!after.commands.iter().any(|c| after.command_line_of(c) == Some("$ ls")));
+        assert!(after.last_command().is_some());
         assert_ne!(before.last_command(), after.last_command(), "the index shifted");
-        assert_eq!(after.commands_started, 2, "but it's the same command");
+        // A paused viewer keeps its place: the same command, by id.
+        assert_eq!(after.last_command_id(), before.last_command_id(), "but it's the same command");
+        assert_eq!(after.commands_started, 2);
         t.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n\x1b]133;C\x07");
         assert_eq!(t.transcript().commands_started, 3);
+    }
+
+    #[test]
+    fn a_running_command_stays_the_last_one_after_its_prompt_left_the_scrollback() {
+        let t = term(20, 3);
+        t.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07tail -f\r\n\x1b]133;C\x07");
+        let before = t.transcript();
+        for i in 0..(crate::DEFAULT_SCROLLBACK + 10) {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let after = t.transcript();
+        assert!(after.commands.iter().all(|c| c.prompt.is_empty()), "the prompt is gone");
+        let last = after.last_command().expect("still the last command");
+        assert!(after.prompt_evicted(last));
+        assert_eq!(after.last_command_id(), before.last_command_id(), "a paused viewer stays paused");
+        let out = &after.commands[last].output;
+        assert_eq!(after.lines[out.end - 1].text, format!("line {}", crate::DEFAULT_SCROLLBACK + 9));
+        // Finished, at the next prompt: still that command.
+        t.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        let at_prompt = t.transcript();
+        assert_eq!(at_prompt.last_command(), Some(0));
+        assert_eq!(at_prompt.last_command_id(), before.last_command_id());
+        // Output from before shell integration isn't a command.
+        let fresh = term(20, 3);
+        fresh.feed(b"old output\r\n\x1b]133;A\x07$ ");
+        assert_eq!(fresh.transcript().last_command(), None);
     }
 
     #[test]

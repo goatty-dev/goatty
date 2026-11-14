@@ -456,7 +456,7 @@ impl OutputView {
     /// index shifts when the scrollback drops old commands, and two runs of
     /// the same command line look alike.
     fn last_identity(&self) -> Option<u64> {
-        self.transcript.last_command().map(|_| self.transcript.commands_started)
+        self.transcript.last_command_id()
     }
 
     /// The source's block, for a command source.
@@ -1142,7 +1142,8 @@ impl OutputView {
             (Source::All, _) => (format!("All output · {}", lines(self.range.len())).into(), None),
             (_, Some(b)) => {
                 let running = t.running && Some(b) == t.commands.len().checked_sub(1);
-                let cmd = t.command_line(b).filter(|c| !c.is_empty()).unwrap_or("Output before the first prompt");
+                let fallback = if t.prompt_evicted(b) { "Its command line left the scrollback" } else { "Output before the first prompt" };
+                let cmd = t.command_line(b).filter(|c| !c.is_empty()).unwrap_or(fallback);
                 let badge = running.then_some(("running", Tone::Accent));
                 (format!("{cmd} · {}", lines(self.range.len())).into(), badge)
             }
