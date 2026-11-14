@@ -53,7 +53,9 @@ fn resync(t: &mut Term, shell: ShellState) -> Vec<u8> {
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
     // region, origin mode, and the alt-screen switch in whichever direction.
-    out.push_str("\x1b[0m\x1b[r\x1b[?6l");
+    // Autowrap on for the replay (soft-wrapped rows rely on it);
+    // `write_modes` then sets the session's own state.
+    out.push_str("\x1b[0m\x1b[r\x1b[?6l\x1b[?7h");
     out.push_str(if mode.contains(TermMode::ALT_SCREEN) { "\x1b[?1049h" } else { "\x1b[?1049l" });
     write_screen(t, true, &mut out);
     write_shell_state(shell, &mut out);
@@ -335,6 +337,21 @@ mod tests {
         let (ta, tb) = (a.transcript(), b.transcript());
         assert_eq!(ta.commands, tb.commands);
         assert_eq!(tb.command_line(1), Some("$ ls"));
+    }
+
+    #[test]
+    fn resync_replays_wrapped_rows_even_if_the_client_missed_autowrap_on() {
+        let size = TermSize::new(10, 4);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        a.feed(b"\x1b[?7l");
+        b.feed(b"\x1b[?7l");
+        // The client misses autowrap going back on, and the wrapped line.
+        a.feed(b"\x1b[?7h0123456789abcdefghijX");
+        b.feed(&a.resync_snapshot());
+        assert_eq!(b.transcript().lines.last().unwrap().text, "0123456789abcdefghijX");
+        assert_eq!(text_of(&a), text_of(&b));
+        assert!(b.mode().contains(crate::TermMode::LINE_WRAP));
     }
 
     #[test]
