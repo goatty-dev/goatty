@@ -18,27 +18,41 @@
 //! Toasts never take focus: the terminal keeps the keyboard, and clicking a
 //! toast's button doesn't move focus either. They pause while the pointer
 //! is over one and while their window is in the background, so nothing
-//! disappears unread. Every toast is also logged.
+//! disappears unread. From the keyboard, the bindable actions
+//! `dismiss_notifications` and `press_notification_button` ([`dismiss_all`],
+//! [`press_primary`]) close them or press the newest one's main button.
+//! Screen readers announce each toast (the cards are live regions). Every
+//! toast is also logged, and kept in the [`history`] ("Notifications: Show
+//! recent").
 //!
 //! Pieces:
 //! - [`Toast`]: what to show (level, title, body, buttons, key, lifetime).
 //! - [`stack`]: one window's toasts without UI (ordering, replacing by key,
 //!   eviction, pausable timers), unit-tested with explicit clocks.
 //! - [`ToastLayer`]: the view a window's root renders on top of its content;
-//!   it registers itself here so [`show`] can find it.
+//!   it registers itself here so [`show`] can find it. Terminal windows and
+//!   the settings window have one.
+//! - [`history`]: the last notifications, to read again; [`recent`] is the
+//!   overlay that lists them.
 //! - The functions below route a toast to a window: the one given, else the
-//!   active window if it has a layer, else the most recently opened one.
-//!   Toasts shown before any layer exists wait for the first one.
+//!   active window if it has a layer, else the most recently opened
+//!   terminal window. The settings window only gets toasts while it's
+//!   active (or when shown there), so a result of background work doesn't
+//!   land in a window that is about to close. Toasts shown before any layer
+//!   exists wait for the first one.
 
+pub mod history;
 mod layer;
+pub mod recent;
 pub mod stack;
 
 use std::fmt;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gpui::{AnyWindowHandle, App, Global, SharedString, WeakEntity, Window};
 
+use history::History;
 pub use layer::ToastLayer;
 
 /// How a toast looks and how long it stays by default.
@@ -214,9 +228,18 @@ pub struct ToastId(pub u64);
 struct ToastCenter {
     next_id: u64,
     /// In registration order (the last is the newest window).
-    layers: Vec<(AnyWindowHandle, WeakEntity<ToastLayer>)>,
+    layers: Vec<Registered>,
     /// Shown before any layer existed.
     pending: Vec<(ToastId, Toast)>,
+    history: History,
+}
+
+struct Registered {
+    window: AnyWindowHandle,
+    layer: WeakEntity<ToastLayer>,
+    /// Gets toasts while no window with a layer is active (terminal
+    /// windows); otherwise only while active or when asked for.
+    fallback: bool,
 }
 
 impl Global for ToastCenter {}
@@ -242,6 +265,7 @@ pub fn show_in(window: &Window, cx: &mut App, toast: Toast) -> ToastId {
 /// it is gone (dismissed or expired), `toast` is shown as a new one.
 pub fn update(cx: &mut App, id: ToastId, toast: Toast) {
     log_toast(&toast);
+    cx.default_global::<ToastCenter>().history.record(id, &toast, SystemTime::now());
     deliver(cx, None, Op::Update(id, toast));
 }
 
@@ -255,10 +279,34 @@ pub fn dismiss_all(cx: &mut App) {
     deliver(cx, None, Op::DismissAll);
 }
 
+/// Press the main (first) button of the newest toast in `window` that has
+/// one, as if clicked. Returns false if there is none.
+pub fn press_primary(window: &mut Window, cx: &mut App) -> bool {
+    let handle = window.window_handle();
+    let layer = cx.try_global::<ToastCenter>().and_then(|c| c.layers.iter().find(|r| r.window == handle)).and_then(|r| r.layer.upgrade());
+    let Some((id, run)) = layer.as_ref().and_then(|l| l.read(cx).primary_action()) else { return false };
+    // Like a click: run it (outside the layer, it may show toasts), then dismiss.
+    run(window, cx);
+    dismiss(cx, id);
+    true
+}
+
+/// The notifications shown recently (newest first), and a number that
+/// changes whenever they do.
+pub fn recent(cx: &App) -> (Vec<history::Entry>, u64) {
+    cx.try_global::<ToastCenter>().map_or_else(Default::default, |c| (c.history.newest_first().cloned().collect(), c.history.version()))
+}
+
+/// Forget the recent notifications.
+pub fn clear_history(cx: &mut App) {
+    cx.default_global::<ToastCenter>().history.clear();
+}
+
 fn send(cx: &mut App, window: Option<AnyWindowHandle>, toast: Toast) -> ToastId {
     let center = cx.default_global::<ToastCenter>();
     center.next_id += 1;
     let id = ToastId(center.next_id);
+    center.history.record(id, &toast, SystemTime::now());
     log_toast(&toast);
     deliver(cx, window, Op::Show(id, toast));
     id
@@ -279,23 +327,24 @@ fn deliver(cx: &mut App, window: Option<AnyWindowHandle>, op: Op) {
 
 fn apply(cx: &mut App, window: Option<AnyWindowHandle>, op: Op) {
     let center = cx.default_global::<ToastCenter>();
-    center.layers.retain(|(_, l)| l.upgrade().is_some());
-    let layers: Vec<_> = center.layers.iter().filter_map(|(w, l)| Some((*w, l.upgrade()?))).collect();
+    center.layers.retain(|r| r.layer.upgrade().is_some());
+    let layers: Vec<_> = center.layers.iter().filter_map(|r| Some((r.window, r.layer.upgrade()?, r.fallback))).collect();
     // Not `cx.active_window()`: on Wayland it borrows the platform client,
     // which may already be borrowed while deferred work runs. Each layer
     // tracks its own window's activation.
     let target = window
-        .and_then(|w| layers.iter().find(|(lw, _)| *lw == w))
-        .or_else(|| layers.iter().find(|(_, l)| l.read(cx).window_active()))
+        .and_then(|w| layers.iter().find(|(lw, _, _)| *lw == w))
+        .or_else(|| layers.iter().find(|(_, l, _)| l.read(cx).window_active()))
+        .or_else(|| layers.iter().rfind(|(_, _, fallback)| *fallback))
         .or(layers.last())
-        .map(|(_, l)| l.clone());
+        .map(|(_, l, _)| l.clone());
     match op {
         Op::Show(id, toast) => match target {
             Some(layer) => layer.update(cx, |l, cx| l.show(id, toast, cx)),
             None => cx.default_global::<ToastCenter>().pending.push((id, toast)),
         },
         Op::Update(id, toast) => {
-            if let Some((_, layer)) = layers.iter().find(|(_, l)| l.read(cx).contains(id)) {
+            if let Some((_, layer, _)) = layers.iter().find(|(_, l, _)| l.read(cx).contains(id)) {
                 layer.update(cx, |l, cx| l.update(id, toast, cx));
             } else if let Some(p) = cx.default_global::<ToastCenter>().pending.iter_mut().find(|(pid, _)| *pid == id) {
                 p.1 = toast;
@@ -305,13 +354,13 @@ fn apply(cx: &mut App, window: Option<AnyWindowHandle>, op: Op) {
         }
         Op::Dismiss(id) => {
             cx.default_global::<ToastCenter>().pending.retain(|(pid, _)| *pid != id);
-            for (_, layer) in &layers {
+            for (_, layer, _) in &layers {
                 layer.update(cx, |l, cx| l.dismiss(id, cx));
             }
         }
         Op::DismissAll => {
             cx.default_global::<ToastCenter>().pending.clear();
-            for (_, layer) in &layers {
+            for (_, layer, _) in &layers {
                 layer.update(cx, |l, cx| l.dismiss_all(cx));
             }
         }
@@ -319,9 +368,9 @@ fn apply(cx: &mut App, window: Option<AnyWindowHandle>, op: Op) {
 }
 
 /// Called by a new [`ToastLayer`]: register it and hand it what was waiting.
-fn register(cx: &mut App, window: AnyWindowHandle, layer: WeakEntity<ToastLayer>) -> Vec<(ToastId, Toast)> {
+fn register(cx: &mut App, window: AnyWindowHandle, layer: WeakEntity<ToastLayer>, fallback: bool) -> Vec<(ToastId, Toast)> {
     let center = cx.default_global::<ToastCenter>();
-    center.layers.push((window, layer));
+    center.layers.push(Registered { window, layer, fallback });
     std::mem::take(&mut center.pending)
 }
 

@@ -2,7 +2,8 @@
 //! terminal panes, plus everything window-level: the title (the focused
 //! pane's), closing when the last shell exits, the command palette overlay,
 //! paste and close confirmations (`crate::paste_confirm`,
-//! `crate::close_confirm`) and the window's toasts (`crate::toast`).
+//! `crate::close_confirm`), the window's toasts (`crate::toast`) and the
+//! list of recent notifications (`crate::toast::recent`).
 //!
 //! - `layout`: the split tree of a tab (pure, unit-tested).
 //! - `tab_bar`: the horizontal tab strip (`tabs.style` modern / compact)
@@ -63,6 +64,7 @@ use crate::session::AttachMode;
 use crate::session::{Session, Spawner};
 use crate::settings::AppSettings;
 use crate::terminal::{Activity, PasteRequest, TerminalEvent, TerminalView};
+use crate::toast::recent::{RecentEvent, RecentNotifications};
 use crate::toast::{self, Toast, ToastLayer};
 use crate::ui::style::Ui;
 use crate::ui::text_input::{TextInput, TextInputEvent};
@@ -197,6 +199,8 @@ pub struct Workspace {
     next_id: u64,
     rename: Option<Rename>,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
+    /// "Notifications: Show recent".
+    recent: Option<(Entity<RecentNotifications>, Subscription)>,
     paste: Option<(Entity<PasteConfirm>, PaneId, Subscription)>,
     close: Option<(Entity<CloseConfirm>, CloseTarget, Subscription)>,
     toasts: Entity<ToastLayer>,
@@ -263,6 +267,7 @@ impl Workspace {
             next_id: 1,
             rename: None,
             palette: None,
+            recent: None,
             paste: None,
             close: None,
             toasts,
@@ -483,8 +488,14 @@ impl Workspace {
 
     // ---- focus and titles ---------------------------------------------------
 
+    /// Focus the active tab's pane (or connect screen); an open palette or
+    /// list of recent notifications keeps the keyboard until it closes.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some((view, _)) = self.active_tab().and_then(|t| t.connecting.as_ref()) {
+        if let Some((view, _)) = &self.recent {
+            view.focus_handle(cx).focus(window, cx);
+        } else if let Some((palette, _)) = &self.palette {
+            palette.focus_handle(cx).focus(window, cx);
+        } else if let Some((view, _)) = self.active_tab().and_then(|t| t.connecting.as_ref()) {
             view.focus_handle(cx).focus(window, cx);
         } else if let Some(view) = self.focused_view() {
             view.focus_handle(cx).focus(window, cx);
@@ -1190,6 +1201,7 @@ impl Workspace {
 
     fn confirm_close(&mut self, target: CloseTarget, closing: Closing, busy: Vec<String>, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_palette(window, cx);
+        self.close_recent(window, cx);
         let dialog = cx.new(|cx| CloseConfirm::new(closing, busy, window, cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &CloseConfirmEvent, window, cx| {
             let CloseConfirmEvent::Done(close) = *ev;
@@ -1206,6 +1218,7 @@ impl Workspace {
 
     fn confirm_paste(&mut self, pane: PaneId, request: PasteRequest, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_palette(window, cx);
+        self.close_recent(window, cx);
         let dialog = cx.new(|cx| PasteConfirm::new(request, window, cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &PasteConfirmEvent, window, cx| {
             let PasteConfirmEvent::Done(text) = ev;
@@ -1226,6 +1239,27 @@ impl Workspace {
         cx.notify();
     }
 
+    fn show_recent_notifications(&mut self, _: &ShowRecentNotifications, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.recent.is_some() {
+            self.close_recent(window, cx);
+            return;
+        }
+        self.close_palette(window, cx);
+        let view = cx.new(|cx| RecentNotifications::new(window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &RecentEvent, window, cx| match ev {
+            RecentEvent::Dismissed => this.close_recent(window, cx),
+        });
+        self.recent = Some((view, sub));
+        cx.notify();
+    }
+
+    fn close_recent(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.recent.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
     fn toggle_palette(&mut self, _: &ToggleCommandPalette, window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
@@ -1239,6 +1273,7 @@ impl Workspace {
     }
 
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.close_recent(window, cx);
         let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
         let sub = cx.subscribe_in(&palette, window, |this, _, ev: &PaletteEvent, window, cx| match ev {
             PaletteEvent::Dismissed => this.close_palette(window, cx),
@@ -1415,6 +1450,11 @@ impl Render for Workspace {
             root.flex_col().when(show_bar, |d| d.child(self.render_tab_bar(window, cx))).child(self.render_panes(cx))
         };
         root.on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::show_recent_notifications))
+            .on_action(|_: &DismissNotifications, _, cx| toast::dismiss_all(cx))
+            .on_action(|_: &PressNotificationButton, window, cx| {
+                toast::press_primary(window, cx);
+            })
             .on_action(cx.listener(Self::connect_to_host))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_pane))
@@ -1453,6 +1493,9 @@ impl Render for Workspace {
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {
                 d.child(div().absolute().top(px(48.)).left(px(panes_left)).right_0().px_4().flex().justify_center().child(palette.clone()))
+            })
+            .when_some(self.recent.as_ref(), |d, (view, _)| {
+                d.child(div().absolute().top(px(48.)).left(px(panes_left)).right_0().px_4().flex().justify_center().child(view.clone()))
             })
             .when_some(self.paste.as_ref(), |d, (dialog, _, _)| d.child(modal(dialog.clone())))
             .when_some(self.close.as_ref(), |d, (dialog, _, _)| d.child(modal(dialog.clone())))

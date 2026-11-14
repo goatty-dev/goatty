@@ -46,6 +46,18 @@ actions!(
 );
 
 actions!(
+    notifications,
+    [
+        /// Dismiss every toast in every window.
+        DismissNotifications,
+        /// Press the main (first) button of the window's newest toast that has one.
+        PressNotificationButton,
+        /// List the recent notifications (or close the list).
+        ShowRecentNotifications,
+    ]
+);
+
+actions!(
     workspace,
     [
         NewTab,
@@ -104,6 +116,9 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "command_palette" => Box::new(ToggleCommandPalette),
         "connect_to_host" => Box::new(ConnectToHost),
         "reload_shells" => Box::new(ReloadShells),
+        "dismiss_notifications" => Box::new(DismissNotifications),
+        "press_notification_button" => Box::new(PressNotificationButton),
+        "show_recent_notifications" => Box::new(ShowRecentNotifications),
         "new_tab" => Box::new(NewTab),
         "close_pane" => Box::new(ClosePane),
         "close_tab" => Box::new(CloseTab),
@@ -177,6 +192,10 @@ pub fn apply_keybindings(overrides: &BTreeMap<String, Option<String>>, cx: &mut 
     let palette_keys = goatty_config::keys::keys_for("command_palette", overrides);
     let palette = crate::command_palette::bindings(&palette_keys, cx);
     cx.bind_keys(palette);
+    let recent_keys = goatty_config::keys::keys_for("show_recent_notifications", overrides);
+    let recent = crate::toast::recent::bindings(&recent_keys, cx);
+    cx.bind_keys(recent);
+    cx.bind_keys(crate::settings_window::notification_bindings(overrides, cx));
     errors
 }
 

@@ -482,7 +482,7 @@ impl SettingsWindow {
                     "Reload running shells",
                     ButtonKind::Primary,
                     ui,
-                    self.act(cx, |v, cx| v.reload_shells(cx)),
+                    self.act_closing_outcome(cx, |v, cx| v.reload_shells(cx)),
                 ));
             }
             actions = actions.child(button(
@@ -490,7 +490,7 @@ impl SettingsWindow {
                 if offer_reload { "Not now" } else { "Dismiss" },
                 ButtonKind::Normal,
                 ui,
-                self.act(cx, |v, cx| {
+                self.act_closing_outcome(cx, |v, cx| {
                     v.outcome = None;
                     cx.notify();
                 }),
@@ -681,6 +681,8 @@ impl Render for SettingsWindow {
             .on_action(cx.listener(Self::focus_prev_control))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::prev_page))
+            .on_action(cx.listener(Self::dismiss_notifications))
+            .on_action(cx.listener(Self::press_notification_button))
             .on_key_down(cx.listener(Self::on_key))
             .child(nav)
             // After layout: a focused control that is gone gives its focus to the page.
@@ -697,20 +699,28 @@ impl Render for SettingsWindow {
                     .min_w_0()
                     .h_full()
                     .child(
-                        div().id("page").flex_1().overflow_y_scroll().track_scroll(&self.scroll).child(
-                            div().flex().justify_center().px(px(gutter)).child(
-                                div()
-                                    .w_full()
-                                    .max_w(px(780.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(28.))
-                                    .pt(px(30.))
-                                    .pb(px(48.))
-                                    .child(self.header(ui, cx))
-                                    .child(page),
-                            ),
-                        ),
+                        // Toasts sit over the page's corner, above the bar.
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                div().id("page").size_full().overflow_y_scroll().track_scroll(&self.scroll).child(
+                                    div().flex().justify_center().px(px(gutter)).child(
+                                        div()
+                                            .w_full()
+                                            .max_w(px(780.))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(28.))
+                                            .pt(px(30.))
+                                            .pb(px(48.))
+                                            .child(self.header(ui, cx))
+                                            .child(page),
+                                    ),
+                                ),
+                            )
+                            .child(self.toasts.clone()),
                     )
                     .child(div().absolute().top(px(14.)).right(px(14.)).child(
                         icon_button("close-window", Icon::Close, "Close  (Ctrl+W)", ui, |window, _| window.remove_window()).size(px(34.)),

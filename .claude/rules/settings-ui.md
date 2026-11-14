@@ -15,6 +15,7 @@ One design language (Material 3 Expressive, the tonal-surface kind, with libadwa
 - **Unavailable ≠ hidden:** `row.disabled(true)` with a description saying why ("Needs Starship"), so the layout doesn't jump.
 - **Long lists get search, filters and folding:** `kit::search_field`, `kit::chip` filters with counts, collapsible groups, an `kit::empty` state that says what to do.
 - **Text is short.** One-line descriptions; longer explanations go in a section `.footer` or a dropdown option's description. Write labels as plain statements ("Show the tab bar"), not questions.
+- **Feedback:** a short result (saved, exported, imported, reloaded) is a toast (`toast::show`); the window has its own toast layer. The bar at the bottom (`Outcome`) is only for unapplied host changes and results that need room or a decision (preview/apply/rollback with the diff, a profile import).
 - **Previews over prose:** when a setting changes how something looks (theme, cursor, prompt, tabs), show it.
 - **Plugins:** the list only shows name, summary, status badges and the switch. Every plugin setting lives on the plugin's own page, grouped by the manifest's `group`, with `advanced` ones behind an expander. Pages like Prompt and History may show a built-in plugin's main switch where people look for it.
 - **Icons:** Lucide-style SVGs in `assets/icons/` (24 grid, 2px stroke), listed in `ui/icons.rs`. `svg()` doesn't inherit the text color: set `text_color` on the svg (`icon_button` does, including hover).

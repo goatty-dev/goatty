@@ -93,23 +93,31 @@ fn reload_shells(cx: &mut App) {
         toast::show(cx, Toast::warning("Can't reload shells").body("This window isn't connected to a goatty host."));
         return;
     };
-    let id = toast::show(cx, Toast::loading("Reloading shells…").key("shell.reload"));
+    reload_shells_on(link, cx);
+}
+
+/// Ask `link`'s host to reload its running managed shells, with a progress
+/// toast that turns into the result (the settings window's button too).
+/// One per host: reloading two hosts shows two toasts.
+pub fn reload_shells_on(link: settings_window::HostLink, cx: &mut App) {
+    let key = format!("shell.reload:{}", link.label());
+    let id = toast::show(cx, Toast::loading("Reloading shells…").key(key.clone()));
+    let retry = link.clone();
     cx.spawn(async move |cx| {
         let result = cx.background_executor().spawn(async move { link.reload_shells() }).await;
-        cx.update(|cx| toast::update(cx, id, reload_result(result)));
+        cx.update(|cx| toast::update(cx, id, reload_result(result, retry).key(key)));
     })
     .detach();
 }
 
-fn reload_result(result: anyhow::Result<u32>) -> Toast {
-    let t = match result {
+fn reload_result(result: anyhow::Result<u32>, link: settings_window::HostLink) -> Toast {
+    match result {
         Ok(0) => Toast::info("No goatty shells to reload").body("Only managed shells (goatty's zsh) can reload; none are running."),
         Ok(n) => Toast::success(if n == 1 { "Asked 1 shell to reload".to_string() } else { format!("Asked {n} shells to reload") })
             .body("Idle prompts restart now, busy shells after their current command."),
         Err(e) => Toast::error("Couldn't reload shells")
             .body(format!("{e:#}"))
-            .action("Retry", |_, cx| reload_shells(cx))
+            .action("Retry", move |_, cx| reload_shells_on(link.clone(), cx))
             .action("Shell settings", |_, cx| settings_window::open_at(cx, Some(settings_window::Page::Shell))),
-    };
-    t.key("shell.reload")
+    }
 }

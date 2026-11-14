@@ -301,8 +301,20 @@ pub fn builtins() -> Vec<Command> {
             "fill",
         ]),
         Command::action("pane.equalize", "Panes", "Make all panes the same size", "equalize_panes").keywords(&["balance", "even", "reset"]),
-        Command::handler("notifications.dismiss_all", "Notifications", "Dismiss all", |_, cx| toast::dismiss_all(cx))
+        Command::action("notifications.dismiss_all", "Notifications", "Dismiss all", "dismiss_notifications")
             .keywords(&["toasts", "clear", "close", "hide"]),
+        Command::action("notifications.press", "Notifications", "Press the newest one's main button", "press_notification_button")
+            .keywords(&["toast", "button", "action", "accept", "keyboard"]),
+        Command::action("notifications.recent", "Notifications", "Show recent", "show_recent_notifications").keywords(&[
+            "history",
+            "toasts",
+            "messages",
+            "errors",
+            "log",
+            "missed",
+            "read again",
+            "copy",
+        ]),
         Command::handler("app.quit", "goatty", "Quit", |_, cx| cx.quit()).keywords(&["exit", "close"]),
     ]
 }

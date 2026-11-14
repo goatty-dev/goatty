@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Level, Toast, ToastId};
+use super::{Handler, Level, Toast, ToastId};
 
 /// At most this many toasts are visible; a new one pushes the oldest out.
 pub const MAX_VISIBLE: usize = 4;
@@ -20,6 +20,9 @@ pub struct Entry {
     pub toast: Toast,
     /// How often this toast was shown in a row (same key, same content).
     pub count: u32,
+    /// When it was last shown or updated, as a counter: a keyed toast
+    /// replaced in place keeps its position but is the newest.
+    seq: u64,
     /// Time left while visible; `None` for sticky toasts.
     remaining: Option<Duration>,
     /// When the timer last (re)started; `None` while paused.
@@ -59,9 +62,10 @@ impl Entry {
 
 #[derive(Debug, Default)]
 pub struct Stack {
-    /// Oldest first.
+    /// Oldest first (by position; `Entry::seq` says which was shown last).
     entries: Vec<Entry>,
     paused: bool,
+    next_seq: u64,
 }
 
 impl Stack {
@@ -77,19 +81,37 @@ impl Stack {
         self.entries.iter().any(|e| e.id == id && !e.leaving())
     }
 
+    /// The visible toast with a button that was shown or updated last, and
+    /// its first button's code (what `press_notification_button` presses).
+    pub fn primary_action(&self) -> Option<(ToastId, Handler)> {
+        self.entries
+            .iter()
+            .filter(|e| !e.leaving())
+            .filter_map(|e| Some((e.seq, e.id, e.toast.actions.first()?.run.clone())))
+            .max_by_key(|(seq, _, _)| *seq)
+            .map(|(_, id, run)| (id, run))
+    }
+
+    fn seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
     /// Show `toast`. One with the same key as a visible toast replaces it in
     /// place (taking the new id); otherwise it goes at the end.
     pub fn push(&mut self, id: ToastId, toast: Toast, now: Instant) {
         let paused = self.paused;
+        let seq = self.seq();
         if toast.key.is_some()
             && let Some(e) = self.entries.iter_mut().find(|e| !e.leaving() && e.toast.key == toast.key)
         {
             e.count = if e.toast.same_content(&toast) { e.count + 1 } else { 1 };
             e.id = id;
+            e.seq = seq;
             e.start(toast, paused, now);
             return;
         }
-        let mut e = Entry { id, toast: toast.clone(), count: 1, remaining: None, running_since: None, leaving_since: None };
+        let mut e = Entry { id, toast: toast.clone(), count: 1, seq, remaining: None, running_since: None, leaving_since: None };
         e.start(toast, paused, now);
         self.entries.push(e);
         self.evict(now);
@@ -99,8 +121,10 @@ impl Stack {
     /// it isn't visible any more.
     pub fn update(&mut self, id: ToastId, toast: Toast, now: Instant) -> bool {
         let paused = self.paused;
+        let seq = self.seq();
         let Some(e) = self.entries.iter_mut().find(|e| e.id == id && !e.leaving()) else { return false };
         e.count = 1;
+        e.seq = seq;
         e.start(toast, paused, now);
         true
     }
@@ -250,6 +274,28 @@ mod tests {
         assert_eq!(visible.len(), MAX_VISIBLE);
         assert_eq!(visible[0], "busy");
         assert!(!visible.contains(&"t2".to_string()) && !visible.contains(&"t3".to_string()));
+    }
+
+    #[test]
+    fn primary_action_is_the_newest_visible_button() {
+        let t0 = Instant::now();
+        let mut s = Stack::default();
+        assert!(s.primary_action().is_none());
+        s.push(ToastId(1), Toast::error("a").action("Retry", |_, _| {}), t0);
+        s.push(ToastId(2), Toast::error("b").action("Open", |_, _| {}).action("Copy", |_, _| {}), t0);
+        s.push(ToastId(3), Toast::info("no buttons"), t0);
+        assert_eq!(s.primary_action().map(|(id, _)| id), Some(ToastId(2)));
+        s.dismiss(ToastId(2), t0);
+        assert_eq!(s.primary_action().map(|(id, _)| id), Some(ToastId(1)));
+        // A keyed toast replaced in place stays where it is but is the newest.
+        s.push(ToastId(4), Toast::warning("k").key("k").action("Fix", |_, _| {}), t0);
+        s.push(ToastId(5), Toast::error("c").action("Retry", |_, _| {}), t0);
+        s.push(ToastId(6), Toast::warning("k again").key("k").action("Fix", |_, _| {}), t0);
+        assert_eq!(titles(&s), ["a", "no buttons", "k again", "c"]);
+        assert_eq!(s.primary_action().map(|(id, _)| id), Some(ToastId(6)));
+        // So is one updated in place.
+        assert!(s.update(ToastId(5), Toast::error("c failed").action("Retry", |_, _| {}), t0));
+        assert_eq!(s.primary_action().map(|(id, _)| id), Some(ToastId(5)));
     }
 
     #[test]
