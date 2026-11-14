@@ -44,6 +44,9 @@ pub struct Field {
     /// checks is fine too (hosts), without it only these (choices).
     pub suggestions: Vec<Suggestion>,
     pub custom: bool,
+    /// Leading and trailing spaces aren't part of the answer (hosts).
+    /// Text and paths keep theirs; numbers are trimmed by their check.
+    pub trim: bool,
 }
 
 /// An entry under the field.
@@ -76,6 +79,7 @@ impl Field {
             check: None,
             suggestions: Vec::new(),
             custom: true,
+            trim: false,
         }
     }
 
@@ -121,6 +125,7 @@ impl Field {
     /// suggest (host, label).
     pub fn host(id: &str, label: &str, known: Vec<(String, String)>) -> Self {
         let mut f = Self::text(id, label);
+        f.trim = true;
         f.check = Some(Rc::new(|h: &str| goatty_config::ssh_host_problem(h.trim()).map(|p| format!("Not a host: {p}"))));
         f.suggestions = known
             .into_iter()
@@ -182,8 +187,8 @@ impl Field {
     /// The value to answer with for `text`, or what's wrong with it. Paths
     /// that must exist are checked separately ([`missing_path`]).
     pub fn validate(&self, text: &str) -> Result<String, String> {
-        let text = if self.spec.kind == InputKind::Choice { text.to_string() } else { text.trim().to_string() };
-        let value = check_value(&self.spec, &text)?;
+        let text = if self.trim { text.trim() } else { text };
+        let value = check_value(&self.spec, text)?;
         if value.is_empty() {
             return Ok(value);
         }
@@ -209,12 +214,16 @@ pub struct Ask {
     /// The answers are for this computer: paths can be checked and
     /// completed here.
     pub local: bool,
+    /// What relative paths are relative to: the directory of the terminal
+    /// the answer is for (set by the workspace when it's on this computer).
+    /// Without one, relative paths aren't looked up.
+    pub base: Option<PathBuf>,
     pub then: AnswerHandler,
 }
 
 impl Ask {
     pub fn new(title: impl Into<SharedString>, fields: Vec<Field>, then: impl Fn(&Answers, &mut Window, &mut App) + 'static) -> Self {
-        Self { title: title.into(), fields, local: true, then: Rc::new(then) }
+        Self { title: title.into(), fields, local: true, base: None, then: Rc::new(then) }
     }
 
     /// The answers are for another host: don't look at this computer's files.
@@ -254,12 +263,17 @@ pub fn contract_home(path: &Path, home: Option<&Path>) -> String {
 }
 
 /// Why `value` (a path field's answer) isn't there, looked up on this
-/// computer. Blocking: call it off the UI thread.
-pub fn missing_path(spec: &CommandInput, value: &str, home: Option<&Path>) -> Option<String> {
+/// computer; a relative one in `base` (the terminal's directory, where the
+/// answer is used), or not at all without one. Blocking: call it off the
+/// UI thread.
+pub fn missing_path(spec: &CommandInput, value: &str, home: Option<&Path>, base: Option<&Path>) -> Option<String> {
     if !spec.must_exist || value.is_empty() {
         return None;
     }
-    let p = expand_home(value, home);
+    let mut p = expand_home(value, home);
+    if p.is_relative() {
+        p = base?.join(p);
+    }
     match std::fs::metadata(&p) {
         Ok(m) if spec.kind == InputKind::Folder && !m.is_dir() => Some("That's a file, not a folder".into()),
         Ok(_) => None,
@@ -348,6 +362,8 @@ mod tests {
         let opt = Field::text("t", "T").optional().check(|v| v.contains(' ').then(|| "No spaces".into()));
         assert_eq!(opt.validate(""), Ok(String::new()), "the extra check skips empty optional values");
         assert_eq!(opt.validate("a b"), Err("No spaces".into()));
+        assert_eq!(Field::text("t", "T").validate(" a "), Ok(" a ".into()), "text keeps its spaces");
+        assert_eq!(Field::folder("d", "D", false).validate("/tmp/build "), Ok("/tmp/build ".into()), "paths too");
     }
 
     #[test]
@@ -388,10 +404,14 @@ mod tests {
         std::fs::write(tmp.path().join("file"), "").unwrap();
         let f = Field::folder("d", "Folder", true).spec;
         let at = |n: &str| tmp.path().join(n).display().to_string();
-        assert_eq!(missing_path(&f, &at("sub"), None), None);
-        assert_eq!(missing_path(&f, &at("file"), None).as_deref(), Some("That's a file, not a folder"));
-        assert_eq!(missing_path(&f, &at("nope"), None).as_deref(), Some("Doesn't exist"));
-        assert_eq!(missing_path(&Field::folder("d", "Folder", false).spec, &at("nope"), None), None);
+        assert_eq!(missing_path(&f, &at("sub"), None, None), None);
+        assert_eq!(missing_path(&f, &at("file"), None, None).as_deref(), Some("That's a file, not a folder"));
+        assert_eq!(missing_path(&f, &at("nope"), None, None).as_deref(), Some("Doesn't exist"));
+        assert_eq!(missing_path(&Field::folder("d", "Folder", false).spec, &at("nope"), None, None), None);
+        // Relative: in the terminal's directory, or not looked up without one.
+        assert_eq!(missing_path(&f, "sub", None, Some(tmp.path())), None);
+        assert_eq!(missing_path(&f, "nope", None, Some(tmp.path())).as_deref(), Some("Doesn't exist"));
+        assert_eq!(missing_path(&f, "nope", None, None), None);
         let listed: Vec<String> = list_folder(&format!("{}/", tmp.path().display()), None, false).into_iter().map(|s| s.label).collect();
         assert_eq!(listed, [format!("{}/sub/", tmp.path().display()), format!("{}/file", tmp.path().display())]);
     }

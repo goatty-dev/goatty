@@ -51,12 +51,17 @@ pub fn refresh(cx: &mut App) {
     let link = cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone());
     let state = cx.default_global::<State>();
     state.generation += 1;
+    let moved = match (&state.link, &link) {
+        (Some(a), Some(b)) => !a.same(b),
+        (a, b) => a.is_some() != b.is_some(),
+    };
     state.link = link.clone();
     let generation = state.generation;
-    let Some(link) = link else {
+    // Another host: its plugins aren't the last one's, so none until fetched.
+    if moved {
         replace(None, Vec::new(), cx);
-        return;
-    };
+    }
+    let Some(link) = link else { return };
     cx.spawn(async move |cx: &mut AsyncApp| {
         let l = link.clone();
         let reply = cx.background_executor().spawn(async move { l.plugin(Request::Catalog { refresh: false }) }).await;
@@ -105,14 +110,15 @@ fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Com
     let cmd = Rc::new(c.clone());
     let title = format!("{name}: {}", c.title);
     let remote = !link.is_local();
+    let origin = link.clone();
     let mut out = Command::handler(&command_id(plugin, &c.id), name, &c.title, move |window, cx| {
         if cmd.inputs.is_empty() {
-            run(&cmd, &Answers::new(), window, cx);
+            run(&cmd, &origin, &Answers::new(), window, cx);
             return;
         }
         let fields = cmd.inputs.iter().map(Field::from_plugin).collect();
-        let then = cmd.clone();
-        let a = Ask::new(title.clone(), fields, move |answers, window, cx| run(&then, answers, window, cx)).remote(remote);
+        let (then, origin) = (cmd.clone(), origin.clone());
+        let a = Ask::new(title.clone(), fields, move |answers, window, cx| run(&then, &origin, answers, window, cx)).remote(remote);
         ask(window, cx, a);
     });
     let mut words: Vec<&str> = c.keywords.iter().map(String::as_str).collect();
@@ -123,27 +129,47 @@ fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Com
     out
 }
 
-/// Type `c`'s line for `answers` into the focused pane, if a shell is
-/// waiting there; otherwise offer to copy it.
-fn run(c: &PaletteCommand, answers: &Answers, window: &mut Window, cx: &mut App) {
+/// Type `c`'s line for `answers` into the focused pane, if it's on the
+/// host the command came from (`origin`) and a shell is waiting there;
+/// otherwise offer to copy it.
+fn run(c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Window, cx: &mut App) {
     let line = command_line(c, answers);
+    let origin = origin.clone();
     // Deferred: the palette runs commands from inside the workspace.
     window.defer(cx, move |window, cx| {
-        let Some(view) = window.root::<Workspace>().flatten().and_then(|ws| ws.read(cx).focused_terminal()) else {
-            toast::show(cx, Toast::warning("No terminal to run it in").body(line.clone()));
+        let ws = window.root::<Workspace>().flatten();
+        let target = ws.as_ref().map(|ws| (ws.read(cx).focused_terminal(), ws.read(cx).active_host_link()));
+        let copy = line.clone();
+        let refuse = |title: String, body: String, window: &mut Window, cx: &mut App| {
+            let t = Toast::warning(title)
+                .body(body)
+                .action("Copy the command", move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))
+                .key("plugin.command");
+            toast::show_in(window, cx, t);
+        };
+        let Some((Some(view), host)) = target else {
+            refuse("No terminal to run it in".into(), line.clone(), window, cx);
             return;
         };
-        let busy = view.read(cx).process().filter(|p| !crate::workspace::icons::is_shell(p)).map(str::to_string);
-        if let Some(program) = busy {
-            let copy = line.clone();
-            toast::show_in(
+        // A command listed for another host (the tab changed meanwhile).
+        if !host.is_some_and(|h| h.same(&origin)) {
+            refuse(
+                format!("This command is from {}'s plugins", origin.label()),
+                format!("The active tab is on another host. Run it in a tab on {}: {line}", origin.label()),
                 window,
                 cx,
-                Toast::warning(format!("{program} is running in this pane"))
-                    .body(format!("Run it at a prompt: {line}"))
-                    .action("Copy the command", move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))
-                    .key("plugin.command"),
             );
+            return;
+        }
+        let v = view.read(cx);
+        let busy = match v.process() {
+            Some(p) if !crate::workspace::icons::is_shell(p) => Some(p.to_string()),
+            // Shell integration knows a command runs even when the program isn't known.
+            _ if v.session().terminal.command_running() => Some("A command".to_string()),
+            _ => None,
+        };
+        if let Some(program) = busy {
+            refuse(format!("{program} is running in this pane"), format!("Run it at a prompt: {line}"), window, cx);
             return;
         }
         view.update(cx, |v, cx| v.run_line(&line, cx));

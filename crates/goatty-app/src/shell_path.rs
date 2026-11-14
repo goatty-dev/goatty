@@ -100,18 +100,30 @@ fn load(link: &HostLink) -> Result<(HostSettings, Vec<store::Unknown>)> {
     Ok((loaded.value, loaded.unknown))
 }
 
-/// Apply `change` on `link`'s host, with a toast for the result. `Ok(false)`:
-/// nothing to do.
-fn apply(link: &HostLink, change: &Change) -> Result<bool> {
+/// What [`apply`] did.
+enum Done {
+    /// Nothing to do (already there, or not on the list).
+    Unchanged,
+    /// Saved; `active`: goatty's managed zsh runs there, so it takes effect.
+    Changed { active: bool },
+}
+
+/// One PATH change at a time: each loads the settings, changes them and
+/// writes them back, so two at once would lose one of the changes.
+static APPLYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Apply `change` on `link`'s host. Blocking.
+fn apply(link: &HostLink, change: &Change) -> Result<Done> {
+    let _one = APPLYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut s, unknown) = load(link)?;
     match change {
-        Change::Add(dir) if s.shell.path.contains(dir) => return Ok(false),
+        Change::Add(dir) if s.shell.path.contains(dir) => return Ok(Done::Unchanged),
         Change::Add(dir) => s.shell.path.push(dir.clone()),
         Change::Remove(dir) => {
             let before = s.shell.path.len();
             s.shell.path.retain(|d| d != dir);
             if s.shell.path.len() == before {
-                return Ok(false);
+                return Ok(Done::Unchanged);
             }
         }
     }
@@ -119,7 +131,12 @@ fn apply(link: &HostLink, change: &Change) -> Result<bool> {
     if !applied.applied {
         bail!("{}", if applied.issues.is_empty() { "the host didn't apply the change".into() } else { applied.issues.join("; ") });
     }
-    Ok(true)
+    Ok(Done::Changed { active: managed_zsh(&s) })
+}
+
+/// `shell.path` only reaches goatty's managed zsh.
+fn managed_zsh(s: &HostSettings) -> bool {
+    s.shell.managed && s.shell.program.as_deref().is_none_or(|p| p == "zsh" || p.ends_with("/zsh"))
 }
 
 fn change(link: HostLink, change: Change, cx: &mut App) {
@@ -130,28 +147,33 @@ fn change(link: HostLink, change: Change, cx: &mut App) {
         cx.update(|cx| {
             let label = link.label();
             let reload = link.clone();
+            let settings = |t: Toast| t.action("Shell settings", |_, cx| settings_window::open_at(cx, Some(Page::Shell))).key(KEY);
             let t = match (result, &change) {
-                (Ok(true), Change::Add(dir)) => Toast::success(format!("Added {dir} to PATH"))
+                (Ok(Done::Changed { active: false }), Change::Add(dir)) => {
+                    let body = format!(
+                        "goatty's managed zsh is off on {label}, and only it adds these folders. Turn it on in the shell settings."
+                    );
+                    toast::update(cx, id, settings(Toast::warning(format!("Saved {dir}, but it isn't used yet")).body(body)));
+                    return;
+                }
+                (Ok(Done::Changed { active: false }), Change::Remove(dir)) => {
+                    toast::update(cx, id, Toast::success(format!("Removed {dir} from the list")).key(KEY));
+                    return;
+                }
+                (Ok(Done::Changed { active: true }), Change::Add(dir)) => Toast::success(format!("Added {dir} to PATH"))
                     .body(format!("New goatty shells on {label} have it. Running shells get it when they reload.")),
-                (Ok(true), Change::Remove(dir)) => Toast::success(format!("Removed {dir} from PATH"))
+                (Ok(Done::Changed { active: true }), Change::Remove(dir)) => Toast::success(format!("Removed {dir} from PATH"))
                     .body(format!("New goatty shells on {label} don't have it. Running shells change when they reload.")),
-                (Ok(false), Change::Add(dir)) => {
+                (Ok(Done::Unchanged), Change::Add(dir)) => {
                     toast::update(cx, id, Toast::info(format!("{dir} is on PATH already")).key(KEY));
                     return;
                 }
-                (Ok(false), Change::Remove(dir)) => {
+                (Ok(Done::Unchanged), Change::Remove(dir)) => {
                     toast::update(cx, id, Toast::info(format!("{dir} wasn't on the list")).key(KEY));
                     return;
                 }
                 (Err(e), _) => {
-                    toast::update(
-                        cx,
-                        id,
-                        Toast::error("Couldn't change PATH")
-                            .body(format!("{e:#}"))
-                            .action("Shell settings", |_, cx| settings_window::open_at(cx, Some(Page::Shell)))
-                            .key(KEY),
-                    );
+                    toast::update(cx, id, settings(Toast::error("Couldn't change PATH").body(format!("{e:#}"))));
                     return;
                 }
             };
@@ -160,4 +182,22 @@ fn change(link: HostLink, change: Change, cx: &mut App) {
         });
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_only_reaches_managed_zsh() {
+        let mut s = HostSettings::default();
+        assert!(managed_zsh(&s));
+        s.shell.program = Some("/usr/bin/zsh".into());
+        assert!(managed_zsh(&s));
+        s.shell.program = Some("fish".into());
+        assert!(!managed_zsh(&s));
+        s.shell.program = None;
+        s.shell.managed = false;
+        assert!(!managed_zsh(&s));
+    }
 }

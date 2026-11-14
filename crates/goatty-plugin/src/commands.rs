@@ -152,8 +152,12 @@ pub fn check_value(input: &CommandInput, text: &str) -> Result<String, String> {
     if text.is_empty() {
         return if input.optional { Ok(String::new()) } else { Err("Required".into()) };
     }
-    if text.contains(['\0', '\n', '\r']) {
+    if text.contains(['\n', '\r']) {
         return Err("Must be a single line".into());
+    }
+    // Control characters would act as keys when the line is typed (Ctrl+U…).
+    if text.chars().any(char::is_control) {
+        return Err("Can't contain control characters".into());
     }
     let bounds = |n: f64| -> Result<(), String> {
         match (input.min, input.max) {
@@ -230,14 +234,33 @@ pub fn command_line(c: &PaletteCommand, values: &BTreeMap<String, String>) -> St
                 continue;
             }
         }
-        let word: String = ps
-            .iter()
-            .map(|p| match p {
-                Part::Text(s) => s.clone(),
-                Part::Var(v) => values.get(*v).cloned().unwrap_or_default(),
-            })
-            .collect();
-        words.push(crate::zsh::word(&word));
+        // Inside a word (`--out={dir}`), a path's `~` becomes "$HOME": the
+        // shell doesn't expand a tilde after `=`. Each literal run is quoted.
+        let mut runs: Vec<String> = Vec::new();
+        let mut text = String::new();
+        for p in &ps {
+            match p {
+                Part::Text(s) => text.push_str(s),
+                Part::Var(v) => {
+                    let value = values.get(*v).map(String::as_str).unwrap_or_default();
+                    let is_path = c.inputs.iter().any(|i| i.id == *v && matches!(i.kind, InputKind::Path | InputKind::Folder));
+                    match value.strip_prefix('~').filter(|rest| is_path && (rest.is_empty() || rest.starts_with('/'))) {
+                        Some(rest) => {
+                            if !text.is_empty() {
+                                runs.push(crate::zsh::word(&std::mem::take(&mut text)));
+                            }
+                            runs.push("\"$HOME\"".into());
+                            text.push_str(rest);
+                        }
+                        None => text.push_str(value),
+                    }
+                }
+            }
+        }
+        if !text.is_empty() || runs.is_empty() {
+            runs.push(crate::zsh::word(&text));
+        }
+        words.push(runs.concat());
     }
     words.join(" ")
 }
@@ -396,6 +419,12 @@ pattern_help = "a name pattern without /"
         v.insert("filter".to_string(), "~/x".to_string());
         assert_eq!(command_line(c, &v), r"eza --tree --level=3 'my dir/it'\''s' '~/x'", "only paths expand ~");
         v.insert("filter".to_string(), "$(rm -rf ~)".to_string());
+        let inline = PaletteCommand { run: vec!["eza".into(), "--out={dir}".into(), "x{depth}".into()], ..c.clone() };
+        let mut w = v.clone();
+        w.insert("dir".to_string(), "~/my src".to_string());
+        assert_eq!(command_line(&inline, &w), r#"eza --out="$HOME"'/my src' x3"#, "~ inside a word");
+        w.insert("dir".to_string(), "~".to_string());
+        assert_eq!(command_line(&inline, &w), r#"eza --out="$HOME" x3"#);
         assert_eq!(command_line(c, &v), r"eza --tree --level=3 'my dir/it'\''s' '$(rm -rf ~)'");
         assert_eq!(describe(c), "eza --tree --level={depth} {dir} {filter}");
     }
@@ -412,6 +441,8 @@ pattern_help = "a name pattern without /"
         assert_eq!(check_value(filter, "a/b"), Err("Use a name pattern without /".into()));
         assert_eq!(check_value(filter, "*.rs"), Ok("*.rs".into()));
         assert_eq!(check_value(filter, "a\nb"), Err("Must be a single line".into()));
+        assert_eq!(check_value(filter, "a\u{15}b"), Err("Can't contain control characters".into()), "Ctrl+U");
+        assert_eq!(check_value(filter, "a\u{1b}[A"), Err("Can't contain control characters".into()));
         let choice = CommandInput {
             kind: InputKind::Choice,
             choices: vec![InputChoice { value: "sh".into(), label: None, help: String::new() }],

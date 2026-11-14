@@ -232,6 +232,12 @@ impl Document for HostSettings {
             issues.push(Issue::new(format!("aliases.{name}"), format!("not a usable alias name ({why}); ignored")));
             self.aliases.remove(&name);
         }
+        for dir in std::mem::take(&mut self.shell.path) {
+            match path_entry_problem(&dir) {
+                Some(why) => issues.push(Issue::new("shell.path", format!("{dir:?} ignored: {why}"))),
+                None => self.shell.path.push(dir),
+            }
+        }
         let empty: Vec<String> = self.aliases.iter().filter(|(_, a)| a.command.trim().is_empty()).map(|(n, _)| n.clone()).collect();
         for name in empty {
             issues.push(Issue::new(format!("aliases.{name}.command"), "empty; alias ignored"));
@@ -417,6 +423,10 @@ mod tests {
         let s: HostSettings = serde_json::from_str(r#"{"shell": {"path": ["~/bin"]}}"#).unwrap();
         assert_eq!(s.shell.path, ["~/bin"]);
         assert!(s.shell.managed, "other shell settings keep their defaults");
+        let mut s: HostSettings = serde_json::from_str(r#"{"shell": {"path": ["~/bin", "bin", "/a:/b"]}}"#).unwrap();
+        let issues = s.validate();
+        assert_eq!(s.shell.path, ["~/bin"], "bad entries are dropped on load");
+        assert_eq!(issues.iter().filter(|i| i.to_string().contains("shell.path")).count(), 2, "{issues:?}");
     }
 
     fn with(vars: &[(&str, &str)]) -> HostSettings {

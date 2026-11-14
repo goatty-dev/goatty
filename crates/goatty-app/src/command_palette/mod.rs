@@ -187,6 +187,8 @@ struct Asking {
     /// it, or the field only takes its choices); otherwise the text is.
     picked: bool,
     home: Option<PathBuf>,
+    /// What relative paths are relative to (`Ask::base`).
+    base: Option<PathBuf>,
     /// Folder listing and existence check for the current text.
     _work: Option<Task<()>>,
 }
@@ -371,11 +373,9 @@ impl CommandPalette {
             TextInputEvent::Submitted(_) => this.confirm(cx),
         });
         // `~/.ssh/config` is re-read in the background; list what it has now.
-        let hosts_changed = cx.observe_global::<HostList>(|this, cx| {
-            this.load_commands(cx);
-            let q = std::mem::take(&mut this.query);
-            this.set_query(&q, cx);
-        });
+        let hosts_changed = cx.observe_global::<HostList>(|this, cx| this.reload_commands(cx));
+        // Plugin commands arrive after the host's catalog is fetched.
+        let commands_changed = cx.observe_global::<CommandRegistry>(|this, cx| this.reload_commands(cx));
         hosts::refresh(cx);
         input.focus_handle(cx).focus(window, cx);
         let mut this = Self {
@@ -396,7 +396,7 @@ impl CommandPalette {
             status: None,
             _load: None,
             asking: None,
-            _subscriptions: vec![sub, hosts_changed],
+            _subscriptions: vec![sub, hosts_changed, commands_changed],
         };
         this.load_commands(cx);
         this.set_query("", cx);
@@ -417,6 +417,7 @@ impl CommandPalette {
             tried: false,
             picked: false,
             home: std::env::var_os("HOME").map(PathBuf::from),
+            base: ask.base,
             _work: None,
         });
         if this.asking.as_ref().is_some_and(|a| a.fields.is_empty()) {
@@ -426,6 +427,17 @@ impl CommandPalette {
             this.start_step(0, None, cx);
         }
         this
+    }
+
+    /// The registry or the hosts changed: list them again, keeping the
+    /// query (not while asking: the suggestions are the field's).
+    fn reload_commands(&mut self, cx: &mut Context<'_, Self>) {
+        if self.asking.is_some() {
+            return;
+        }
+        self.load_commands(cx);
+        let q = std::mem::take(&mut self.query);
+        self.set_query(&q, cx);
     }
 
     /// The commands to list: the registry's and the hosts, or only the hosts.
@@ -627,7 +639,7 @@ impl CommandPalette {
             if !a.local {
                 return;
             }
-            let (home, text_owned, step) = (a.home.clone(), text.to_string(), a.step);
+            let (home, base, text_owned, step) = (a.home.clone(), a.base.clone(), text.to_string(), a.step);
             let folders = field.spec.kind == goatty_plugin::commands::InputKind::Folder;
             // Only a value that passes the other checks is looked up.
             let value = field.validate(text).ok().map(|v| input::trim_completed(&v).to_string());
@@ -638,7 +650,7 @@ impl CommandPalette {
                     .background_executor()
                     .spawn(async move {
                         let list = input::list_folder(&t, home.as_deref(), folders);
-                        let missing = value.and_then(|v| input::missing_path(&spec, &v, home.as_deref()));
+                        let missing = value.and_then(|v| input::missing_path(&spec, &v, home.as_deref(), base.as_deref()));
                         (list, missing)
                     })
                     .await;
@@ -658,6 +670,13 @@ impl CommandPalette {
         }
         let list = field.suggestions.clone();
         self.show_suggestions(list, text, cx);
+        // A default or earlier answer selects its own choice, not the
+        // first fuzzy match (a label may look like another's value).
+        if field.strict()
+            && let Some(ix) = self.hits.iter().position(|h| self.commands[h.index].id == text)
+        {
+            self.select(ix, cx);
+        }
     }
 
     /// List `list` under the field, filtered by `query` (fuzzy, by label
@@ -726,10 +745,11 @@ impl CommandPalette {
             self.accept(value, cx);
             return;
         }
-        let (home, step, spec) = (a.home.clone(), a.step, field.spec.clone());
+        let (home, base, step, spec) = (a.home.clone(), a.base.clone(), a.step, field.spec.clone());
         a._work = Some(cx.spawn(async move |this, cx| {
             let v = value.clone();
-            let missing = cx.background_executor().spawn(async move { input::missing_path(&spec, &v, home.as_deref()) }).await;
+            let missing =
+                cx.background_executor().spawn(async move { input::missing_path(&spec, &v, home.as_deref(), base.as_deref()) }).await;
             let _ = this.update(cx, |this, cx| {
                 let Some(a) = &mut this.asking else { return };
                 if a.step != step {

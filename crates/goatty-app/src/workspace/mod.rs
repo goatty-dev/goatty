@@ -1281,7 +1281,11 @@ impl Workspace {
 
     /// Ask for `ask`'s input in the palette (replacing an open one); see
     /// `command_palette::ask`.
-    pub fn open_ask(&mut self, ask: crate::command_palette::Ask, window: &mut Window, cx: &mut Context<'_, Self>) {
+    pub fn open_ask(&mut self, mut ask: crate::command_palette::Ask, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Relative paths in the answers mean the focused pane's directory.
+        if ask.local && ask.base.is_none() {
+            ask.base = self.focused_view().and_then(|v| v.read(cx).cwd());
+        }
         self.close_recent(window, cx);
         self.palette = None;
         let palette = cx.new(|cx| CommandPalette::asking(ask, window, cx));
@@ -1291,6 +1295,11 @@ impl Workspace {
     /// The focused pane's terminal, for commands that act on it.
     pub fn focused_terminal(&self) -> Option<Entity<TerminalView>> {
         self.focused_view().cloned()
+    }
+
+    /// The host of the active tab (`None` while it connects).
+    pub fn active_host_link(&self) -> Option<crate::settings_window::HostLink> {
+        self.active_tab()?.host.as_ref().map(Spawner::host_link)
     }
 
     fn show_palette(&mut self, palette: Entity<CommandPalette>, window: &mut Window, cx: &mut Context<'_, Self>) {

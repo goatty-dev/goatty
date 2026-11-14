@@ -1089,6 +1089,8 @@ impl SettingsWindow {
                 });
                 view.draft = None;
                 view.load_host(cx);
+                // A rollback can switch plugins on or off: their commands too.
+                crate::plugin_commands::refresh(cx);
             });
         })
         .detach();
