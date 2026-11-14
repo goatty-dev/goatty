@@ -431,16 +431,32 @@ impl OutputView {
     /// scrollback is full, old commands drop out and indices shift.
     fn refresh(&mut self, cx: &mut Context<'_, Self>) {
         self.last_refresh = Instant::now();
+        let before = self.last_identity();
         if !matches!(self.source, Source::Command(_)) {
             self.transcript = Arc::new(self.session.terminal.transcript());
         }
         self.refresh_cost = self.last_refresh.elapsed();
         let current = self.current.and_then(|i| self.matches.get(i).cloned());
         self.rebuild();
+        // "Last" moved on to another command (one started meanwhile): treat
+        // it like opening it, so a running one follows. A pause within the
+        // same command stays.
+        if self.source == Source::Last && self.last_identity() != before {
+            self.follow = follows(Source::Last, &self.transcript);
+            self.reveal = (!self.follow).then_some(Reveal::Top);
+            self.selection = None;
+        }
         if let Some(m) = current {
             self.current = self.matches.iter().position(|x| *x == m).or(self.current.filter(|&i| i < self.matches.len()));
         }
         cx.notify();
+    }
+
+    /// Which command "Last" shows: its index and command line (indices
+    /// alone shift once the scrollback drops old commands).
+    fn last_identity(&self) -> Option<(usize, String)> {
+        let b = self.transcript.last_command()?;
+        Some((b, self.transcript.command_line(b).unwrap_or_default().to_string()))
     }
 
     /// The source's block, for a command source.
@@ -554,6 +570,19 @@ impl OutputView {
         self.current = Some(i);
         self.reveal_match(i);
         cx.notify();
+    }
+
+    /// Enter / Shift+Enter: the next or previous match, except on a focused
+    /// toolbar control, where the key goes on to press it (GPUI clicks a
+    /// focused element with `on_click` when no action took the key).
+    fn match_key(&mut self, step: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let on_control =
+            STOPS.iter().filter(|s| !matches!(s, Stop::Search | Stop::Text)).any(|&s| self.stops[s as usize].is_focused(window));
+        if on_control {
+            cx.propagate();
+        } else {
+            self.step_match(step, window, cx);
+        }
     }
 
     /// Wrap long lines or not, keeping the current match or the top line in view.
@@ -1008,7 +1037,11 @@ impl OutputView {
     fn reveal_pos(&mut self, pos: Pos, cols: usize) {
         let Some(si) = self.shown.iter().position(|&i| i == pos.line) else { return };
         let text = &self.transcript.lines[pos.line].text;
-        let byte = pos.byte.min(text.len());
+        // Live output can rewrite the line after the position was taken.
+        let mut byte = pos.byte.min(text.len());
+        while !text.is_char_boundary(byte) {
+            byte -= 1;
+        }
         let sub = if self.wrap { wrap_points(text, cols).partition_point(|&p| p <= byte).saturating_sub(1) } else { 0 };
         let row = (self.rows.first_row(si) + sub) as f32;
         let visible = self.geom.visible_rows.floor();
@@ -1417,8 +1450,8 @@ impl Render for OutputView {
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(|_, _: &Close, _, cx| cx.emit(OutputEvent::Close)))
-            .on_action(cx.listener(|v, _: &NextMatch, w, cx| v.step_match(1, w, cx)))
-            .on_action(cx.listener(|v, _: &PreviousMatch, w, cx| v.step_match(-1, w, cx)))
+            .on_action(cx.listener(|v, _: &NextMatch, w, cx| v.match_key(1, w, cx)))
+            .on_action(cx.listener(|v, _: &PreviousMatch, w, cx| v.match_key(-1, w, cx)))
             .on_action(cx.listener(|v, _: &FocusSearch, w, cx| v.focus_search(w, cx)))
             .on_action(cx.listener(|v, _: &ToggleCaseSensitive, _, cx| v.toggle(|v| &mut v.query.case_sensitive, cx)))
             .on_action(cx.listener(|v, _: &ToggleRegex, _, cx| v.toggle(|v| &mut v.query.regex, cx)))

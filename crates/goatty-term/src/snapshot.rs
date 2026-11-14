@@ -74,20 +74,17 @@ fn serialize(t: &Term, max_history: usize, shell: ShellState) -> Vec<u8> {
     // active, `t.grid` *is* the alt grid (rio swaps them), so history replay
     // is only possible on the primary screen.
     if !alt {
+        // The scrollback and every screen row in one run: the last screen
+        // row lands on the client's bottom row, which scrolls exactly the
+        // scrollback into its history, and a line wrapping from the
+        // scrollback onto the screen stays one line.
         let history = t.history_size().min(max_history) as i32;
-        write_rows(t, -history..0, true, &mut out);
-        // Push the history off-screen: the last history line must scroll
-        // past the top, i.e. (screen_lines - 1) more newlines.
-        for _ in 0..t.screen_lines().saturating_sub(1) {
-            out.push_str("\r\n");
-        }
+        write_rows(t, -history..t.screen_lines() as i32, false, &mut out);
+        write_cursor(t, &mut out);
     } else {
         out.push_str("\x1b[?1049h");
+        write_screen(t, false, &mut out);
     }
-
-    // The screen is blank here: clearing it would push a blank screen
-    // into the client's history.
-    write_screen(t, false, &mut out);
     write_shell_state(shell, &mut out);
     write_modes(t, mode, &mut out);
     out.into_bytes()
@@ -106,6 +103,11 @@ fn write_screen(t: &Term, clear: bool, out: &mut String) {
     if let Some(last) = last {
         write_rows(t, 0..last + 1, false, out);
     }
+    write_cursor(t, out);
+}
+
+/// Reset the pen, then the cursor's position and visibility.
+fn write_cursor(t: &Term, out: &mut String) {
     out.push_str("\x1b[0m");
     let pos = t.grid.cursor.pos;
     let _ = write!(out, "\x1b[{};{}H", pos.row.0.max(0) + 1, pos.col.0 + 1);
@@ -294,6 +296,18 @@ mod tests {
         let b = reattached(&a, size);
         assert_eq!(a.transcript().lines, b.transcript().lines);
         assert_eq!(b.transcript().lines[0].text, "0123456789abcdefghijX");
+        assert_eq!(text_of(&a), text_of(&b));
+    }
+
+    #[test]
+    fn roundtrip_keeps_a_line_wrapping_from_history_onto_the_screen() {
+        let size = TermSize::new(10, 3);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        a.feed(b"0123456789abcdefghijABCDEFGHIJZ");
+        assert_eq!(a.history_size(), 1);
+        let b = reattached(&a, size);
+        assert_eq!(b.history_size(), 1);
+        assert_eq!(b.transcript().lines[0].text, "0123456789abcdefghijABCDEFGHIJZ");
         assert_eq!(text_of(&a), text_of(&b));
     }
 
