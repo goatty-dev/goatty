@@ -245,15 +245,16 @@ _goatty_reload_requested() {
 # signal can arrive before zle is loaded (non-interactive, or a build where
 # the zle module isn't available); then the flag stays set and the reload
 # happens at the next prompt instead.
-_goatty_reload_idle() {
-  (( $+builtins[zle] )) || return 0
-  [[ $CONTEXT == start && -z $BUFFER ]] && zle .send-break
-}
-(( $+builtins[zle] )) && zle -N _goatty_reload_idle
-
+# Inspect CONTEXT/BUFFER directly and invoke only the built-in `.send-break`
+# rather than calling a user widget (`zle _...`), because invoking a user
+# widget from a signal trap while zle-line-pre-redraw hooks (such as
+# zsh-syntax-highlighting) are running calls execzlefunc/doshfunc re-entrantly
+# and corrupts zsh's heap.
 TRAPURG() {
   _goatty_reload_pending=1
-  zle && zle _goatty_reload_idle
+  if (( $+builtins[zle] )) && zle && [[ $CONTEXT == start && -z $BUFFER ]]; then
+    zle .send-break
+  fi
   return 0
 }
 
