@@ -452,11 +452,11 @@ impl OutputView {
         cx.notify();
     }
 
-    /// Which command "Last" shows: its index and command line (indices
-    /// alone shift once the scrollback drops old commands).
-    fn last_identity(&self) -> Option<(usize, String)> {
-        let b = self.transcript.last_command()?;
-        Some((b, self.transcript.command_line(b).unwrap_or_default().to_string()))
+    /// Which command "Last" shows, by how many commands had started: the
+    /// index shifts when the scrollback drops old commands, and two runs of
+    /// the same command line look alike.
+    fn last_identity(&self) -> Option<u64> {
+        self.transcript.last_command().map(|_| self.transcript.commands_started)
     }
 
     /// The source's block, for a command source.

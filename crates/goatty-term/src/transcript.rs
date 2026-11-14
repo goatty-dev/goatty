@@ -63,6 +63,10 @@ pub struct Transcript {
     /// The last block's command finished but no prompt followed yet (the
     /// moment between the two, or a shell that exited after it).
     pub awaiting_prompt: bool,
+    /// How many commands this terminal saw start: changes exactly when a new
+    /// command starts, unlike indices into `commands` (which shift when the
+    /// scrollback drops old commands) or the text of a command line.
+    pub commands_started: u64,
     /// A full-screen program (alternate screen) is showing: the lines are
     /// its screen, not the scrollback.
     pub alt_screen: bool,
@@ -92,6 +96,12 @@ impl Transcript {
         Some(line.text.trim())
     }
 
+    #[cfg(test)]
+    fn command_line_of(&self, c: &CommandBlock) -> Option<&str> {
+        let line = self.lines.get(c.prompt.end.checked_sub(1)?)?;
+        Some(line.text.trim())
+    }
+
     /// The plain text of `lines`, one per line.
     pub fn text(&self, lines: Range<usize>) -> String {
         let mut out = String::new();
@@ -113,7 +123,11 @@ impl Terminal {
     pub fn transcript(&self) -> Transcript {
         let palette = self.palette();
         // The state changes with the terminal locked, so read it locked too.
-        self.with_term(|t| build(t, &palette, self.shell_state()))
+        self.with_term(|t| {
+            let mut tr = build(t, &palette, self.shell_state());
+            tr.commands_started = self.inner.started.load(std::sync::atomic::Ordering::Relaxed);
+            tr
+        })
     }
 }
 
@@ -192,6 +206,7 @@ fn build(t: &Term, pal: &Palette, shell: ShellState) -> Transcript {
         commands,
         running: shell == ShellState::Running,
         awaiting_prompt: shell == ShellState::Finished,
+        commands_started: 0,
         alt_screen: t.mode().contains(TermMode::ALT_SCREEN),
     }
 }
@@ -338,6 +353,25 @@ mod tests {
         assert_eq!(tr.last_command(), Some(0));
         command(&t, "pwd", "/\r\n");
         assert_eq!(t.transcript().last_command(), Some(1));
+    }
+
+    #[test]
+    fn commands_started_survives_the_scrollback_dropping_old_commands() {
+        let t = term(20, 3);
+        command(&t, "ls", "a\r\n");
+        t.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07tail -f\r\n\x1b]133;C\x07");
+        let before = t.transcript();
+        assert_eq!(before.commands_started, 2);
+        // Enough output to push `ls` out of the scrollback.
+        for i in 0..(crate::DEFAULT_SCROLLBACK + 10) {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let after = t.transcript();
+        assert!(!after.commands.iter().any(|c| after.command_line_of(c) == Some("$ ls")));
+        assert_ne!(before.last_command(), after.last_command(), "the index shifted");
+        assert_eq!(after.commands_started, 2, "but it's the same command");
+        t.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n\x1b]133;C\x07");
+        assert_eq!(t.transcript().commands_started, 3);
     }
 
     #[test]

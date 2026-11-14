@@ -2,7 +2,7 @@
 //! a cheap, thread-safe handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rio_vt::ansi::CursorShape;
@@ -52,6 +52,9 @@ pub(crate) struct Inner {
     /// What the shell last said ([`ShellState`] as a byte). Changed with
     /// the terminal locked (in `feed`), so it matches the grid under the lock.
     pub(crate) shell: AtomicU8,
+    /// Commands started (OSC 133;C) since this terminal was created: tells
+    /// commands apart where indices shift (the scrollback drops old ones).
+    pub(crate) started: AtomicU64,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -95,7 +98,14 @@ impl Terminal {
         let palette: SharedPalette = Arc::new(parking_lot::RwLock::new(palette));
         let listener = Listener { replies: rtx, ui: utx.clone(), answer_queries, palette: palette.clone(), size: packed.clone() };
         let term = Crosswords::new(size.to_crosswords(), CursorShape::Block, listener, WindowId::from(0), 0, DEFAULT_SCROLLBACK);
-        let inner = Inner { term: Mutex::new(term), parser: Mutex::new(Parser::default()), size: packed, ui: utx, shell: AtomicU8::new(0) };
+        let inner = Inner {
+            term: Mutex::new(term),
+            parser: Mutex::new(Parser::default()),
+            size: packed,
+            ui: utx,
+            shell: AtomicU8::new(0),
+            started: AtomicU64::new(0),
+        };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
 
@@ -181,8 +191,16 @@ impl Terminal {
                     }
                 }
                 self.set_shell(ShellState::Running);
+                self.inner.started.fetch_add(1, Ordering::Relaxed);
             }
-            Mark::Restore(state) => self.set_shell(state),
+            Mark::Restore(state) => {
+                // A resync that finds a command running which this client
+                // never saw start: count it.
+                if state == ShellState::Running && self.shell_state() != ShellState::Running {
+                    self.inner.started.fetch_add(1, Ordering::Relaxed);
+                }
+                self.set_shell(state);
+            }
             Mark::CommandFinished(exit) => {
                 self.set_shell(ShellState::Finished);
                 let _ = self.inner.ui.send(UiEvent::CommandFinished { exit });
