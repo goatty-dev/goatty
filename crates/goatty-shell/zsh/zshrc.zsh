@@ -45,6 +45,9 @@ setopt $_goatty_hist_opts
 # installed package always wins.
 typeset -gU path fpath
 path+=("$_goatty_bin")
+# Completion functions of goatty and goatty's tools (goattyd's, starship's
+# when goatty installed it), after the system's for the same reason.
+fpath+=("$_goatty_fpath")
 
 # --- Plugins: completion paths and environment -------------------------------
 # Before compinit, so plugin completions are found. `goattyd plugin list`

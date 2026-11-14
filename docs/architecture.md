@@ -41,7 +41,7 @@ Rules:
 | `client`     | one connection: decode requests, its subscriptions, the writer thread    |
 | `session`    | PTY + authoritative `Terminal` + subscribers with flow control, the output pump |
 | `proxy`      | `goattyd proxy`: stdio ⇄ socket relay for remote transports              |
-| `main.rs`    | clap CLI; control commands go through `goatty_client::Control`; `stop --force` (any protocol version, `goatty_client::local::stop_daemon`), `service install|uninstall|status` |
+| `main.rs`    | clap CLI; control commands go through `goatty_client::Control`; `stop --force` (any protocol version, `goatty_client::local::stop_daemon`), `service install|uninstall|status`, `completions SHELL` (`serve` also writes `_goattyd` for the managed shell) |
 
 Threads per session: `s{id}-reader` (PTY → terminal → subscribers) and `s{id}-replies` (query answers → PTY). Per connection: a reader (the accept thread's spawn) and `c{conn}-writer`.
 
@@ -55,6 +55,7 @@ Threads per session: `s{id}-reader` (PTY → terminal → subscribers) and `s{id
 | `builtins`| the plugins that come with goatty (`plugins/<id>/`, compiled in): fzf, fzf-tab, autosuggestions, syntax highlighting, Starship |
 | `packages`| where a plugin's package is: system copy, goatty's managed copy, or missing |
 | `install` | download (curl/wget), verify, unpack, activate `bin/` and `plugins/` symlinks, uninstall packages |
+| `completions` | zsh completion functions in `share/zsh/site-functions/` (on fpath): goatty's and goattyd's own (written when they start), packages' `completions` command after an install (removed with the package, backfilled when goattyd starts); drops the compinit dump on changes |
 | `doctor`  | start a real managed shell and parse `goatty-status`                    |
 | `generation` | build → validate (`zsh -n`) → activate generations; list, rollback, diff; `info.json` |
 | `history` | what each generation changed against its base (settings, plugins, files), one-line summaries, names, file diffs |
@@ -70,7 +71,7 @@ Design and startup sequence: [`managed-zsh.md`](managed-zsh.md). The zsh behavio
 ## App (`crates/goatty-app`)
 
 ```
-main.rs        parse CLI (subcommands run without a window), pick what the window starts with (a connect plan, or a local PTY for `--local`), app::run
+main.rs        parse CLI (subcommands run without a window; `completions SHELL`; writes `_goatty` for the managed shell at start), pick what the window starts with (a connect plan, or a local PTY for `--local`), app::run
 commands.rs    `goatty settings …` / `goatty theme …` (headless)
 cli.rs         clap definition
 fonts.rs       the bundled JetBrainsMono Nerd Font (assets/fonts, `scripts/update-nerd-font.sh`): registered at start, the default terminal font when no installed Nerd Font comes first, the fallback of every terminal font, and the tab icons' font

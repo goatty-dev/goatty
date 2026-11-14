@@ -20,6 +20,7 @@ goatty-shell.workspace = true
 goatty-plugin.workspace = true
 serde_json.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 log.workspace = true

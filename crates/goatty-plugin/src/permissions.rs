@@ -194,6 +194,9 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                     .map(|pk| {
                         let mut what: Vec<String> = pk.bin.iter().map(|b| bin_name(b).to_owned()).collect();
                         what.extend(pk.source.as_ref().map(|s| format!("{} (sourced by the shell)", bin_name(s))));
+                        if !pk.completions.is_empty() {
+                            what.push(format!("`{}` once after the download (zsh completions)", pk.completions.join(" ")));
+                        }
                         format!("{} {}: {}", pk.id, pk.version, what.join(", "))
                     })
                     .collect(),
