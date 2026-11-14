@@ -487,6 +487,17 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Type `line` at the prompt and press Enter: a command the user
+    /// picked in the palette (a plugin's). Whatever was typed at the prompt
+    /// is cleared first (Ctrl+E, Ctrl+U: zsh's and bash's emacs keys; it
+    /// goes to the kill ring, Ctrl+Y brings it back), so it can't join the
+    /// command. The line is sent as a paste, so nothing in it acts as a key.
+    pub fn run_line(&mut self, line: &str, cx: &mut Context<'_, Self>) {
+        self.send(b"\x05\x15");
+        self.paste_text(line, cx);
+        self.send(b"\r");
+    }
+
     // ---- links --------------------------------------------------------------
 
     /// Re-detect the link under the mouse. Returns whether what's shown

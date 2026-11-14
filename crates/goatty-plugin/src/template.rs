@@ -19,12 +19,12 @@ use crate::manifest::{Manifest, Setting, SettingKind};
 use crate::schema::{Values, plain_string};
 
 #[derive(Debug, PartialEq, Eq)]
-enum Part<'a> {
+pub(crate) enum Part<'a> {
     Text(String),
     Var(&'a str),
 }
 
-fn parts(t: &str) -> Result<Vec<Part<'_>>, String> {
+pub(crate) fn parts(t: &str) -> Result<Vec<Part<'_>>, String> {
     let mut out = Vec::new();
     let mut text = String::new();
     let mut rest = t;

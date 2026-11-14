@@ -44,6 +44,15 @@ setopt $_goatty_hist_opts
 # Tools goatty installed (goatty-setup) come after the system's, so an
 # installed package always wins.
 typeset -gU path fpath
+# Folders added in goatty's settings (shell.path), in order; `~/` is $HOME,
+# folders that don't exist are skipped.
+() {
+  local dir
+  for dir in "${_goatty_path[@]}"; do
+    [[ $dir == '~' || $dir == '~/'* ]] && dir=$HOME${dir#\~}
+    [[ -d $dir ]] && path+=("$dir")
+  done
+}
 path+=("$_goatty_bin")
 # Completion functions of goatty and goatty's tools (goattyd's, starship's
 # when goatty installed it), after the system's for the same reason.

@@ -880,6 +880,30 @@ fn user_aliases_in_a_real_shell() {
     assert!(text.contains("purr=cat -n hiss=0 nope=0 dots=cd .."), "{text}");
 }
 
+#[test]
+fn added_folders_join_path_in_order() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    std::fs::create_dir_all(sb.home.join("my bin")).unwrap();
+    std::fs::create_dir_all(sb.home.join("opt/it's")).unwrap();
+    exe(&sb.home.join("my bin/hello-goatty"), "#!/bin/sh\necho hello from my bin\n");
+    let mut settings = no_highlighting();
+    let opt = sb.home.join("opt/it's").to_string_lossy().into_owned();
+    settings.shell.path = vec!["~/my bin".into(), "~/missing".into(), opt.clone()];
+    let launch = sb.launch_with(settings, None);
+    let out = sb.run(&launch, "hello-goatty; print -rl -- $path");
+    let text = stdout(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.trim().is_empty(), "startup printed errors:\n{stderr}");
+    assert!(text.starts_with("hello from my bin\n"), "{text}");
+    let path: Vec<&str> = text.lines().skip(1).collect();
+    let mine = sb.home.join("my bin").to_string_lossy().into_owned();
+    let at = |d: &str| path.iter().position(|p| *p == d).unwrap_or_else(|| panic!("{d} not in {path:?}"));
+    assert!(at(&mine) < at(&opt), "in order: {path:?}");
+    assert!(at(&opt) < at(&sb.dirs.bin_dir().to_string_lossy()), "before goatty's own tools: {path:?}");
+    assert!(!path.iter().any(|p| p.ends_with("missing")), "missing folders are skipped: {path:?}");
+}
+
 /// A reload request that arrives while the prompt is being drawn (after
 /// precmd, before the line editor reads input) must still reload an idle
 /// shell right away, not wait for the next command. The user's additions

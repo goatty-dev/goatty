@@ -558,6 +558,7 @@ mod tests {
                 aliases: Vec::new(),
                 files: Vec::new(),
                 settings: Vec::new(),
+                commands: Vec::new(),
                 permissions: Default::default(),
             },
             enabled: true,

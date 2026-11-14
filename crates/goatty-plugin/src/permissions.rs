@@ -31,11 +31,20 @@ pub enum Permission {
     Env,
     /// Generates config files for the tool.
     ConfigFiles,
+    /// Adds commands to goatty's command palette (`[[command]]`).
+    Commands,
 }
 
 impl Permission {
-    pub const ALL: [Permission; 6] =
-        [Permission::Binaries, Permission::ShellCode, Permission::Network, Permission::Aliases, Permission::Env, Permission::ConfigFiles];
+    pub const ALL: [Permission; 7] = [
+        Permission::Binaries,
+        Permission::ShellCode,
+        Permission::Network,
+        Permission::Aliases,
+        Permission::Env,
+        Permission::ConfigFiles,
+        Permission::Commands,
+    ];
 
     /// The key in `[permissions]`.
     pub fn key(self) -> &'static str {
@@ -46,6 +55,7 @@ impl Permission {
             Permission::Aliases => "aliases",
             Permission::Env => "env",
             Permission::ConfigFiles => "config-files",
+            Permission::Commands => "commands",
         }
     }
 
@@ -61,6 +71,7 @@ impl Permission {
             Permission::Aliases => "Adds aliases",
             Permission::Env => "Sets environment variables",
             Permission::ConfigFiles => "Generates config files",
+            Permission::Commands => "Adds commands to the command palette",
         }
     }
 
@@ -77,6 +88,9 @@ impl Permission {
             Permission::Aliases => "Typing these names runs the plugin's command instead.",
             Permission::Env => "These variables are set in every goatty shell.",
             Permission::ConfigFiles => "goatty writes these files into its own shell configuration; nothing in your home directory.",
+            Permission::Commands => {
+                "Picking one asks for its values, then types its command line into your terminal, where you see it run. Values are quoted: they can't become shell code."
+            }
         }
     }
 
@@ -113,6 +127,9 @@ pub fn derived(m: &Manifest) -> Vec<Permission> {
     }
     if !m.files.is_empty() {
         v.push(Permission::ConfigFiles);
+    }
+    if !m.commands.is_empty() {
+        v.push(Permission::Commands);
     }
     v.sort();
     v
@@ -209,6 +226,7 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                 }
                 Permission::Env => m.env.iter().map(|e| e.name.clone()).chain(m.files.iter().filter_map(|f| f.env.clone())).collect(),
                 Permission::ConfigFiles => m.files.iter().map(|f| f.name.clone()).collect(),
+                Permission::Commands => m.commands.iter().map(|c| format!("{}: {}", c.title, crate::commands::describe(c))).collect(),
             };
             Granted {
                 permission: p,

@@ -29,10 +29,11 @@ use goatty_client::{Connection, Endpoint, SshTarget};
 use goatty_config::{ClientSettings, OnLaunch, OpenIn};
 use gpui::{AnyWindowHandle, App, Global};
 
-use crate::command_palette::Command;
+use crate::command_palette::{Ask, Command, Field};
 use crate::connect::ConnectPlan;
 use crate::session::AttachMode;
 use crate::settings::AppSettings;
+use crate::toast::{self, Toast};
 
 /// The goattyd connections in use, so tabs on the same host share one.
 /// Weak: a connection closes with the last tab (or picker) holding it.
@@ -324,6 +325,64 @@ pub fn typed_command(host: &str) -> Command {
     let mut c = Command::handler(&format!("ssh.host:{host}"), "SSH", &format!("Connect to {host}"), move |_, cx| connect(cx, &h));
     c.detail = Some("not in your hosts".into());
     c
+}
+
+/// The hosts to suggest when asking for one: (host, label).
+fn known_hosts(cx: &App) -> Vec<(String, String)> {
+    current(cx).into_iter().map(|e| (e.host, e.label)).collect()
+}
+
+/// "SSH: Connect to a custom host…": ask for an address (your hosts are
+/// suggested) and connect, without adding it to the list.
+pub fn ask_connect(window: &mut gpui::Window, cx: &mut App) {
+    let field = Field::host("host", "Host", known_hosts(cx))
+        .placeholder("user@example.com, or an alias from ~/.ssh/config")
+        .help("Connects once; \"SSH: Add a host to the list…\" keeps it");
+    let a = Ask::new("Connect to a host", vec![field], |answers, _, cx| connect(cx, &answers["host"]));
+    crate::command_palette::ask(window, cx, a);
+}
+
+/// "SSH: Add a host to the list…": ask for the address, a name and how to connect,
+/// then keep it in `ssh.hosts`.
+pub fn ask_add_host(window: &mut gpui::Window, cx: &mut App) {
+    let fields = vec![
+        Field::host("host", "Address", Vec::new())
+            .placeholder("user@example.com, or an alias from ~/.ssh/config")
+            .help("What ssh is given"),
+        Field::text("name", "Name").optional().placeholder("Shown instead of the address (optional)"),
+        Field::choice(
+            "how",
+            "How to connect",
+            vec![
+                (
+                    "goatty".into(),
+                    "With goatty".into(),
+                    "goattyd on the host: sessions survive disconnects, goatty's shell there too".into(),
+                ),
+                ("plain".into(), "Plain SSH".into(), "ssh in a local session: nothing is installed on the host".into()),
+            ],
+        ),
+    ];
+    let a = Ask::new("Add a host", fields, |answers, _, cx| {
+        let host = answers["host"].clone();
+        let name = Some(answers["name"].trim().to_string()).filter(|n| !n.is_empty() && *n != host);
+        let plain = answers["how"] == "plain";
+        AppSettings::update(cx, |s| {
+            s.ssh.edit(&host, true, |h| {
+                h.name = name.clone();
+                h.plain = plain;
+            })
+        });
+        let label = name.unwrap_or_else(|| host.clone());
+        toast::show(
+            cx,
+            Toast::success(format!("Added {label} to your hosts"))
+                .body("It's in the host switcher (Ctrl+Shift+H) and in Settings → Hosts.")
+                .action("Connect", move |_, cx| connect(cx, &host))
+                .key("ssh.add_host"),
+        );
+    });
+    crate::command_palette::ask(window, cx, a);
 }
 
 #[cfg(test)]

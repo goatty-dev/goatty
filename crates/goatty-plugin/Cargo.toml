@@ -18,6 +18,7 @@ ed25519-dalek.workspace = true
 flate2.workspace = true
 tar.workspace = true
 clap.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

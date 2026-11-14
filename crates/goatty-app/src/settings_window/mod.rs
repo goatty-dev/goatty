@@ -341,6 +341,8 @@ pub struct SettingsWindow {
     font_filter: Entity<TextInput>,
     ui_font_filter: Entity<TextInput>,
     shell_path: Entity<TextInput>,
+    /// The Shell page's "Add a folder" field (shell.path).
+    path_entry: Entity<TextInput>,
     file_opener: Entity<TextInput>,
     show_all_fonts: bool,
     show_all_ui_fonts: bool,
@@ -404,6 +406,7 @@ impl SettingsWindow {
         let ui_font_filter = cx.new(|cx| TextInput::new("Search fonts", "", cx).bare());
         let search = cx.new(|cx| TextInput::new("Search settings", "", cx).bare());
         let shell_path = cx.new(|cx| TextInput::new("/usr/bin/nu", "", cx).label("Shell program"));
+        let path_entry = cx.new(|cx| TextInput::new("~/bin or /opt/tool/bin", "", cx).label("Folder to add to PATH"));
         let picker = cx.new(|cx| ColorPicker::new(cx.global::<AppSettings>().colors.get(ColorSlot::Background), cx));
         let theme_name = cx.new(|cx| TextInput::new("Name for a new theme", "", cx).label("Theme name"));
         let opener = cx.global::<AppSettings>().file.value.links.file_opener.clone().unwrap_or_default();
@@ -450,6 +453,12 @@ impl SettingsWindow {
                     AppSettings::update(cx, |s| s.links.file_opener = (!text.is_empty()).then_some(text));
                 }
             }),
+            cx.subscribe(&path_entry, |this, _, ev: &TextInputEvent, cx| {
+                if let TextInputEvent::Submitted(text) = ev {
+                    let text = text.clone();
+                    this.add_path_entry(&text, cx);
+                }
+            }),
             cx.subscribe(&shell_path, |this, _, ev: &TextInputEvent, cx| {
                 if let TextInputEvent::Submitted(text) = ev {
                     let text = text.trim().to_string();
@@ -483,6 +492,7 @@ impl SettingsWindow {
             font_filter,
             ui_font_filter,
             shell_path,
+            path_entry,
             file_opener,
             show_all_fonts: false,
             show_all_ui_fonts: false,
@@ -1018,6 +1028,8 @@ impl SettingsWindow {
                         if a.applied {
                             view.draft = None;
                             view.load_host(cx);
+                            // A plugin switched on or off brings or takes its commands.
+                            crate::plugin_commands::refresh(cx);
                         }
                     }
                     Err(e) => view.outcome = Some(Outcome { ok: false, lines: vec![format!("{e:#}")], diff: Vec::new(), reload: false }),
@@ -1077,6 +1089,8 @@ impl SettingsWindow {
                 });
                 view.draft = None;
                 view.load_host(cx);
+                // A rollback can switch plugins on or off: their commands too.
+                crate::plugin_commands::refresh(cx);
             });
         })
         .detach();

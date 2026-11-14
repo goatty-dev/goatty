@@ -125,12 +125,39 @@ pub struct ShellSettings {
     /// are always launched as they are.
     pub managed: bool,
     pub zsh: ZshSettings,
+    /// Folders added to the end of `PATH` in goatty's managed zsh, in this
+    /// order (`~/…` is the home directory). Folders that don't exist when
+    /// a shell starts are skipped.
+    pub path: Vec<String>,
 }
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { program: None, managed: true, zsh: ZshSettings::default() }
+        Self { program: None, managed: true, zsh: ZshSettings::default(), path: Vec::new() }
     }
+}
+
+/// Why `dir` can't go into [`ShellSettings::path`], if it can't: it must be
+/// absolute or start with `~/`, and be one line without `:`.
+pub fn path_entry_problem(dir: &str) -> Option<&'static str> {
+    if dir.trim().is_empty() {
+        Some("Enter a folder")
+    } else if dir.contains(['\0', '\n', '\r']) {
+        Some("Must be a single line")
+    } else if dir.contains(':') {
+        Some("PATH entries can't contain :")
+    } else if !(dir.starts_with('/') || dir == "~" || dir.starts_with("~/")) {
+        Some("Use a full path: /… or ~/…")
+    } else {
+        None
+    }
+}
+
+/// `dir` as stored: without a trailing `/` (except `/` itself).
+pub fn normalize_path_entry(dir: &str) -> String {
+    let d = dir.trim();
+    let t = d.trim_end_matches('/');
+    if t.is_empty() { d.chars().take(1).collect() } else { t.to_string() }
 }
 
 /// How goatty's managed zsh starts. The tools it loads (fzf, fzf-tab,
@@ -204,6 +231,12 @@ impl Document for HostSettings {
             let why = alias_name_problem(&name).unwrap_or_default();
             issues.push(Issue::new(format!("aliases.{name}"), format!("not a usable alias name ({why}); ignored")));
             self.aliases.remove(&name);
+        }
+        for dir in std::mem::take(&mut self.shell.path) {
+            match path_entry_problem(&dir) {
+                Some(why) => issues.push(Issue::new("shell.path", format!("{dir:?} ignored: {why}"))),
+                None => self.shell.path.push(dir),
+            }
         }
         let empty: Vec<String> = self.aliases.iter().filter(|(_, a)| a.command.trim().is_empty()).map(|(n, _)| n.clone()).collect();
         for name in empty {
@@ -376,6 +409,25 @@ pub(crate) fn parse_bool(s: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_entries() {
+        assert_eq!(path_entry_problem("~/bin"), None);
+        assert_eq!(path_entry_problem("/opt/x y/bin"), None);
+        assert_eq!(path_entry_problem("bin"), Some("Use a full path: /… or ~/…"));
+        assert_eq!(path_entry_problem("~user/bin"), Some("Use a full path: /… or ~/…"));
+        assert_eq!(path_entry_problem("/a:/b"), Some("PATH entries can't contain :"));
+        assert_eq!(path_entry_problem(" "), Some("Enter a folder"));
+        assert_eq!(normalize_path_entry(" ~/bin/ "), "~/bin");
+        assert_eq!(normalize_path_entry("/"), "/");
+        let s: HostSettings = serde_json::from_str(r#"{"shell": {"path": ["~/bin"]}}"#).unwrap();
+        assert_eq!(s.shell.path, ["~/bin"]);
+        assert!(s.shell.managed, "other shell settings keep their defaults");
+        let mut s: HostSettings = serde_json::from_str(r#"{"shell": {"path": ["~/bin", "bin", "/a:/b"]}}"#).unwrap();
+        let issues = s.validate();
+        assert_eq!(s.shell.path, ["~/bin"], "bad entries are dropped on load");
+        assert_eq!(issues.iter().filter(|i| i.to_string().contains("shell.path")).count(), 2, "{issues:?}");
+    }
 
     fn with(vars: &[(&str, &str)]) -> HostSettings {
         let mut s = HostSettings::default();

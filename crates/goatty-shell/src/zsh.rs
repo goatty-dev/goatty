@@ -170,6 +170,8 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     hist.push(if h.share_between_sessions { "share_history" } else { "inc_append_history" });
     out.push_str(&format!("typeset -ga _goatty_hist_opts=({})\n", hist.join(" ")));
     out.push_str(&format!("typeset -ga _goatty_features=({})\n", enabled_features(s).join(" ")));
+    let path: Vec<String> = s.shell.path.iter().map(|p| quote(p)).collect();
+    out.push_str(&format!("typeset -ga _goatty_path=({})\n", path.join(" ")));
     // What goatty-setup installs when they're missing (built-in plugins that are on).
     let defaults: Vec<&str> =
         builtins::BUILTINS.iter().filter(|b| b.default_install && s.plugins.get(b.id).is_none_or(|c| c.enabled)).map(|b| b.id).collect();
@@ -201,6 +203,7 @@ mod tests {
         s.shell.zsh.user_rc = true;
         s.history.size = 5000;
         s.history.share_between_sessions = true;
+        s.shell.path = vec!["~/my bin".into(), "/opt/it's".into()];
         let out = render_settings(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: Some(Path::new("/usr/bin/goattyd")), plugins: &[] });
         assert!(out.contains(r"_goatty_dir='/r o/ot'\''s/data/current/zsh'"), "{out}");
         assert!(out.contains("_goatty_user_rc='1'"));
@@ -208,6 +211,7 @@ mod tests {
         assert!(out.contains("hist_ignore_space share_history)"), "{out}");
         assert!(out.contains("_goatty_daemon='/usr/bin/goattyd'"));
         assert!(out.contains("_goatty_features=(integration)"));
+        assert!(out.contains(r"_goatty_path=('~/my bin' '/opt/it'\''s')"), "{out}");
         assert!(out.contains(r"_goatty_pkgs='/r o/ot'\''s/data/plugins'"), "{out}");
         assert!(out.contains(r"_goatty_fpath='/r o/ot'\''s/data/share/zsh/site-functions'"), "{out}");
         assert!(out.contains("_goatty_setup_defaults=(fzf fzf-tab autosuggestions syntax-highlighting)"), "starship is off: {out}");
