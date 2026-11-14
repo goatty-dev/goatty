@@ -482,7 +482,7 @@ impl SettingsWindow {
                     "Reload running shells",
                     ButtonKind::Primary,
                     ui,
-                    self.act(cx, |v, cx| v.reload_shells(cx)),
+                    self.act_closing_outcome(cx, |v, cx| v.reload_shells(cx)),
                 ));
             }
             actions = actions.child(button(
@@ -490,7 +490,7 @@ impl SettingsWindow {
                 if offer_reload { "Not now" } else { "Dismiss" },
                 ButtonKind::Normal,
                 ui,
-                self.act(cx, |v, cx| {
+                self.act_closing_outcome(cx, |v, cx| {
                     v.outcome = None;
                     cx.notify();
                 }),

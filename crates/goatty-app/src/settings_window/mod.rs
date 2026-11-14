@@ -1188,6 +1188,23 @@ fn builtin_bool_default(id: &str, key: &str) -> bool {
 
 impl SettingsWindow {
     /// Callback acting on the window itself.
+    /// [`act`](Self::act) for a button in the result card that closes it:
+    /// focus first goes back to the page, so a keyboard user isn't left on a
+    /// button that is gone.
+    pub(super) fn act_closing_outcome(
+        &self,
+        cx: &Context<'_, Self>,
+        f: impl Fn(&mut Self, &mut Context<'_, Self>) + 'static,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let this = cx.entity().downgrade();
+        move |window, cx| {
+            let _ = this.update(cx, |view, cx| {
+                crate::ui::focus::hand_over(&view.focus, crate::ui::focus::Handover::FirstOnPage, window, cx);
+                f(view, cx);
+            });
+        }
+    }
+
     pub(super) fn act(
         &self,
         cx: &Context<'_, Self>,
@@ -1266,6 +1283,7 @@ fn theme_import_toast(imported: &[String], failed: &[String]) -> Toast {
     let themes = |n: usize| if n == 1 { "1 theme".to_string() } else { format!("{n} themes") };
     let body = imported.iter().chain(failed).cloned().collect::<Vec<_>>().join("\n");
     let t = match (n, failed.len()) {
+        (0, 0) => Toast::warning("No color schemes found in the chosen files"),
         (_, 0) => Toast::success(format!("Imported {}", themes(n))),
         (0, 1) => Toast::error("Couldn't import the color scheme"),
         (0, f) => Toast::error(format!("Couldn't import {f} color schemes")),

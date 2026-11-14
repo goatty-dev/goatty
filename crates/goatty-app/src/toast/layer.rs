@@ -35,6 +35,8 @@ const GAP: f32 = 8.;
 /// Taller than any card, for the height animation (cards grow from 0 to
 /// their natural height while the spring is below 1).
 const MAX_ANIMATED_HEIGHT: f32 = 240.;
+/// A taller body scrolls.
+const MAX_BODY_HEIGHT: f32 = 120.;
 /// Slide distance when entering and leaving.
 const SLIDE: f32 = 28.;
 /// Lightly underdamped: a hint of overshoot, settled in ~0.3 s.
@@ -278,7 +280,18 @@ impl ToastLayer {
                     .flex()
                     .flex_col()
                     .child(title)
-                    .when_some(toast.body.clone(), |d, body| d.child(div().text_xs().text_color(ui.muted).child(body)))
+                    // A long body (an import's file list) scrolls, keeping the title and buttons in reach.
+                    .when_some(toast.body.clone(), |d, body| {
+                        d.child(
+                            div()
+                                .id(("toast-body", id.0))
+                                .max_h(px(MAX_BODY_HEIGHT))
+                                .overflow_y_scroll()
+                                .text_xs()
+                                .text_color(ui.muted)
+                                .child(body),
+                        )
+                    })
                     .children(actions),
             )
             .child(close);

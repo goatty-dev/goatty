@@ -488,8 +488,14 @@ impl Workspace {
 
     // ---- focus and titles ---------------------------------------------------
 
+    /// Focus the active tab's pane (or connect screen); an open palette or
+    /// list of recent notifications keeps the keyboard until it closes.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some((view, _)) = self.active_tab().and_then(|t| t.connecting.as_ref()) {
+        if let Some((view, _)) = &self.recent {
+            view.focus_handle(cx).focus(window, cx);
+        } else if let Some((palette, _)) = &self.palette {
+            palette.focus_handle(cx).focus(window, cx);
+        } else if let Some((view, _)) = self.active_tab().and_then(|t| t.connecting.as_ref()) {
             view.focus_handle(cx).focus(window, cx);
         } else if let Some(view) = self.focused_view() {
             view.focus_handle(cx).focus(window, cx);

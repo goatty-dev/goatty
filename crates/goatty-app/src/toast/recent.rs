@@ -3,8 +3,10 @@
 //! toast again after it's gone and copy its text.
 //!
 //! Typing filters by words in the title or body. Up/Down (or Tab) choose
-//! one, Enter copies it, Esc closes; the shortcut that opened it closes it
-//! too. It follows the history while open, so a toast shown meanwhile
+//! one, Enter copies it, Ctrl+Shift+C copies all listed, Ctrl+Shift+Backspace
+//! clears the history, Esc closes; the shortcut that opened it closes it
+//! too. The filter keeps the focus, so screen readers hear the chosen
+//! notification and the copy results through live status nodes. It follows the history while open, so a toast shown meanwhile
 //! appears at the top. The [`Workspace`](crate::workspace::Workspace) shows
 //! it above its panes and gives the terminal its focus back when it emits
 //! [`RecentEvent::Dismissed`].
@@ -12,6 +14,7 @@
 use std::rc::Rc;
 use std::time::SystemTime;
 
+use gpui::accesskit::Live;
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, Role, ScrollHandle, SharedString,
     Subscription, WeakEntity, Window, actions, div, prelude::*, px,
@@ -31,7 +34,7 @@ pub const CONTEXT: &str = "RecentNotifications";
 const WIDTH: f32 = 620.;
 const MAX_LIST_HEIGHT: f32 = 440.;
 
-actions!(recent_notifications, [SelectNext, SelectPrevious, SelectFirst, SelectLast, Dismiss]);
+actions!(recent_notifications, [SelectNext, SelectPrevious, SelectFirst, SelectLast, Dismiss, CopyAll, ClearAll]);
 
 /// Key bindings inside the overlay. `toggle_keys` are the keystrokes bound
 /// to opening it, which close it again.
@@ -47,6 +50,8 @@ pub fn bindings(toggle_keys: &[String], cx: &App) -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-home", SelectFirst, c),
         KeyBinding::new("ctrl-end", SelectLast, c),
         KeyBinding::new("escape", Dismiss, c),
+        KeyBinding::new("ctrl-shift-c", CopyAll, c),
+        KeyBinding::new("ctrl-shift-backspace", ClearAll, c),
     ];
     let ctx = gpui::KeyBindingContextPredicate::parse(CONTEXT).ok().map(Rc::new);
     for k in toggle_keys {
@@ -219,7 +224,6 @@ impl RecentNotifications {
             .role(Role::ListItem)
             .aria_label(SharedString::from(e.text()))
             .aria_selected(selected)
-            .when(selected, |d| d.aria_active_descendant())
             .group(group)
             .w_full()
             .flex()
@@ -305,10 +309,27 @@ impl Render for RecentNotifications {
                 .children(rows)
                 .into_any_element()
         };
+        // The filter has the focus, so the chosen row is said through a live
+        // node: "Couldn't save settings. Permission denied, 2 of 7".
+        let selection = self.selected_entry().map(|e| {
+            let label = format!("{}, {} of {}", e.text().replace('\n', ". "), self.selected + 1, self.shown.len());
+            div()
+                .id("recent-selection")
+                .role(Role::Status)
+                .aria_label(label)
+                .a11y_synthetic_children(|b| b.parent_node().set_live(Live::Polite))
+                .absolute()
+                .size_0()
+                .overflow_hidden()
+        });
         let footer = {
             let (copy_all, clear) = (me.clone(), me);
-            let hint = self.status.clone().unwrap_or_else(|| "Enter: copy · Esc: close".into());
+            let hint = self.status.clone().unwrap_or_else(|| "Enter: copy · Ctrl+Shift+C: copy all · Esc: close".into());
             div()
+                .id("recent-footer")
+                .role(Role::Status)
+                .aria_label(hint.clone())
+                .a11y_synthetic_children(|b| b.parent_node().set_live(Live::Polite))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -318,14 +339,20 @@ impl Render for RecentNotifications {
                 .border_color(ui.border)
                 .child(div().flex_1().min_w_0().text_xs().text_color(ui.muted).child(hint))
                 .when(!self.shown.is_empty(), |d| {
-                    d.child(button_with("recent-copy-all", Some(Icon::Copy), "Copy all", ButtonKind::Ghost, ui, move |_, cx| {
-                        let _ = copy_all.update(cx, |this, cx| this.copy_all(cx));
-                    }))
+                    d.child(
+                        button_with("recent-copy-all", Some(Icon::Copy), "Copy all", ButtonKind::Ghost, ui, move |_, cx| {
+                            let _ = copy_all.update(cx, |this, cx| this.copy_all(cx));
+                        })
+                        .aria_keyshortcuts("Control+Shift+C"),
+                    )
                 })
                 .when(!self.entries.is_empty(), |d| {
-                    d.child(button_with("recent-clear", Some(Icon::Trash), "Clear", ButtonKind::Ghost, ui, move |_, cx| {
-                        let _ = clear.update(cx, |this, cx| this.clear(cx));
-                    }))
+                    d.child(
+                        button_with("recent-clear", Some(Icon::Trash), "Clear", ButtonKind::Ghost, ui, move |_, cx| {
+                            let _ = clear.update(cx, |this, cx| this.clear(cx));
+                        })
+                        .aria_keyshortcuts("Control+Shift+Backspace"),
+                    )
                 })
         };
         div()
@@ -335,6 +362,8 @@ impl Render for RecentNotifications {
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::dismiss))
+            .on_action(cx.listener(|this, _: &CopyAll, _, cx| this.copy_all(cx)))
+            .on_action(cx.listener(|this, _: &ClearAll, _, cx| this.clear(cx)))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(RecentEvent::Dismissed)))
             .occlude()
             .w(px(WIDTH))
@@ -355,5 +384,6 @@ impl Render for RecentNotifications {
             .child(div().p_2().child(self.input.clone()))
             .child(list)
             .child(footer)
+            .children(selection)
     }
 }
