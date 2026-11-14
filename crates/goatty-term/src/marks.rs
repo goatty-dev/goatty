@@ -29,10 +29,11 @@ pub(crate) enum Mark {
     /// `OSC 133 ; D`: the command ended, with its exit status if the shell
     /// reported one.
     CommandFinished(Option<i32>),
-    /// `OSC 133 ; C ; goatty=run|done`: goatty's own reattach snapshot
-    /// restoring the shell's state, without marking rows or reporting a
-    /// finished command.
-    Restore(ShellState),
+    /// `OSC 133 ; C ; goatty=prompt|run|done [; n=<started>]`: goatty's own
+    /// reattach/resync snapshot restoring the shell's state and how many
+    /// commands started, without marking rows or reporting a finished
+    /// command.
+    Restore(ShellState, Option<u64>),
 }
 
 /// What the shell last said about its command.
@@ -63,8 +64,8 @@ impl ShellState {
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
-/// The longest OSC prefix we look at: `133;D;-2147483648` plus a bit.
-const KEEP: usize = 32;
+/// The longest OSC prefix we look at: `133;C;goatty=prompt;n=<u64::MAX>`.
+const KEEP: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -164,12 +165,16 @@ fn parse(payload: &[u8]) -> Option<Mark> {
     match kind {
         b'A' => Some(Mark::PromptStart),
         b'P' => Some(if params.any(|p| p == b"k=c" || p == b"k=s") { Mark::PromptContinuation } else { Mark::PromptStart }),
-        b'C' => Some(match params.next() {
-            Some(b"goatty=prompt") => Mark::Restore(ShellState::Prompt),
-            Some(b"goatty=run") => Mark::Restore(ShellState::Running),
-            Some(b"goatty=done") => Mark::Restore(ShellState::Finished),
-            _ => Mark::CommandStart,
-        }),
+        b'C' => {
+            let state = match params.next() {
+                Some(b"goatty=prompt") => ShellState::Prompt,
+                Some(b"goatty=run") => ShellState::Running,
+                Some(b"goatty=done") => ShellState::Finished,
+                _ => return Some(Mark::CommandStart),
+            };
+            let started = params.find_map(|p| p.strip_prefix(b"n=")).and_then(|n| std::str::from_utf8(n).ok()).and_then(|n| n.parse().ok());
+            Some(Mark::Restore(state, started))
+        }
         b'D' => Some(finished(rest)),
         _ => None,
     }
@@ -221,7 +226,9 @@ mod tests {
         }
         assert_eq!(all_marks(b"\x1b]133;P;k=i\x07"), [(12, Mark::PromptStart)]);
         let restore: Vec<Mark> = all_marks(b"\x1b]133;C;goatty=run\x07\x1b]133;C;goatty=done\x07").into_iter().map(|(_, m)| m).collect();
-        assert_eq!(restore, [Mark::Restore(ShellState::Running), Mark::Restore(ShellState::Finished)]);
+        assert_eq!(restore, [Mark::Restore(ShellState::Running, None), Mark::Restore(ShellState::Finished, None)]);
+        let max = format!("\x1b]133;C;goatty=prompt;n={}\x07", u64::MAX);
+        assert_eq!(all_marks(max.as_bytes()), [(max.len(), Mark::Restore(ShellState::Prompt, Some(u64::MAX)))]);
         assert!(all_marks(b"\x1b]133;Ab\x07\x1b]133;\x07").is_empty());
     }
 

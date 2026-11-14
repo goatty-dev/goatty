@@ -34,7 +34,7 @@ impl Terminal {
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_state()))
+        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), (self.shell_state(), self.commands_started())))
     }
 
     /// Catch-up snapshot for a client terminal that already mirrors this
@@ -44,11 +44,11 @@ impl Terminal {
     /// (rio's `ED 2` on the primary screen pushes the viewport up) and the
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
-        self.with_term(|t| resync(t, self.shell_state()))
+        self.with_term(|t| resync(t, (self.shell_state(), self.commands_started())))
     }
 }
 
-fn resync(t: &mut Term, shell: ShellState) -> Vec<u8> {
+fn resync(t: &mut Term, shell: (ShellState, u64)) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
@@ -65,7 +65,7 @@ fn resync(t: &mut Term, shell: ShellState) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn serialize(t: &Term, max_history: usize, shell: ShellState) -> Vec<u8> {
+fn serialize(t: &Term, max_history: usize, shell: (ShellState, u64)) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
@@ -147,12 +147,16 @@ fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, o
 }
 
 /// The shell's state for the client's viewer: running, finished, or at a prompt.
-fn write_shell_state(shell: ShellState, out: &mut String) {
-    out.push_str(match shell {
-        ShellState::Prompt => "\x1b]133;C;goatty=prompt\x07",
-        ShellState::Running => "\x1b]133;C;goatty=run\x07",
-        ShellState::Finished => "\x1b]133;C;goatty=done\x07",
-    });
+/// With how many commands started, so the client tells commands apart
+/// like the session does (a command whose prompt the replay left out is
+/// still one).
+fn write_shell_state((shell, started): (ShellState, u64), out: &mut String) {
+    let state = match shell {
+        ShellState::Prompt => "prompt",
+        ShellState::Running => "run",
+        ShellState::Finished => "done",
+    };
+    let _ = write!(out, "\x1b]133;C;goatty={state};n={started}\x07");
 }
 
 /// The OSC 133 mark that gives the row at the cursor `line`'s mark.
@@ -352,6 +356,44 @@ mod tests {
         assert_eq!(b.transcript().lines.last().unwrap().text, "0123456789abcdefghijX");
         assert_eq!(text_of(&a), text_of(&b));
         assert!(b.mode().contains(crate::TermMode::LINE_WRAP));
+    }
+
+    #[test]
+    fn reattach_keeps_a_finished_command_whose_prompt_the_replay_left_out() {
+        let size = TermSize::new(20, 3);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        let out: String = (0..30).map(|i| format!("out {i}\r\n")).collect();
+        a.feed(format!("\x1b]133;A\x07$ \x1b]133;B\x07seq\r\n\x1b]133;C\x07{out}\x1b]133;D;0\x07").as_bytes());
+        let ta = a.transcript();
+        assert_eq!(ta.last_command(), Some(0));
+        // Replay only the last 5 history rows: the prompt is left out.
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&a.reattach_snapshot_with_history(5));
+        let tb = b.transcript();
+        assert!(tb.commands[0].prompt.is_empty());
+        assert_eq!(tb.last_command(), Some(0), "still a command");
+        assert_eq!(tb.last_command_id(), ta.last_command_id());
+    }
+
+    #[test]
+    fn resync_keeps_the_running_command_id() {
+        let size = TermSize::new(20, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        let start = b"\x1b]133;A\x07$ \x1b]133;B\x07tail -f\r\n\x1b]133;C\x07one\r\n";
+        a.feed(start);
+        b.feed(start);
+        let before = b.transcript().last_command_id();
+        // The client misses some output; the running prompt is still on screen.
+        a.feed(b"two\r\nthree\r\n");
+        b.feed(&a.resync_snapshot());
+        assert!(b.command_running());
+        assert_eq!(b.transcript().last_command_id(), before, "the replayed A mark isn't a new command");
+        // A command the client missed starting is a new one.
+        a.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        b.feed(&a.resync_snapshot());
+        assert_ne!(b.transcript().last_command_id(), before);
+        assert_eq!(b.transcript().commands_started, a.transcript().commands_started);
     }
 
     #[test]

@@ -193,11 +193,12 @@ impl Terminal {
                 self.set_shell(ShellState::Running);
                 self.inner.started.fetch_add(1, Ordering::Relaxed);
             }
-            Mark::Restore(state) => {
-                // A resync that finds a command running which this client
-                // never saw start: count it.
-                if state == ShellState::Running && self.shell_state() != ShellState::Running {
-                    self.inner.started.fetch_add(1, Ordering::Relaxed);
+            Mark::Restore(state, started) => {
+                // The session's own count: after an attach both count the
+                // same `C`s, so a resync changes it only for commands this
+                // client missed (not for the marks the snapshot replays).
+                if let Some(n) = started {
+                    self.inner.started.store(n, Ordering::Relaxed);
                 }
                 self.set_shell(state);
             }
@@ -217,6 +218,11 @@ impl Terminal {
     /// Read it with the terminal locked to match the grid.
     pub(crate) fn shell_state(&self) -> ShellState {
         ShellState::from_u8(self.inner.shell.load(Ordering::Relaxed))
+    }
+
+    /// Commands started so far (see `Inner::started`).
+    pub(crate) fn commands_started(&self) -> u64 {
+        self.inner.started.load(Ordering::Relaxed)
     }
 
     fn set_shell(&self, state: ShellState) {

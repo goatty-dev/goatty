@@ -143,7 +143,7 @@ impl Terminal {
         // The state changes with the terminal locked, so read it locked too.
         self.with_term(|t| {
             let mut tr = build(t, &palette, self.shell_state());
-            tr.commands_started = self.inner.started.load(std::sync::atomic::Ordering::Relaxed);
+            tr.commands_started = self.commands_started();
             tr
         })
     }
