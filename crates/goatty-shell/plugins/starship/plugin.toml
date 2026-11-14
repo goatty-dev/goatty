@@ -17,6 +17,7 @@ keywords = ["prompt", "git"]
 id = "starship"
 version = "1.27.0"
 bin = ["starship"]
+completions = ["starship", "completions", "zsh"]
 
 [[package.asset]]
 target = "x86_64-linux"

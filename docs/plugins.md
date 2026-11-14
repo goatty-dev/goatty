@@ -54,6 +54,9 @@ id = "eza"                      # tools/<id>/
 version = "0.23.5"              # the tool's version
 bin = ["eza"]                   # relative to the asset root; linked as bin/<name>
 prefer_system = true            # default: use a copy already on PATH instead of downloading
+completions = ["eza", "--completions", "zsh"]   # optional: prints the zsh completion function;
+#                                 the first word is one of `bin`. Runs once after goatty installs
+#                                 its copy, kept as `_eza` on fpath (system copies bring their own)
 
 # A zsh plugin instead (or as well): a script goatty sources at the plugin's
 # load slot, after zsh.init ran (so init can set the variables it reads).
@@ -190,6 +193,7 @@ Signing happens offline: the maintainer runs `scripts/publish.sh <secret key>` (
   tools/<pkg>/<version>/      unpacked packages (built-in and installed plugins')
   bin/<exe>                   → tools/…; a link owned by another package or a user file is never replaced
   plugins/<pkg>               → tools/<pkg>/<version>/<root>, for packages with a `source` script
+  share/zsh/site-functions/   `_<exe>` from a package's `completions` command (and goatty's own), on fpath
   current/zsh/
     plugins-early.zsh         fpath + exports (sourced before compinit), `off` for turned-off built-in plugins
     plugins-<slot>.zsh        aliases + init code + package scripts, per plugin guarded by

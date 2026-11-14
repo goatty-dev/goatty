@@ -54,6 +54,10 @@ fn main() -> Result<()> {
     match cli.cmd.take() {
         Some(cli::Command::Settings(c)) => return commands::settings(c),
         Some(cli::Command::Theme(c)) => return commands::theme(c),
+        Some(cli::Command::Completions { shell }) => {
+            print!("{}", cli::completion_script(shell));
+            return Ok(());
+        }
         None => {}
     }
     // goatty's own crates at info; dependencies (wgpu, zbus, ...) only warn, and
@@ -62,6 +66,11 @@ fn main() -> Result<()> {
         env_logger::Env::default().default_filter_or("warn,goatty=info,goatty_client=info,goatty_term=info,rio_vt=error"),
     )
     .init();
+    // goatty's completions in the managed shell, kept current off the UI thread.
+    let _ = std::thread::Builder::new().name("completions".into()).spawn(|| {
+        let script = cli::completion_script(clap_complete::Shell::Zsh);
+        goatty_shell::completions::write_own(goatty_shell::Dirs::from_env().as_ref(), "goatty", &script);
+    });
     let client = goatty_config::load_client().value;
     let on_launch = client.workspace.on_launch;
 

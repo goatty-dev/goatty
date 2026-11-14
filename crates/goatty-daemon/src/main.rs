@@ -46,6 +46,11 @@ enum Cmd {
     /// Aliases in goatty's shells on this host: yours and the ones plugins bring.
     #[command(subcommand)]
     Alias(AliasCmd),
+    /// Print the completion script for SHELL (goatty's managed zsh has it already).
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,7 +262,22 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 
     match cmd {
-        Cmd::Serve => goatty_daemon::serve(&goatty_proto::socket_path()),
+        Cmd::Serve => {
+            // Keep goattyd's completions (and those of goatty's tool copies)
+            // in the managed shell current, off the startup path.
+            let _ = std::thread::Builder::new().name("completions".into()).spawn(|| {
+                let dirs = goatty_shell::Dirs::from_env();
+                goatty_shell::completions::write_own(dirs.as_ref(), "goattyd", &completion_script(clap_complete::Shell::Zsh));
+                if let Some(dirs) = &dirs {
+                    goatty_shell::completions::backfill(dirs);
+                }
+            });
+            goatty_daemon::serve(&goatty_proto::socket_path())
+        }
+        Cmd::Completions { shell } => {
+            print!("{}", completion_script(shell));
+            Ok(())
+        }
         Cmd::Proxy => goatty_daemon::proxy(),
         Cmd::List => {
             let list = Control::connect_local(CLIENT)?.list_sessions()?;
@@ -363,6 +383,14 @@ fn main() -> Result<()> {
     }
 }
 
+/// goattyd's completion script for `shell`.
+fn completion_script(shell: clap_complete::Shell) -> String {
+    use clap::CommandFactory;
+    let mut out = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "goattyd", &mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `goattyd stop`: ask the daemon to shut down; with `force`, stop one that
 /// doesn't speak our protocol too (old versions, after an upgrade).
 fn stop(force: bool) -> Result<()> {
@@ -437,5 +465,12 @@ mod tests {
     fn cli_is_consistent() {
         use clap::CommandFactory;
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn zsh_completions() {
+        let s = super::completion_script(clap_complete::Shell::Zsh);
+        assert!(s.starts_with("#compdef goattyd"), "{s}");
+        assert!(s.contains("rollback") && s.contains("registry"), "subcommands are in it");
     }
 }

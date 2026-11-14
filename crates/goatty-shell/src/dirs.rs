@@ -8,6 +8,7 @@
 //!   tools/<tool>/<version>/       unpacked managed installs
 //!   bin/<exe>                     symlinks to the active managed binaries
 //!   plugins/<tool>                symlinks to the active managed zsh plugins
+//!   share/zsh/site-functions/     completion functions: goatty's own, managed tools' (on fpath)
 //!   installed/<plugin>/           installed goatty plugins (verified copies of their files)
 //!   installed/lock.json           which plugins are installed, from where, what was approved
 //!   registries/<name>/            verified snapshots of plugin registries
@@ -73,6 +74,10 @@ impl Dirs {
     }
     pub fn plugins_dir(&self) -> PathBuf {
         self.data.join("plugins")
+    }
+    /// Zsh completion functions goatty provides ([`crate::completions`]).
+    pub fn site_functions_dir(&self) -> PathBuf {
+        self.data.join("share/zsh/site-functions")
     }
     /// Installed goatty plugins (Stage 5): `installed/<id>/` + `lock.json`.
     pub fn installed_dir(&self) -> PathBuf {

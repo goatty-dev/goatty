@@ -30,6 +30,8 @@ flume = "0.12"
 # Fast byte search (goatty-term: OSC 133 marks in the output stream).
 memchr = "2"
 clap = { version = "4", features = ["derive"] }
+# `goatty completions` / `goattyd completions`, and their zsh functions in the managed shell.
+clap_complete = "4"
 tempfile = "3"
 # Tests read the bundled font (already in the tree through gpui).
 ttf-parser = "0.25"

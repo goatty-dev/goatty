@@ -17,6 +17,7 @@
 //! * [`plugins`]: registries, install plans, installs, what goes into the shell,
 //! * [`packages`]: where a plugin's package is found (system or goatty's copy),
 //! * [`install`]: user-space installs of packages (no sudo),
+//! * [`completions`]: zsh completion functions of goatty and goatty's tools,
 //! * [`doctor`]: asks a real managed shell what it loaded,
 //! * [`service`]: host settings operations (goattyd's API, `goatty --local`),
 //! * [`setup`]: diagnostics and installing the built-in tools, for the GUI,
@@ -29,6 +30,7 @@
 pub mod aliases;
 pub mod builtins;
 pub mod cmd;
+pub mod completions;
 pub mod dirs;
 pub mod doctor;
 pub mod generation;

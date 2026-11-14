@@ -145,6 +145,7 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_dir", &d.zsh_dir().to_string_lossy());
     scalar("_goatty_bin", &d.bin_dir().to_string_lossy());
     scalar("_goatty_pkgs", &d.plugins_dir().to_string_lossy());
+    scalar("_goatty_fpath", &d.site_functions_dir().to_string_lossy());
     scalar("_goatty_cache", &d.cache.to_string_lossy());
     scalar("_goatty_user_zshrc", &d.user_zshrc().to_string_lossy());
     scalar("_goatty_hint_marker", &d.hint_marker().to_string_lossy());
@@ -208,6 +209,7 @@ mod tests {
         assert!(out.contains("_goatty_daemon='/usr/bin/goattyd'"));
         assert!(out.contains("_goatty_features=(integration)"));
         assert!(out.contains(r"_goatty_pkgs='/r o/ot'\''s/data/plugins'"), "{out}");
+        assert!(out.contains(r"_goatty_fpath='/r o/ot'\''s/data/share/zsh/site-functions'"), "{out}");
         assert!(out.contains("_goatty_setup_defaults=(fzf fzf-tab autosuggestions syntax-highlighting)"), "starship is off: {out}");
     }
 

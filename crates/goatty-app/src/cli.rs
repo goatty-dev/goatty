@@ -59,6 +59,11 @@ pub enum Command {
     /// List, import, export and pick color themes.
     #[command(subcommand)]
     Theme(ThemeCmd),
+    /// Print the completion script for SHELL (goatty's managed zsh has it already).
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -118,6 +123,14 @@ pub enum ThemeCmd {
     Delete { id: String },
 }
 
+/// goatty's completion script for `shell`.
+pub fn completion_script(shell: clap_complete::Shell) -> String {
+    use clap::CommandFactory;
+    let mut out = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "goatty", &mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 impl Cli {
     /// `prefer_new`: the workspace setting asks for a new session by default.
     pub fn attach_mode(&self, prefer_new: bool) -> AttachMode {
@@ -168,5 +181,12 @@ mod tests {
         assert!(matches!(cli.cmd, Some(Command::Settings(SettingsCmd::Set { .. }))));
         let cli = Cli::parse_from(["goatty", "theme", "set", "nord", "--for", "dark"]);
         assert!(matches!(cli.cmd, Some(Command::Theme(ThemeCmd::Set { target: Some(ThemeFor::Dark), .. }))));
+    }
+
+    #[test]
+    fn zsh_completions() {
+        let s = completion_script(clap_complete::Shell::Zsh);
+        assert!(s.starts_with("#compdef goatty"), "{s}");
+        assert!(s.contains("--settings") && s.contains("theme"), "{s}");
     }
 }
