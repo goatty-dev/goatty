@@ -6,6 +6,10 @@
 //! keeps the keyboard. Each card occludes the terminal below it (no
 //! selections through a toast); the space between cards does not.
 //!
+//! For screen readers each card is a live region (an alert for warnings and
+//! errors, a status otherwise) named by its text, so it's announced when it
+//! appears or its text changes; its buttons are named buttons.
+//!
 //! Timers are one GPUI task for the earliest deadline, so a window with
 //! toasts but no change in sight draws no frames. Cards animate in and out
 //! with a spring (opacity, a short slide, and height, so the others move
@@ -13,13 +17,14 @@
 
 use std::time::{Duration, Instant};
 
+use gpui::accesskit::Live;
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, FontWeight, Hsla, IntoElement, Render, SharedString, SpringAnimation, SpringConfig, Task,
-    Transformation, Window, div, percentage, prelude::*, px,
+    Animation, AnimationExt, AnyElement, Context, FontWeight, Hsla, IntoElement, Render, Role, SharedString, SpringAnimation, SpringConfig,
+    Task, Transformation, Window, div, percentage, prelude::*, px,
 };
 
 use super::stack::Stack;
-use super::{Level, Toast, ToastId};
+use super::{Handler, Level, Toast, ToastId};
 use crate::settings::AppSettings;
 use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
@@ -45,10 +50,21 @@ pub struct ToastLayer {
 }
 
 impl ToastLayer {
-    /// A layer for `window`, registered so [`super::show`] finds it.
+    /// A terminal window's layer, registered so [`super::show`] finds it.
+    /// It also gets toasts while no goatty window is active.
     pub fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        Self::register(window, true, cx)
+    }
+
+    /// The layer of a secondary window (settings): toasts go there only
+    /// while it's active, or when shown in it.
+    pub fn secondary(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        Self::register(window, false, cx)
+    }
+
+    fn register(window: &mut Window, fallback: bool, cx: &mut Context<'_, Self>) -> Self {
         let me = cx.entity().downgrade();
-        let pending = super::register(cx, window.window_handle(), me);
+        let pending = super::register(cx, window.window_handle(), me, fallback);
         let sub = cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             this.sync_pause(cx);
@@ -70,6 +86,10 @@ impl ToastLayer {
 
     pub(super) fn contains(&self, id: ToastId) -> bool {
         self.stack.contains(id)
+    }
+
+    pub(super) fn primary_action(&self) -> Option<(ToastId, Handler)> {
+        self.stack.primary_action()
     }
 
     pub(super) fn show(&mut self, id: ToastId, toast: Toast, cx: &mut Context<'_, Self>) {
@@ -181,6 +201,8 @@ impl ToastLayer {
                 let layer = cx.entity().downgrade();
                 div()
                     .id(("toast-action", id.0 * 8 + i as u64))
+                    .role(Role::Button)
+                    .aria_label(a.label.clone())
                     .px_2p5()
                     .py_0p5()
                     .rounded_md()
@@ -203,6 +225,8 @@ impl ToastLayer {
 
         let close = div()
             .id(("toast-close", id.0))
+            .role(Role::Button)
+            .aria_label("Dismiss")
             .absolute()
             .top(px(8.))
             .right(px(8.))
@@ -221,8 +245,15 @@ impl ToastLayer {
                 this.dismiss(id, cx);
             }));
 
+        let (role, live) = match toast.level {
+            Level::Warning | Level::Error => (Role::Alert, Live::Assertive),
+            _ => (Role::Status, Live::Polite),
+        };
         let card = div()
             .id(("toast-card", id.0))
+            .role(role)
+            .aria_label(spoken(toast))
+            .a11y_synthetic_children(move |b| b.parent_node().set_live(live))
             .group(group)
             .relative()
             .occlude()
@@ -268,7 +299,20 @@ impl ToastLayer {
     }
 }
 
-fn level_icon(level: Level) -> Icon {
+/// What a screen reader says for `t`: "Error: Couldn't save. Permission denied".
+fn spoken(t: &Toast) -> SharedString {
+    let level = match t.level {
+        Level::Warning => "Warning: ",
+        Level::Error => "Error: ",
+        _ => "",
+    };
+    match &t.body {
+        Some(b) => format!("{level}{}. {b}", t.title).into(),
+        None => format!("{level}{}", t.title).into(),
+    }
+}
+
+pub(super) fn level_icon(level: Level) -> Icon {
     match level {
         Level::Info => Icon::Info,
         Level::Success => Icon::CircleCheck,
@@ -278,7 +322,7 @@ fn level_icon(level: Level) -> Icon {
     }
 }
 
-fn level_color(level: Level, ui: Ui) -> Hsla {
+pub(super) fn level_color(level: Level, ui: Ui) -> Hsla {
     match level {
         Level::Info | Level::Loading => ui.accent,
         Level::Success => ui.success,

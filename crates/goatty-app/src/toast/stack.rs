@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{Level, Toast, ToastId};
+use super::{Handler, Level, Toast, ToastId};
 
 /// At most this many toasts are visible; a new one pushes the oldest out.
 pub const MAX_VISIBLE: usize = 4;
@@ -75,6 +75,12 @@ impl Stack {
 
     pub fn contains(&self, id: ToastId) -> bool {
         self.entries.iter().any(|e| e.id == id && !e.leaving())
+    }
+
+    /// The newest visible toast with a button, and its first button's code
+    /// (what `press_notification_button` presses).
+    pub fn primary_action(&self) -> Option<(ToastId, Handler)> {
+        self.entries.iter().rev().filter(|e| !e.leaving()).find_map(|e| Some((e.id, e.toast.actions.first()?.run.clone())))
     }
 
     /// Show `toast`. One with the same key as a visible toast replaces it in
@@ -250,6 +256,19 @@ mod tests {
         assert_eq!(visible.len(), MAX_VISIBLE);
         assert_eq!(visible[0], "busy");
         assert!(!visible.contains(&"t2".to_string()) && !visible.contains(&"t3".to_string()));
+    }
+
+    #[test]
+    fn primary_action_is_the_newest_visible_button() {
+        let t0 = Instant::now();
+        let mut s = Stack::default();
+        assert!(s.primary_action().is_none());
+        s.push(ToastId(1), Toast::error("a").action("Retry", |_, _| {}), t0);
+        s.push(ToastId(2), Toast::error("b").action("Open", |_, _| {}).action("Copy", |_, _| {}), t0);
+        s.push(ToastId(3), Toast::info("no buttons"), t0);
+        assert_eq!(s.primary_action().map(|(id, _)| id), Some(ToastId(2)));
+        s.dismiss(ToastId(2), t0);
+        assert_eq!(s.primary_action().map(|(id, _)| id), Some(ToastId(1)));
     }
 
     #[test]

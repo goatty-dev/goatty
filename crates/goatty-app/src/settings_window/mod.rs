@@ -5,6 +5,12 @@
 //! connected goattyd's host: edits are staged as a draft, can be previewed
 //! as a diff of the generated shell configuration, and are applied as a new
 //! generation (validated first, rollback-able). See `docs/profiles.md`.
+//!
+//! The window has its own toast layer (above the bar at the bottom), so
+//! feedback shown while it's active appears here. Short results (a theme
+//! saved, a profile exported, shells reloaded) are toasts; the bar is for
+//! what needs room or a decision: unapplied host changes and the result of
+//! a preview, apply, rollback or profile import, with the diff.
 
 mod about;
 mod aliases;
@@ -35,7 +41,9 @@ use gpui::{
 pub use diagnostics::progress_card;
 pub use host::{GenRow, HostLink, HostLinkGlobal};
 
+use crate::actions::{DismissNotifications, PressNotificationButton};
 use crate::settings::AppSettings;
+use crate::toast::{self, Toast, ToastLayer};
 use crate::ui::color_picker::{ColorPicker, ColorPickerEvent, ContrastRef};
 use crate::ui::icons::Icon;
 use crate::ui::text_input::{TextInput, TextInputEvent};
@@ -65,6 +73,25 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-pagedown", NextPage, Some(NAVIGATING)),
         KeyBinding::new("ctrl-pageup", PrevPage, Some(NAVIGATING)),
     ]
+}
+
+/// The user's keys for the notification actions that make sense here too
+/// (the terminal's bindings don't reach this window). Not while a shortcut
+/// is being recorded.
+pub fn notification_bindings(overrides: &std::collections::BTreeMap<String, Option<String>>, cx: &App) -> Vec<KeyBinding> {
+    let ctx = gpui::KeyBindingContextPredicate::parse(NAVIGATING).ok().map(std::rc::Rc::new);
+    let mut v = Vec::new();
+    for name in ["dismiss_notifications", "press_notification_button"] {
+        for k in goatty_config::keys::keys_for(name, overrides) {
+            let Some(action) = crate::actions::action_by_name(name) else { continue };
+            match KeyBinding::load(&k, action, ctx.clone(), false, None, cx) {
+                Ok(b) => v.push(b),
+                // Already reported with the terminal's bindings.
+                Err(e) => log::debug!("settings window: can't bind {k}: {e}"),
+            }
+        }
+    }
+    v
 }
 
 /// The open settings window, if any (there's at most one).
@@ -359,6 +386,7 @@ pub struct SettingsWindow {
     gen_name: Entity<TextInput>,
     /// Profile: a generation's file changes (`None`: loading).
     gen_diff: Option<(u32, Option<GenDiff>)>,
+    toasts: Entity<ToastLayer>,
     _subs: Vec<Subscription>,
 }
 
@@ -487,6 +515,7 @@ impl SettingsWindow {
             gen_open: None,
             gen_name,
             gen_diff: None,
+            toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
             _subs: subs,
         };
         this.load_host(cx);
@@ -677,17 +706,13 @@ impl SettingsWindow {
         self.select_slot(self.edit_slot, cx);
     }
 
-    fn message(&mut self, ok: bool, line: String, cx: &mut Context<'_, Self>) {
-        self.outcome = Some(Outcome { ok, lines: vec![line], diff: Vec::new(), reload: false });
-        cx.notify();
-    }
-
     /// Save the colors on screen as a new user theme and switch to it.
     pub fn save_theme_as(&mut self, cx: &mut Context<'_, Self>) {
         self.flush_color(cx);
         let name = self.theme_name.read(cx).text().trim().to_string();
         if name.is_empty() {
-            return self.message(false, "Give the new theme a name first.".into(), cx);
+            toast::show(cx, Toast::warning("Give the new theme a name first").key("theme.save"));
+            return;
         }
         let app = cx.global::<AppSettings>();
         let (lib, colors) = (app.themes.clone(), app.colors);
@@ -698,9 +723,14 @@ impl SettingsWindow {
                 AppSettings::update(cx, |s| s.theme.overrides = Default::default());
                 self.choose_theme(id, cx);
                 self.theme_name.update(cx, |i, cx| i.set_text("", cx));
-                self.message(true, format!("Saved {name:?} to {}.", path.display()), cx);
+                toast::show(
+                    cx,
+                    Toast::success(format!("Saved the theme \u{201c}{name}\u{201d}")).body(path.display().to_string()).key("theme.save"),
+                );
             }
-            Err(e) => self.message(false, format!("Couldn't save the theme: {e}"), cx),
+            Err(e) => {
+                toast::show(cx, Toast::error("Couldn't save the theme").body(e.to_string()).key("theme.save"));
+            }
         }
     }
 
@@ -714,9 +744,11 @@ impl SettingsWindow {
             Ok(_) => {
                 AppSettings::reload_themes(cx);
                 AppSettings::update(cx, |s| s.theme.overrides = Default::default());
-                self.message(true, format!("Updated {:?}.", entry.name), cx);
+                toast::show(cx, Toast::success(format!("Updated the theme \u{201c}{}\u{201d}", entry.name)).key("theme.save"));
             }
-            Err(e) => self.message(false, format!("Couldn't save the theme: {e}"), cx),
+            Err(e) => {
+                toast::show(cx, Toast::error("Couldn't save the theme").body(e.to_string()).key("theme.save"));
+            }
         }
     }
 
@@ -744,9 +776,11 @@ impl SettingsWindow {
                     }
                 });
                 self.select_slot(self.edit_slot, cx);
-                self.message(true, format!("Deleted theme {id:?}."), cx);
+                toast::show(cx, Toast::success(format!("Deleted the theme \u{201c}{id}\u{201d}")).key("theme.delete"));
             }
-            Err(e) => self.message(false, format!("Couldn't delete the theme: {e}"), cx),
+            Err(e) => {
+                toast::show(cx, Toast::error("Couldn't delete the theme").body(e.to_string()).key("theme.delete"));
+            }
         }
     }
 
@@ -762,28 +796,24 @@ impl SettingsWindow {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else { return };
             let _ = this.update(cx, |view, cx| {
-                let mut lines = Vec::new();
+                let (mut imported, mut failed) = (Vec::new(), Vec::new());
                 let mut first = None;
-                let mut ok = true;
                 for path in paths {
                     match crate::commands::import_theme_file(&path) {
                         Ok(saved) => {
                             for (id, name, format) in saved {
-                                lines.push(format!("Imported {name:?} ({format})."));
+                                imported.push(format!("\u{201c}{name}\u{201d} ({format})"));
                                 first.get_or_insert(id);
                             }
                         }
-                        Err(e) => {
-                            ok = false;
-                            lines.push(format!("{}: {e}", path.display()));
-                        }
+                        Err(e) => failed.push(format!("{}: {e}", path.display())),
                     }
                 }
                 AppSettings::reload_themes(cx);
                 if let Some(id) = first {
                     view.choose_theme(id, cx);
                 }
-                view.outcome = Some(Outcome { ok, lines, diff: Vec::new(), reload: false });
+                toast::show(cx, theme_import_toast(&imported, &failed));
                 cx.notify();
             });
         })
@@ -804,6 +834,17 @@ impl SettingsWindow {
 
     fn close(&mut self, _: &CloseSettings, window: &mut Window, _cx: &mut Context<'_, Self>) {
         window.remove_window();
+    }
+
+    fn dismiss_notifications(&mut self, _: &DismissNotifications, _: &mut Window, cx: &mut Context<'_, Self>) {
+        toast::dismiss_all(cx);
+    }
+
+    fn press_notification_button(&mut self, _: &PressNotificationButton, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Deferred: the button's code may open or update this window.
+        window.defer(cx, |window, cx| {
+            toast::press_primary(window, cx);
+        });
     }
 
     fn focus_next_control(&mut self, _: &FocusNextControl, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1001,32 +1042,14 @@ impl SettingsWindow {
     }
 
     /// Ask the host's running managed shells to restart with the active
-    /// generation.
+    /// generation. The result is a toast; the offer in the bar is answered.
     pub fn reload_shells(&mut self, cx: &mut Context<'_, Self>) {
         let Some(link) = self.link.clone() else { return };
-        self.busy = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { link.reload_shells() }).await;
-            let _ = this.update(cx, |view, cx| {
-                view.busy = false;
-                let (ok, lines) = match result {
-                    Ok(0) => (true, vec!["No running goatty shells to reload.".to_string()]),
-                    Ok(n) => (
-                        true,
-                        vec![
-                            format!("Asked {n} running shell(s) to reload."),
-                            "Idle prompts restart now, busy shells after their current command. Shells with background jobs only show a reminder."
-                                .into(),
-                        ],
-                    ),
-                    Err(e) => (false, vec![format!("Couldn't reload shells: {e:#}")]),
-                };
-                view.outcome = Some(Outcome { ok, lines, diff: Vec::new(), reload: false });
-                cx.notify();
-            });
-        })
-        .detach();
+        if self.outcome.as_ref().is_some_and(|o| o.reload) {
+            self.outcome = None;
+            cx.notify();
+        }
+        crate::app::reload_shells_on(link, cx);
     }
 
     pub fn rollback(&mut self, generation: u32, cx: &mut Context<'_, Self>) {
@@ -1065,21 +1088,16 @@ impl SettingsWindow {
         let Some(host) = self.host.as_ref().map(|h| h.loaded.value.clone()) else { return };
         let dir = dirs_home();
         let rx = cx.prompt_for_new_path(&dir, Some("goatty-profile.json"));
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
             let text = goatty_config::profile::export(&client, &host);
             let result = std::fs::write(&path, text);
-            let _ = this.update(cx, |view, cx| {
-                view.outcome = Some(match result {
-                    Ok(()) => Outcome { ok: true, lines: vec![format!("Exported to {}", path.display())], diff: Vec::new(), reload: false },
-                    Err(e) => Outcome {
-                        ok: false,
-                        lines: vec![format!("Couldn't write {}: {e}", path.display())],
-                        diff: Vec::new(),
-                        reload: false,
-                    },
-                });
-                cx.notify();
+            cx.update(|cx| {
+                let t = match result {
+                    Ok(()) => Toast::success("Exported the profile").body(path.display().to_string()),
+                    Err(e) => Toast::error(format!("Couldn't write {}", path.display())).body(e.to_string()),
+                };
+                toast::show(cx, t.key("profile.export"));
             });
         })
         .detach();
@@ -1240,4 +1258,18 @@ fn contrast_refs(slot: ColorSlot, colors: &goatty_config::ThemeColors) -> Vec<Co
             min: c.min,
         })
         .collect()
+}
+
+/// The toast after importing color schemes: what was imported, what wasn't.
+fn theme_import_toast(imported: &[String], failed: &[String]) -> Toast {
+    let n = imported.len();
+    let themes = |n: usize| if n == 1 { "1 theme".to_string() } else { format!("{n} themes") };
+    let body = imported.iter().chain(failed).cloned().collect::<Vec<_>>().join("\n");
+    let t = match (n, failed.len()) {
+        (_, 0) => Toast::success(format!("Imported {}", themes(n))),
+        (0, 1) => Toast::error("Couldn't import the color scheme"),
+        (0, f) => Toast::error(format!("Couldn't import {f} color schemes")),
+        (_, f) => Toast::warning(format!("Imported {}, {f} failed", themes(n))),
+    };
+    t.body(body).key("theme.import")
 }

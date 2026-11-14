@@ -26,7 +26,7 @@ pub struct ActionInfo {
 }
 
 /// Action groups in display order.
-pub const GROUPS: &[&str] = &["Clipboard", "Scrolling", "Text size", "goatty", "Tabs", "Panes"];
+pub const GROUPS: &[&str] = &["Clipboard", "Scrolling", "Text size", "goatty", "Notifications", "Tabs", "Panes"];
 
 pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "copy", label: "Copy the selection", group: "Clipboard" },
@@ -41,6 +41,10 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "command_palette", label: "Show the command palette", group: "goatty" },
     ActionInfo { name: "connect_to_host", label: "Connect to a host (SSH)", group: "goatty" },
     ActionInfo { name: "reload_shells", label: "Reload running shells with new shell settings", group: "goatty" },
+    // Unbound by default: Escape belongs to the terminal (#86).
+    ActionInfo { name: "dismiss_notifications", label: "Dismiss all notifications", group: "Notifications" },
+    ActionInfo { name: "press_notification_button", label: "Press the newest notification's main button", group: "Notifications" },
+    ActionInfo { name: "show_recent_notifications", label: "Show recent notifications", group: "Notifications" },
     ActionInfo { name: "new_tab", label: "New tab", group: "Tabs" },
     ActionInfo { name: "close_pane", label: "Close the pane (the tab with its last pane)", group: "Panes" },
     ActionInfo { name: "close_tab", label: "Close the tab", group: "Tabs" },

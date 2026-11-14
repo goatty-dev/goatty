@@ -99,9 +99,11 @@ settings_window/
   profile.rs   files (copy path, open folder), problems, export/import, generations (summary, details: every change, file diff, name), reset
   about.rs     version, connection, links, "copy for a bug report"
 toast/
-  mod.rs       Toast (level, title, body, buttons, key, lifetime) and the API: show/show_in/update/dismiss/dismiss_all, routed to a window's layer
-  stack.rs     one window's toasts without UI: replace by key, eviction, pausable timers (unit-tested with explicit clocks)
-  layer.rs     ToastLayer view: bottom-right cards, spring enter/exit, pause on hover / inactive window, one timer task
+  mod.rs       Toast (level, title, body, buttons, key, lifetime) and the API: show/show_in/update/dismiss/dismiss_all/press_primary, routed to a window's layer (terminal windows, and the settings window while it's active); every toast is recorded in the history
+  stack.rs     one window's toasts without UI: replace by key, eviction, pausable timers, the newest main button (unit-tested with explicit clocks)
+  layer.rs     ToastLayer view: bottom-right cards, spring enter/exit, pause on hover / inactive window, one timer task; cards are live regions (alert/status) for screen readers
+  history.rs   the last 50 notifications without handlers (results, not progress; updates and keys replace their entry; unit-tested)
+  recent.rs    "Notifications: Show recent": an overlay like the palette that lists, filters and copies the history
 ui/
   style.rs     UI colors derived from the terminal theme
   icons.rs     Icon enum + Assets (SVGs from assets/icons/, embedded, served to svg())
@@ -110,7 +112,7 @@ ui/
   prompt_preview.rs draws a prompt from `PromptSettings::layout` with sample values (Prompt page, style cards, welcome window)
   color_picker.rs color picker widget: `Entity<ColorPicker>` emitting `Changed`/`Committed`; `Pick` (float state), `Wheel` (HSV) and `Disc` (OKLCH, a generated bitmap) geometry, painting, drag and arrow-key handling (`Knob`s are tab stops), lighter/darker nudges, the contrast row (`ContrastRef`, filled per slot by the settings window)
 workspace/
-  mod.rs       root view per window: tabs of split panes, each tab on its own host (`Spawner`), connecting tabs (connect screen until the session is there), a saved layout per goattyd, spawning/closing panes, window title, closes with the last pane; command palette, paste confirmations, toast layer
+  mod.rs       root view per window: tabs of split panes, each tab on its own host (`Spawner`), connecting tabs (connect screen until the session is there), a saved layout per goattyd, spawning/closing panes, window title, closes with the last pane; command palette, paste confirmations, toast layer, recent notifications
   layout.rs    a tab's split tree (pure, unit-tested): n-ary splits with weights, split/remove/normalize, layout → leaf rects + dividers, neighbor, resize
   tab_bar.rs   the horizontal strip (`tabs.style`: modern / compact; scrolls when the tabs don't fit) and what every style shares: switch, close, rename, live drag to reorder, the mouse wheel (`tabs.scroll_to_switch`), activity markers on background tabs
   sidebar.rs   the vertical style (#168): a sidebar of rows (icon, title, directory and host) that folds into a rail of icons, resized or folded by dragging its edge (saved shortly after the drag stops), next to the panes drawn as a rounded card
@@ -152,7 +154,7 @@ Links (#27): `goatty_term::Terminal::link_at(col, row)` finds the OSC 8 hyperlin
 
 Paste (#29): every paste goes through `goatty_term::paste::check` (runs commands without bracketed paste, control or invisible characters, `curl … | sh`, > 256 KiB, multiline); `paste.confirm` decides which of those ask first.
 
-Feedback: anything that finishes without a visible result (a palette command, a background request, later plugins) reports through `crate::toast`: `toast::show(cx, Toast::success(…))`, or `Toast::loading` first and `toast::update` with the result. Give repeated feedback a `key` so it replaces itself. Toasts never take focus.
+Feedback: anything that finishes without a visible result (a palette command, a background request, later plugins) reports through `crate::toast`: `toast::show(cx, Toast::success(…))`, or `Toast::loading` first and `toast::update` with the result. Give repeated feedback a `key` so it replaces itself (in the history too: a key keeps one entry there). Toasts never take focus: from the keyboard, `dismiss_notifications`, `press_notification_button` and `show_recent_notifications` (bindable, unbound by default, since Escape belongs to the terminal) dismiss them, press the newest one's main button, or list them again. In the settings window, short results are toasts; its bar is for unapplied host changes and the outcome of a preview, apply, rollback or profile import.
 
 Input: GPUI dispatches a bound action before the view's raw `on_key_down`. Shortcuts are actions in `actions.rs`, and anything unbound goes to the shell through `terminal::keys` and `goatty_term::input`. Don't add shortcuts as `match` arms in `on_key`.
 
