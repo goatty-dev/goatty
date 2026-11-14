@@ -377,17 +377,26 @@ mod tests {
     fn commands_started_survives_the_scrollback_dropping_old_commands() {
         let t = term(20, 3);
         command(&t, "ls", "a\r\n");
-        t.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07tail -f\r\n\x1b]133;C\x07");
+        t.feed(b"\x1b]133;A\x07~ $ \x1b]133;B\x07tail -f\r\n\x1b]133;C\x07");
         let before = t.transcript();
         assert_eq!(before.commands_started, 2);
-        // Enough output to push `ls` out of the scrollback.
-        for i in 0..(crate::DEFAULT_SCROLLBACK + 10) {
+        assert_eq!(before.last_command(), Some(1));
+        // Output until `ls` (its prompt and its output) has left the
+        // scrollback, and no further: the running command's prompt stays.
+        let bulk: String = (0..crate::DEFAULT_SCROLLBACK - 20).map(|i| format!("bulk {i}\r\n")).collect();
+        t.feed(bulk.as_bytes());
+        let mut i = 0;
+        let after = loop {
             t.feed(format!("line {i}\r\n").as_bytes());
-        }
-        let after = t.transcript();
-        assert!(!after.commands.iter().any(|c| after.command_line_of(c) == Some("$ ls")));
-        assert!(after.last_command().is_some());
-        assert_ne!(before.last_command(), after.last_command(), "the index shifted");
+            i += 1;
+            let tr = t.transcript();
+            if tr.commands.len() == 1 {
+                break tr;
+            }
+        };
+        assert!(!after.lines.iter().any(|l| l.text == "~ $ ls" || l.text == "a"), "ls is gone");
+        assert_eq!(after.command_line_of(&after.commands[0]), Some("~ $ tail -f"), "the running prompt stays");
+        assert_eq!(after.last_command(), Some(0), "the index shifted");
         // A paused viewer keeps its place: the same command, by id.
         assert_eq!(after.last_command_id(), before.last_command_id(), "but it's the same command");
         assert_eq!(after.commands_started, 2);

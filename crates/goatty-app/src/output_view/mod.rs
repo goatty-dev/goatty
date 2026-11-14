@@ -441,9 +441,11 @@ impl OutputView {
         // "Last" moved on to another command (one started meanwhile): treat
         // it like opening it, so a running one follows. A pause within the
         // same command stays.
-        if self.source == Source::Last && self.last_identity() != before {
-            self.follow = follows(Source::Last, &self.transcript);
-            self.reveal = (!self.follow).then_some(Reveal::Top);
+        if self.source == Source::Last
+            && let Some(follow) = last_moved(before, &self.transcript)
+        {
+            self.follow = follow;
+            self.reveal = (!follow).then_some(Reveal::Top);
             self.selection = None;
         }
         if let Some(m) = current {
@@ -1574,6 +1576,14 @@ impl Render for OutputView {
     }
 }
 
+/// After reading the terminal again for "Last": `Some(follow)` when it is
+/// another command now (start over as if just opened: a running one
+/// follows), `None` when it is the same command, whose place (followed or
+/// paused) stays. `before` is [`Transcript::last_command_id`] from before.
+fn last_moved(before: Option<u64>, after: &Transcript) -> Option<bool> {
+    (after.last_command_id() != before).then(|| follows(Source::Last, after))
+}
+
 /// Whether a source starts at its end and follows new lines: all output
 /// and a running command do; a finished command reads from its start.
 fn follows(source: Source, t: &Transcript) -> bool {
@@ -1633,6 +1643,43 @@ mod tests {
         assert_eq!(w(5), " ");
         assert_eq!(w(t.len()), "denied");
         assert_eq!(word_at("", 0), (0, 0));
+    }
+
+    /// What a paused "Last" view does on refresh, with real terminals: the
+    /// same command stays paused through either kind of eviction, and a new
+    /// command starts over (following, since it runs).
+    #[test]
+    fn a_paused_last_command_stays_paused_through_evictions() {
+        use goatty_term::{Palette, TermSize, Terminal};
+        let new = || Terminal::new(TermSize::new(20, 3), false, std::sync::Arc::new(Palette::default())).0;
+        let flood = |t: &Terminal, until: &dyn Fn(&Transcript) -> bool| {
+            // Most of the scrollback at once, then line by line to the boundary.
+            if t.history_size() < 100 {
+                let bulk: String = (0..goatty_term::DEFAULT_SCROLLBACK - 20).map(|i| format!("bulk {i}\r\n")).collect();
+                t.feed(bulk.as_bytes());
+            }
+            for i in 0.. {
+                t.feed(format!("line {i}\r\n").as_bytes());
+                if until(&t.transcript()) {
+                    break;
+                }
+            }
+        };
+        let older = new();
+        older.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a\r\n\x1b]133;D;0\x07");
+        older.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07tail -f\r\n\x1b]133;C\x07");
+        let before = older.transcript().last_command_id();
+        // Only the older command leaves: the running prompt is still there.
+        flood(&older, &|t| t.commands.len() == 1);
+        let after = older.transcript();
+        assert_eq!(after.command_line(0), Some("$ tail -f"));
+        assert_eq!(last_moved(before, &after), None, "still paused");
+        // Then its own prompt leaves too.
+        flood(&older, &|t| t.commands[0].prompt.is_empty());
+        assert_eq!(last_moved(before, &older.transcript()), None, "still paused");
+        // A new command is another one: it runs, so the view follows it.
+        older.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        assert_eq!(last_moved(before, &older.transcript()), Some(true));
     }
 
     #[test]
