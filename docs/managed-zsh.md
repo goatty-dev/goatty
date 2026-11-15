@@ -141,9 +141,9 @@ fzf is goatty's one fuzzy finder (#165), split over two built-in plugins:
 
 `integration.zsh` emits OSC 133 `A` (prompt start) and `B` (input start) inside `PS1`, re-added on every prompt if a theme rebuilt it. It emits `C` from `preexec`, then `D;<status>` and OSC 7 (`file://host/percent-encoded/path`) from `precmd`. zsh restores `$?` for every hook, so hook order doesn't affect the status. rio-vt parses OSC 7; goatty-term applies the OSC 133 marks itself: they mark prompt rows (so the output viewer finds each command's output), say whether a command runs, and finished commands show as tab activity.
 
-## Installing tools
+## Installing and updating tools
 
-`goattyd shell install [NAME…] [-y]` (or `goatty-setup` inside a goatty shell, which passes exactly the missing tools of the built-in plugins that are on and marked for default install, then reloads the shell) installs the packages of built-in plugins. It plans them like any plugin install (`Plugins::plan` on the built-in candidate: a package already on the system or already installed by goatty at the pinned version downloads nothing), shows the downloads with sizes and asks first; without a terminal it requires `--yes`. `goattyd plugin install starship` does the same with the full plan (permissions, shell code). Each package:
+`goattyd shell install [NAME…] [-y]` (or `goatty-setup` inside a goatty shell, which passes the missing default tools and outdated managed copies of enabled built-in plugins, then reloads the shell) installs and updates the packages of built-in plugins. `goattyd shell update [NAME…] [-y]` updates only goatty's outdated managed copies (without names: all outdated managed copies; skips system copies). They plan packages like any plugin install (`Plugins::plan` on the built-in candidate: a package already on the system or already installed by goatty at the pinned version downloads nothing), show downloads/updates with sizes and ask first; without a terminal they require `--yes`. `goattyd plugin install starship` and `goattyd plugin update` do the same with the full plan (permissions, shell code). Each package:
 
 1. Downloads the pinned release archive with `curl` (fallback `wget`). The sha256 pin is what makes an archive trusted, so goattyd needs no TLS stack of its own.
 2. Checks the archive against the sha256 in the plugin's manifest before unpacking anything.
@@ -162,19 +162,28 @@ No sudo, nothing outside goatty's data directory. `goattyd shell uninstall NAME�
 
 Pinned 2026-11-07 to releases at least two weeks old (fzf-tab 2026-11-13: v1.3.0 is from 2026-03-16). Checksums were computed from the downloads and matched upstream's published `.sha256`/checksums files where they exist (Starship, fzf); GitHub's source tarballs (fzf-tab, the zsh plugins) have none, so their checksum was taken from two separate downloads. fzf-tab's system copies: Arch's AUR `fzf-tab-git`, NixOS/Nix `zsh-fzf-tab`. The package ids are the tool ids from before #98, so managed installs made then (`tools/<id>/`, `bin/` and `plugins/` links) are used as they are. zsh itself isn't installed: if it's missing, goatty starts `$SHELL` and `goattyd shell status` says so.
 
+### Bumping a tool pin (#45)
+
+When a built-in tool's upstream release is at least two weeks old:
+
+1. Download the release archive(s) and compute each archive's sha256 and byte size (or run `goatty-plugin hash <URL>...`, which fetches the URLs, computes `sha256` and `size`, and lists executables).
+2. Compare the computed `sha256` with upstream's published checksums file where available (Starship, fzf). For source tarballs without published checksums (`fzf-tab`, `autosuggestions`, `syntax-highlighting`), compare two separate downloads to catch transient corruption.
+3. Update the built-in manifest in `crates/goatty-shell/plugins/<id>/plugin.toml`: set `[[package]].version`, update each `[[package.asset]]`'s `url`, `sha256`, `size` (and `root` if the unpacked directory name embeds the version, e.g. `fzf-tab-<version>`). Update the pin table and date note above in `docs/managed-zsh.md`.
+4. Verify the manifests and links with `cargo test -p goatty-shell` (and `goatty-plugin check-downloads crates/goatty-shell/plugins/<id>` to re-fetch and verify every asset URL, size and checksum).
+
 ## First run and the GUI
 
-On the very first start (no `settings.json`, no `~/.local/state/goatty/welcome-shown`), goatty opens a **welcome window** with three steps: a theme (or follow the desktop) and the text size; the built-in tools of the window's host, the missing ones preselected and installed one at a time with progress, plus the prompt style; then the shortcuts worth knowing. Everything else keeps its defaults. The command palette's "Welcome and setup" opens it again.
+On the very first start (no `settings.json`, no `~/.local/state/goatty/welcome-shown`), goatty opens a **welcome window** with three steps: a theme (or follow the desktop) and the text size; the built-in tools of the window's host, the missing or outdated managed ones preselected and installed one at a time with progress, plus the prompt style; then the shortcuts worth knowing. Everything else keeps its defaults. The command palette's "Welcome and setup" opens it again.
 
-When a tab connects to another host, goatty offers to bring this computer's whole shell setup there, tools included ([`profiles.md`](profiles.md#the-same-shell-on-every-host-159)). When a tab connects to this computer, or to a host set to never sync, and its managed shell misses default tools, a sticky toast offers to install them: Install / Not now / Don't ask again. That happens once per host per run, never while the welcome window is open, and never after "Don't ask again" (the same marker as `goatty-setup --dismiss`). The in-shell hint stays quiet in sessions of a goatty window that offers the setup itself (goattyd sets `GOATTY_GUI_SETUP=1` for clients with protocol v9, `goatty --local` always; the shell unsets it after startup), and on hosts where a window already offered it (`shell-setup-offered`). Installing reloads the host's running shells, so an idle prompt has the new tools at once.
+When a tab connects to another host, goatty offers to bring this computer's whole shell setup there, tools included ([`profiles.md`](profiles.md#the-same-shell-on-every-host-159)). When a tab connects to this computer, or to a host set to never sync, and its managed shell misses default tools or has outdated managed copies, a sticky toast offers to install/update them: Install / Update / Not now / Don't ask again. That happens once per host per run, never while the welcome window is open, and never after "Don't ask again" (the same marker as `goatty-setup --dismiss`). The in-shell hint stays quiet in sessions of a goatty window that offers the setup itself (goattyd sets `GOATTY_GUI_SETUP=1` for clients with protocol v9, `goatty --local` always; the shell unsets it after startup), and for missing tools on hosts where a window already offered the install (`shell-setup-offered`); outdated managed copies still show the in-shell hint unless dismissed (`goatty-setup --dismiss`). Installing or updating reloads the host's running shells, so an idle prompt has the new tools at once.
 
 The GUI talks to the host through `goatty_shell::setup` (protocol v9 `Shell`, JSON like the plugin operations; with `--local` in-process): `status`, `install` (built-in tool ids), `offered`, `dismiss`. A goattyd older than v9 gets no offer and the Diagnostics page says to restart it.
 
 ## Diagnostics
 
-Settings → Diagnostics (or `goatty --settings=diagnostics`, or "Shell diagnostics" in the palette) shows the same report as `goattyd shell status` for the window's host: the program and configuration, the startup time, each feature with where it came from (system path or goatty's copy and its version), what the startup printed to stderr, the user's own startup files, and an Install button for missing tools. "Copy report" puts it on the clipboard for a bug report.
+Settings → Diagnostics (or `goatty --settings=diagnostics`, or "Shell diagnostics" in the palette) shows the same report as `goattyd shell status` for the window's host: the program and configuration, the startup time, each feature with where it came from (system path or goatty's copy and its version), what the startup printed to stderr, the user's own startup files, an Install button for missing tools, and an Update button when goatty's managed copy differs from the pinned version. "Copy report" puts it on the clipboard for a bug report.
 
-`goattyd shell status` prints the configuration, then starts the managed shell the way a session would (login + interactive, no TTY), runs `goatty-status`, and lists each feature with where it came from and the startup time. Anything the startup printed to stderr is shown. Inside a shell, `goatty-status` prints the same feature table.
+`goattyd shell status` prints the configuration, then starts the managed shell the way a session would (login + interactive, no TTY), runs `goatty-status`, and lists each feature with where it came from, flagging outdated managed copies (`⚠ managed <Name> <old> → <pin>: goattyd shell update <id>`), and the startup time. Anything the startup printed to stderr is shown. Inside a shell, `goatty-status` prints the same feature table, and new interactive shells print a hint when default tools are missing or managed copies are outdated.
 
 ## PATH
 
@@ -214,4 +223,4 @@ Installed plugins (Stage 5, [`plugins.md`](plugins.md)) render into `plugins-ear
 
 ## Not done yet
 
-Caching tool init scripts (#41, including `fzf --zsh`), installs for macOS and other architectures (#42), updating managed tools after a pin bump (#45), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).
+Caching tool init scripts (#41, including `fzf --zsh`), installs for macOS and other architectures (#42), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).

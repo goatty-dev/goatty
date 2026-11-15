@@ -239,7 +239,7 @@ fzf, fzf-tab, autosuggestions, syntax-highlighting and starship come with goatty
 - **Always there.** No lock entry and no copy in `installed/`: their files are part of goatty, read from the binary when a generation is built. They're on unless `plugins.<id>.enabled` is `false`; `goattyd plugin disable fzf-tab` (or the switch on the Shell/Prompt/History page) turns one off, and `goatty-status` says `off`. Uninstalling is refused; `goattyd shell uninstall <id>` removes goatty's download of the tool.
 - **Planning one = its packages.** `find("fzf")` always resolves to the built-in plugin (a registry can't shadow it). Its plan lists each package as already on the system, already installed by goatty at the pinned version (`current`), or to download; installing downloads only the latter. `goattyd shell install` and `goatty-setup` use exactly this.
 - **Works with system copies anywhere.** Only a download needs a build for the host, so on macOS a Homebrew Starship is used even though goatty has no managed build there (#97).
-- **Updates come with goatty releases**, like the pins did. After a pin bump, `goattyd plugin list` and the Plugins page show the older managed copy with an Update button (#45).
+- **Updates come with goatty releases**, like the pins did. After a pin bump, `goattyd shell status`, `goattyd shell update`, `goatty-setup`, the in-shell hint, Diagnostics, `goattyd plugin list` and the Plugins page all flag older managed copies and offer to update them (#45).
 - Their packages keep the ids of the old tool table, so installs made before #98 are found where they are. Their init code may use goatty's own variables (`$_goatty_dir` for the generated `starship.toml`); registry plugins shouldn't.
 
 ## Using it

@@ -226,7 +226,7 @@ impl Welcome {
                 v.loading = false;
                 match result {
                     Ok((status, host)) => {
-                        v.chosen = status.offer().map(|t| t.id.clone()).collect();
+                        v.chosen = status.offer().chain(status.updates()).map(|t| t.id.clone()).collect();
                         v.status = Some(status);
                         v.host = host;
                     }
@@ -503,8 +503,28 @@ impl Welcome {
                 (ToolLocation::System { .. }, _) => {
                     r.desc(format!("{} · already on your system", t.summary)).control(badge("Installed", Tone::Success, ui))
                 }
-                (ToolLocation::Managed { .. }, _) => {
-                    r.desc(format!("{} · installed by goatty", t.summary)).control(badge("Installed", Tone::Success, ui))
+                (ToolLocation::Managed { version }, _) if t.outdated().is_none() => {
+                    r.desc(format!("{} · installed by goatty ({version})", t.summary)).control(badge("Installed", Tone::Success, ui))
+                }
+                (ToolLocation::Managed { version }, Some(why)) => r
+                    .desc(format!("{} · goatty {version} (pinned {}: {why})", t.summary, t.version))
+                    .control(badge("Outdated", Tone::Warning, ui)),
+                (ToolLocation::Managed { version }, None) => {
+                    let on = self.chosen.contains(&t.id);
+                    let id = t.id.clone();
+                    r.desc(format!("{} · update {version} → {} · {}", t.summary, t.version, setup::size(t.download)))
+                        .disabled(busy)
+                        .control(toggle(
+                            SharedString::from(format!("tool-{}", t.id)),
+                            on,
+                            ui,
+                            self.act(cx, move |v, cx| {
+                                if !v.chosen.remove(&id) {
+                                    v.chosen.insert(id.clone());
+                                }
+                                cx.notify();
+                            }),
+                        ))
                 }
                 (ToolLocation::Missing, Some(why)) => r.desc(why.clone()).control(badge("Not available", Tone::Neutral, ui)),
                 (ToolLocation::Missing, None) => {
@@ -648,7 +668,15 @@ impl Welcome {
                 let s = self.status.as_ref();
                 let bytes: u64 = s.map(|s| s.tools.iter().filter(|t| self.chosen.contains(&t.id)).map(|t| t.download).sum()).unwrap_or(0);
                 let n = self.chosen.len();
-                let label = format!("Install {n} {} · {}", if n == 1 { "tool" } else { "tools" }, setup::size(bytes));
+                let verb = match (
+                    s.is_some_and(|s| s.tools.iter().any(|t| self.chosen.contains(&t.id) && t.outdated().is_none())),
+                    s.is_some_and(|s| s.tools.iter().any(|t| self.chosen.contains(&t.id) && t.outdated().is_some())),
+                ) {
+                    (true, true) => "Install & update",
+                    (false, true) => "Update",
+                    _ => "Install",
+                };
+                let label = format!("{verb} {n} {} · {}", if n == 1 { "tool" } else { "tools" }, setup::size(bytes));
                 button_with("next", Some(Icon::Download), label, ButtonKind::Primary, ui, self.act(cx, |v, cx| v.install(cx)))
             }
             Step::Shell => button("next", "Continue", ButtonKind::Primary, ui, self.act(cx, |v, cx| v.go(Step::Ready, cx))),

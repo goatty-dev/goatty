@@ -168,27 +168,45 @@ impl SettingsWindow {
             .into_any_element();
         };
         let offer: Vec<_> = s.offer().collect();
+        let updates: Vec<_> = s.updates().collect();
+        let mut todo: Vec<_> = offer.clone();
+        for u in &updates {
+            if !todo.iter().any(|t| t.id == u.id) {
+                todo.push(*u);
+            }
+        }
         let missing = st.features.iter().filter(|f| f.state == FeatureState::Missing && !f.is_helper()).count();
+        let outdated = st.features.iter().filter(|f| s.tool(&f.id).is_some_and(|t| t.outdated().is_some())).count();
         let installing = self.diag.progress.as_ref().is_some_and(|p| !p.finished);
         let (tone, title) = if !st.stderr.is_empty() {
             (Tone::Warning, "The shell printed errors while starting".to_string())
         } else if missing > 0 {
             (Tone::Warning, if missing == 1 { "1 tool isn't installed".to_string() } else { format!("{missing} tools aren't installed") })
+        } else if outdated > 0 {
+            (
+                Tone::Warning,
+                if outdated == 1 { "1 managed tool is outdated".to_string() } else { format!("{outdated} managed tools are outdated") },
+            )
         } else {
             (Tone::Success, "Everything works".to_string())
         };
         let line = format!("Started in {} ms on {host}, measured just now.", st.ms);
         let mut b = div().flex().flex_col().gap(px(10.)).child(banner(ui, tone, title, vec![line]));
-        if !offer.is_empty() && !installing {
-            let ids: Vec<String> = offer.iter().map(|t| t.id.clone()).collect();
-            let bytes: u64 = offer.iter().map(|t| t.download).sum();
-            let names: Vec<&str> = offer.iter().map(|t| t.name.as_str()).collect();
+        if !todo.is_empty() && !installing {
+            let ids: Vec<String> = todo.iter().map(|t| t.id.clone()).collect();
+            let bytes: u64 = todo.iter().map(|t| t.download).sum();
+            let names: Vec<&str> = todo.iter().map(|t| t.name.as_str()).collect();
+            let verb = match (!offer.is_empty(), !updates.is_empty()) {
+                (true, true) => "Install & update",
+                (false, true) => "Update",
+                _ => "Install",
+            };
             b = b.child(
                 div().flex().items_center().gap(px(10.)).px(px(4.)).child(
                     button_with(
                         "diag-install-all",
                         Some(Icon::Download),
-                        format!("Install {} ({})", shell_setup::names(&names), size(bytes)),
+                        format!("{verb} {} ({})", shell_setup::names(&names), size(bytes)),
                         ButtonKind::Primary,
                         ui,
                         self.act(cx, move |v, cx| v.diag_install(ids.clone(), cx)),
@@ -239,9 +257,25 @@ impl SettingsWindow {
         let rows = st.features.iter().map(|f| {
             let r = row(ui, f.name.clone());
             match &f.state {
-                FeatureState::Loaded { detail, managed: Some(v) } => {
-                    r.desc(format!("goatty's copy {v} · {detail}")).control(badge("Loaded", Tone::Success, ui))
-                }
+                FeatureState::Loaded { detail, managed: Some(v) } => match s.tool(&f.id) {
+                    Some(t) if t.updatable() => {
+                        let id = t.id.clone();
+                        r.desc(format!("goatty's copy {v} (outdated; {} is {}) · {detail}", t.version, size(t.download))).control(
+                            button("diag-update-".to_string() + &t.id, "Update", ButtonKind::Normal, ui, {
+                                self.act(cx, move |v, cx| v.diag_install(vec![id.clone()], cx))
+                            })
+                            .when(installing, |d| d.opacity(0.5)),
+                        )
+                    }
+                    Some(t) if t.outdated().is_some() => r
+                        .desc(format!(
+                            "goatty's copy {v} (pinned {}: {}) · {detail}",
+                            t.version,
+                            t.unavailable.as_deref().unwrap_or("not available")
+                        ))
+                        .control(badge("Outdated", Tone::Warning, ui)),
+                    _ => r.desc(format!("goatty's copy {v} · {detail}")).control(badge("Loaded", Tone::Success, ui)),
+                },
                 FeatureState::Loaded { detail, .. } if f.is_helper() => {
                     r.desc(format!("Optional: {} · {detail}", helper_use(&f.id))).control(badge("Found", Tone::Success, ui))
                 }
@@ -382,7 +416,10 @@ fn report(s: &Status) -> String {
             out.push(format!("startup: {} ms", st.ms));
             for f in &st.features {
                 out.push(match &f.state {
-                    FeatureState::Loaded { detail, managed: Some(v) } => format!("  {} ok (managed {v}) {detail}", f.id),
+                    FeatureState::Loaded { detail, managed: Some(v) } => match s.tool(&f.id).filter(|t| t.outdated().is_some()) {
+                        Some(t) => format!("  {} ok (managed {v}, pinned {}) {detail}", f.id, t.version),
+                        None => format!("  {} ok (managed {v}) {detail}", f.id),
+                    },
                     FeatureState::Loaded { detail, managed: None } => format!("  {} ok {detail}", f.id),
                     FeatureState::Off => format!("  {} off", f.id),
                     FeatureState::Missing if f.is_helper() => format!("  {} missing (optional)", f.id),
@@ -398,6 +435,9 @@ fn report(s: &Status) -> String {
             for t in &s.tools {
                 out.push(match &t.location {
                     ToolLocation::System { path } => format!("  {} {path}", t.id),
+                    ToolLocation::Managed { version } if *version != t.version => {
+                        format!("  {} managed {version} (pinned {})", t.id, t.version)
+                    }
                     ToolLocation::Managed { version } => format!("  {} managed {version}", t.id),
                     ToolLocation::Missing => format!("  {} not found", t.id),
                 });
