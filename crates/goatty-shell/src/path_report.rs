@@ -2,7 +2,8 @@
 //! for the GUI's PATH page.
 //!
 //! goatty's startup files note `$PATH` after each step (`_goatty_path_marks`:
-//! the system's zshenv, the user's `.zshenv`, …, goatty's settings, its
+//! the system's zshenv, the user's `.zshenv`, …, what was imported from the
+//! user's shell, goatty's settings, its
 //! tools, plugins, the user's additions). A folder came from the first step
 //! whose PATH has it; what was there before the first step was inherited
 //! from goattyd's environment. The probe starts a real managed shell the
@@ -220,13 +221,16 @@ pub fn attribute(steps: &[(String, String)]) -> Vec<(String, &str)> {
 struct Files {
     zdotdir: PathBuf,
     additions: String,
+    /// Where imported PATH folders came from (`~/.zshrc (imported)`).
+    imported: String,
 }
 
 impl Files {
     fn find(svc: &HostService) -> Self {
         let zdotdir = std::env::var_os("ZDOTDIR").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
         let additions = svc.launcher.dirs().map_or_else(|| "~/.config/goatty/zshrc".into(), |d| tilde(&d.user_zshrc()));
-        Files { zdotdir, additions }
+        let imported = svc.launcher.dirs().map_or_else(|| "your shell's startup files (imported)".into(), crate::import::path_origin);
+        Files { zdotdir, additions, imported }
     }
 
     fn origin(&self, step: &str) -> Origin {
@@ -239,6 +243,8 @@ impl Files {
             "zshenv" => user(".zshenv"),
             "zprofile" => user(".zprofile"),
             "zshrc" => user(".zshrc"),
+            // A User origin (not a new kind), so older windows can read it.
+            "imported" => Origin::User { file: self.imported.clone() },
             "settings" => Origin::Settings,
             "tools" => Origin::Tools,
             "plugins" => Origin::Plugins,

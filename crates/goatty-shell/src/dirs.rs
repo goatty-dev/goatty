@@ -16,6 +16,7 @@
 //! $XDG_CONFIG_HOME/goatty/registries.json   plugin registries added besides the official one
 //! $XDG_CACHE_HOME/goatty/         completion dump, downloads
 //! $XDG_STATE_HOME/goatty/         small flags (the dismissed setup hint, the GUI offered the setup)
+//!   import/                       what the user's own shell sets up (harvest.json, import.zsh)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -94,6 +95,18 @@ impl Dirs {
     /// The user's own zsh additions, sourced late by the managed `.zshrc`.
     pub fn user_zshrc(&self) -> PathBuf {
         self.config.join("zshrc")
+    }
+    /// What goatty imported from the user's own shell ([`crate::import`]).
+    pub fn import_dir(&self) -> PathBuf {
+        self.state.join("import")
+    }
+    /// The last harvest and failure, as JSON.
+    pub fn import_record(&self) -> PathBuf {
+        self.import_dir().join("harvest.json")
+    }
+    /// The harvest as zsh, sourced by the managed `.zshrc`.
+    pub fn import_file(&self) -> PathBuf {
+        self.import_dir().join("import.zsh")
     }
     /// Exists once the user dismissed the "tools missing" hint.
     pub fn hint_marker(&self) -> PathBuf {

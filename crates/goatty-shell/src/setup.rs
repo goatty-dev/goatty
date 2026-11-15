@@ -60,6 +60,14 @@ pub enum Request {
     /// The PATH a new shell gets, where each folder came from, and what
     /// became of the folders in `shell.path` (starts a shell). Reply: `Path`.
     Path,
+    /// What goatty imports from the user's own shell (`shell.import`) and
+    /// the aliases it can copy into goatty's;
+    /// `refresh`: run their shell now to see what it sets up (also while
+    /// the import is off). Reply: `Import`.
+    Import {
+        #[serde(default)]
+        refresh: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +79,7 @@ pub enum Reply {
     Generations { list: Vec<history::Entry> },
     Diff { files: Vec<generation::FileDiff> },
     Path(Box<crate::path_report::Report>),
+    Import(Box<crate::import::Status>),
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -269,7 +278,20 @@ impl HostService {
             }
             Request::GenerationDiff { number } => Ok(Reply::Diff { files: history::file_diff(dirs_of(self)?, number)? }),
             Request::Path => Ok(Reply::Path(Box::new(self.path_report()))),
+            Request::Import { refresh } => Ok(Reply::Import(Box::new(self.import_status(refresh)?))),
         }
+    }
+}
+
+impl HostService {
+    /// What goatty imports from the user's shell; `refresh` runs it first.
+    pub fn import_status(&self, refresh: bool) -> Result<crate::import::Status> {
+        let dirs = dirs_of(self)?;
+        let ctx = self.launcher.import_context().context("no home directory to import from")?;
+        let host = self.settings();
+        let shell = &host.value.shell;
+        let managed = shell.managed && crate::launch::is_zsh(&crate::launch::resolve_program(shell.program.as_deref()));
+        Ok(crate::import::status(dirs, &host.value, managed, &ctx, refresh))
     }
 }
 
@@ -338,6 +360,10 @@ pub fn status(svc: &HostService) -> Result<Status> {
     Ok(s)
 }
 
+/// The prefix of what the managed zsh skipped in the user's `.zshrc`
+/// (`rc:oh-my-zsh`), shown as off.
+pub const RC_SKIPPED: &str = "rc:";
+
 /// The prefix of optional helpers in `goatty-status` (`helper:fd`): tools
 /// the fzf plugins use when they're there.
 pub const HELPER: &str = "helper:";
@@ -357,6 +383,21 @@ impl Feature {
     pub fn is_helper(&self) -> bool {
         self.id.starts_with(HELPER)
     }
+
+    /// The import of the user's shell setup (`missing`: nothing imported yet).
+    pub fn is_import(&self) -> bool {
+        self.id == "import"
+    }
+
+    /// Something the managed zsh skipped in the user's `.zshrc` (`rc:oh-my-zsh`).
+    pub fn is_rc_skipped(&self) -> bool {
+        self.id.starts_with(RC_SKIPPED)
+    }
+
+    /// Not a tool: missing doesn't mean something to install.
+    pub fn is_tool(&self) -> bool {
+        !(self.is_helper() || self.is_import() || self.is_rc_skipped() || self.id == "integration")
+    }
 }
 
 /// Whether `detail` (reported by `goatty-status`) points inside goatty's
@@ -369,6 +410,8 @@ pub fn is_managed_detail(dirs: &Dirs, detail: &str) -> bool {
 fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
     let name = match id {
         "integration" => "Shell integration".to_owned(),
+        "import" => "Imported from your shell".to_owned(),
+        _ if id.starts_with(RC_SKIPPED) => format!("{} (skipped in your .zshrc)", &id[RC_SKIPPED.len()..]),
         _ if id.starts_with(HELPER) => id[HELPER.len()..].to_owned(),
         _ => match builtins::get(id) {
             Some(b) => b.manifest().name.clone(),
@@ -376,6 +419,9 @@ fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
         },
     };
     let state = match state {
+        State::Ok(from) if id == "import" => {
+            FeatureState::Loaded { detail: format!("PATH folders and variables from {from}"), managed: None }
+        }
         State::Ok(_) if id == "integration" => {
             FeatureState::Loaded { detail: "Prompt marks (OSC 133) and the working directory (OSC 7)".into(), managed: None }
         }
@@ -477,6 +523,11 @@ pub fn install(svc: &HostService, ids: &[String]) -> Result<Installed> {
 mod tests {
     use super::*;
     use crate::launch::Launcher;
+
+    #[test]
+    fn import_requests_default_to_no_refresh() {
+        assert_eq!(serde_json::from_str::<Request>(r#"{"op":"import"}"#).unwrap(), Request::Import { refresh: false });
+    }
 
     #[test]
     fn requests_and_replies_round_trip_as_json() {

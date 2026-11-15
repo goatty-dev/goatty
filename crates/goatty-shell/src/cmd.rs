@@ -26,6 +26,68 @@ fn dirs_of(launcher: &Launcher) -> Result<&Dirs> {
     launcher.dirs().context("$HOME is not set, so goatty has nowhere to keep its shell environment")
 }
 
+/// `goattyd shell import [--refresh]`.
+pub fn import(svc: &crate::HostService, refresh: bool) -> Result<()> {
+    let s = svc.import_status(refresh)?;
+    println!("goatty import of your shell setup");
+    println!("  import      {}", if s.enabled { "on" } else { "off (goattyd settings set shell.import.enabled true)" });
+    if !s.managed {
+        println!("  note        only goatty's managed zsh applies it, and sessions here don't use it");
+    }
+    match &s.source {
+        Some(src) => println!("  from        {} ({})", src.program, src.why),
+        None => println!("  from        -"),
+    }
+    if let Some(p) = &s.problem {
+        println!("  problem     {p}");
+    }
+    for (i, f) in s.files.iter().enumerate() {
+        println!("  {:<10}  {}{}", if i == 0 { "files" } else { "" }, f.path, if f.exists { "" } else { " (not there)" });
+    }
+    if let Some(f) = &s.failure {
+        println!("  last run    failed {} ago: {}", ago(s.now.saturating_sub(f.at)), f.message);
+        if !f.stderr.is_empty() {
+            println!("              {}", f.stderr.replace('\n', "\n              "));
+        }
+    }
+    // `--refresh` that didn't work fails the command (after saying why).
+    let result = || if refresh && s.refreshed == Some(false) { anyhow::bail!("checking your shell setup failed") } else { Ok(()) };
+    let Some(h) = &s.harvest else {
+        println!("  harvest     none yet{}", if refresh { "" } else { " (--refresh runs your shell now)" });
+        return result();
+    };
+    println!("  harvest     {} ago, took {} ms", ago(s.now.saturating_sub(h.at)), h.ms);
+    let added = h.added_path();
+    println!();
+    println!("PATH folders added ({})", added.len());
+    for d in added {
+        println!("  {d}");
+    }
+    println!("variables ({})", h.vars.len());
+    for v in &h.vars {
+        println!("  {}={}", v.name, v.value);
+    }
+    let offer = crate::import::offer_aliases(h, &svc.settings().value);
+    println!("aliases goatty doesn't have yet ({}; not imported: copy them under Settings → Aliases, or goattyd alias add)", offer.len());
+    for a in offer {
+        println!("  {}={}{}", a.name, a.value, if a.own { "" } else { "  (from a framework or plugin)" });
+    }
+    if !h.stderr.is_empty() {
+        println!("stderr");
+        println!("  {}", h.stderr.replace('\n', "\n  "));
+    }
+    result()
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs / 60),
+        3600..86400 => format!("{} h", secs / 3600),
+        _ => format!("{} days", secs / 86400),
+    }
+}
+
 /// `goattyd shell status`: configuration, what a real shell loads, startup
 /// time. The same [`setup::Status`] the GUI's Diagnostics page shows.
 pub fn status(svc: &crate::HostService) -> Result<()> {
@@ -50,7 +112,7 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
         let what = match (f.exists, f.sourced, f.path.ends_with(".zshrc")) {
             (false, ..) => "not there",
             (true, true, _) => "sourced",
-            (true, false, true) => "not sourced (GOATTY_ZSH_USER_RC=1 to include it)",
+            (true, false, true) => "not sourced (`goattyd shell import` brings what it sets up; GOATTY_ZSH_USER_RC=1 runs it)",
             (true, false, false) => "not sourced",
         };
         println!("  {:<10}  {}: {what}", if i == 0 { "your files" } else { "" }, f.path);
@@ -76,7 +138,9 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
                         _ => format!("\u{2713} managed {} {v}", f.name),
                     },
                     FeatureState::Loaded { detail, .. } => format!("\u{2713} {detail}"),
+                    FeatureState::Off if f.is_rc_skipped() => "- skipped in your .zshrc: goatty loads its own".into(),
                     FeatureState::Off => "- off".into(),
+                    FeatureState::Missing if f.is_import() => "- nothing imported yet (`goattyd shell import --refresh`)".into(),
                     FeatureState::Missing if f.is_helper() => {
                         format!("- not installed (optional: {}; goattyd plugin install {})", setup::helper_use(&f.id), f.name)
                     }

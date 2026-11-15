@@ -21,6 +21,7 @@ pub const ZSHENV: &str = include_str!("../zsh/zshenv.zsh");
 pub const ZPROFILE: &str = include_str!("../zsh/zprofile.zsh");
 pub const ZSHRC: &str = include_str!("../zsh/zshrc.zsh");
 pub const INTEGRATION: &str = include_str!("../zsh/integration.zsh");
+pub const RC_GUARD: &str = include_str!("../zsh/rc-guard.zsh");
 
 /// Inputs for [`render`].
 pub struct ZshConfig<'a> {
@@ -55,6 +56,7 @@ pub fn render(cfg: &ZshConfig<'_>) -> Vec<GeneratedFile> {
         GeneratedFile::new(".zprofile", ZPROFILE),
         GeneratedFile::new(".zshrc", ZSHRC),
         GeneratedFile::new("integration.zsh", INTEGRATION),
+        GeneratedFile::new("rc-guard.zsh", RC_GUARD),
         GeneratedFile::new("starship.toml", crate::starship::render(cfg.settings)),
         GeneratedFile::new("aliases.zsh", crate::aliases::render(cfg.settings)),
     ];
@@ -154,6 +156,9 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_daemon", &cfg.daemon_exe.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
     scalar("_goatty_user_env", flag(s.shell.zsh.user_env));
     scalar("_goatty_user_rc", flag(s.shell.zsh.user_rc));
+    let imp = &s.shell.import;
+    scalar("_goatty_import", flag(imp.enabled));
+    scalar("_goatty_import_file", &d.import_file().to_string_lossy());
     scalar("_goatty_hist_size", &s.history.size.to_string());
     scalar("_goatty_prompt_two_line", flag(s.prompt.two_line));
     scalar("_goatty_prompt_transient", flag(s.prompt.transient));
@@ -173,6 +178,8 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     out.push_str(&format!("typeset -ga _goatty_features=({})\n", enabled_features(s).join(" ")));
     let path: Vec<String> = s.shell.path.iter().map(|p| quote(p)).collect();
     out.push_str(&format!("typeset -ga _goatty_path=({})\n", path.join(" ")));
+    let words = |list: &[String]| list.iter().map(|n| quote(n)).collect::<Vec<_>>().join(" ");
+    out.push_str(&format!("typeset -ga _goatty_import_skip_vars=({})\n", words(&imp.skip_vars)));
     // What goatty-setup installs when they're missing (built-in plugins that are on).
     let defaults: Vec<&str> =
         builtins::BUILTINS.iter().filter(|b| b.default_install && s.plugins.get(b.id).is_none_or(|c| c.enabled)).map(|b| b.id).collect();
@@ -211,9 +218,14 @@ mod tests {
         s.history.size = 5000;
         s.history.share_between_sessions = true;
         s.shell.path = vec!["~/my bin".into(), "/opt/it's".into()];
+        s.shell.import.enabled = true;
+        s.shell.import.skip_vars = vec!["LESS".into()];
         let out = render_settings(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: Some(Path::new("/usr/bin/goattyd")), plugins: &[] });
         assert!(out.contains(r"_goatty_dir='/r o/ot'\''s/data/current/zsh'"), "{out}");
         assert!(out.contains("_goatty_user_rc='1'"));
+        assert!(out.contains("_goatty_import='1'"), "{out}");
+        assert!(out.contains(r"_goatty_import_file='/r o/ot'\''s/state/import/import.zsh'"), "{out}");
+        assert!(out.contains("_goatty_import_skip_vars=('LESS')"), "{out}");
         assert!(out.contains("_goatty_hist_size='5000'"));
         assert!(out.contains("hist_ignore_space share_history)"), "{out}");
         assert!(out.contains("_goatty_daemon='/usr/bin/goattyd'"));

@@ -4,10 +4,12 @@
 //! goatty generates, so the user gets autosuggestions, syntax highlighting,
 //! fuzzy history search and completion (fzf), Starship and shell integration
 //! without touching their dotfiles. The user's `.zshenv`/`.zprofile` still
-//! run (and `.zshrc` on request); the user's `ZDOTDIR` is restored once
+//! run (and `.zshrc` on request, or what it sets up imported); the user's `ZDOTDIR` is restored once
 //! startup is done.
 //!
 //! * [`aliases`]: the user's and the plugins' aliases, `goattyd alias …`,
+//! * [`import`]: what the user's own shell sets up (PATH, variables,
+//!   aliases from `.zshrc`/`.bashrc`), harvested in a separate process,
 //! * [`launch`]: which shell a session runs, and its environment,
 //! * [`zsh`]: the startup files, rendered from the host settings,
 //! * [`generation`]: build, validate, activate and roll back configurations,
@@ -36,6 +38,7 @@ pub mod dirs;
 pub mod doctor;
 pub mod generation;
 pub mod history;
+pub mod import;
 pub mod install;
 pub mod launch;
 pub mod packages;

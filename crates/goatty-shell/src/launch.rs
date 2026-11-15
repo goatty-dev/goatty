@@ -25,17 +25,64 @@ pub struct Launch {
 pub struct Launcher {
     dirs: Option<Dirs>,
     daemon_exe: Option<PathBuf>,
+    /// Where imports of the user's shell setup come from.
+    import: ImportFrom,
+}
+
+/// Whose shell [`Launcher`] imports from.
+#[derive(Debug, Clone)]
+enum ImportFrom {
+    /// Nobody's: a launcher built with [`Launcher::new`] (tests, tools)
+    /// never runs the developer's real login shell.
+    Nobody,
+    /// This process's home, login shell and environment (goattyd).
+    Env,
+    Given(crate::import::Context),
 }
 
 impl Launcher {
     /// `dirs`: where the managed environment lives (`None`: no `$HOME`, so
     /// no managed zsh). `daemon_exe`: the goattyd that `goatty-setup` runs.
+    /// It imports nobody's shell setup ([`Self::from_env`] and
+    /// [`Self::with_import_context`] do).
     pub fn new(dirs: Option<Dirs>, daemon_exe: Option<PathBuf>) -> Self {
-        Self { dirs, daemon_exe }
+        Self { dirs, daemon_exe, import: ImportFrom::Nobody }
     }
 
+    /// Import the user's shell setup from `ctx` instead of this process's
+    /// home and environment (tests, sandboxes).
+    pub fn with_import_context(mut self, ctx: crate::import::Context) -> Self {
+        self.import = ImportFrom::Given(ctx);
+        self
+    }
+
+    /// Where the user's shell setup is imported from (`None` without
+    /// `$HOME`, or for a launcher that imports nothing).
+    pub fn import_context(&self) -> Option<crate::import::Context> {
+        match &self.import {
+            ImportFrom::Given(c) => Some(c.clone()),
+            ImportFrom::Env => crate::import::Context::from_env(&self.dirs.as_ref()?.zsh_dir()),
+            ImportFrom::Nobody => None,
+        }
+    }
+
+    /// Bring the import of the user's shell setup up to date, if it's on
+    /// (may run their shell: call off the UI thread).
+    pub fn prepare_import(&self, settings: &HostSettings) {
+        if !settings.shell.import.enabled {
+            return;
+        }
+        let (Some(dirs), Some(ctx)) = (&self.dirs, self.import_context()) else { return };
+        match crate::import::prepare(dirs, settings, &ctx) {
+            Ok(p) => log::debug!("import: {p:?}"),
+            Err(e) => log::warn!("import: {e:#}"),
+        }
+    }
+
+    /// The user's dirs, importing their shell setup from this process's
+    /// environment.
     pub fn from_env(daemon_exe: Option<PathBuf>) -> Self {
-        Self::new(Dirs::from_env(), daemon_exe)
+        Self { import: ImportFrom::Env, ..Self::new(Dirs::from_env(), daemon_exe) }
     }
 
     pub fn dirs(&self) -> Option<&Dirs> {
@@ -84,6 +131,7 @@ impl Launcher {
         if let Err(e) = self.apply(host) {
             log::warn!("couldn't build the shell configuration: {e:#}");
         }
+        self.prepare_import(&host.value);
         if !dirs.zsh_dir().join(".zshrc").is_file() {
             log::warn!("no usable shell configuration generation: starting plain zsh");
             return launch;

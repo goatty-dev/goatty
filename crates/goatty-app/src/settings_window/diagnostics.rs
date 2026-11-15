@@ -176,7 +176,7 @@ impl SettingsWindow {
                 todo.push(*u);
             }
         }
-        let missing = st.features.iter().filter(|f| f.state == FeatureState::Missing && !f.is_helper()).count();
+        let missing = st.features.iter().filter(|f| f.state == FeatureState::Missing && f.is_tool()).count();
         let outdated = st.features.iter().filter(|f| s.tool(&f.id).is_some_and(|t| t.outdated().is_some())).count();
         let installing = self.diag.progress.as_ref().is_some_and(|p| !p.finished);
         let (tone, title) = if !st.stderr.is_empty() {
@@ -287,7 +287,13 @@ impl SettingsWindow {
                     r.desc(format!("Optional: {} · {detail}", helper_use(&f.id))).control(badge("Found", Tone::Success, ui))
                 }
                 FeatureState::Loaded { detail, managed: None } => r.desc(detail.clone()).control(badge("Loaded", Tone::Success, ui)),
+                FeatureState::Off if f.is_rc_skipped() => {
+                    r.desc("Your .zshrc loads it; goatty's shell skips it and uses its own").control(badge("Skipped", Tone::Neutral, ui))
+                }
                 FeatureState::Off => r.desc("Turned off in the settings").control(badge("Off", Tone::Neutral, ui)),
+                FeatureState::Missing if f.is_import() => r
+                    .desc("Nothing imported from your .zshrc or .bashrc: Dotfiles says why")
+                    .control(badge("Nothing yet", Tone::Neutral, ui)),
                 FeatureState::Missing if f.is_helper() => r
                     .desc(format!("Optional: {}. Install the {} plugin, or your distribution's package", helper_use(&f.id), f.name))
                     .control(badge("Not installed", Tone::Neutral, ui)),
