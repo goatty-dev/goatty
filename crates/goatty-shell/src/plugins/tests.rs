@@ -327,8 +327,9 @@ fn builtins_are_active_unless_turned_off_and_ordered() {
     let w = world();
     let mut s = HostSettings::default();
     let ids = |s: &HostSettings| super::active(&w.dirs, s).0.into_iter().map(|a| a.manifest.id).collect::<Vec<_>>();
-    assert_eq!(ids(&s), ["fzf", "fzf-tab", "autosuggestions", "starship", "syntax-highlighting"]);
+    assert_eq!(ids(&s), ["fzf", "fzf-tab", "autosuggestions", "starship", "basics", "syntax-highlighting"]);
     s.edit_plugin("fzf-tab", |c| c.enabled = false);
+    s.edit_plugin("basics", |c| c.enabled = false);
     assert_eq!(ids(&s), ["fzf", "autosuggestions", "starship", "syntax-highlighting"]);
     let (_, issues) = super::active(&w.dirs, &s);
     assert!(issues.is_empty(), "settings for built-in plugins aren't 'not installed': {issues:?}");
@@ -345,5 +346,5 @@ fn builtins_are_active_unless_turned_off_and_ordered() {
             a.manifest.zsh.after = vec!["autosuggestions".into()];
         }
     }
-    assert_eq!(load_order(list).len(), 5);
+    assert_eq!(load_order(list).len(), 6);
 }

@@ -158,6 +158,10 @@ impl HostService {
                 Ok(api::Reply::Changed(self.install_plugin(&c, &approved)?))
             }
             api::Request::Uninstall { id } => Ok(api::Reply::Changed(self.uninstall_plugin(&id)?)),
+            api::Request::Snippets => self.plugins(|p| Ok(api::Reply::Snippets(crate::snippets::list(p.dirs, &settings)))),
+            api::Request::Suggest { owner, snippet, input, values, cwd } => self.plugins(|p| {
+                crate::snippets::suggest(p.dirs, &settings, &owner, &snippet, &input, &values, cwd.as_deref()).map(api::Reply::Suggestions)
+            }),
         }
     }
 

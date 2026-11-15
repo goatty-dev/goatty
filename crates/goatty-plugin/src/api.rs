@@ -37,6 +37,20 @@ pub enum Request {
     Uninstall {
         id: String,
     },
+    /// Every snippet and expansion on this host: the user's own (from
+    /// `host.json`) and the enabled plugins' (#89).
+    Snippets,
+    /// Suggestions for one snippet input: the host looks its source up in
+    /// its own snippets (a client never sends a command), fills in the
+    /// earlier `values` and runs it in `cwd` (the pane's directory there).
+    Suggest {
+        /// `""` for the user's own snippets, else the plugin's id.
+        owner: String,
+        snippet: String,
+        input: String,
+        values: std::collections::BTreeMap<String, String>,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,6 +59,66 @@ pub enum Reply {
     Catalog(Catalog),
     Plan(Box<Plan>),
     Changed(Changed),
+    Snippets(SnippetList),
+    Suggestions(Suggestions),
+}
+
+/// A host's snippets and expansions ([`Request::Snippets`]).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SnippetList {
+    pub snippets: Vec<HostSnippet>,
+    pub expansions: Vec<HostExpansion>,
+    /// Expansions are on (`shell.expansions`).
+    #[serde(default)]
+    pub expansions_on: bool,
+    /// Snippets or expansions that were left out, and why.
+    pub issues: Vec<String>,
+}
+
+/// Where a snippet or expansion comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// `""`: the user's own; else the plugin's id.
+    pub owner: String,
+    /// "Yours", or the plugin's name.
+    pub name: String,
+}
+
+impl Origin {
+    pub fn mine(&self) -> bool {
+        self.owner.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostSnippet {
+    pub origin: Origin,
+    pub snippet: crate::snippets::Snippet,
+    /// Programs the line runs that this host doesn't have (`docker`).
+    #[serde(default)]
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostExpansion {
+    pub origin: Origin,
+    /// The key in `host.json` for the user's own (`""` for a plugin's).
+    #[serde(default)]
+    pub id: String,
+    pub expansion: crate::snippets::Expansion,
+    /// The user turned it off (their own) or its plugin is off.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// What a snippet input's source suggested ([`Request::Suggest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Suggestions {
+    pub items: Vec<crate::snippets::Item>,
+    /// Shown under the field: the source's `on_fail`, or what went wrong.
+    pub note: Option<String>,
+    /// There were more than the cap.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

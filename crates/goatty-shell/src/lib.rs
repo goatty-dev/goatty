@@ -46,6 +46,7 @@ pub mod path_report;
 pub mod plugins;
 pub mod service;
 pub mod setup;
+pub mod snippets;
 pub mod starship;
 pub mod sync;
 pub mod zsh;

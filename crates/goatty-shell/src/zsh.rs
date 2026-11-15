@@ -22,6 +22,7 @@ pub const ZPROFILE: &str = include_str!("../zsh/zprofile.zsh");
 pub const ZSHRC: &str = include_str!("../zsh/zshrc.zsh");
 pub const INTEGRATION: &str = include_str!("../zsh/integration.zsh");
 pub const RC_GUARD: &str = include_str!("../zsh/rc-guard.zsh");
+pub const EXPAND: &str = include_str!("../zsh/expand.zsh");
 
 /// Inputs for [`render`].
 pub struct ZshConfig<'a> {
@@ -57,6 +58,8 @@ pub fn render(cfg: &ZshConfig<'_>) -> Vec<GeneratedFile> {
         GeneratedFile::new(".zshrc", ZSHRC),
         GeneratedFile::new("integration.zsh", INTEGRATION),
         GeneratedFile::new("rc-guard.zsh", RC_GUARD),
+        GeneratedFile::new("expand.zsh", EXPAND),
+        GeneratedFile::new("expansions.zsh", crate::snippets::render_expansions(cfg.settings, cfg.plugins).0),
         GeneratedFile::new("starship.toml", crate::starship::render(cfg.settings)),
         GeneratedFile::new("aliases.zsh", crate::aliases::render(cfg.settings)),
     ];
@@ -129,7 +132,10 @@ fn render_plugins(cfg: &ZshConfig<'_>) -> Vec<GeneratedFile> {
 /// goatty's own features (not plugins) as the `.zshrc` knows them, for the
 /// enabled ones.
 pub fn enabled_features(s: &HostSettings) -> Vec<&'static str> {
-    [("integration", s.shell.zsh.integration)].into_iter().filter_map(|(name, on)| on.then_some(name)).collect()
+    [("integration", s.shell.zsh.integration), ("expansions", s.shell.expansions)]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect()
 }
 
 fn flag(b: bool) -> &'static str {
@@ -229,7 +235,7 @@ mod tests {
         assert!(out.contains("_goatty_hist_size='5000'"));
         assert!(out.contains("hist_ignore_space share_history)"), "{out}");
         assert!(out.contains("_goatty_daemon='/usr/bin/goattyd'"));
-        assert!(out.contains("_goatty_features=(integration)"));
+        assert!(out.contains("_goatty_features=(integration expansions)"), "{out}");
         assert!(out.contains(r"_goatty_path=('~/my bin' '/opt/it'\''s')"), "{out}");
         assert!(out.contains(r"_goatty_pkgs='/r o/ot'\''s/data/plugins'"), "{out}");
         assert!(out.contains(r"_goatty_tools='/r o/ot'\''s/data/tools'"), "{out}");
@@ -261,7 +267,8 @@ mod tests {
         assert!(!line.contains("atuin"), "{line}");
         assert!(!get("plugins-prompt.zsh").contains("_goatty_prompt=starship"), "starship is off");
         assert!(get("plugins-last.zsh").contains("_goatty_src[syntax-highlighting]"));
-        assert!(!get("plugins.zsh").contains("# ---"), "nothing in the normal slot");
+        let normal = get("plugins.zsh");
+        assert_eq!(normal.matches("# --- ").count(), 1, "only the basics snippets in the normal slot: {normal}");
         assert!(files.iter().any(|f| f.name == "plugins/fzf-tab/zsh/init.zsh"), "the shipped init file");
         let rc = get("plugins/fzf/fzfrc");
         assert!(rc.contains("--color=fg:-1,bg:-1") && rc.contains("--preview-window='right:60%"), "{rc}");

@@ -1246,3 +1246,72 @@ fn outdated_managed_tools_hint_and_setup() {
     let dismissed_out = pty_session(&sb, &launch, &[]);
     assert!(!dismissed_out.contains("outdated:"), "{dismissed_out:?}");
 }
+
+/// What the last command printed: the text after its OSC 133;C mark.
+fn last_output(sh: &PtyShell) -> String {
+    let t = sh.text();
+    let start = t.rfind("\x1b]133;C").unwrap_or(0);
+    t[start..].to_string()
+}
+
+#[test]
+fn expansions_rewrite_words_on_space_and_enter() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    // The built-in Basics pack brings the rules; autosuggestions and syntax
+    // highlighting load too when the host has them, and wrap the widgets.
+    let launch = sb.launch_with(HostSettings::default(), None);
+    let mut sh = PtyShell::start(&sb, &launch);
+
+    // Space expands `| first 2 lines` into `| head -n 2` before it runs.
+    sh.run("printf 'L%s\\n' 1 2 3 4 | first 2 lines ");
+    let out = last_output(&sh);
+    assert!(out.contains("L2") && !out.contains("L3"), "{out:?}");
+    assert!(sh.text().contains("→  | head -n 2"), "the message says what happened: {:?}", sh.text());
+
+    // Enter on a line ending in a rule expands it and stops; Enter again runs it.
+    let before = sh.prompts();
+    sh.pty.write(b"printf 'L%s\\n' 1 2 3 | last 1 lines\r").unwrap();
+    sh.wait_for(b"| tail -n 1");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(sh.prompts(), before, "not run yet");
+    sh.run("");
+    let out = last_output(&sh);
+    assert!(out.contains("L3") && !out.contains("L1"), "{out:?}");
+
+    // Backspace right after an expansion brings back what was typed.
+    sh.pty.write(b"echo | sorted \x7f").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    sh.run("x");
+    assert!(last_output(&sh).contains("sortedx"), "{:?}", last_output(&sh));
+
+    // Inside quotes nothing changes.
+    sh.run("echo 'a | first 2 lines b'");
+    assert!(last_output(&sh).contains("a | first 2 lines b"), "{:?}", last_output(&sh));
+
+    // Pasted text is never rewritten, not by a Space or an Enter right after it.
+    sh.run("\x1b[200~echo pasted | sorted\x1b[201~");
+    assert!(last_output(&sh).contains("sorted"), "{:?}", last_output(&sh));
+    sh.run("\x1b[200~echo pasted | sorted\x1b[201~ ");
+    assert!(last_output(&sh).contains("sorted"), "{:?}", last_output(&sh));
+
+    // A placeholder at the end: the word before it is the key.
+    sh.run("printf 'L%s\\n' apple banana | only lines with ban ");
+    let out = last_output(&sh);
+    assert!(out.contains("Lbanana") && !out.contains("Lapple"), "{out:?}");
+    let _ = sh.pty.write(b"exit\r");
+}
+
+#[test]
+fn expansions_can_be_turned_off() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    let mut s = HostSettings::default();
+    s.shell.expansions = false;
+    let launch = sb.launch_with(s, None);
+    let out = stdout(&sb.run(&launch, "print -r -- ${_goatty_state[expansions]} ${widgets[goatty-expand-space]-none} $#_goatty_exp_re"));
+    assert_eq!(out.trim(), "off none 0");
+    let launch = sb.launch_with(HostSettings::default(), None);
+    let out = stdout(&sb.run(&launch, "print -r -- ${_goatty_state[expansions]%%$'\\t'*} ${widgets[goatty-expand-space]}"));
+    assert_eq!(out.trim(), "ok user:goatty-expand-space");
+}

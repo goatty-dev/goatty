@@ -33,10 +33,15 @@ pub enum Permission {
     ConfigFiles,
     /// Adds commands to goatty's command palette (`[[command]]`).
     Commands,
+    /// Offers snippets and expansions (`[[snippet]]`, `[[expansion]]`):
+    /// text that's only ever inserted at the prompt.
+    Snippets,
+    /// Runs programs to suggest snippet values (`[snippet.input.source]`).
+    SnippetSources,
 }
 
 impl Permission {
-    pub const ALL: [Permission; 7] = [
+    pub const ALL: [Permission; 9] = [
         Permission::Binaries,
         Permission::ShellCode,
         Permission::Network,
@@ -44,6 +49,8 @@ impl Permission {
         Permission::Env,
         Permission::ConfigFiles,
         Permission::Commands,
+        Permission::Snippets,
+        Permission::SnippetSources,
     ];
 
     /// The key in `[permissions]`.
@@ -56,6 +63,8 @@ impl Permission {
             Permission::Env => "env",
             Permission::ConfigFiles => "config-files",
             Permission::Commands => "commands",
+            Permission::Snippets => "snippets",
+            Permission::SnippetSources => "snippet-sources",
         }
     }
 
@@ -72,6 +81,8 @@ impl Permission {
             Permission::Env => "Sets environment variables",
             Permission::ConfigFiles => "Generates config files",
             Permission::Commands => "Adds commands to the command palette",
+            Permission::Snippets => "Adds snippets and expansions",
+            Permission::SnippetSources => "Runs programs to suggest snippet values",
         }
     }
 
@@ -91,6 +102,12 @@ impl Permission {
             Permission::Commands => {
                 "Picking one asks for its values, then types its command line into your terminal, where you see it run. Values are quoted: they can't become shell code."
             }
+            Permission::Snippets => {
+                "Nothing runs: a snippet's line is put on your prompt for you to read and run, and an expansion rewrites words you typed (shown before it runs, Backspace undoes it)."
+            }
+            Permission::SnippetSources => {
+                "When you fill in a snippet, these programs run on the tab's host (in the pane's folder, without a shell, stopped after a few seconds) to list suggestions."
+            }
         }
     }
 
@@ -101,7 +118,7 @@ impl Permission {
 
     /// The author has to say why (`[permissions]`).
     pub fn needs_reason(self) -> bool {
-        matches!(self, Permission::Binaries | Permission::ShellCode | Permission::Network)
+        matches!(self, Permission::Binaries | Permission::ShellCode | Permission::Network | Permission::SnippetSources)
     }
 
     /// Only the author can know it's needed (not derivable from the manifest).
@@ -130,6 +147,12 @@ pub fn derived(m: &Manifest) -> Vec<Permission> {
     }
     if !m.commands.is_empty() {
         v.push(Permission::Commands);
+    }
+    if !m.snippets.is_empty() || !m.expansions.is_empty() {
+        v.push(Permission::Snippets);
+    }
+    if m.snippets.iter().flat_map(|s| &s.inputs).any(|i| i.source.is_some()) {
+        v.push(Permission::SnippetSources);
     }
     v.sort();
     v
@@ -183,6 +206,7 @@ fn what_uses(p: Permission) -> &'static str {
     match p {
         Permission::Binaries => "installs programs ([[package]])",
         Permission::ShellCode => "runs shell code (zsh.init)",
+        Permission::SnippetSources => "runs programs for snippet suggestions ([snippet.input.source])",
         _ => "uses it",
     }
 }
@@ -227,6 +251,18 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                 Permission::Env => m.env.iter().map(|e| e.name.clone()).chain(m.files.iter().filter_map(|f| f.env.clone())).collect(),
                 Permission::ConfigFiles => m.files.iter().map(|f| f.name.clone()).collect(),
                 Permission::Commands => m.commands.iter().map(|c| format!("{}: {}", c.title, crate::commands::describe(c))).collect(),
+                Permission::Snippets => m
+                    .snippets
+                    .iter()
+                    .map(|s| format!("{}: {}", s.title, s.line))
+                    .chain(m.expansions.iter().map(|e| format!("{} → {}", e.say, e.to)))
+                    .collect(),
+                Permission::SnippetSources => m
+                    .snippets
+                    .iter()
+                    .flat_map(|s| s.inputs.iter().filter_map(move |i| i.source.as_ref().map(|src| (s, i, src))))
+                    .map(|(s, i, src)| format!("{} → {}: {}", s.title, i.label, src.describe()))
+                    .collect(),
             };
             Granted {
                 permission: p,

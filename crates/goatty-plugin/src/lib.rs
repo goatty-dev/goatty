@@ -6,6 +6,7 @@
 //!   settings, aliases, environment, config files, zsh code,
 //! * [`schema`]: settings values: defaults, validation, lenient resolution,
 //! * [`commands`]: palette commands that ask for input and type a command line,
+//! * [`snippets`]: command lines with blanks, suggestion sources, expansions,
 //! * [`alias`]: a plugin's aliases as rows for the GUI and CLI,
 //! * [`template`]: how setting values reach aliases, variables and files,
 //! * [`permissions`]: what a plugin may do, derived from its manifest,
@@ -29,6 +30,7 @@ pub mod manifest;
 pub mod permissions;
 pub mod schema;
 pub mod sign;
+pub mod snippets;
 pub mod template;
 pub mod zsh;
 

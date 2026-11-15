@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use goatty_plugin::{bundle, index, manifest, permissions, schema, sign, zsh};
+use goatty_plugin::{bundle, index, manifest, permissions, schema, sign, snippets, zsh};
 
 #[derive(Parser)]
 #[command(name = "goatty-plugin", version, about = "Build, check and publish goatty plugins")]
@@ -156,12 +156,24 @@ fn validate(dir: &Path) -> Result<bool> {
             println!("              {}", g.details.join(", "));
         }
     }
+    for sn in &m.snippets {
+        println!("  snippet     {} [{}]: {}", sn.title, sn.safety().key(), sn.line);
+    }
+    for e in &m.expansions {
+        println!("  expansion   {} → {}", e.say, e.to);
+    }
     let target = goatty_plugin::current_target();
     if let Err(why) = m.compatible(goatty_plugin::GOATTY_VERSION, &target) {
         println!("  note        not installable on this machine ({target}): {why}");
     }
     for s in m.settings.iter().filter(|s| s.help.trim().is_empty()) {
         println!("  hint        setting {:?} has no help text: explain what it does in plain words", s.id);
+    }
+    for s in m.snippets.iter().filter(|s| s.description.trim().is_empty()) {
+        println!("  hint        snippet {:?} has no description: say in plain words what happens when it runs", s.id);
+    }
+    for s in m.snippets.iter().filter(|s| s.safety.is_none()) {
+        println!("  hint        snippet {:?} doesn't say its safety; goatty guesses {:?}", s.id, s.safety().key());
     }
     Ok(true)
 }
@@ -194,6 +206,19 @@ fn render(dir: &Path, set: &[String]) -> Result<()> {
     println!("### {} (load = \"{}\")\n{}", r.load.file(), r.load.key(), r.main);
     for (name, contents) in &r.files {
         println!("### plugins/{}/{name}\n{contents}", m.id);
+    }
+    if !m.snippets.is_empty() {
+        println!("### snippets (what the picker inserts, with each input's default or ‹label›)");
+        for sn in &m.snippets {
+            let values: snippets::Answers = sn.inputs.iter().filter_map(|i| i.default.clone().map(|d| (i.id.clone(), d))).collect();
+            let shown: String = sn.preview(&values, None).iter().map(snippets::Seg::text).collect();
+            println!("{}: {shown}", sn.title);
+        }
+        println!();
+    }
+    if !m.expansions.is_empty() {
+        let rules: Vec<snippets::Compiled> = m.expansions.iter().filter_map(|e| snippets::compile(e).ok()).collect();
+        println!("### expansions.zsh\n{}", snippets::render_table(&rules));
     }
     Ok(())
 }

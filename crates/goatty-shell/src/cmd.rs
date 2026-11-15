@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use goatty_config::{Effective, HostSettings, store};
 
-use crate::builtins::{self, BUILTINS, Builtin};
+use crate::builtins::{self, Builtin};
 use crate::dirs::Dirs;
 use crate::doctor;
 use crate::generation;
@@ -230,8 +230,7 @@ fn outdated_managed(b: &Builtin, dirs: &Dirs, path: Option<&str>, probe: Option<
 fn default_install_targets(host: &Effective<HostSettings>, launcher: &Launcher, dirs: &Dirs) -> Vec<&'static Builtin> {
     let probe = probe_shell(host, launcher);
     let path = std::env::var("PATH").ok();
-    BUILTINS
-        .iter()
+    builtins::tools()
         .filter(|b| host.value.plugin_enabled(b.id))
         .filter(|b| {
             (b.default_install && is_missing(b, dirs, path.as_deref(), probe.as_ref()))
@@ -244,14 +243,14 @@ fn default_install_targets(host: &Effective<HostSettings>, launcher: &Launcher, 
 fn outdated_targets(host: &Effective<HostSettings>, launcher: &Launcher, dirs: &Dirs) -> Vec<&'static Builtin> {
     let probe = probe_shell(host, launcher);
     let path = std::env::var("PATH").ok();
-    BUILTINS.iter().filter(|b| outdated_managed(b, dirs, path.as_deref(), probe.as_ref()).is_some()).collect()
+    builtins::tools().filter(|b| outdated_managed(b, dirs, path.as_deref(), probe.as_ref()).is_some()).collect()
 }
 
 fn resolve_names(names: &[String]) -> Result<Vec<&'static Builtin>> {
     let mut out: Vec<&'static Builtin> = Vec::new();
     for n in names {
         let Some(b) = builtins::find(n) else {
-            let ids: Vec<_> = BUILTINS.iter().map(|b| b.id).collect();
+            let ids: Vec<_> = builtins::tools().map(|b| b.id).collect();
             bail!("{n:?} isn't one of goatty's built-in plugins ({}); other plugins: goattyd plugin install {n}", ids.join(", "));
         };
         if !out.iter().any(|o| o.id == b.id) {
@@ -451,7 +450,7 @@ pub fn uninstall(launcher: &Launcher, names: &[String], all: bool) -> Result<()>
     let plugins = Plugins { dirs, fetch: &fetch, builtin: &[] };
     let retired: Vec<_> = builtins::RETIRED.iter().filter(|(id, _)| all || names.iter().any(|n| n == id)).collect();
     let names: Vec<String> = names.iter().filter(|n| !retired.iter().any(|(id, _)| id == n)).cloned().collect();
-    let list = if all { BUILTINS.iter().collect() } else { resolve_names(&names)? };
+    let list = if all { builtins::tools().collect() } else { resolve_names(&names)? };
     if list.is_empty() && retired.is_empty() {
         bail!("name the tools to remove, or pass --all");
     }

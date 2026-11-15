@@ -1,5 +1,5 @@
 //! The plugins that come with goatty: fzf, fzf-tab, autosuggestions,
-//! Starship and syntax highlighting (`crates/goatty-shell/plugins/<id>/`).
+//! Starship, syntax highlighting, and the Basics snippets (`crates/goatty-shell/plugins/<id>/`).
 //!
 //! They're ordinary plugin manifests, compiled into goatty: same install
 //! plans, settings UI and load-order slots as registry plugins. What's
@@ -46,7 +46,15 @@ pub static BUILTINS: &[Builtin] = &[
     plugin!("autosuggestions", true, ["plugin.toml", "zsh/init.zsh"]),
     plugin!("starship", true, ["plugin.toml", "zsh/init.zsh"]),
     plugin!("syntax-highlighting", true, ["plugin.toml", "zsh/init.zsh"]),
+    // Snippets and expansions only: no tool, nothing to install (#89).
+    plugin!("basics", false, ["plugin.toml"]),
 ];
+
+/// The built-in plugins that bring a tool (a package to install): what
+/// `goattyd shell install`, the welcome window and the diagnostics list.
+pub fn tools() -> impl Iterator<Item = &'static Builtin> {
+    BUILTINS.iter().filter(|b| !b.manifest().packages.is_empty())
+}
 
 /// Packages of plugins that used to come with goatty: (package id, its
 /// executables). goatty's downloads of them stay usable by a registry
