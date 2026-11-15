@@ -34,6 +34,8 @@ _goatty_ok() { _goatty_state[$1]="ok"$'\t'"$2" }
 # --- Options ----------------------------------------------------------------
 setopt auto_cd auto_pushd pushd_ignore_dups pushd_silent
 setopt interactive_comments no_beep
+# Ctrl+S/Ctrl+Q are keys, not XOFF/XON (the PTY has ixon off too).
+setopt no_flow_control
 setopt complete_in_word always_to_end
 
 # --- History (settings: history.*) -------------------------------------------
