@@ -176,6 +176,8 @@ pub enum PaletteEvent {
     Run(Rc<Command>),
     /// Close and call the asker's handler with the answers.
     Answered(input::AnswerHandler, Answers),
+    /// Close and go back to where the asking started (the snippet picker).
+    Back(input::WindowAction),
 }
 
 /// Asking for input: the [`input::Ask`] and where it's at.
@@ -198,6 +200,20 @@ struct Asking {
     base: Option<PathBuf>,
     /// Folder listing and existence check for the current text.
     _work: Option<Task<()>>,
+    preview: Option<input::Preview>,
+    badge: Option<input::Badge>,
+    back: Option<input::WindowAction>,
+    done_label: Option<SharedString>,
+    /// A `multiple` field's values so far.
+    chosen: Vec<String>,
+    /// The user moved through the suggestions with the keyboard since the
+    /// last value was added (a `multiple` field's Enter then adds it).
+    moved: bool,
+    /// A loader's results per step, with the answers they were for.
+    loaded: std::collections::BTreeMap<usize, (String, input::Loaded)>,
+    /// Shown under the field instead of its help: the loader's note.
+    note: Option<SharedString>,
+    _load: Option<Task<()>>,
 }
 
 impl Asking {
@@ -435,7 +451,19 @@ impl CommandPalette {
             home: std::env::var_os("HOME").map(PathBuf::from),
             base: ask.base,
             _work: None,
+            preview: ask.preview,
+            badge: ask.badge,
+            back: ask.back,
+            done_label: ask.done_label,
+            chosen: Vec::new(),
+            moved: false,
+            loaded: Default::default(),
+            note: None,
+            _load: None,
         });
+        if let Some(a) = &mut this.asking {
+            a.answers = ask.answers;
+        }
         if this.asking.as_ref().is_some_and(|a| a.fields.is_empty()) {
             // Nothing to ask: answer right away (after the palette is set up).
             cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.finish_ask(cx)).ok()).detach();
@@ -575,6 +603,11 @@ impl CommandPalette {
             self.start_step(prev, text, cx);
             return;
         }
+        // Back to where the asking started.
+        if let Some(back) = self.asking.as_ref().and_then(|a| a.back.clone()) {
+            cx.emit(PaletteEvent::Back(back));
+            return;
+        }
         // From a host's sessions back to the hosts.
         if matches!(self.scope, Scope::Sessions(_)) {
             self.show_scope(Scope::Hosts, cx);
@@ -616,6 +649,7 @@ impl CommandPalette {
     fn pick(&mut self) {
         if let Some(a) = &mut self.asking {
             a.picked = true;
+            a.moved = true;
         }
     }
 
@@ -632,6 +666,16 @@ impl CommandPalette {
         a.picked = false;
         a.message = None;
         a._work = None;
+        a.moved = false;
+        a.note = None;
+        let multiple = a.fields[step].multiple;
+        // A multiple field's values are chips; the text starts empty.
+        a.chosen = if multiple {
+            text.iter().flat_map(|t| t.split('\n')).filter(|v| !v.is_empty()).map(str::to_string).collect()
+        } else {
+            Vec::new()
+        };
+        let text = if multiple { Some(String::new()) } else { text };
         let spec = &a.fields[step].spec;
         let text = text.or_else(|| spec.default.clone()).unwrap_or_default();
         let placeholder = if spec.placeholder.is_empty() { format!("{}…", spec.label) } else { spec.placeholder.clone() };
@@ -644,6 +688,45 @@ impl CommandPalette {
             input.select_all_text(cx);
         });
         self.ask_changed(&text, cx);
+        self.load_suggestions(step, cx);
+    }
+
+    /// Fetch the suggestions of field `step` if it has a loader (once per
+    /// step and earlier answers).
+    fn load_suggestions(&mut self, step: usize, cx: &mut Context<'_, Self>) {
+        let Some(a) = &mut self.asking else { return };
+        let Some(loader) = a.fields[step].loader.clone() else { return };
+        let key: String = a.fields[..step].iter().map(|f| format!("{}={:?};", f.spec.id, a.answers.get(&f.spec.id))).collect();
+        if let Some((k, loaded)) = a.loaded.get(&step)
+            && *k == key
+        {
+            let loaded = loaded.clone();
+            self.show_loaded(step, loaded, cx);
+            return;
+        }
+        let job = loader(&a.answers);
+        self.status = Some(("Looking for suggestions…".into(), true));
+        a._load = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx.background_executor().spawn(async move { job() }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(a) = &mut this.asking else { return };
+                if a.step != step {
+                    return;
+                }
+                a.loaded.insert(step, (key, loaded.clone()));
+                this.status = None;
+                this.show_loaded(step, loaded, cx);
+            });
+        }));
+        cx.notify();
+    }
+
+    fn show_loaded(&mut self, step: usize, loaded: input::Loaded, cx: &mut Context<'_, Self>) {
+        let Some(a) = &mut self.asking else { return };
+        a.fields[step].suggestions = loaded.items;
+        a.note = loaded.note.map(Into::into);
+        let q = self.query.clone();
+        self.ask_changed(&q, cx);
     }
 
     /// The field's text changed: check it, update the suggestions.
@@ -653,6 +736,11 @@ impl CommandPalette {
         a.picked = a.field().strict();
         let field = a.field().clone();
         a.message = message_for(&field, text, a.tried);
+        if let Some(note) = a.note.clone()
+            && a.message.as_ref().is_none_or(|(_, err)| !err)
+        {
+            a.message = Some((note, false));
+        }
         if field.is_path() {
             self.show_suggestions(Vec::new(), "", cx);
             let Some(a) = &mut self.asking else { return };
@@ -688,7 +776,8 @@ impl CommandPalette {
             }));
             return;
         }
-        let list = field.suggestions.clone();
+        let mut list = field.suggestions.clone();
+        list.retain(|s| !a.chosen.contains(&s.value));
         self.show_suggestions(list, text, cx);
         // A default or earlier answer selects its own choice, not the
         // first fuzzy match (a label may look like another's value).
@@ -741,6 +830,51 @@ impl CommandPalette {
         let Some(a) = &mut self.asking else { return };
         let picked = a.picked.then(|| self.hits.get(self.selected).map(|h| self.commands[h.index].id.to_string())).flatten();
         let field = a.field().clone();
+        if field.multiple {
+            // Enter adds the selected suggestion (or the text); on an empty
+            // field it goes on with the values so far.
+            let typed = !self.query.trim().is_empty();
+            let candidate = match picked {
+                Some(v) if a.moved || typed => Some(v),
+                _ if typed && !field.strict() => Some(self.query.clone()),
+                _ if typed => {
+                    a.tried = true;
+                    a.message = Some(("Pick one from the list".into(), true));
+                    cx.notify();
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(v) = candidate {
+                match field.validate(&v) {
+                    Ok(v) if !v.is_empty() => {
+                        if !a.chosen.contains(&v) {
+                            a.chosen.push(v);
+                        }
+                        a.moved = false;
+                        a.tried = false;
+                        self.input.update(cx, |input, cx| input.set_text("", cx));
+                        self.ask_changed("", cx);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        a.tried = true;
+                        a.message = Some((e.into(), true));
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+            if a.chosen.is_empty() && !field.spec.optional {
+                a.tried = true;
+                a.message = Some(("Add at least one".into(), true));
+                cx.notify();
+                return;
+            }
+            let value = a.chosen.join("\n");
+            self.accept(value, cx);
+            return;
+        }
         let text = match picked {
             Some(v) => v,
             None if field.strict() => {
@@ -785,6 +919,14 @@ impl CommandPalette {
                 }
             });
         }));
+    }
+
+    /// Remove a `multiple` field's value (its chip was clicked).
+    fn unchoose(&mut self, value: &str, cx: &mut Context<'_, Self>) {
+        let Some(a) = &mut self.asking else { return };
+        a.chosen.retain(|v| v != value);
+        let q = self.query.clone();
+        self.ask_changed(&q, cx);
     }
 
     /// Keep `value` for the current field and go on.
@@ -953,6 +1095,7 @@ impl CommandPalette {
                 self.fill_suggestion(ix, cx);
             } else {
                 a.picked = true;
+                a.moved = true;
                 self.select(ix, cx);
                 self.submit_answer(cx);
             }
@@ -1137,8 +1280,32 @@ impl Render for CommandPalette {
             .rounded_lg()
             .shadow_lg()
             .overflow_hidden()
-            .when_some(self.asking.as_ref(), |d, a| d.child(ask_header(a, ui)))
+            .when_some(self.asking.as_ref(), |d, a| {
+                let mono = cx.global::<AppSettings>().client.font.family.clone().unwrap_or_else(|| "monospace".into());
+                d.child(ask_header(a, &self.query, ui, mono.into()))
+            })
             .child(div().p_2().when(self.asking.is_some(), |d| d.pt_0()).child(self.input.clone()))
+            .when_some(self.asking.as_ref().filter(|a| !a.chosen.is_empty()), |d, a| {
+                d.child(div().px_3().flex().flex_wrap().gap_1().children(a.chosen.iter().enumerate().map(|(i, v)| {
+                    let value = v.clone();
+                    div()
+                        .id(("chosen", i))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded(px(crate::ui::style::radius::SMALL))
+                        .bg(ui.accent_soft)
+                        .text_color(ui.accent_text)
+                        .text_xs()
+                        .cursor_pointer()
+                        .tooltip(crate::ui::controls::tooltip("Remove"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.unchoose(&value, cx)))
+                        .child(v.clone())
+                        .child(Icon::Close.svg().size(px(10.)).text_color(ui.accent_text))
+                })))
+            })
             .when_some(self.asking.as_ref().and_then(|a| a.message.clone()), |d, (text, error)| {
                 d.child(
                     div()
@@ -1167,8 +1334,14 @@ impl Render for CommandPalette {
             })
             .when_some(self.asking.as_ref(), |d, a| {
                 let last = a.step + 1 == a.fields.len();
-                let mut hint =
-                    format!("Enter: {} · Esc: {}", if last { "done" } else { "next" }, if a.step > 0 { "back" } else { "cancel" });
+                let done = a.done_label.clone().unwrap_or_else(|| "done".into());
+                let next: SharedString = if last { done } else { "next".into() };
+                let back = if a.step > 0 || a.back.is_some() { "back" } else { "cancel" };
+                let mut hint = if a.field().multiple {
+                    format!("Enter: add · Enter on an empty field: {next} · Esc: {back}")
+                } else {
+                    format!("Enter: {next} · Esc: {back}")
+                };
                 if !self.hits.is_empty() {
                     hint.push_str(if a.field().strict() { " · ↑↓: pick" } else { " · ↑↓: pick · Tab: fill in" });
                 }
@@ -1204,18 +1377,102 @@ fn message_for(field: &Field, text: &str, tried: bool) -> Option<(SharedString, 
     }
 }
 
-/// The title of what's being asked, the field's label and the step.
-fn ask_header(a: &Asking, ui: Ui) -> impl IntoElement {
+/// The title of what's being asked (with its badge), the finished line
+/// so far, the field's label and the step.
+fn ask_header(a: &Asking, text: &str, ui: Ui, mono: SharedString) -> impl IntoElement {
     let steps = (a.fields.len() > 1).then(|| format!("{} of {}", a.step + 1, a.fields.len()));
-    div().px_4().pt_2().pb_1().flex().flex_col().gap_0p5().child(div().text_xs().text_color(ui.muted).child(a.title.clone())).child(
-        div()
-            .flex()
-            .justify_between()
-            .items_baseline()
-            .gap_2()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(a.field().spec.label.clone()))
-            .when_some(steps, |d, s| d.child(div().text_xs().text_color(ui.muted).child(s))),
-    )
+    let current = a.field().spec.id.clone();
+    let preview = a.preview.as_ref().map(|p| {
+        // The field being typed shows its text as it'll be inserted.
+        let segs = p(&a.answers, &current, text);
+        preview_line(&segs, ui, mono)
+    });
+    div()
+        .px_4()
+        .pt_2()
+        .pb_1()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(div().text_xs().text_color(ui.muted).child(a.title.clone()))
+                .when_some(a.badge.clone(), |d, b| d.child(badge(&b, ui))),
+        )
+        .when_some(preview, |d, p| d.child(p))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_baseline()
+                .gap_2()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(a.field().spec.label.clone()))
+                .when_some(steps, |d, s| d.child(div().text_xs().text_color(ui.muted).child(s))),
+        )
+}
+
+/// A command line with its blanks: filled values stand out, the blank
+/// being asked is highlighted, the others are dim.
+pub fn preview_line(segs: &[goatty_plugin::snippets::Seg], ui: Ui, mono: SharedString) -> gpui::Div {
+    use goatty_plugin::snippets::Seg;
+    let mut text = String::new();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for seg in segs {
+        let start = text.len();
+        text.push_str(&seg.text());
+        let style = match seg {
+            Seg::Text(_) => None,
+            Seg::Value { .. } => {
+                Some(HighlightStyle { color: Some(ui.accent_text), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() })
+            }
+            Seg::Blank { current: true, .. } => {
+                Some(HighlightStyle { color: Some(ui.on_accent), background_color: Some(ui.accent), ..Default::default() })
+            }
+            Seg::Blank { .. } => Some(HighlightStyle { color: Some(ui.faint), ..Default::default() }),
+        };
+        if let Some(st) = style
+            && text.len() > start
+        {
+            highlights.push((start..text.len(), st));
+        }
+    }
+    div()
+        .w_full()
+        .px_2()
+        .py_1p5()
+        .rounded(px(crate::ui::style::radius::SMALL))
+        .bg(ui.field)
+        .font_family(mono)
+        .text_sm()
+        .flex()
+        .gap_2()
+        .child(div().flex_none().text_color(ui.faint).child("$"))
+        .child(div().flex_1().min_w_0().text_color(ui.text).child(StyledText::new(text).with_highlights(highlights)))
+}
+
+/// A small colored label.
+pub fn badge(b: &input::Badge, ui: Ui) -> impl IntoElement {
+    let color = match b.tone {
+        input::Tone::Good => ui.success,
+        input::Tone::Warn => ui.warning,
+        input::Tone::Danger => ui.danger,
+    };
+    div()
+        .id(SharedString::from(format!("badge-{}", b.text)))
+        .flex_none()
+        .px_1p5()
+        .rounded(px(crate::ui::style::radius::SMALL))
+        .border_1()
+        .border_color(color.opacity(0.5))
+        .bg(color.opacity(0.12))
+        .text_color(color)
+        .text_size(px(crate::ui::style::text::CAPTION))
+        .tooltip(crate::ui::controls::tooltip(b.tooltip.clone()))
+        .child(b.text.clone())
 }
 
 fn placeholder(scope: &Scope) -> SharedString {

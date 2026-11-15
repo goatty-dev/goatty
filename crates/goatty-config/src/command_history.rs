@@ -81,6 +81,12 @@ pub fn history_file() -> Option<PathBuf> {
     state_dir_from(|k| std::env::var(k).ok()).map(|d| d.join("command-history.json"))
 }
 
+/// The snippets the user filled in recently (same format, ids like
+/// `<host>/<owner>.<snippet>`), so the snippet picker lists them first.
+pub fn snippet_history_file() -> Option<PathBuf> {
+    state_dir_from(|k| std::env::var(k).ok()).map(|d| d.join("snippet-history.json"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

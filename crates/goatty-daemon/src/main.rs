@@ -59,6 +59,9 @@ enum Cmd {
     /// Aliases in goatty's shells on this host: yours and the ones plugins bring.
     #[command(subcommand)]
     Alias(AliasCmd),
+    /// Snippets (commands with blanks) and expansions on this host: yours and the plugins'.
+    #[command(subcommand)]
+    Snippet(SnippetCmd),
     /// Print the completion script for SHELL (goatty's managed zsh has it already).
     Completions {
         #[arg(value_enum)]
@@ -74,6 +77,45 @@ enum ServiceCmd {
     Uninstall,
     /// Whether the units are installed and running, and whether lingering is on.
     Status,
+}
+
+#[derive(Subcommand)]
+enum SnippetCmd {
+    /// Your snippets, then each plugin's, and the expansions.
+    List,
+    /// One snippet: its line, blanks and where it comes from.
+    Show {
+        id: String,
+        /// The plugin's snippet with that id (default: the first found, yours first).
+        #[arg(short, long)]
+        plugin: Option<String>,
+    },
+    /// Add a snippet: `goattyd snippet add "Find big files" 'du -ah {dir} | sort -rh | head -n {count}'`.
+    /// Every {name} becomes a blank goatty asks for.
+    Add {
+        title: String,
+        line: String,
+        #[arg(short, long)]
+        description: Option<String>,
+        /// A topic to filter by (repeatable).
+        #[arg(short, long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Remove snippets or expansions of yours.
+    #[command(visible_alias = "rm")]
+    Remove {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Write your snippets and expansions as TOML (to stdout without FILE).
+    Export { file: Option<std::path::PathBuf> },
+    /// Add the snippets and expansions of a TOML file to yours.
+    Import {
+        file: std::path::PathBuf,
+        /// Replace the ones you have with the same id.
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -287,12 +329,14 @@ fn main() -> Result<()> {
     }
     // The proxy's stderr goes back over ssh into the GUI's log: keep it quiet.
     // Silence rio_vt's [unhandled osc_dispatch] warnings (e.g. systemd OSC 3008) by default (#20).
-    let default_level =
-        if matches!(cmd, Cmd::Proxy | Cmd::RestoreVersion | Cmd::Shell(_) | Cmd::Settings(_) | Cmd::Plugin(_) | Cmd::Alias(_)) {
-            "warn,rio_vt=error"
-        } else {
-            "info,rio_vt=error"
-        };
+    let default_level = if matches!(
+        cmd,
+        Cmd::Proxy | Cmd::RestoreVersion | Cmd::Shell(_) | Cmd::Settings(_) | Cmd::Plugin(_) | Cmd::Alias(_) | Cmd::Snippet(_)
+    ) {
+        "warn,rio_vt=error"
+    } else {
+        "info,rio_vt=error"
+    };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 
     match cmd {
@@ -400,6 +444,18 @@ fn main() -> Result<()> {
                 AliasCmd::Remove { names } => cmd::remove(&svc, &names),
                 AliasCmd::Enable { names, group, plugin } => cmd::set_enabled(&svc, cmd::Selection { names, group, plugin }, true),
                 AliasCmd::Disable { names, group, plugin } => cmd::set_enabled(&svc, cmd::Selection { names, group, plugin }, false),
+            }
+        }
+        Cmd::Snippet(cmd) => {
+            use goatty_shell::snippet_cmd as cmd;
+            let svc = goatty_shell::HostService::from_env(std::env::current_exe().ok());
+            match cmd {
+                SnippetCmd::List => cmd::list(&svc),
+                SnippetCmd::Show { id, plugin } => cmd::show(&svc, &id, plugin.as_deref()),
+                SnippetCmd::Add { title, line, description, tags } => cmd::add(&svc, &title, &line, description.as_deref(), &tags),
+                SnippetCmd::Remove { ids } => cmd::remove(&svc, &ids),
+                SnippetCmd::Export { file } => cmd::export(&svc, file.as_deref()),
+                SnippetCmd::Import { file, force } => cmd::import(&svc, &file, force),
             }
         }
         Cmd::Shell(cmd) => {

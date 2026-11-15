@@ -196,6 +196,12 @@ pub fn builtins() -> Vec<Command> {
             &["alias", "abbreviations", "commands", "shorthand"],
         ),
         page(
+            "settings.snippets",
+            "Snippets: add and edit snippets and expansions",
+            Page::Snippets,
+            &["snippet", "expansion", "cheatsheet", "template", "abbreviation"],
+        ),
+        page(
             "plugins.open",
             "Plugins: browse, install and configure",
             Page::Plugins,
@@ -255,6 +261,19 @@ pub fn builtins() -> Vec<Command> {
             toast::show(cx, Toast::info("Opening the themes folder").body(dir.display().to_string()).key("themes.open_folder"));
         })
         .keywords(&["directory", "files"]),
+        Command::action("snippets.find", "Snippets", "Find and fill in a command", "snippets").keywords(&[
+            "cheatsheet",
+            "how do i",
+            "help",
+            "template",
+            "recipe",
+            "example",
+            "commands",
+            "tldr",
+            "navi",
+        ]),
+        Command::handler("snippets.save_last", "Snippets", "Save the last command as a snippet…", crate::snippets::save_last)
+            .keywords(&["new", "add", "create", "remember", "history", "template"]),
         Command::action("ssh.connect", "SSH", "Connect to a host…", "connect_to_host")
             .keywords(&["remote", "server", "hosts", "goattyd", "open"]),
         Command::action("session.list", "Sessions", "Sessions on this host…", "list_sessions")

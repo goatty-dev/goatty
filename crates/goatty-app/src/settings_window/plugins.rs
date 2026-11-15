@@ -264,6 +264,7 @@ impl SettingsWindow {
         self.load_plugins(false, cx);
         // Its palette commands come or go.
         crate::plugin_commands::refresh(cx);
+        crate::snippets::refresh(cx);
         if let Some(rid) = return_id
             && let Some(back) = self.plugins.take_plan_return(rid)
         {
@@ -1139,6 +1140,8 @@ fn perm_icon(p: Permission) -> Icon {
         Permission::Env => Icon::Sliders,
         Permission::ConfigFiles => Icon::FileText,
         Permission::Commands => Icon::SquareTerminal,
+        Permission::Snippets => Icon::TextCursorInput,
+        Permission::SnippetSources => Icon::Zap,
     }
 }
 

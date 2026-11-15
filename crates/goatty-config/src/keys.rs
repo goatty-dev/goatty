@@ -42,6 +42,7 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "open_settings", label: "Open settings", group: "goatty" },
     ActionInfo { name: "command_palette", label: "Show the command palette", group: "goatty" },
     ActionInfo { name: "connect_to_host", label: "Connect to a host (SSH)", group: "goatty" },
+    ActionInfo { name: "snippets", label: "Find a snippet and fill it in", group: "goatty" },
     ActionInfo { name: "list_sessions", label: "Sessions on this host (open or end one)", group: "goatty" },
     ActionInfo { name: "reload_shells", label: "Reload running shells with new shell settings", group: "goatty" },
     // Unbound by default: Escape belongs to the terminal (#86).
@@ -111,6 +112,7 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl-,", "open_settings"),
     ("ctrl-shift-p", "command_palette"),
     ("ctrl-shift-h", "connect_to_host"),
+    ("ctrl-shift-s", "snippets"),
     // Tabs. Alt+digit and Alt+arrows fall through to the shell when there's
     // no such tab or pane, so a single pane loses nothing.
     ("ctrl-shift-t", "new_tab"),

@@ -557,6 +557,8 @@ mod tests {
                 env: Vec::new(),
                 aliases: Vec::new(),
                 files: Vec::new(),
+                snippets: Vec::new(),
+                expansions: Vec::new(),
                 settings: Vec::new(),
                 commands: Vec::new(),
                 permissions: Default::default(),

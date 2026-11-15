@@ -487,6 +487,14 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Put `line` on the prompt at the cursor, without pressing Enter: a
+    /// snippet the user filled in, to read and run. Nothing typed there is
+    /// cleared. It goes through the paste check like any paste, so a
+    /// `curl … | sh` still asks first.
+    pub fn insert_line(&mut self, line: &str, cx: &mut Context<'_, Self>) {
+        self.paste_checked(Some(line.to_string()), cx);
+    }
+
     /// Type `line` at the prompt and press Enter: a command the user
     /// picked in the palette (a plugin's). Whatever was typed at the prompt
     /// is cleared first (Ctrl+E, Ctrl+U: zsh's and bash's emacs keys; it

@@ -794,6 +794,50 @@ fn command_safety(cmd: &[&str]) -> Safety {
     }
 }
 
+/// `title` as an id for the user's own: `Find big files` →
+/// `find-big-files`, `-2`, `-3`… when `taken`.
+pub fn id_from(title: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    let mut s = String::new();
+    for c in title.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c);
+        } else if !s.ends_with('-') && !s.is_empty() {
+            s.push('-');
+        }
+    }
+    let mut s: String = s.trim_end_matches('-').chars().take(32).collect();
+    if s.is_empty() || !s.as_bytes()[0].is_ascii_lowercase() {
+        s.insert_str(0, "my-");
+    }
+    let s = s.trim_end_matches('-').to_string();
+    if !taken(&s) {
+        return s;
+    }
+    (2..).map(|n| format!("{s}-{n}")).find(|c| !taken(c)).unwrap_or(s)
+}
+
+/// Snippets and expansions as a file (`goattyd snippet export`, the
+/// settings window's export): the manifest's `[[snippet]]` and
+/// `[[expansion]]` tables on their own.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pack {
+    #[serde(default, rename = "snippet", skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<Snippet>,
+    #[serde(default, rename = "expansion", skip_serializing_if = "Vec::is_empty")]
+    pub expansions: Vec<Expansion>,
+}
+
+impl Pack {
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).unwrap_or_default()
+    }
+
+    pub fn from_toml(text: &str) -> Result<Pack, String> {
+        toml::from_str(text).map_err(|e| e.message().to_string())
+    }
+}
+
 // ---- sources -------------------------------------------------------------------
 
 /// One suggestion from a source.
