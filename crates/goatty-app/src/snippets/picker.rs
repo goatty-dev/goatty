@@ -372,7 +372,9 @@ impl SnippetPicker {
 
     fn render_preview(&self, ui: Ui, mono: SharedString) -> gpui::AnyElement {
         let Some(s) = self.selected_snippet() else { return div().into_any_element() };
-        let values: goatty_plugin::snippets::Answers = Default::default();
+        // With the defaults filled in: the likely command.
+        let values: goatty_plugin::snippets::Answers =
+            s.snippet.inputs.iter().filter_map(|i| i.default.clone().map(|d| (i.id.clone(), d))).collect();
         let segs = s.snippet.preview(&values, None);
         let safety = s.snippet.safety();
         let blanks = s.snippet.inputs.len();

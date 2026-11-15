@@ -678,6 +678,9 @@ impl CommandPalette {
         let text = if multiple { Some(String::new()) } else { text };
         let spec = &a.fields[step].spec;
         let text = text.or_else(|| spec.default.clone()).unwrap_or_default();
+        // A pick-from-list field lists everything with its value selected;
+        // the text only filters.
+        let (text, preselect) = if a.fields[step].strict() && !multiple { (String::new(), Some(text)) } else { (text, None) };
         let placeholder = if spec.placeholder.is_empty() { format!("{}…", spec.label) } else { spec.placeholder.clone() };
         let label = spec.label.clone();
         self.input.update(cx, |input, cx| {
@@ -688,6 +691,11 @@ impl CommandPalette {
             input.select_all_text(cx);
         });
         self.ask_changed(&text, cx);
+        if let Some(value) = preselect
+            && let Some(ix) = self.hits.iter().position(|h| self.commands[h.index].id == value)
+        {
+            self.select(ix, cx);
+        }
         self.load_suggestions(step, cx);
     }
 
@@ -802,7 +810,9 @@ impl CommandPalette {
         self.listed = self.commands.len();
         self.labels = self.commands.iter().map(|c| SharedString::from(c.label())).collect();
         self.shortcuts = vec![Vec::new(); self.commands.len()];
-        let values: Vec<[SharedString; 1]> = self.commands.iter().map(|c| [c.id.clone()]).collect();
+        // Found by label, value or detail (a process by its name or id).
+        let values: Vec<Vec<SharedString>> =
+            self.commands.iter().map(|c| std::iter::once(c.id.clone()).chain(c.detail.clone()).collect()).collect();
         let entries: Vec<Entry<'_>> = self
             .labels
             .iter()
@@ -1282,7 +1292,13 @@ impl Render for CommandPalette {
             .overflow_hidden()
             .when_some(self.asking.as_ref(), |d, a| {
                 let mono = cx.global::<AppSettings>().client.font.family.clone().unwrap_or_else(|| "monospace".into());
-                d.child(ask_header(a, &self.query, ui, mono.into()))
+                // What a pick-from-list field answers is the selected entry, not the filter text.
+                let text = if a.field().strict() {
+                    self.hits.get(self.selected).map(|h| self.commands[h.index].id.to_string()).unwrap_or_default()
+                } else {
+                    self.query.clone()
+                };
+                d.child(ask_header(a, &text, ui, mono.into()))
             })
             .child(div().p_2().when(self.asking.is_some(), |d| d.pt_0()).child(self.input.clone()))
             .when_some(self.asking.as_ref().filter(|a| !a.chosen.is_empty()), |d, a| {

@@ -268,6 +268,7 @@ fn parses_source_output() {
         split: Some("\t".into()),
         column: None,
         detail: None,
+        label: None,
         skip: 0,
         cwd: SourceCwd::Pane,
         on_fail: None,
@@ -281,11 +282,15 @@ fn parses_source_output() {
     );
     let ps = Source { split: Some(" ".into()), column: Some(2), detail: Some(1), skip: 1, ..src.clone() };
     let (items, _) = parse_output("  PID COMMAND\n  12 zsh\n 345  cargo build\n", &ps);
-    assert_eq!(items[0], Item { value: "zsh".into(), detail: Some("12".into()) });
-    assert_eq!(items[1], Item { value: "cargo".into(), detail: Some("345".into()) });
+    assert_eq!(items[0], Item { value: "zsh".into(), label: None, detail: Some("12".into()) });
+    assert_eq!(items[1], Item { value: "cargo".into(), label: None, detail: Some("345".into()) });
+    // A process id to insert, its name to show and search.
+    let pids = Source { split: Some(" ".into()), column: Some(1), label: Some(2), ..src.clone() };
+    let (items, _) = parse_output("  12 zsh\n", &pids);
+    assert_eq!(items[0], Item { value: "12".into(), label: Some("zsh".into()), detail: None });
     let plain = Source { split: None, ..src.clone() };
     let (items, _) = parse_output(" a b \n", &plain);
-    assert_eq!(items, [Item { value: "a b".into(), detail: None }]);
+    assert_eq!(items, [Item { value: "a b".into(), label: None, detail: None }]);
     let many: String = (0..MAX_ITEMS + 5).map(|i| format!("{i}\n")).collect();
     let (items, more) = parse_output(&many, &plain);
     assert!(more && items.len() == MAX_ITEMS);

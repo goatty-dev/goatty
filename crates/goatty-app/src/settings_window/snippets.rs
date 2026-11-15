@@ -360,6 +360,7 @@ impl SettingsWindow {
                             split: None,
                             column: None,
                             detail: None,
+                            label: None,
                             skip: 0,
                             cwd: Default::default(),
                             on_fail: None,

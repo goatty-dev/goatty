@@ -186,7 +186,19 @@ pub fn ask_for(hs: &HostSnippet, link: &HostLink, cwd: Option<PathBuf>, back: Op
 fn suggestions(reply: anyhow::Result<Reply>) -> Loaded {
     match reply {
         Ok(Reply::Suggestions(s)) => Loaded {
-            items: s.items.into_iter().map(|i| Suggestion { label: i.value.clone(), value: i.value, detail: i.detail }).collect(),
+            items: s
+                .items
+                .into_iter()
+                .map(|i| {
+                    // A shown label (a process name) puts the value (its id) in the detail.
+                    let detail = match (&i.label, i.detail) {
+                        (Some(_), Some(d)) => Some(format!("{}  {d}", i.value)),
+                        (Some(_), None) => Some(i.value.clone()),
+                        (None, d) => d,
+                    };
+                    Suggestion { label: i.label.unwrap_or_else(|| i.value.clone()), value: i.value, detail }
+                })
+                .collect(),
             note: s.note,
         },
         Ok(_) => Loaded { items: Vec::new(), note: Some("Unexpected reply from the host".into()) },

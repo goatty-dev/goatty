@@ -349,13 +349,14 @@ line = "kill {force} {pid}"
 [[snippet.input]]
 id = "pid"
 label = "Program"
-help = "Type part of its name; the number is its process id"
+help = "Type part of its name: your running programs, with their process id"
 strict = true
 [snippet.input.source]
-run = ["ps", "-eo", "pid=,comm="]
+# Your own programs (BSD-style `x`: with or without a terminal), id and name.
+run = ["ps", "x", "-o", "pid=,comm="]
 split = " "
 column = 1
-detail = 2
+label = 2
 
 [[snippet.input]]
 id = "force"

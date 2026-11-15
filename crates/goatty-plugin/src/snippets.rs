@@ -207,6 +207,10 @@ pub struct Source {
     /// The column shown dimmed next to it (default: the other columns).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<usize>,
+    /// The column shown (and searched) instead of the value: a process
+    /// name for a process id (the value is still what's inserted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<usize>,
     /// Header lines to skip (`docker ps` has one).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skip: usize,
@@ -844,6 +848,9 @@ impl Pack {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub value: String,
+    /// Shown instead of the value (the source's `label` column).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Shown dimmed next to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -913,18 +920,25 @@ pub fn parse_output(stdout: &str, src: &Source) -> (Vec<Item>, bool) {
         if value.chars().any(char::is_control) || !seen.insert(value.to_string()) {
             continue;
         }
+        let label_col = src.label.map(|l| l.max(1) - 1);
+        let label = label_col.and_then(|l| cols.get(l)).map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
         let detail = match src.detail {
             Some(d) => cols.get(d.max(1) - 1).map(|d| d.trim().to_string()),
-            None if cols.len() > 1 => {
-                Some(cols.iter().enumerate().filter(|(i, _)| *i != col).map(|(_, c)| c.trim()).collect::<Vec<_>>().join("  "))
-            }
+            None if cols.len() > 1 => Some(
+                cols.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != col && Some(*i) != label_col)
+                    .map(|(_, c)| c.trim())
+                    .collect::<Vec<_>>()
+                    .join("  "),
+            ),
             None => None,
         }
         .filter(|d| !d.is_empty());
         if out.len() == MAX_ITEMS {
             return (out, true);
         }
-        out.push(Item { value: value.to_string(), detail });
+        out.push(Item { value: value.to_string(), label, detail });
     }
     (out, false)
 }
@@ -1095,7 +1109,7 @@ fn check_source(s: &Snippet, index: usize, src: &Source, at: &str, owner: Owner<
     if src.split.as_deref() == Some("") {
         err(format!("{at}.split"), "empty: leave it out for one value per line".into());
     }
-    if src.column == Some(0) || src.detail == Some(0) {
+    if src.column == Some(0) || src.detail == Some(0) || src.label == Some(0) {
         err(format!("{at}.column"), "columns count from 1".into());
     }
     if let Some(t) = src.timeout
