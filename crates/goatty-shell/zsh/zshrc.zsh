@@ -213,8 +213,28 @@ goatty-status() {
   done
 }
 
-# Install the missing tools of goatty's built-in plugins into goatty's data
-# directory (no sudo), then reload. Named ones (`goatty-setup fzf`) too.
+# Outdated managed tools: built-in plugins whose loaded copy lives under
+# $_goatty_tools at a version other than $_goatty_pins[$k]. Sets $reply
+# (pure zsh, no subprocesses).
+_goatty_outdated_tools() {
+  reply=()
+  local tools_real=${_goatty_tools:A} k v detail rel rest ver
+  for k in ${(ko)_goatty_pins}; do
+    v=${_goatty_state[$k]-}
+    [[ $v == ok$'\t'* ]] || continue
+    detail=${${v#ok$'\t'}:A}
+    [[ $detail == "$tools_real"/* ]] || continue
+    rel=${detail#"$tools_real"/}
+    rest=${rel#*/}
+    [[ $rest == */* ]] || continue
+    ver=${rest%%/*}
+    [[ -n $ver && $ver != $_goatty_pins[$k] ]] && reply+=($k)
+  done
+}
+
+# Install the missing tools (and update outdated managed copies) of goatty's
+# built-in plugins into goatty's data directory (no sudo), then reload.
+# Named ones (`goatty-setup fzf`) too.
 goatty-setup() {
   local daemon=${_goatty_daemon:-goattyd}
   if [[ $1 == --dismiss ]]; then
@@ -222,12 +242,16 @@ goatty-setup() {
     return
   fi
   if (( $# == 0 )); then
-    local -a missing=(${(ko)_goatty_state[(R)missing]})
-    set -- ${missing:*_goatty_setup_defaults}
-    if (( $# == 0 )); then
-      builtin print -r -- "goatty: nothing to install (see goatty-status)"
-      return 0
+    local -a reply missing=(${(ko)_goatty_state[(R)missing]})
+    missing=(${missing:*_goatty_setup_defaults})
+    _goatty_outdated_tools
+    local -aU todo=($missing $reply)
+    todo=(${(o)todo})
+    if (( ${#todo} == 0 )); then
+      "$daemon" shell install && goatty-reload
+      return
     fi
+    set -- $todo
   fi
   "$daemon" shell install -- "$@" && goatty-reload
 }
@@ -295,14 +319,30 @@ fi
 builtin autoload -Uz add-zsh-hook
 add-zsh-hook precmd _goatty_reload_requested
 
-# --- Missing-tools hint -----------------------------------------------------
-# Quiet once dismissed, once goatty's window offered the install, and in
-# sessions of a goatty window that offers it itself (GOATTY_GUI_SETUP).
+# --- Missing/outdated-tools hint --------------------------------------------
+# Missing tools stay quiet once dismissed, once goatty's window offered the
+# install, and in sessions of a goatty window that offers it itself
+# (GOATTY_GUI_SETUP). Outdated managed tools still notify unless dismissed or
+# inside a GUI window that offers the setup itself.
 () {
-  local -a missing=(${(ko)_goatty_state[(R)missing]})
-  missing=(${missing:*_goatty_setup_defaults})
-  (( $#missing )) && [[ -t 1 && -z $GOATTY_GUI_SETUP && ! -e $_goatty_hint_marker && ! -e $_goatty_offer_marker ]] || return 0
-  builtin print -r -- $'\e[33mgoatty:\e[0m not installed: '"${(j:, :)missing}"$'. Run \e[1mgoatty-setup\e[0m to install (user space, no sudo), \e[1mgoatty-setup --dismiss\e[0m to hide this.'
+  local -a reply missing outdated
+  if [[ ! -e $_goatty_offer_marker ]]; then
+    missing=(${(ko)_goatty_state[(R)missing]})
+    missing=(${missing:*_goatty_setup_defaults})
+  fi
+  _goatty_outdated_tools
+  outdated=($reply)
+  (( $#missing || $#outdated )) && [[ -t 1 && -z $GOATTY_GUI_SETUP && ! -e $_goatty_hint_marker ]] || return 0
+  local -a parts
+  (( $#missing )) && parts+=("not installed: ${(j:, :)missing}")
+  (( $#outdated )) && parts+=("outdated: ${(j:, :)outdated}")
+  local action=install
+  if (( $#missing && $#outdated )); then
+    action='install/update'
+  elif (( $#outdated )); then
+    action=update
+  fi
+  builtin print -r -- $'\e[33mgoatty:\e[0m '"${(j:; :)parts}"$'. Run \e[1mgoatty-setup\e[0m to '"$action"$' (user space, no sudo), \e[1mgoatty-setup --dismiss\e[0m to hide this.'
 }
 
 # --- Done --------------------------------------------------------------------

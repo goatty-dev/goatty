@@ -34,7 +34,7 @@ enum Cmd {
     /// Run goattyd as a systemd user service (socket-activated).
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// goatty's managed zsh on this host: status, tool installs.
+    /// goatty's managed zsh on this host: status, tool installs and updates.
     #[command(subcommand)]
     Shell(ShellCmd),
     /// This host's settings (host.json: shell, prompt, history).
@@ -214,9 +214,18 @@ enum ShellCmd {
     /// What the managed shell loads, what's missing, and its startup time.
     Status,
     /// Install the tools of goatty's built-in plugins into goatty's data
-    /// directory (no sudo). Without names: the default ones the shell is
-    /// missing (what `goatty-setup` runs).
+    /// directory (no sudo). Without names: missing default ones plus outdated
+    /// managed copies (what `goatty-setup` runs).
     Install {
+        /// Built-in plugins: fzf, fzf-tab, autosuggestions, syntax-highlighting, starship.
+        tools: Vec<String>,
+        /// Don't ask before downloading.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Update goatty's managed copies of built-in plugins' tools to the pinned
+    /// versions (no sudo). Without names: all outdated managed copies.
+    Update {
         /// Built-in plugins: fzf, fzf-tab, autosuggestions, syntax-highlighting, starship.
         tools: Vec<String>,
         /// Don't ask before downloading.
@@ -367,6 +376,7 @@ fn main() -> Result<()> {
             match cmd {
                 ShellCmd::Status => cmd::status(&goatty_shell::HostService::from_env(std::env::current_exe().ok())),
                 ShellCmd::Install { tools, yes } => cmd::install(&host, &launcher, &tools, yes),
+                ShellCmd::Update { tools, yes } => cmd::update(&host, &launcher, &tools, yes),
                 ShellCmd::Generations => cmd::generations(&launcher),
                 ShellCmd::Name { generation, name } => cmd::name(&launcher, generation, &name),
                 ShellCmd::Diff { generation } => cmd::diff(&host, &launcher, generation),
