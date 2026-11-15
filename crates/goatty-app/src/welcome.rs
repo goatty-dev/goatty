@@ -5,7 +5,8 @@
 //! 1. **Look**: a theme (or follow the desktop's light/dark) and the text size.
 //! 2. **Shell**: goatty's built-in tools on the window's host, preselected
 //!    when missing, installed with progress (no sudo, pinned checksums),
-//!    and the prompt style.
+//!    whether to import what the user's own `.zshrc`/`.bashrc` sets up
+//!    (opt-in; shown when they have one), and the prompt style.
 //! 3. **Ready**: the few shortcuts worth knowing, links onward.
 //!
 //! It opens by itself once, on the very first start (no client settings
@@ -145,6 +146,12 @@ pub struct Welcome {
     /// Applying a prompt style change.
     saving: bool,
     prompt_error: Option<String>,
+    /// What importing the user's shell setup would bring (`None`: not asked yet).
+    import: Option<goatty_shell::import::Status>,
+    /// The host runs the user's shell to see what it sets up.
+    import_checking: bool,
+    import_saving: bool,
+    import_error: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -183,6 +190,10 @@ impl Welcome {
             host: None,
             saving: false,
             prompt_error: None,
+            import: None,
+            import_checking: false,
+            import_saving: false,
+            import_error: None,
             _subs: subs,
         }
     }
@@ -227,8 +238,12 @@ impl Welcome {
                 match result {
                     Ok((status, host)) => {
                         v.chosen = status.offer().map(|t| t.id.clone()).collect();
+                        let managed = status.managed;
                         v.status = Some(status);
                         v.host = host;
+                        if managed {
+                            v.load_import(cx);
+                        }
                     }
                     Err(e) => v.error = Some(format!("{e:#}")),
                 }
@@ -236,6 +251,128 @@ impl Welcome {
             });
         })
         .detach();
+    }
+
+    /// What the user's own startup files set up: asked first, then (when
+    /// nothing was checked yet) the host runs their shell once to find out.
+    fn load_import(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(link) = self.link.clone() else { return };
+        self.import_checking = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let first = link.clone();
+            let status = cx.background_executor().spawn(async move { first.import_status(false) }).await;
+            let check = matches!(&status, Ok(s) if s.harvest.is_none() && s.source.is_some() && s.files.iter().any(|f| f.exists));
+            let _ = this.update(cx, |v, cx| {
+                v.import = status.ok();
+                v.import_checking = check;
+                cx.notify();
+            });
+            if check {
+                let status = cx.background_executor().spawn(async move { link.import_status(true) }).await;
+                let _ = this.update(cx, |v, cx| {
+                    if let Ok(s) = status {
+                        v.import = Some(s);
+                    }
+                    v.import_checking = false;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Turn the import on or off on the host (a new generation; running
+    /// shells reload).
+    fn set_import(&mut self, on: bool, cx: &mut Context<'_, Self>) {
+        let Some(link) = self.link.clone() else { return };
+        if self.import_saving {
+            return;
+        }
+        if let Some(s) = self.import.as_mut() {
+            s.enabled = on;
+        }
+        self.import_saving = true;
+        self.import_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let loaded = store::parse::<HostSettings>(&link.get()?.json);
+                    let mut value = loaded.value;
+                    value.shell.import.enabled = on;
+                    let applied = link.set(store::to_json(&value, &loaded.unknown), true)?;
+                    if applied.applied && !applied.diff.is_empty() {
+                        link.reload_shells()?;
+                    }
+                    anyhow::Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |v, cx| {
+                v.import_saving = false;
+                if let Err(e) = result {
+                    v.import_error = Some(format!("{e:#}"));
+                    if let Some(s) = v.import.as_mut() {
+                        s.enabled = !on;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The question about the user's own startup files, when they have some.
+    fn import_section(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<impl IntoElement> {
+        let s = self.import.as_ref()?;
+        s.source.as_ref()?;
+        let found: Vec<&str> = s.files.iter().filter(|f| f.exists).map(|f| f.path.as_str()).collect();
+        let main = *found.iter().find(|f| f.ends_with("rc")).or(found.last())?;
+        let desc = match (&s.harvest, &s.failure) {
+            (Some(h), _) => {
+                let mut parts = Vec::new();
+                let path = h.added_path().len();
+                if path > 0 {
+                    parts.push(format!("{path} PATH {}", if path == 1 { "folder" } else { "folders" }));
+                }
+                let n = h.vars.len();
+                if n > 0 {
+                    let word = if n == 1 { "variable" } else { "variables" };
+                    parts.push(match h.vars.iter().find(|v| v.name == "EDITOR") {
+                        Some(e) => format!("{n} {word} (EDITOR={})", e.value),
+                        None => format!("{n} {word}"),
+                    });
+                }
+                if !h.aliases.is_empty() {
+                    parts.push(format!("{} {}", h.aliases.len(), if h.aliases.len() == 1 { "alias" } else { "aliases" }));
+                }
+                if parts.is_empty() {
+                    "It sets nothing up that goatty's shell doesn't have already".to_string()
+                } else {
+                    format!("Brings {} into goatty's shell", shell_setup::names(&parts.iter().map(String::as_str).collect::<Vec<_>>()))
+                }
+            }
+            (None, Some(f)) => format!("Couldn't check it: {}", f.message),
+            (None, None) if self.import_checking => "Checking what it sets up…".to_string(),
+            (None, None) => "PATH folders, variables and aliases it sets up".to_string(),
+        };
+        let on = s.enabled;
+        let mut sec = settings_section(ui, "Your dotfiles").desc(format!("goatty found {}", found.join(", "))).child(
+            settings_row(ui, format!("Use what {main} sets up")).desc(desc).disabled(self.import_saving).control(toggle(
+                "import",
+                on,
+                ui,
+                self.act(cx, move |v, cx| v.set_import(!on, cx)),
+            )),
+        );
+        sec = match &self.import_error {
+            Some(e) => sec.footer(format!("Couldn't change it: {e}")),
+            None => {
+                sec.footer("Your prompt and plugin frameworks in it stay out of goatty's shell. Change it later under Settings → Dotfiles.")
+            }
+        };
+        Some(sec)
     }
 
     fn install(&mut self, cx: &mut Context<'_, Self>) {
@@ -534,6 +671,9 @@ impl Welcome {
         );
         if let Some(p) = &self.progress {
             page = page.child(settings_window::progress_card(ui, p));
+        }
+        if let Some(sec) = self.import_section(ui, cx) {
+            page = page.child(sec);
         }
         if let Some(h) = &self.host {
             let style = h.prompt.style;

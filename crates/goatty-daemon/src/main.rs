@@ -245,6 +245,13 @@ enum ShellCmd {
     /// Ask the daemon's running managed shells to restart with the active
     /// configuration (idle ones now, busy ones at their next prompt).
     Reload,
+    /// What goatty imports from your own shell (PATH, variables, aliases
+    /// from .zshrc or .bashrc; `goattyd settings set shell.import.enabled true`).
+    Import {
+        /// Run your shell now to see what it sets up (also while the import is off).
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 const CLIENT: &str = concat!("goattyd-cli ", env!("CARGO_PKG_VERSION"));
@@ -373,6 +380,7 @@ fn main() -> Result<()> {
                 ShellCmd::Rollback { generation } => cmd::rollback(&launcher, &host_file()?, generation),
                 ShellCmd::Uninstall { tools, all } => cmd::uninstall(&launcher, &tools, all),
                 ShellCmd::Dismiss => cmd::dismiss(&launcher),
+                ShellCmd::Import { refresh } => cmd::import(&goatty_shell::HostService::from_env(std::env::current_exe().ok()), refresh),
                 ShellCmd::Reload => {
                     let n = Control::connect_local(CLIENT)?.reload_shells()?;
                     println!("asked {n} running shell(s) to reload");

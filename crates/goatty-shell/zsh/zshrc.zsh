@@ -31,6 +31,36 @@ _goatty_find() {
 }
 _goatty_ok() { _goatty_state[$1]="ok"$'\t'"$2" }
 
+# --- What your own shell sets up (shell.import, opt-in) ---------------------
+# goatty ran your login shell with its startup files in a separate process
+# and noted the variables, PATH and aliases it ended up with (import.zsh,
+# written by goatty). Variables and PATH apply here, before the plugins look
+# for their tools; aliases at the very end, so goatty's and yours win.
+if (( _goatty_import )); then
+  if [[ -r $_goatty_import_file ]] && builtin source -- "$_goatty_import_file"; then
+    () {
+      local k v
+      for k v in "${_goatty_imported_vars[@]}"; do
+        (( ${_goatty_import_skip_vars[(Ie)$k]} )) && continue
+        [[ ${parameters[$k]-} == *readonly* ]] && continue
+        builtin export "$k=$v"
+      done
+    }
+    if (( $#_goatty_imported_path && ! ${_goatty_import_skip_vars[(Ie)PATH]} )); then
+      typeset -gU path
+      path=("${_goatty_imported_path[@]}" $path)
+    fi
+    if [[ -n $_goatty_imported_from ]]; then
+      _goatty_ok import "$_goatty_imported_from"
+    else
+      _goatty_state[import]=missing
+    fi
+  else
+    _goatty_state[import]=missing
+  fi
+  _goatty_path_marks+=("imported"$'\t'"$PATH")
+fi
+
 # --- Options ----------------------------------------------------------------
 setopt auto_cd auto_pushd pushd_ignore_dups pushd_silent
 setopt interactive_comments no_beep
@@ -113,10 +143,66 @@ zstyle ':completion:*' use-cache on
 zstyle ':completion:*' cache-path "$_goatty_cache/zcompcache"
 
 # --- The user's .zshrc (opt-in: GOATTY_ZSH_USER_RC=1) ----------------------
+# Guarded: what it sources goes through rc-guard.zsh, which skips prompt and
+# plugin frameworks (oh-my-zsh, Powerlevel10k, zinit, …) and second copies
+# of goatty's own plugins; `compinit` (goatty ran it) and `starship init`,
+# `oh-my-posh init` and `fzf --zsh` do nothing. Everything else runs.
+typeset -g _goatty_ps1_before=$PS1
 if (( _goatty_user_rc )); then
   _goatty_zdotdir_user
   if _goatty_user_file .zshrc; then
+    typeset -ga _goatty_rc_skipped=()
+    # What the user's file (and what it sources) may not load: a label, or
+    # status 1. $1: the file.
+    _goatty_rc_blocked() {
+      local off=${(j: :)${(k)_goatty_state[(R)off]}}
+      case $1 in
+        */oh-my-zsh.sh) REPLY=oh-my-zsh ;;
+        */p10k-instant-prompt-*.zsh|*/powerlevel10k.zsh-theme|*/powerlevel9k.zsh-theme|*/.p10k.zsh|*/p10k.zsh) REPLY=powerlevel10k ;;
+        */.zprezto/init.zsh|*/zprezto/init.zsh) REPLY=prezto ;;
+        */.zim/init.zsh|*/zim/init.zsh|*/zimfw.zsh) REPLY=zim ;;
+        */antigen.zsh) REPLY=antigen ;;
+        */antidote.zsh|*/.zsh_plugins.zsh) REPLY=antidote ;;
+        */zinit.zsh|*/zi.zsh) REPLY=zinit ;;
+        */zplug/init.zsh) REPLY=zplug ;;
+        */zsh-autosuggestions.zsh|*/zsh-autosuggestions.plugin.zsh) [[ " $off " == *" autosuggestions "* ]] && return 1; REPLY=zsh-autosuggestions ;;
+        */zsh-syntax-highlighting.zsh|*/zsh-syntax-highlighting.plugin.zsh|*/fast-syntax-highlighting.plugin.zsh|*/F-Sy-H.plugin.zsh)
+          [[ " $off " == *" syntax-highlighting "* ]] && return 1; REPLY=${${1:t}%%.*} ;;
+        */fzf-tab.plugin.zsh|*/fzf-tab.zsh) [[ " $off " == *" fzf-tab "* ]] && return 1; REPLY=fzf-tab ;;
+        */fzf/shell/key-bindings.zsh|*/fzf/key-bindings.zsh|*/fzf/shell/completion.zsh|*/fzf/completion.zsh)
+          [[ " $off " == *" fzf "* ]] && return 1; REPLY=fzf ;;
+        *) return 1 ;;
+      esac
+    }
+    # Tools whose init goatty's plugins do (unless that plugin is off). The
+    # init runs in a command substitution (`eval "$(starship init zsh)"`,
+    # `source <(fzf --zsh)`), so the stub prints the line that records it.
+    _goatty_rc_stub() {
+      local cmd=$1 arg=$2 plugin=$3
+      [[ ${_goatty_state[$plugin]} == off ]] && return
+      (( ${+functions[$cmd]} )) && return
+      functions[$cmd]="if [[ \$1 == ${(q)arg} ]]; then builtin print -r -- '_goatty_rc_skipped+=(${(q)cmd})'; return 0; fi; command ${(q)cmd} \"\$@\""
+      _goatty_rc_stubs+=($cmd)
+    }
+    typeset -ga _goatty_rc_stubs=()
+    _goatty_rc_stub starship init starship
+    _goatty_rc_stub oh-my-posh init starship
+    _goatty_rc_stub fzf --zsh fzf
+    # goatty ran compinit; a second run is slow and resets completion.
+    if (( ! ${+functions[compinit]} )); then
+      compinit() { : }
+      _goatty_rc_stubs+=(compinit)
+    fi
+    builtin alias source="builtin source ${(q)_goatty_dir}/rc-guard.zsh"
+    builtin alias .="builtin source ${(q)_goatty_dir}/rc-guard.zsh"
     builtin source -- "$REPLY"
+    builtin unalias source . 2>/dev/null
+    (( $#_goatty_rc_stubs )) && builtin unfunction $_goatty_rc_stubs 2>/dev/null
+    builtin unfunction _goatty_rc_blocked _goatty_rc_stub
+    for REPLY in ${(u)_goatty_rc_skipped}; do
+      _goatty_state[rc:$REPLY]=off
+    done
+    builtin unset _goatty_rc_skipped _goatty_rc_stubs
   fi
   _goatty_zdotdir_capture
   builtin export ZDOTDIR=$_goatty_dir
@@ -132,7 +218,8 @@ builtin source -- "$_goatty_dir/plugins-line-editor.zsh"
 # The Starship plugin (or another prompt plugin); goatty's config for it is
 # generated from the prompt settings.
 builtin source -- "$_goatty_dir/plugins-prompt.zsh"
-if (( ! ${+_goatty_prompt} && ! _goatty_user_rc )); then
+# Kept when your .zshrc set a prompt of its own.
+if (( ! ${+_goatty_prompt} )) && [[ $PS1 == $_goatty_ps1_before ]]; then
   # Small built-in prompt: directory, then a marker that turns red when
   # the last command failed.
   if (( _goatty_prompt_two_line )); then
@@ -305,6 +392,24 @@ add-zsh-hook precmd _goatty_reload_requested
   builtin print -r -- $'\e[33mgoatty:\e[0m not installed: '"${(j:, :)missing}"$'. Run \e[1mgoatty-setup\e[0m to install (user space, no sudo), \e[1mgoatty-setup --dismiss\e[0m to hide this.'
 }
 
+# --- Aliases from your own shell (shell.import) -----------------------------
+# Last, and only names nothing defined yet: goatty's aliases, the plugins'
+# and your additions win, and no code of goatty's is read with them.
+if (( _goatty_import && _goatty_import_aliases && ${+_goatty_imported_aliases} )); then
+  () {
+    local kind name value
+    for kind name value in "${_goatty_imported_aliases[@]}"; do
+      (( ${_goatty_import_skip_aliases[(Ie)$name]} )) && continue
+      case $kind in
+        g) (( ${+galiases[$name]} )) || builtin alias -g -- "$name=$value" ;;
+        s) (( ${+saliases[$name]} )) || builtin alias -s -- "$name=$value" ;;
+        *) (( ${+aliases[$name]} )) || builtin alias -- "$name=$value" ;;
+      esac
+    done
+  }
+fi
+
 # --- Done --------------------------------------------------------------------
 builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file _goatty_on _goatty_find _goatty_ok
-builtin unset _goatty_user_zdotdir _goatty_src _goatty_prompt GOATTY_GUI_SETUP
+builtin unset _goatty_user_zdotdir _goatty_src _goatty_prompt GOATTY_GUI_SETUP _goatty_ps1_before
+builtin unset _goatty_imported_vars _goatty_imported_path _goatty_imported_aliases _goatty_imported_from

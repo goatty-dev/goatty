@@ -111,21 +111,29 @@ impl SettingsWindow {
                     row(ui, "Program to run").desc("A path or a name on PATH. Enter saves").below(self.shell_path.clone()).into_any_element()
                 });
             let off = !(managed && zsh);
-            let dotfiles = section(ui, "Your dotfiles")
-                .desc(if off { "Only with goatty's managed zsh" } else { "What goatty's zsh reads from your own configuration" })
-                .child(row(ui, "Use ~/.zshenv and ~/.zprofile").desc("Your environment: PATH, EDITOR, …").disabled(off).control(toggle(
-                    "user-env",
-                    z.user_env,
-                    ui,
-                    self.host(cx, |h| h.shell.zsh.user_env = !h.shell.zsh.user_env),
-                )))
-                .child(row(ui, "Also use ~/.zshrc").desc("Most .zshrc files load their own prompt and plugins, which can fight goatty's").disabled(off).control(toggle(
-                    "user-rc",
-                    z.user_rc,
-                    ui,
-                    self.host(cx, |h| h.shell.zsh.user_rc = !h.shell.zsh.user_rc),
-                )))
-                .footer("Your own additions for goatty's zsh go in ~/.config/goatty/zshrc.");
+            let imp = &h.shell.import;
+            let mut used = Vec::new();
+            if imp.enabled {
+                used.push("importing what your shell sets up");
+            }
+            if z.user_env {
+                used.push("~/.zshenv and ~/.zprofile");
+            }
+            if z.user_rc {
+                used.push("~/.zshrc");
+            }
+            let dotfiles = section(ui, "Your dotfiles").child(
+                row(ui, "Dotfiles")
+                    .icon(Icon::FileText)
+                    .desc(if off {
+                        "Only with goatty's managed zsh".to_string()
+                    } else if used.is_empty() {
+                        "PATH, variables and aliases from your .zshrc or .bashrc · nothing used".to_string()
+                    } else {
+                        format!("Using {}", used.join(", "))
+                    })
+                    .on_click("shell-dotfiles", self.listener_go(cx, Page::Dotfiles)),
+            );
             let on = BUILTIN_TOOLS.iter().filter(|id| h.plugin_enabled(id)).count();
             let integration = section(ui, "Integration")
                 .child(row(ui, "Shell integration").desc("Marks prompts and commands (OSC 133) and reports the directory (OSC 7)").disabled(off).control(toggle(

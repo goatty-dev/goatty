@@ -20,8 +20,9 @@ zsh then reads the startup files from goatty's directory:
            restore the user's ZDOTDIR, source the user's .zshenv
            interactive? → ZDOTDIR = goatty's dir again   (else: done, plain zsh)
 .zprofile  (login) source the user's .zprofile with their ZDOTDIR, re-pin goatty's
-.zshrc     options, history, PATH, plugins-early.zsh (plugin fpath + env), keys, compinit
-           [user's .zshrc, if shell.zsh.user_rc]
+.zshrc     [import.zsh: variables and PATH your own shell sets up, if shell.import]
+           options, history, PATH, plugins-early.zsh (plugin fpath + env), keys, compinit
+           [user's .zshrc, guarded, if shell.zsh.user_rc]
            plugins-line-editor.zsh (fzf → fzf-tab → autosuggestions)
            plugins-prompt.zsh (starship), or goatty's fallback prompt when no prompt plugin loaded
            plugins.zsh (plugin aliases + code) → aliases.zsh (yours) → integration
@@ -29,6 +30,7 @@ zsh then reads the startup files from goatty's directory:
            ~/.config/goatty/zshrc (the user's additions)
            plugins-last.zsh (syntax highlighting: it wraps every widget defined before it)
            goatty-status / goatty-setup / goatty-reload, reload-on-request trap, missing-tools hint
+           [aliases your own shell sets up, if shell.import: only names nothing defined]
 .zlogin    the user's own, because ZDOTDIR is already theirs again
 ```
 
@@ -53,6 +55,7 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
   zsh/plugins-*.zsh             the plugins, one file per load slot (see plugins.md)
   zsh/.zshenv .zprofile .zshrc  static, from crates/goatty-shell/zsh/
   zsh/integration.zsh           OSC 133 + OSC 7
+  zsh/rc-guard.zsh              what a guarded .zshrc sources goes through it
   zsh/starship.toml             generated from the prompt settings; used unless you prefer your own starship.toml
   host.json, info.json          the settings it was built from; when, by which goatty, on which generation, what changed, its name
 ~/.local/share/goatty/current → generations/<n>   the active one
@@ -64,6 +67,7 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
 ~/.cache/goatty/                zcompdump, completion cache, downloads
 ~/.local/state/goatty/shell-hint-dismissed      set by `goatty-setup --dismiss` or the GUI's "Don't ask again"
 ~/.local/state/goatty/shell-setup-offered       set once goatty's window offered the install (the shell hint stays quiet)
+~/.local/state/goatty/import/   what your own shell sets up: harvest.json (the last harvest and failure), import.zsh
 ```
 
 XDG variables are respected. History stays in the file plain zsh would use (`${ZDOTDIR:-$HOME}/.zsh_history`), so existing history keeps working.
@@ -77,7 +81,9 @@ XDG variables are respected. History stays in the file plain zsh would use (`${Z
 | `shell.program` | zsh if installed | `GOATTY_SHELL` |
 | `shell.managed` | on | `GOATTY_SHELL_MANAGED=0/1` |
 | `shell.zsh.user_env` (`.zshenv`, `.zprofile`) | on | |
-| `shell.zsh.user_rc` (`.zshrc`) | off | `GOATTY_ZSH_USER_RC=0/1` |
+| `shell.zsh.user_rc` (`.zshrc`, guarded) | off | `GOATTY_ZSH_USER_RC=0/1` |
+| `shell.import.enabled`: apply what your own shell sets up ([below](#importing-your-shell-setup)) | off | |
+| `shell.import.from` (`auto`/`zsh`/`bash`), `shell.import.aliases`, `shell.import.skip_vars`, `shell.import.skip_aliases` | auto, on, none, none | |
 | `shell.zsh.integration` | on | |
 | `shell.path`: folders added to the end of PATH (before goatty's `bin/`), `~/…` = home, missing ones skipped; edited on Settings → PATH and with the palette's "Shell: Add a folder to PATH…" | none | |
 | `prompt.style` (`rich`/`lean`/`classic`/`rainbow`), `prompt.symbols` (`nerd`/`emoji`/`text`/`none`), `prompt.show` (`all`/`essential`) | rich, nerd, all | |
@@ -94,7 +100,27 @@ XDG variables are respected. History stays in the file plain zsh would use (`${Z
 
 Each built-in plugin has its own page under Plugins with all its settings; Prompt shows the Starship switches, History the fzf and fzf-tab ones. `host.json` version 1 had the switches as `shell.zsh.{autosuggestions, syntax_highlighting, fzf}`, `prompt.starship`, `history.atuin` and the options as `prompt.prefer_user_config`, `history.atuin_up_arrow`: loading one moves them to `plugins.*` (version 2; only keys the file had, so it stays sparse). Version 3 (#165) drops `plugins.atuin`: Atuin left the built-in plugins, and its entry would only be reported as a plugin that isn't installed.
 
-`.zshrc` is off by default because most `.zshrc` files load their own prompt and plugins, which would fight goatty's. With it on, it runs after compinit and before goatty's plugins, so goatty's prompt still wins. Turn off the Starship plugin to keep your own prompt.
+`.zshrc` is off by default because most `.zshrc` files load their own prompt and plugins, which would fight goatty's. What it sets up (PATH, variables, aliases) comes along without running it through the import below. With `user_rc` on, it runs guarded after compinit and before goatty's plugins (see [Running your .zshrc](#running-your-zshrc-guarded)), so goatty's prompt still wins. Turn off the Starship plugin to keep your own prompt.
+
+## Importing your shell setup
+
+Installers (rustup, nvm, bun, pnpm, conda, Homebrew) and years of habit put PATH entries, `EDITOR` and aliases in `.zshrc` or `.bashrc`, which goatty's zsh doesn't run. `shell.import` (Settings → Dotfiles, asked in the welcome window when you have such a file; opt-in for now) brings what they set up into goatty's shell without running them there. Code: `goatty_shell::import`.
+
+**The harvest.** goattyd runs your login shell the way your old terminal did, `zsh -l -i -c …` or `bash -l -i -c …`, in its own process group with no terminal, stdin from `/dev/null`, stdout discarded and stderr kept (shortened, without bash's job-control complaints). Once the startup files are done, a script writes every exported variable, the aliases (zsh: regular, `-g`, `-s`) and the final `ZDOTDIR` as NUL-separated records to a file, with alias expansion off first so the startup's aliases can't change it. It gets goattyd's environment without goatty's own variables, plus `GOATTY_IMPORT=1` (a `.zshrc` can skip slow parts), `DISABLE_AUTO_UPDATE=true` (oh-my-zsh) and `POWERLEVEL9K_INSTANT_PROMPT=off`. A login bash reads `.bashrc` only through its login file, so the harvest sources `~/.bashrc` itself when the first of `.bash_profile`/`.bash_login`/`.profile` doesn't mention it. After the shell exits, its process group is killed, so nothing it started in the background outlives it.
+
+**What's kept.** Exported variables the startup set or changed, except shell and terminal state (`PWD`, `SHLVL`, `ZDOTDIR`, `ZSH*`, prompts, history settings, `TERM*`, `SSH_AUTH_SOCK`, `GPG_TTY`, `STARSHIP_*`, `P9K_*`, `GOATTY_*`: `import::is_shell_state`); the PATH it ended with; the aliases. `Auto` takes the login shell's files (passwd, else `$SHELL`); a zsh without any startup files of yours, but with a `.bashrc` or `.bash_profile`, takes bash's. Other login shells (fish) need `from: zsh` or `bash`.
+
+**Applying it.** The harvest is cached in `$XDG_STATE_HOME/goatty/import/harvest.json` and written as `import.zsh` (arrays only). goatty's `.zshrc` applies it right after the system's zshrc: variables (not the skipped ones, not read-only ones) are exported and PATH becomes the harvested PATH followed by what the shell had, so plugins find your tools and goatty's `shell.path` and `bin/` still come after. Aliases are defined at the very end of `.zshrc`, after goatty's, the plugins' and `~/.config/goatty/zshrc`, and only names nothing defined yet: goatty's own win, and no code of goatty's is read with your aliases in effect. The settings live in `settings.zsh`, so switching entries off is a generation like any setting; `import.zsh` only changes with a new harvest. `goatty-status` reports `import` (ok with the files, or missing), and the PATH page attributes imported folders to `~/.zshrc (imported)`.
+
+**When it runs.** `Launcher::launch` (every new session) checks a fingerprint of the shell, its startup files (size and mtime of the user's and the system's, `/etc/profile.d` included) and the environment it starts with. A change, or no harvest yet, harvests before the session starts, for up to 5 s (a slower startup finishes in the background). A harvest older than an hour is redone in the background. goattyd harvests when it starts and after an apply with the import on, so the first tab and reloaded shells don't wait. A failed harvest (timeout, or a startup that runs `exec tmux` or `exit` and never reports) keeps the previous one, isn't retried until something changes, and is shown with its reason and stderr on the Dotfiles page and by `goattyd shell import`. A lock in the import directory keeps processes from running your startup twice at once.
+
+**Not imported:** shell functions and hooks (`nvm`, `conda activate`, `pyenv shell`, direnv's or zoxide's hooks). Their PATH effects come along (node from `nvm use default` is on PATH), the functions themselves don't. Run `.zshrc` guarded for those, or use goatty's plugins for zoxide, direnv and the like.
+
+`goattyd shell import [--refresh]` prints the same as the Dotfiles page: where it reads from, the files, the last harvest (PATH folders, variables, aliases, stderr) and the last failure.
+
+## Running your .zshrc, guarded
+
+With `shell.zsh.user_rc`, goatty's `.zshrc` sources your `.zshrc` at top level with your `ZDOTDIR`, but while it runs, `source` and `.` are aliases for `source rc-guard.zsh`, which receives the file as `$1`. A sourced file still runs at top level (a sourced file, not a function), so its `typeset`s stay global, and it sees an empty `$@` unless it was given arguments. `rc-guard.zsh` skips what would fight goatty's shell and records it in `goatty-status` as `rc:<name>` (off): oh-my-zsh (`oh-my-zsh.sh`), Powerlevel10k (instant prompt, theme, `.p10k.zsh`), prezto, zim, antigen, antidote, zinit, zplug, and second copies of zsh-autosuggestions, zsh-syntax-highlighting (fast-syntax-highlighting too), fzf-tab and fzf's key bindings, each only while goatty's plugin for it is on. `compinit` is a no-op (goatty ran it), and `starship init`, `oh-my-posh init` and `fzf --zsh` print only a line that records them (they're run inside `eval "$(…)"` or `source <(…)`). Everything else runs: your functions, key bindings, options, zstyles, hooks. Afterwards the aliases and stubs are gone. A prompt your `.zshrc` sets stays when no prompt plugin is on; otherwise goatty's fallback prompt is used.
 
 ### The prompt
 
@@ -178,7 +204,7 @@ Settings → Diagnostics (or `goatty --settings=diagnostics`, or "Shell diagnost
 
 ## PATH
 
-Settings → PATH (`goatty --settings=path`) edits `shell.path` (add, browse on this computer, reorder, remove) and shows the PATH a new shell gets, each folder with where it came from. Interactive startups note `$PATH` after each step in `_goatty_path_marks` (`step<TAB>PATH`): `etc-zshenv`, `zshenv`, `etc-zprofile`, `zprofile`, `etc-zshrc`, `settings` (`shell.path`), `tools` (goatty's `bin/`), `plugins`, `zshrc`, `additions`. `goatty_shell::path_report` (the `path` request) starts the managed shell like Diagnostics does, prints the marks and the final PATH, and gives each folder the first step whose PATH has it; folders already there before the first step are inherited from goattyd's environment. It also checks each `shell.path` folder on the host: used, missing or not a folder (skipped), already on PATH from an earlier step (the setting changes nothing), or removed again by something later. A goattyd from before this gets an "update it" note instead.
+Settings → PATH (`goatty --settings=path`) edits `shell.path` (add, browse on this computer, reorder, remove) and shows the PATH a new shell gets, each folder with where it came from. Interactive startups note `$PATH` after each step in `_goatty_path_marks` (`step<TAB>PATH`): `etc-zshenv`, `zshenv`, `etc-zprofile`, `zprofile`, `etc-zshrc`, `imported` (with `shell.import` on), `settings` (`shell.path`), `tools` (goatty's `bin/`), `plugins`, `zshrc`, `additions`. `goatty_shell::path_report` (the `path` request) starts the managed shell like Diagnostics does, prints the marks and the final PATH, and gives each folder the first step whose PATH has it; folders already there before the first step are inherited from goattyd's environment. It also checks each `shell.path` folder on the host: used, missing or not a folder (skipped), already on PATH from an earlier step (the setting changes nothing), or removed again by something later. A goattyd from before this gets an "update it" note instead.
 
 ## Startup cost
 

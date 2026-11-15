@@ -198,6 +198,15 @@ impl HostLink {
     }
 
     /// Ask the host's running managed shells to reload. Returns how many were asked.
+    /// What the host imports from the user's own shell; `refresh` runs
+    /// their shell there first (slow: off the UI thread).
+    pub fn import_status(&self, refresh: bool) -> Result<goatty_shell::import::Status> {
+        match self.shell(setup::Request::Import { refresh })? {
+            setup::Reply::Import(s) => Ok(*s),
+            other => bail!("unexpected reply from the host: {other:?}"),
+        }
+    }
+
     pub fn reload_shells(&self) -> Result<u32> {
         Ok(match self {
             HostLink::Daemon(c) => c.reload_shells()?,

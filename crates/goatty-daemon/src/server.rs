@@ -257,6 +257,11 @@ pub fn serve(path: &Path) -> Result<()> {
         let d = daemon.clone();
         std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, listener))?;
     }
+    // The first tab shouldn't wait for the import of the user's shell setup.
+    {
+        let host = daemon.host.clone();
+        std::thread::Builder::new().name("shell-import".into()).spawn(move || host.launcher.prepare_import(&host.settings().value))?;
+    }
     // Socket watchdog. On a server, systemd-logind deletes
     // /run/user/$UID when the user's last login session ends (unless
     // lingering is enabled). The daemon and its shells survive that, but the

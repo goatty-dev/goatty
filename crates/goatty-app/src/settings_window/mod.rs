@@ -17,6 +17,7 @@ mod aliases;
 mod appearance;
 mod chrome;
 mod diagnostics;
+mod dotfiles;
 mod host;
 mod hosts;
 pub(crate) mod kit;
@@ -166,6 +167,7 @@ pub enum Page {
     Shortcuts,
     Hosts,
     Shell,
+    Dotfiles,
     Path,
     Prompt,
     History,
@@ -179,13 +181,14 @@ pub enum Page {
 impl Page {
     /// Sidebar order: this computer's pages, the host's shell pages, then
     /// the files and About.
-    pub const ALL: [Page; 14] = [
+    pub const ALL: [Page; 15] = [
         Page::Appearance,
         Page::Terminal,
         Page::Workspace,
         Page::Shortcuts,
         Page::Hosts,
         Page::Shell,
+        Page::Dotfiles,
         Page::Path,
         Page::Prompt,
         Page::History,
@@ -204,6 +207,7 @@ impl Page {
             Page::Shortcuts => "Shortcuts",
             Page::Hosts => "Hosts",
             Page::Shell => "Shell",
+            Page::Dotfiles => "Dotfiles",
             Page::Path => "PATH",
             Page::Prompt => "Prompt",
             Page::History => "History",
@@ -224,6 +228,7 @@ impl Page {
             Page::Shortcuts => "Keys for terminal windows",
             Page::Hosts => "Machines to open sessions on over SSH",
             Page::Shell => "The shell goatty starts",
+            Page::Dotfiles => "What goatty uses from your .zshrc or .bashrc",
             Page::Path => "Where the shell looks for programs",
             Page::Prompt => "What the prompt shows",
             Page::History => "What the shell remembers",
@@ -243,6 +248,7 @@ impl Page {
             Page::Shortcuts => Icon::Keyboard,
             Page::Hosts => Icon::Server,
             Page::Shell => Icon::Shell,
+            Page::Dotfiles => Icon::FileText,
             Page::Path => Icon::FolderOpen,
             Page::Prompt => Icon::TextCursorInput,
             Page::History => Icon::History,
@@ -262,6 +268,7 @@ impl Page {
             "tabs" | "panes" => Some(Page::Workspace),
             "ssh" => Some(Page::Hosts),
             "path" | "env" | "environment" => Some(Page::Path),
+            "import" | "zshrc" | "bashrc" | "rc" => Some(Page::Dotfiles),
             "profiles" | "files" => Some(Page::Profile),
             "doctor" | "status" | "setup" => Some(Page::Diagnostics),
             _ => None,
@@ -271,7 +278,10 @@ impl Page {
 
     /// Edits the connected host's settings (staged, then applied).
     pub fn is_host(self) -> bool {
-        matches!(self, Page::Shell | Page::Path | Page::Prompt | Page::History | Page::Aliases | Page::Plugins | Page::Diagnostics)
+        matches!(
+            self,
+            Page::Shell | Page::Dotfiles | Page::Path | Page::Prompt | Page::History | Page::Aliases | Page::Plugins | Page::Diagnostics
+        )
     }
 }
 
@@ -376,6 +386,7 @@ pub struct SettingsWindow {
     plugins: plugins::PluginsPage,
     diag: diagnostics::DiagPage,
     path: path::PathPage,
+    dotfiles: dotfiles::DotfilesPage,
     aliases: aliases::AliasesPage,
     prompt: prompt::PromptPage,
     hosts: hosts::HostsPage,
@@ -524,6 +535,7 @@ impl SettingsWindow {
             plugins: plugins::PluginsPage::default(),
             diag: diagnostics::DiagPage::default(),
             path: path::PathPage::new(cx),
+            dotfiles: dotfiles::DotfilesPage::new(cx),
             aliases: aliases::AliasesPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
             hosts: hosts::HostsPage::new(cx),
@@ -569,11 +581,13 @@ impl SettingsWindow {
         self.plugins = plugins::PluginsPage::default();
         self.diag = diagnostics::DiagPage::default();
         self.path.reset();
+        self.dotfiles.reset();
         self.load_host(cx);
         self.load_plugins(false, cx);
         match self.page {
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),
+            Page::Dotfiles => self.load_dotfiles(false, cx),
             _ => {}
         }
         cx.notify();
@@ -597,6 +611,7 @@ impl SettingsWindow {
             Page::Hosts => crate::hosts::refresh(cx),
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),
+            Page::Dotfiles => self.load_dotfiles(false, cx),
             _ => {}
         }
         cx.notify();
@@ -975,6 +990,7 @@ impl SettingsWindow {
                         view.host_error = None;
                         view.sync_prompt_inputs(cx);
                         view.path_host_changed(cx);
+                        view.dotfiles_host_changed(cx);
                     }
                     Err(e) => view.host_error = Some(format!("{e:#}")),
                 }

@@ -7,7 +7,7 @@ The profile is the source of truth for everything goatty manages. The settings w
 | Document | File (`$XDG_CONFIG_HOME/goatty/`) | Lives on | Contains |
 |---|---|---|---|
 | `ClientSettings` | `settings.json` | the machine running the window | font (terminal and interface), theme, cursor, padding (one number, or `{top, right, bottom, left}`), background opacity/blur, renderer, keybindings, links, paste, selection (copy on select), workspace (on launch), ssh hosts (added hosts, plain SSH per host, list `~/.ssh/config`, open hosts in a new window or tab, bringing the shell setup to hosts: `ssh.sync` and per host `ssh.hosts[].sync`), debug |
-| `HostSettings` | `host.json` | each machine running a goattyd | shell program, managed zsh and its features, user dotfiles, prompt, history |
+| `HostSettings` | `host.json` | each machine running a goattyd | shell program, managed zsh and its features, user dotfiles and the import of what they set up, prompt, history |
 
 The split follows where a setting takes effect. The window draws text, so fonts and colors are the client's. Shells run on the daemon's host, so their configuration belongs to that host. A remote host keeps its own `host.json`, and the settings window edits it through the protocol. Connecting to a different host shows that host's shell settings.
 
@@ -104,7 +104,8 @@ Settings travel as JSON documents rather than typed structs, so a schema change 
 | Workspace | what a new window shows, tab style (visual), tab bar, program icons, fading inactive panes, asking before closing a running program | live / next launch |
 | Shortcuts | a table of every action: grouped or sorted by name or keys, search by name or keys (typed, or pressed with the keyboard button), filters for changed and unbound; per action: keycaps (× removes), + records a keystroke, reset; warnings when a recorded key took over another action's key, when a key you added is one the shell uses, and when a keystroke doesn't parse | live |
 | Hosts | open hosts in a new window or tab (`ssh.open_in`), add hosts (`user@host` or an ssh alias, optional name), plain SSH per host, list the hosts in `~/.ssh/config`, connect | saved immediately |
-| Shell | managed zsh, program, user dotfiles, shell integration (the built-in tools are on Plugins) | staged → preview → apply |
+| Shell | managed zsh, program, shell integration (the built-in tools are on Plugins), links to Dotfiles and PATH | staged → preview → apply |
+| Dotfiles | importing what your shell sets up (on/off, zsh or bash, aliases; what the last check found, each entry switchable, "Check again"), running `~/.zshenv`/`~/.zprofile` and (guarded) `~/.zshrc` | staged |
 | Prompt | live preview; Starship, rich/minimal style, own starship.toml (off by default), two-line, blank line, duration threshold | staged |
 | History | size, duplicates, leading space, sharing, fzf history search, fzf-tab completion and its previews | staged |
 | Aliases | yours first, then each plugin's (folded); filters All / Mine / From plugins; add/edit in a dialog (group completes existing groups) | staged |

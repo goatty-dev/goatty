@@ -92,8 +92,22 @@ pub const INDEX: &[Entry] = &[
     e(Page::Hosts, "From ~/.ssh/config", "List these hosts too", "ssh config discover").keys(&["ssh.discover"]),
     e(Page::Shell, "", "goatty's managed zsh", "zsh managed dotfiles").keys(&["shell.managed"]),
     e(Page::Shell, "Program", "Shell", "program bash fish login shell").keys(&["shell.program"]),
-    e(Page::Shell, "Your dotfiles", "Use ~/.zshenv and ~/.zprofile", "dotfiles environment path").keys(&["shell.zsh.user_env"]),
-    e(Page::Shell, "Your dotfiles", "Also use ~/.zshrc", "zshrc dotfiles").keys(&["shell.zsh.user_rc"]),
+    e(Page::Shell, "Your dotfiles", "Dotfiles", "zshrc bashrc dotfiles import oh-my-zsh existing config"),
+    e(
+        Page::Dotfiles,
+        "Import from your shell",
+        "Use what your shell sets up",
+        "import zshrc bashrc path editor aliases existing oh-my-zsh installer nvm conda",
+    )
+    .keys(&["shell.import.enabled"]),
+    e(Page::Dotfiles, "Import from your shell", "Read from", "import zsh bash login shell").keys(&["shell.import.from"]),
+    e(Page::Dotfiles, "Import from your shell", "Import aliases", "import aliases zshrc bashrc").keys(&["shell.import.aliases"]),
+    e(Page::Dotfiles, "What your shell sets up", "What your shell sets up", "import check variables aliases path skip")
+        .keys(&["shell.import.skip_vars", "shell.import.skip_aliases"]),
+    e(Page::Dotfiles, "Run your files in goatty's shell", "Use ~/.zshenv and ~/.zprofile", "dotfiles environment path")
+        .keys(&["shell.zsh.user_env"]),
+    e(Page::Dotfiles, "Run your files in goatty's shell", "Also run ~/.zshrc", "zshrc dotfiles functions key bindings oh-my-zsh")
+        .keys(&["shell.zsh.user_rc"]),
     e(Page::Shell, "Integration", "PATH", "path bin directory folder programs environment"),
     e(Page::Path, "Your folders", "Add a folder", "path bin directory folder add export programs").keys(&["shell.path"]),
     e(Page::Path, "PATH in a new shell", "PATH in a new shell", "path where which find check folder origin zprofile missing"),

@@ -130,6 +130,8 @@ impl HostService {
         store::save(path, &host.file.value, &host.file.unknown)
             .with_context(|| format!("built generation {} but couldn't save {}", activated.generation, path.display()))?;
         log::info!("host settings saved; generation {} active", activated.generation);
+        // Shells reloaded after this apply read the import straight away.
+        self.launcher.prepare_import(&host.value);
         Ok(ApplyOutcome { issues, diff, applied: true, generation: Some(activated.generation) })
     }
 
