@@ -13,8 +13,10 @@ arch=('x86_64')
 url='https://github.com/goatty-dev/goatty'
 license=('MIT OR Apache-2.0')
 depends=(
-    'gcc-libs'
     'glibc'
+    'hicolor-icon-theme'
+    'libgcc'
+    'libstdc++'
     'libxcb'
     'libxkbcommon'
     'libxkbcommon-x11'

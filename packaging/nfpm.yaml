@@ -115,6 +115,9 @@ overrides:
       - mesa-vulkan-drivers
   archlinux:
     depends:
+      - hicolor-icon-theme
+      - libgcc
+      - libstdc++
       - libxcb
       - libxkbcommon
       - libxkbcommon-x11
