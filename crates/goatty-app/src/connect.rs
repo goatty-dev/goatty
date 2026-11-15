@@ -28,7 +28,7 @@
 //! second tab on a host reuses the first one's link.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -284,12 +284,17 @@ pub fn describe_local(problem: &LocalProblem, installed: Option<&std::path::Path
     }
 }
 
-/// [`ConnectView::restarted`]: not restarted.
-const NOT_RESTARTED: u8 = 0;
-/// Restarted; it had no sessions.
-const RESTARTED_EMPTY: u8 = 1;
-/// Restarted with its sessions.
-const RESTARTED_KEPT: u8 = 2;
+/// What happened to an outdated local daemon on the way (the tab tells
+/// the user once it's connected).
+enum Restart {
+    /// Restarted; it had no sessions.
+    Empty,
+    /// Restarted with its sessions.
+    Kept,
+    /// It could have kept its sessions, but didn't restart (why): goatty
+    /// goes on with it.
+    Refused(String),
+}
 
 /// Restart the local daemon with the installed build and connect to it. Its
 /// sessions carry over when it can do that, else they end (callers only get
@@ -318,21 +323,35 @@ fn restart_local(conn: Option<Arc<Connection>>) -> Result<(Arc<Connection>, bool
 
 /// Check the local daemon is the installed build: restart it right away
 /// when that keeps its sessions or it holds none, else ask
-/// ([`LocalProblem::Outdated`]). `restarted` says how it was restarted.
-fn check_local(conn: Arc<Connection>, restarted: &AtomicU8) -> Result<Arc<Connection>> {
+/// ([`LocalProblem::Outdated`]). `restarted` says how that went.
+fn check_local(conn: Arc<Connection>, restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
     let Some(outdated) = local::outdated(conn.daemon_pid()) else { return Ok(conn) };
-    let keeps = local::can_keep_sessions(conn.protocol_version());
-    if !keeps && local::declined(&outdated) {
+    // Kept running on purpose, or a restart was refused: until it or the
+    // installed build changes.
+    if local::declined(&outdated) {
         return Ok(conn);
     }
+    let keeps = local::can_keep_sessions(conn.protocol_version());
     let sessions = conn.list_sessions()?.len();
     if sessions > 0 && !keeps {
         return Err(LocalProblem::Outdated { outdated, sessions }.into());
     }
     log::info!("restarting goattyd ({sessions} sessions, kept): {} replaces {}", outdated.installed.display(), outdated.running.display());
-    let (conn, kept) = restart_local(Some(conn))?;
-    let how = if kept && sessions > 0 { RESTARTED_KEPT } else { RESTARTED_EMPTY };
-    restarted.store(how, Ordering::Relaxed);
+    let old = conn.clone();
+    let (conn, kept) = match restart_local(Some(conn)) {
+        Ok(done) => done,
+        // It refused (e.g. the installed build can't take over) and runs on:
+        // keep using it rather than asking to retry the same thing.
+        Err(e) if keeps && old.is_connected() => {
+            log::warn!("goattyd didn't restart with the new build: {e:#}");
+            local::decline(&outdated);
+            *restarted.lock().unwrap_or_else(|p| p.into_inner()) = Some(Restart::Refused(format!("{e:#}")));
+            return Ok(old);
+        }
+        Err(e) => return Err(e),
+    };
+    let how = if kept && sessions > 0 { Restart::Kept } else { Restart::Empty };
+    *restarted.lock().unwrap_or_else(|p| p.into_inner()) = Some(how);
     Ok(conn)
 }
 
@@ -356,9 +375,8 @@ pub struct ConnectView {
     check_local: bool,
     /// The outdated local daemon being asked about.
     outdated: Option<Outdated>,
-    /// The local daemon was restarted on the way (tell the user):
-    /// [`NOT_RESTARTED`], [`RESTARTED_EMPTY`] or [`RESTARTED_KEPT`].
-    restarted: Arc<AtomicU8>,
+    /// What a restart of the local daemon on the way did (tell the user).
+    restarted: Arc<Mutex<Option<Restart>>>,
     /// goattyd is being installed on the host (a fresh install, not an update).
     installing: bool,
     /// It was, and the connection works: the shell setup comes along.
@@ -456,13 +474,20 @@ impl ConnectView {
     fn finish(&mut self, result: Result<Ready>, _window: &mut Window, cx: &mut Context<'_, Self>) {
         match result {
             Ok(ready) => {
-                let body = match self.restarted.swap(NOT_RESTARTED, Ordering::Relaxed) {
-                    RESTARTED_EMPTY => Some("It was an older build and had no sessions."),
-                    RESTARTED_KEPT => Some("It was an older build. Your sessions kept running."),
-                    _ => None,
+                let restarted = self.restarted.lock().unwrap_or_else(|p| p.into_inner()).take();
+                let toast = match restarted {
+                    Some(Restart::Empty) => Some(Toast::success("Restarted goattyd").body("It was an older build and had no sessions.")),
+                    Some(Restart::Kept) => {
+                        Some(Toast::success("Restarted goattyd").body("It was an older build. Your sessions kept running."))
+                    }
+                    Some(Restart::Refused(why)) => Some(
+                        Toast::warning("goattyd still runs the older build")
+                            .body(format!("It couldn't restart with the new one: {why}. Everything works, without what changed since.")),
+                    ),
+                    None => None,
                 };
-                if let Some(body) = body {
-                    toast::show(cx, Toast::success("Restarted goattyd").body(body).key("goattyd-restarted"));
+                if let Some(t) = toast {
+                    toast::show(cx, t.key("goattyd-restarted"));
                 }
                 self.installed = std::mem::take(&mut self.installing);
                 self.ready = Some(ready);

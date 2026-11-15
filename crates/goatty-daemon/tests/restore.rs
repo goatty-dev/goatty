@@ -82,7 +82,7 @@ fn read_until(s: &mut UnixStream, needle: &str) -> String {
         match read_msg::<_, ServerMsg>(s).unwrap() {
             ServerMsg::Attached { snapshot, .. } => out.extend(snapshot),
             ServerMsg::Output { data, .. } => out.extend(data),
-            ServerMsg::Exited { .. } => break,
+            ServerMsg::Exited { .. } => panic!("the session ended before {needle:?}: {:?}", String::from_utf8_lossy(&out)),
             _ => {}
         }
     }
@@ -116,6 +116,9 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
     };
     send(&mut s, &ClientMsg::Input { session: id, data: b"echo before-$((40+2))\r".to_vec() });
     read_until(&mut s, "before-42");
+    // A full-screen program is on (the alternate screen) when it restarts.
+    send(&mut s, &ClientMsg::Input { session: id, data: b"printf '\\033[?1049hIN-ALT-%s' $((3*3))\r".to_vec() });
+    read_until(&mut s, "IN-ALT-9");
     send(&mut s, &ClientMsg::SaveLayout { id: 77, sessions: vec![id], json: "{\"tabs\":1}".into() });
     let pid_before = Control::connect(&sock, "test").unwrap().list_sessions().unwrap()[0].pid;
 
@@ -144,9 +147,19 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
         other => panic!("{other:?}"),
     }
     send(&mut s, &ClientMsg::Attach { req: 3, session: id, size: SIZE, opts: StreamOpts::LOCAL });
-    read_until(&mut s, "before-42");
-    send(&mut s, &ClientMsg::Input { session: id, data: b"echo after-$((1+1))\r".to_vec() });
+    read_until(&mut s, "IN-ALT-9");
+    // Leaving it shows the primary screen from before the restart.
+    send(&mut s, &ClientMsg::Input { session: id, data: b"printf '\\033[?1049l'; echo after-$((1+1))\r".to_vec() });
     read_until(&mut s, "after-2");
+    let mut viewer = connect(&sock);
+    send(&mut viewer, &ClientMsg::Attach { req: 1, session: id, size: SIZE, opts: StreamOpts::LOCAL });
+    match read_msg::<_, ServerMsg>(&mut viewer).unwrap() {
+        ServerMsg::Attached { snapshot, .. } => {
+            let text = String::from_utf8_lossy(&snapshot);
+            assert!(text.contains("before-42") && text.contains("after-2"), "{text:?}");
+        }
+        other => panic!("{other:?}"),
+    }
 
     // New sessions don't reuse the id.
     send(&mut s, &ClientMsg::Create { req: 4, size: SIZE, cwd: None, opts: StreamOpts::LOCAL });

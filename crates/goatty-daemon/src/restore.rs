@@ -3,7 +3,8 @@
 //!
 //! What has to carry over is each session's PTY master (the shell keeps
 //! running as long as one is open) and what the daemon knows about it: the
-//! screen and scrollback (as the VT snapshot clients get on attach), size,
+//! screens and scrollback (`Terminal::restore_snapshot`: the attach
+//! snapshot plus the primary screen behind a full-screen program), size,
 //! ids, and the saved window layouts.
 //!
 //! * **Restart** (protocol `Restart`, `goattyd restart`): every output pump
@@ -86,16 +87,49 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Pause every session's output pump. False when one didn't pause in time
-/// (its last bytes may be missing from the saved screen).
+/// (it may hold output it read but didn't feed yet).
 fn pause_all(sessions: &HashMap<SessionId, Arc<Session>>) -> bool {
     let mut all = true;
     for s in sessions.values() {
         if !s.pause.pause(PAUSE_TIMEOUT) {
-            log::warn!("session {}: output didn't pause; its screen may miss the last output", s.id);
+            log::warn!("session {}: output didn't pause", s.id);
             all = false;
         }
     }
     all
+}
+
+/// Wait until the query answers the paused output produced reached the
+/// PTYs (a program may wait for one). False when one is still pending after
+/// [`PAUSE_TIMEOUT`]: the write blocks, or the queue isn't empty.
+fn settle_replies(sessions: &HashMap<SessionId, Arc<Session>>) -> bool {
+    let deadline = Instant::now() + PAUSE_TIMEOUT;
+    for s in sessions.values() {
+        loop {
+            // Twice, a moment apart: an answer the thread just took off the
+            // queue is counted as taken right after.
+            let taken = s.replies_taken.load(Ordering::SeqCst);
+            if s.replies_idle() {
+                std::thread::sleep(Duration::from_millis(5));
+                if s.replies_idle() && s.replies_taken.load(Ordering::SeqCst) == taken {
+                    break;
+                }
+            }
+            if Instant::now() > deadline {
+                log::warn!("session {}: a query answer is still on its way to the program", s.id);
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    true
+}
+
+/// Stop new sessions from starting, waiting for the ones being started to
+/// be registered. False when a restart is already under way.
+fn close_admission(daemon: &Daemon) -> bool {
+    let _exclusive = daemon.admission.write();
+    !daemon.restarting.swap(true, Ordering::SeqCst)
 }
 
 fn resume_all(sessions: &HashMap<SessionId, Arc<Session>>) {
@@ -112,13 +146,13 @@ fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: 
     std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut saved = Vec::new();
     for s in sessions.values() {
-        let pty = s.pty.lock();
-        let Some(pid) = pty.pid() else { continue };
+        // Not through `s.pty`: an input write may hold its lock.
+        let Some(pid) = s.pid else { continue };
         let snapshot = format!("s{}.vt", s.id);
-        write_private(&dir.join(&snapshot), &s.term.reattach_snapshot())?;
+        write_private(&dir.join(&snapshot), &s.term.restore_snapshot())?;
         saved.push(SavedSession {
             id: s.id,
-            fd: with_fds.then(|| pty.master_fd().as_raw_fd()),
+            fd: with_fds.then_some(s.master_fd),
             pid,
             created_unix: s.created_unix,
             managed: s.managed,
@@ -197,17 +231,24 @@ pub(crate) fn successor(daemon: &Daemon, exe: Option<String>) -> Result<PathBuf>
 /// Replace this process with `exe`, handing it every session. Returns only
 /// when that failed; the daemon then goes on as before.
 pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
-    if daemon.restarting.swap(true, Ordering::SeqCst) {
+    if !close_admission(daemon) {
         bail!("a restart is already under way");
     }
     // Held until the exec: no session starts or ends meanwhile.
     let sessions = daemon.sessions.lock();
-    pause_all(&sessions);
     let result = (|| -> Result<std::io::Error> {
+        // Whatever a pump read and didn't feed, or an answer not written
+        // yet, would be lost with this process: rather not restart.
+        if !pause_all(&sessions) {
+            bail!("a session's output didn't pause; not restarting");
+        }
+        if !settle_replies(&sessions) {
+            bail!("a session's program doesn't take its input; not restarting");
+        }
         let file = save(daemon, &sessions, true)?;
         let listener = daemon.listener_fd.lock().context("no listening socket")?;
         let mut fds = vec![listener];
-        fds.extend(sessions.values().map(|s| s.pty.lock().master_fd().as_raw_fd()));
+        fds.extend(sessions.values().map(|s| s.master_fd));
         for &fd in &fds {
             pty::set_cloexec(fd, false)?;
         }
@@ -377,9 +418,12 @@ pub(crate) fn save_on_sigterm(daemon: Arc<Daemon>) -> Result<()> {
         let mut b = [0u8; 1];
         // SAFETY: reading one byte into a valid buffer from our own pipe.
         while unsafe { libc::read(rx.as_raw_fd(), b.as_mut_ptr().cast(), 1) } != 1 {}
-        daemon.restarting.store(true, Ordering::SeqCst);
+        close_admission(&daemon);
         let sessions = daemon.sessions.lock();
-        pause_all(&sessions);
+        // Best effort: the process ends either way.
+        if !(pause_all(&sessions) && settle_replies(&sessions)) {
+            log::warn!("SIGTERM: saving the screens anyway");
+        }
         match save(&daemon, &sessions, false) {
             Ok(_) => log::info!("SIGTERM: saved {} sessions; systemd keeps their PTYs", sessions.len()),
             Err(e) => log::error!("SIGTERM: couldn't save the sessions' screens: {e:#}"),

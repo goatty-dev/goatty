@@ -1274,17 +1274,28 @@ impl Workspace {
         self.open_palette(Scope::Hosts, window, cx);
     }
 
-    /// The active tab's host's sessions (this computer's for a local or
-    /// plain SSH tab, whose sessions live in the local goattyd or nowhere).
+    /// The active tab's host's sessions. A plain SSH tab's live in this
+    /// computer's goattyd; a tab whose sessions no goattyd keeps (a local
+    /// PTY), or that reaches its daemon another way, says so instead.
     fn list_sessions(&mut self, _: &ListSessions, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let host = match self.active_tab().and_then(|t| t.host.as_ref()) {
-            Some(Spawner::Daemon(conn)) => match conn.endpoint() {
-                goatty_client::Endpoint::Ssh(t) => HostRef::Ssh(t.host.clone()),
-                _ => HostRef::Local,
-            },
-            _ => HostRef::Local,
+        fn host_of(spawner: &Spawner) -> Option<HostRef> {
+            match spawner {
+                Spawner::Daemon(conn) => match conn.endpoint() {
+                    goatty_client::Endpoint::Local => Some(HostRef::Local),
+                    goatty_client::Endpoint::Ssh(t) => Some(HostRef::Ssh(t.host.clone())),
+                    goatty_client::Endpoint::Command { .. } => None,
+                },
+                Spawner::Plain { base, .. } => host_of(base),
+                Spawner::Local(_) => None,
+            }
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let body = match tab.host.as_ref().map(host_of) {
+            Some(Some(host)) => return self.open_palette(Scope::Sessions(host), window, cx),
+            Some(None) => "This tab's shell isn't kept by a goattyd goatty can list sessions of.",
+            None => "This tab is still connecting.",
         };
-        self.open_palette(Scope::Sessions(host), window, cx);
+        toast::show(cx, Toast::info("No sessions to list here").body(body).key("list-sessions"));
     }
 
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {

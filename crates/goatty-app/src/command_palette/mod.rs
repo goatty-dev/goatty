@@ -408,8 +408,14 @@ impl CommandPalette {
             asking: None,
             _subscriptions: vec![sub, hosts_changed, commands_changed],
         };
-        this.load_commands(cx);
-        this.set_query("", cx);
+        // A host's sessions are fetched; the other scopes list what's here.
+        match this.scope.clone() {
+            Scope::Sessions(host) => this.show_sessions(host, cx),
+            _ => {
+                this.load_commands(cx);
+                this.set_query("", cx);
+            }
+        }
         this
     }
 

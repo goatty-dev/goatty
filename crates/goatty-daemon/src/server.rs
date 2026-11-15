@@ -16,7 +16,7 @@ use goatty_proto::{HostInfo, SessionId, SessionInfo, WinSize};
 use goatty_shell::HostService;
 use goatty_term::pty::{Pty, ShellCommand};
 use goatty_term::{Palette, Terminal, TerminalChannels};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::layouts::Layouts;
 use crate::session::{Pause, Session, pump_output, to_size};
@@ -41,6 +41,10 @@ pub(crate) struct Daemon {
     pub(crate) exe: Option<PathBuf>,
     /// A restart is under way: no new sessions.
     pub(crate) restarting: AtomicBool,
+    /// Held (shared) while a session is created, from the `restarting`
+    /// check to its registration; a restart takes it exclusively to set
+    /// `restarting`, so it never misses a session being started.
+    pub(crate) admission: RwLock<()>,
 }
 
 /// What [`Daemon::start`] makes a session of: a PTY with its process, and
@@ -76,6 +80,7 @@ impl Daemon {
             listener_fd: Mutex::new(None),
             exe: own_exe(),
             restarting: AtomicBool::new(false),
+            admission: RwLock::new(()),
         }
     }
 
@@ -109,6 +114,7 @@ impl Daemon {
     }
 
     fn spawn(self: &Arc<Self>, mut cmd: ShellCommand, managed: bool, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
+        let _admitted = self.admission.read();
         if self.restarting.load(Ordering::SeqCst) {
             bail!("goattyd is restarting; try again in a moment");
         }
@@ -127,7 +133,7 @@ impl Daemon {
         log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
         let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed })?;
         if crate::systemd::has_fd_store() {
-            crate::systemd::store(&session.stored(), session.pty.lock().master_fd().as_raw_fd());
+            crate::systemd::store(&session.stored(), session.master_fd);
         }
         Ok(session)
     }
@@ -136,6 +142,7 @@ impl Daemon {
     /// PTY → terminal + subscribers until the process exits.
     pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
         let NewSession { id, pty, reader, term, chans, created_unix, managed } = n;
+        let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
         let session = Arc::new(Session {
             id,
             term,
@@ -146,12 +153,17 @@ impl Daemon {
             fg: OnceLock::new(),
             managed,
             pause: Pause::new()?,
+            pid,
+            master_fd,
+            replies: chans.replies.clone(),
+            replies_taken: AtomicU64::new(0),
+            replies_written: AtomicU64::new(0),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");
         }
         // Only goatty's zsh handles the reload request.
-        let managed_pid = session.pty.lock().pid().filter(|_| managed);
+        let managed_pid = pid.filter(|_| managed);
         if let Some(pid) = managed_pid {
             self.host.track_shell(pid);
         }
@@ -162,7 +174,9 @@ impl Daemon {
             std::thread::Builder::new().name(format!("s{id}-replies")).spawn(move || {
                 while let Ok(bytes) = chans.replies.recv() {
                     let Some(s) = s.upgrade() else { break };
+                    s.replies_taken.fetch_add(1, Ordering::SeqCst);
                     let _ = s.pty.lock().write(&bytes);
+                    s.replies_written.fetch_add(1, Ordering::SeqCst);
                 }
             })?;
         }

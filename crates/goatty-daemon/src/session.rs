@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -60,9 +60,25 @@ pub(crate) struct Session {
     pub(crate) managed: bool,
     /// Lets a restart stop the output pump between two reads.
     pub(crate) pause: Pause,
+    /// The process and the PTY master, known without `pty`'s lock (an
+    /// input write can hold it for as long as the program doesn't read).
+    /// The fd is open as long as `pty` is.
+    pub(crate) pid: Option<u32>,
+    pub(crate) master_fd: RawFd,
+    /// The terminal's query answers on their way to the PTY: the replies
+    /// thread's queue and how many it took and wrote, so a restart can wait
+    /// until none is left behind.
+    pub(crate) replies: flume::Receiver<Vec<u8>>,
+    pub(crate) replies_taken: AtomicU64,
+    pub(crate) replies_written: AtomicU64,
 }
 
 impl Session {
+    /// No query answer waits to be written.
+    pub(crate) fn replies_idle(&self) -> bool {
+        self.replies.is_empty() && self.replies_taken.load(Ordering::SeqCst) == self.replies_written.load(Ordering::SeqCst)
+    }
+
     /// How the session's PTY is named in systemd's fd store.
     pub(crate) fn stored(&self) -> StoredPty {
         StoredPty { id: self.id, created_unix: self.created_unix, managed: self.managed }

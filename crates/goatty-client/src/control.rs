@@ -44,13 +44,25 @@ pub fn socket_owner(path: &Path) -> Result<u32> {
 impl Control {
     /// Connect to the daemon socket at `path` and perform the handshake.
     pub fn connect(path: &Path, client: &str) -> Result<Self> {
+        Self::connect_within(path, client, None)
+    }
+
+    /// [`Self::connect`], giving up when the daemon hasn't greeted within
+    /// `timeout` (a socket can accept connections before anything serves it).
+    pub fn connect_within(path: &Path, client: &str, timeout: Option<std::time::Duration>) -> Result<Self> {
         let mut announce = PROTOCOL_VERSION;
         loop {
             let mut stream =
                 UnixStream::connect(path).with_context(|| format!("goattyd is not running (no socket at {})", path.display()))?;
+            stream.set_read_timeout(timeout)?;
+            stream.set_write_timeout(timeout)?;
             stream.write_all(&handshake::hello(client, announce)?)?;
             match handshake::read_greeting(&mut stream, &path.display().to_string(), announce)? {
-                Outcome::Ok(g) => return Ok(Self { stream, host: g.host, pid: g.pid, version: g.version, next_req: 1 }),
+                Outcome::Ok(g) => {
+                    stream.set_read_timeout(None)?;
+                    stream.set_write_timeout(None)?;
+                    return Ok(Self { stream, host: g.host, pid: g.pid, version: g.version, next_req: 1 });
+                }
                 // An old exact-match daemon: speak its version (only ever lower).
                 Outcome::RetryWith(v) => announce = v,
             }

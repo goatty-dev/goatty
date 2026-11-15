@@ -37,6 +37,35 @@ impl Terminal {
         self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), (self.shell_state(), self.commands_started())))
     }
 
+    /// Everything another process needs to rebuild this terminal (goattyd
+    /// handing its sessions to its next version): like
+    /// [`Self::reattach_snapshot`], plus the primary screen and its
+    /// scrollback while the alternate screen is active, which the attach
+    /// snapshot leaves out. Leaves the terminal as it was.
+    pub fn restore_snapshot(&self) -> Vec<u8> {
+        self.with_term(|t| {
+            let shell = (self.shell_state(), self.commands_started());
+            if !t.mode().contains(TermMode::ALT_SCREEN) {
+                return serialize(t, MAX_REPLAY_HISTORY, shell);
+            }
+            // rio-vt keeps the primary grid private while the alternate one
+            // is active. Switch to it, and back: switching to the alternate
+            // screen clears it, so put its grid back afterwards.
+            let alt = t.grid.clone();
+            t.swap_alt();
+            let mut out = String::from("\x1bc");
+            write_primary(t, MAX_REPLAY_HISTORY, &mut out);
+            t.swap_alt();
+            t.grid = alt;
+            let mode = t.mode();
+            out.push_str("\x1b[?1049h");
+            write_screen(t, false, &mut out);
+            write_shell_state(shell, &mut out);
+            write_modes(t, mode, &mut out);
+            out.into_bytes()
+        })
+    }
+
     /// Catch-up snapshot for a client terminal that already mirrors this
     /// session but missed some output (flow control skipped it). Unlike
     /// [`Self::reattach_snapshot`] it does not reset the client, so the
@@ -76,13 +105,7 @@ fn serialize(t: &Term, max_history: usize, shell: (ShellState, u64)) -> Vec<u8> 
     // active, `t.grid` *is* the alt grid (rio swaps them), so history replay
     // is only possible on the primary screen.
     if !alt {
-        // The scrollback and every screen row in one run: the last screen
-        // row lands on the client's bottom row, which scrolls exactly the
-        // scrollback into its history, and a line wrapping from the
-        // scrollback onto the screen stays one line.
-        let history = t.history_size().min(max_history) as i32;
-        write_rows(t, -history..t.screen_lines() as i32, false, &mut out);
-        write_cursor(t, &mut out);
+        write_primary(t, max_history, &mut out);
     } else {
         out.push_str("\x1b[?1049h");
         write_screen(t, false, &mut out);
@@ -90,6 +113,17 @@ fn serialize(t: &Term, max_history: usize, shell: (ShellState, u64)) -> Vec<u8> 
     write_shell_state(shell, &mut out);
     write_modes(t, mode, &mut out);
     out.into_bytes()
+}
+
+/// The primary screen with up to `max_history` lines of scrollback, and the
+/// cursor. The scrollback and every screen row go in one run: the last
+/// screen row lands on the client's bottom row, which scrolls exactly the
+/// scrollback into its history, and a line wrapping from the scrollback onto
+/// the screen stays one line.
+fn write_primary(t: &Term, max_history: usize, out: &mut String) {
+    let history = t.history_size().min(max_history) as i32;
+    write_rows(t, -history..t.screen_lines() as i32, false, out);
+    write_cursor(t, out);
 }
 
 /// The visible screen like rio's `contents_formatted` (reset, clear, rows,
@@ -267,6 +301,34 @@ mod tests {
         let ha = a.history_size();
         let hb = b.history_size();
         assert_eq!(ha, hb, "history should be replayed");
+    }
+
+    #[test]
+    fn restore_snapshot_keeps_both_screens() {
+        let size = TermSize::new(20, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        for i in 0..12 {
+            a.feed(format!("line {i}\r\n").as_bytes());
+        }
+        a.feed(b"$ vim");
+        let (primary, history) = (text_of(&a), a.history_size());
+        a.feed(b"\x1b[?1049h\x1b[2;3HALT SCREEN");
+        let alt = text_of(&a);
+        let snap = a.restore_snapshot();
+        // Taking it changes nothing.
+        assert_eq!(text_of(&a), alt);
+        a.feed(b"!");
+
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&snap);
+        b.feed(b"!");
+        assert_eq!(text_of(&b), text_of(&a), "the alternate screen and its cursor");
+        // Leaving it shows the primary screen and its history on both.
+        for t in [&a, &b] {
+            t.feed(b"\x1b[?1049l");
+            assert_eq!(text_of(t), primary);
+            assert_eq!(t.history_size(), history);
+        }
     }
 
     #[test]

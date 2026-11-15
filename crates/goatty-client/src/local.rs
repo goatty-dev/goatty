@@ -178,7 +178,8 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     // The new image accepts on the same socket once it took the sessions over.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match Control::connect_local("goatty-restart") {
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(50));
+        match Control::connect_within(&goatty_proto::socket_path(), "goatty-restart", Some(left)) {
             Ok(c) if c.pid() == pid => return Ok(Restarted::Kept { sessions }),
             Ok(c) => anyhow::bail!("another goattyd (pid {}) answers now", c.pid()),
             Err(e) if Instant::now() > deadline => return Err(e.context("goattyd didn't come back after restarting")),
