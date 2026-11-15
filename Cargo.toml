@@ -81,3 +81,10 @@ opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"
+
+# What releases ship (release.yml): the release build without debug info,
+# a fifth of the size. Symbol names stay, so backtraces still name functions.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = "debuginfo"

@@ -1,23 +1,97 @@
 name: Release
 
+# A release is the workspace version in Cargo.toml, tagged `v<version>`
+# (docs/releasing.md). It's published when
+# - a push to main changes that version (`just bump X.Y.Z` opens the PR), or
+# - a `v*` tag matching it is pushed.
+# Run it by hand (Actions → Release → Run workflow, any branch) for a dry run:
+# it builds and tests the packages without publishing anything.
 on:
   push:
+    branches: [main]
+    # Not evaluated for tag pushes.
+    paths: [Cargo.toml]
     tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          version=$(scripts/version.sh)
+          tag="v$version"
+          build=true
+          publish=false
+          case "$EVENT:$GITHUB_REF" in
+            push:refs/tags/*)
+              if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+                echo "::error::Tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($version)."
+                exit 1
+              fi
+              publish=true
+              ;;
+            push:*)
+              previous=$(git show "$BEFORE:Cargo.toml" 2>/dev/null | scripts/version.sh - 2>/dev/null || true)
+              if [ "$previous" = "$version" ]; then
+                echo "The version is still $version: nothing to release."
+                build=false
+              elif git rev-parse --quiet --verify "refs/tags/$tag" >/dev/null; then
+                echo "::warning::The version changed to $version, but $tag already exists: not releasing it again."
+                build=false
+              else
+                echo "The version changed from ${previous:-?} to $version: releasing $tag."
+                publish=true
+              fi
+              ;;
+            *)
+              echo "Dry run for $version: building and testing the packages, publishing nothing."
+              ;;
+          esac
+          case $version in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "build=$build"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+          echo "**$tag**: build=$build, publish=$publish, prerelease=$prerelease" >>"$GITHUB_STEP_SUMMARY"
+
   # Static goattyd for remote hosts (any Linux distro, any libc): what
   # `goatty --ssh` uploads to hosts without goattyd (crates/goatty-client/src/remote.rs).
   # zig provides the C++ cross compiler rio-vt's simdutf needs.
   remote-goattyd:
     name: goattyd ${{ matrix.target }} (static)
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         include:
@@ -30,49 +104,151 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: dist-${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
       - run: cargo install --locked cargo-zigbuild
-      - run: cargo zigbuild --release --locked -p goatty-daemon --target ${{ matrix.target }}
+      - run: cargo zigbuild --profile dist --locked -p goatty-daemon --target ${{ matrix.target }}
       - name: Check it's static
         run: |
-          f=target/${{ matrix.target }}/release/goattyd
+          f=target/${{ matrix.target }}/dist/goattyd
           file "$f"
           file "$f" | grep -Eq 'static(ally|-pie) linked'
-          mkdir -p dist && cp "$f" "dist/goattyd-${{ matrix.name }}"
+          mkdir -p out && cp "$f" "out/goattyd-${{ matrix.name }}"
       - uses: actions/upload-artifact@v4
         with:
           name: goattyd-${{ matrix.name }}
-          path: dist/goattyd-${{ matrix.name }}
+          path: out/goattyd-${{ matrix.name }}
+          if-no-files-found: error
 
   linux:
-    name: linux x86_64
-    needs: remote-goattyd
-    runs-on: ubuntu-latest
+    name: linux x86_64 packages
+    needs: [plan, remote-goattyd]
+    # The oldest supported runner: the binaries need this glibc (2.35) or newer.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      NFPM_VERSION: 2.49.0
+      NFPM_SHA256: 2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7
     steps:
       - uses: actions/checkout@v7
       - run: ./scripts/ci-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --workspace
+        with:
+          key: dist
+      - name: Install nfpm
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/nfpm.tar.gz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+      - run: cargo build --profile dist --locked -p goatty-app -p goatty-daemon
       - uses: actions/download-artifact@v4
         with:
           pattern: goattyd-*
           path: remote
           merge-multiple: true
+      - run: chmod 755 remote/goattyd-*
       - name: Package
         run: |
-          name="goatty-${GITHUB_REF_NAME}-x86_64-linux"
-          mkdir -p "dist/$name/remote"
-          cp target/release/goatty target/release/goattyd README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
-          cp scripts/install.sh crates/goatty-app/assets/brand/goatty.svg "dist/$name/"
-          install -m 755 remote/goattyd-* "dist/$name/remote/"
-          chmod 755 "dist/$name/install.sh"
-          ls -l "dist/$name/remote"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          sha256sum "dist/$name.tar.gz" > "dist/$name.tar.gz.sha256"
+          echo "Newest glibc symbol needed: $(objdump -T target/dist/goatty target/dist/goattyd | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          scripts/package.sh dist
+          ls -l dist
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
+
+  # Install each package on a clean system: catches dependency names that
+  # don't exist there and libraries the binaries need but don't declare.
+  test-packages:
+    name: install on ${{ matrix.image }}
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            install: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends ./goatty_*.deb
+          - image: ubuntu:24.04
+            install: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends ./goatty_*.deb
+          - image: debian:12
+            install: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends ./goatty_*.deb
+          - image: fedora:latest
+            install: dnf install -y --setopt=install_weak_deps=False ./goatty-*.rpm
+          - image: archlinux:latest
+            # vulkan-swrast provides vulkan-driver without pulling in a GPU driver.
+            install: pacman -Syu --noconfirm vulkan-swrast && pacman -U --noconfirm ./goatty-*.pkg.tar.zst
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+      - name: Install
+        run: ${{ matrix.install }}
+      - name: Check
+        run: |
+          set -x
+          goatty --version
+          goattyd --version
+          ls -l /usr/lib/goatty/remote/
+          /usr/lib/goatty/remote/goattyd-x86_64-linux --version
+          test -f /usr/share/applications/dev.goatty.goatty.desktop
+          test -f /usr/share/icons/hicolor/scalable/apps/goatty.svg
+          goatty completions zsh >/dev/null
+
+  publish:
+    name: Publish ${{ needs.plan.outputs.tag }}
+    needs: [plan, remote-goattyd, linux, test-packages]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        working-directory: assets
+        run: |
+          sha256sum -- * >SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        working-directory: assets
+        run: |
+          deb=$(echo goatty_*.deb) rpm=$(echo goatty-*.rpm) pkg=$(echo goatty-*.pkg.tar.zst) tgz=$(echo goatty-*-linux.tar.gz)
+          url="https://github.com/$GH_REPO/releases/download/$TAG"
+          {
+            echo "## Install (Linux x86_64)"
+            echo
+            echo "- **Arch Linux**: \`curl -LO $url/$pkg && sudo pacman -U $pkg\`"
+            echo "- **Ubuntu 22.04+ / Debian 12+**: \`curl -LO $url/$deb && sudo apt install ./$deb\`"
+            echo "- **Fedora**: \`sudo dnf install $url/$rpm\`"
+            echo "- **Any other distro, no root**: extract \`$tgz\` and run \`./install.sh\` (installs into \`~/.local\`)"
+            echo
+            echo "\`goattyd-<arch>-linux\` are the static daemons goatty installs on remote hosts over SSH. Verify downloads with \`sha256sum -c SHA256SUMS --ignore-missing\`."
+            echo
+            gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" --jq .body
+          } >"$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
       - name: Publish
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --generate-notes --prerelease
+        working-directory: assets
+        run: |
+          flags=()
+          [ "$PRERELEASE" = true ] && flags+=(--prerelease)
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "goatty $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" -- *

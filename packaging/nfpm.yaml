@@ -1,0 +1,126 @@
+# Linux packages (.deb, .rpm, Arch .pkg.tar.zst) of a dist build, made by
+# nfpm (https://nfpm.goreleaser.com). scripts/package.sh runs it with VERSION
+# and ARCH set; paths are relative to the repository root.
+name: goatty
+version: ${VERSION}
+arch: ${ARCH}
+platform: linux
+release: 1
+section: x11
+priority: optional
+maintainer: goatty-dev <https://github.com/goatty-dev/goatty>
+vendor: goatty-dev
+homepage: https://github.com/goatty-dev/goatty
+license: MIT OR Apache-2.0
+description: |-
+  GPU-rendered terminal with persistent sessions
+  goatty is a fast terminal with a managed zsh, a GUI for every setting and
+  plugins. Sessions live in goattyd, so shells outlive the window, and goatty
+  can attach to goattyd on other machines over SSH.
+
+contents:
+  - src: target/dist/goatty
+    dst: /usr/bin/goatty
+    file_info: { mode: 0755 }
+  - src: target/dist/goattyd
+    dst: /usr/bin/goattyd
+    file_info: { mode: 0755 }
+  # Static goattyds that goatty uploads to remote hosts; it looks for them in
+  # ../lib/goatty/remote next to its binary (goatty_client::remote::find_bundled).
+  - src: remote/goattyd-*
+    dst: /usr/lib/goatty/remote/
+    file_info: { mode: 0755 }
+  - src: packaging/linux/dev.goatty.goatty.desktop
+    dst: /usr/share/applications/dev.goatty.goatty.desktop
+    file_info: { mode: 0644 }
+  - src: crates/goatty-app/assets/brand/goatty.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/goatty.svg
+    file_info: { mode: 0644 }
+  # Completions for shells outside goatty (its managed zsh has them already).
+  - src: target/dist/completions/goatty.bash
+    dst: /usr/share/bash-completion/completions/goatty
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/goattyd.bash
+    dst: /usr/share/bash-completion/completions/goattyd
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/goatty.fish
+    dst: /usr/share/fish/vendor_completions.d/goatty.fish
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/goattyd.fish
+    dst: /usr/share/fish/vendor_completions.d/goattyd.fish
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/_goatty
+    dst: /usr/share/zsh/vendor-completions/_goatty
+    packager: deb
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/_goattyd
+    dst: /usr/share/zsh/vendor-completions/_goattyd
+    packager: deb
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/_goatty
+    dst: /usr/share/zsh/site-functions/_goatty
+    packager: rpm
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/_goattyd
+    dst: /usr/share/zsh/site-functions/_goattyd
+    packager: rpm
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/_goatty
+    dst: /usr/share/zsh/site-functions/_goatty
+    packager: archlinux
+    file_info: { mode: 0644 }
+  - src: target/dist/completions/_goattyd
+    dst: /usr/share/zsh/site-functions/_goattyd
+    packager: archlinux
+    file_info: { mode: 0644 }
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/goatty/LICENSE-MIT
+    file_info: { mode: 0644 }
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/goatty/LICENSE-APACHE
+    file_info: { mode: 0644 }
+  - src: README.md
+    dst: /usr/share/doc/goatty/README.md
+    file_info: { mode: 0644 }
+
+# Linked: libxcb, libxkbcommon(-x11), libstdc++. Loaded at runtime by GPUI:
+# libwayland-client/-egl and the Vulkan loader, which needs a Vulkan driver.
+# The deb floor is the glibc of the build host (ubuntu-22.04 in release.yml).
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.35)
+      - libgcc-s1
+      - libstdc++6
+      - libxcb1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-egl1
+      - libvulkan1
+    recommends:
+      - zsh
+      - mesa-vulkan-drivers | vulkan-icd
+  rpm:
+    depends:
+      - libstdc++.so.6()(64bit)
+      - libxcb.so.1()(64bit)
+      - libxkbcommon.so.0()(64bit)
+      - libxkbcommon-x11.so.0()(64bit)
+      - libwayland-client.so.0()(64bit)
+      - libwayland-egl.so.1()(64bit)
+      - libvulkan.so.1()(64bit)
+    recommends:
+      - zsh
+      - mesa-vulkan-drivers
+  archlinux:
+    depends:
+      - libxcb
+      - libxkbcommon
+      - libxkbcommon-x11
+      - wayland
+      - vulkan-icd-loader
+      - vulkan-driver
+    # nfpm writes these as optdepends (and expands env vars in them).
+    recommends:
+      - "zsh: the managed shell (without it goatty starts your login shell)"
