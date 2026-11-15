@@ -205,7 +205,7 @@ jobs:
           goatty completions zsh >/dev/null
 
   publish:
-    name: Publish ${{ needs.plan.outputs.tag }}
+    name: Publish
     needs: [plan, remote-goattyd, linux, test-packages]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
