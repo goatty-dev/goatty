@@ -257,6 +257,8 @@ pub fn builtins() -> Vec<Command> {
         .keywords(&["directory", "files"]),
         Command::action("ssh.connect", "SSH", "Connect to a host…", "connect_to_host")
             .keywords(&["remote", "server", "hosts", "goattyd", "open"]),
+        Command::action("session.list", "Sessions", "Sessions on this host…", "list_sessions")
+            .keywords(&["end", "kill", "stop", "close", "detached", "attach", "reopen"]),
         Command::handler("ssh.connect_custom", "SSH", "Connect to a custom host…", crate::hosts::ask_connect).keywords(&[
             "remote",
             "address",

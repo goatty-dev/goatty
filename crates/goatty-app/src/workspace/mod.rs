@@ -59,6 +59,7 @@ use crate::app::Initial;
 use crate::close_confirm::{CloseConfirm, CloseConfirmEvent, Closing};
 use crate::command_palette::{CommandPalette, PaletteEvent, Scope};
 use crate::connect::{ConnectEvent, ConnectPlan, ConnectView};
+use crate::hosts::HostRef;
 use crate::paste_confirm::{PasteConfirm, PasteConfirmEvent};
 use crate::session::AttachMode;
 use crate::session::{Session, Spawner};
@@ -1273,6 +1274,30 @@ impl Workspace {
         self.open_palette(Scope::Hosts, window, cx);
     }
 
+    /// The active tab's host's sessions. A plain SSH tab's live in this
+    /// computer's goattyd; a tab whose sessions no goattyd keeps (a local
+    /// PTY), or that reaches its daemon another way, says so instead.
+    fn list_sessions(&mut self, _: &ListSessions, window: &mut Window, cx: &mut Context<'_, Self>) {
+        fn host_of(spawner: &Spawner) -> Option<HostRef> {
+            match spawner {
+                Spawner::Daemon(conn) => match conn.endpoint() {
+                    goatty_client::Endpoint::Local => Some(HostRef::Local),
+                    goatty_client::Endpoint::Ssh(t) => Some(HostRef::Ssh(t.host.clone())),
+                    goatty_client::Endpoint::Command { .. } => None,
+                },
+                Spawner::Plain { base, .. } => host_of(base),
+                Spawner::Local(_) => None,
+            }
+        }
+        let Some(tab) = self.active_tab() else { return };
+        let body = match tab.host.as_ref().map(host_of) {
+            Some(Some(host)) => return self.open_palette(Scope::Sessions(host), window, cx),
+            Some(None) => "This tab's shell isn't kept by a goattyd goatty can list sessions of.",
+            None => "This tab is still connecting.",
+        };
+        toast::show(cx, Toast::info("No sessions to list here").body(body).key("list-sessions"));
+    }
+
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_recent(window, cx);
         let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
@@ -1489,6 +1514,7 @@ impl Render for Workspace {
                 toast::press_primary(window, cx);
             })
             .on_action(cx.listener(Self::connect_to_host))
+            .on_action(cx.listener(Self::list_sessions))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_pane))
             .on_action(cx.listener(Self::close_tab))

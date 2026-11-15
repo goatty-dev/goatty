@@ -22,8 +22,9 @@
 //!   version, same files the user already approved here. Anything else is
 //!   listed as skipped with the reason. Plugins installed from a folder
 //!   can't be copied.
-//! * **Tools**: the built-in plugins' tools the host is missing and the
-//!   synced settings keep on (Starship, fzf, …).
+//! * **Tools**: the built-in plugins' tools the host is missing or has an
+//!   outdated managed copy of, and the synced settings keep on (Starship,
+//!   fzf, …).
 //!
 //! Nothing is uninstalled: plugins only the host has stay.
 
@@ -210,7 +211,10 @@ impl Plan {
                 None => format!("install {} {}", p.name, p.version),
             });
         }
-        out.extend(self.tools.iter().map(|t| format!("install {} {}", t.name, t.version)));
+        out.extend(self.tools.iter().map(|t| match t.outdated() {
+            Some(old) => format!("update {} {old} → {}", t.name, t.version),
+            None => format!("install {} {}", t.name, t.version),
+        }));
         out.extend(self.skipped.iter().map(|s| format!("skip {}: {}", s.id, s.reason)));
         out
     }
@@ -275,7 +279,7 @@ pub fn plan(local: &LocalSetup, host: &HostSetup) -> Plan {
     let tools = host
         .tools
         .iter()
-        .filter(|t| t.default_install && t.installable() && synced.plugins.get(&t.id).is_none_or(|c| c.enabled))
+        .filter(|t| synced.plugins.get(&t.id).is_none_or(|c| c.enabled) && ((t.default_install && t.installable()) || t.updatable()))
         .cloned()
         .collect();
 
@@ -433,6 +437,7 @@ impl Step {
         match self {
             Step::Plugin(p) if p.replaces.is_some() => format!("Updating {}", p.name),
             Step::Plugin(p) => format!("Installing {}", p.name),
+            Step::Tool(t) if t.outdated().is_some() => format!("Updating {}", t.name),
             Step::Tool(t) => format!("Installing {}", t.name),
             Step::Settings { .. } => "Applying your settings".into(),
         }
@@ -598,7 +603,11 @@ mod tests {
             r#"{"version": 4, "plugins": {"extra": {"settings": {"x": 1}}}}"#,
             vec![installed("eza", "1.0.0"), installed("zoxide", "2.0.0"), installed("extra", "0.1.0")],
             vec![registry("official", &[], true)],
-            vec![tool("starship", ToolLocation::Missing), tool("fzf-tab", ToolLocation::Missing)],
+            vec![
+                tool("starship", ToolLocation::Missing),
+                tool("fzf-tab", ToolLocation::Missing),
+                Tool { version: "0.74.5".into(), ..tool("fzf", ToolLocation::Managed { version: "0.70.0".into() }) },
+            ],
         );
         let p = plan(&l, &h);
         let keys: Vec<&str> = p.changes.iter().map(|c| c.key.as_str()).collect();
@@ -611,8 +620,9 @@ mod tests {
         let skipped: Vec<&str> = p.skipped.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(skipped, ["zoxide", "mine"]);
         assert!(p.skipped[0].reason.contains("doesn't downgrade"));
-        // fzf-tab is off in the synced settings: not installed.
-        assert_eq!(p.tools.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["starship"]);
+        // fzf-tab is off in the synced settings: not installed; starship is missing; fzf is outdated managed.
+        assert_eq!(p.tools.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["starship", "fzf"]);
+        assert!(p.lines().iter().any(|line| line == "update fzf 0.70.0 → 0.74.5"), "{:?}", p.lines());
         // A plugin only the host has keeps its settings.
         assert_eq!(p.kept, ["extra"]);
         assert!(p.settings_json.contains("\"extra\""), "{}", p.settings_json);

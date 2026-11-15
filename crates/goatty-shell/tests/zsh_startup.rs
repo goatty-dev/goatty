@@ -1135,3 +1135,114 @@ fn guarded_zshrc_never_runs_compinit_twice() {
     assert_eq!(sb.trace(), ["compinit-ran", "rc-done"], "goatty's run only");
     assert!(text.contains("defined=1") && text.contains("compinit-ran"), "the user's definition is back: {text}");
 }
+
+/// Outdated managed tools (#45): detected in pure zsh when the active copy
+/// lives under `tools/<id>/<old>/`, shown in the startup hint even if an
+/// earlier GUI offered the setup, hidden under `--dismiss` or `GOATTY_GUI_SETUP`,
+/// ignored when shadowed by a system copy, and passed to `goatty-setup`.
+#[test]
+fn outdated_managed_tools_hint_and_setup() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+
+    // Seed an outdated managed binary (starship) and an outdated managed plugin script (fzf-tab),
+    // plus a current managed script (autosuggestions) and a system fzf that shadows an old managed fzf.
+    let starship_dir = sb.dirs.tools_dir().join("starship/1.0.0");
+    std::fs::create_dir_all(&starship_dir).unwrap();
+    exe(&starship_dir.join("starship"), "#!/bin/sh\n[ \"$1\" = init ] && echo 'PROMPT=\"managed-starship> \"'\n");
+    std::fs::create_dir_all(sb.dirs.bin_dir()).unwrap();
+    std::os::unix::fs::symlink(starship_dir.join("starship"), sb.dirs.bin_dir().join("starship")).unwrap();
+
+    let tab_dir = sb.dirs.tools_dir().join("fzf-tab/1.0.0/fzf-tab-1.0.0");
+    std::fs::create_dir_all(&tab_dir).unwrap();
+    std::fs::write(tab_dir.join("fzf-tab.plugin.zsh"), "ftb_w() { :; }; zle -N ftb_w\n").unwrap();
+    std::fs::create_dir_all(sb.dirs.plugins_dir()).unwrap();
+    std::os::unix::fs::symlink(&tab_dir, sb.dirs.plugins_dir().join("fzf-tab")).unwrap();
+
+    let current_as = goatty_shell::builtins::get("autosuggestions").unwrap().manifest().packages[0].version.clone();
+    let as_root = sb.dirs.tools_dir().join(format!("autosuggestions/{current_as}/zsh-autosuggestions-{current_as}"));
+    std::fs::create_dir_all(&as_root).unwrap();
+    std::fs::write(as_root.join("zsh-autosuggestions.zsh"), "true\n").unwrap();
+    std::os::unix::fs::symlink(&as_root, sb.dirs.plugins_dir().join("autosuggestions")).unwrap();
+
+    // System fzf on PATH shadows an old managed fzf -> fzf must NOT be flagged outdated.
+    let old_fzf_dir = sb.dirs.tools_dir().join("fzf/0.10.0");
+    std::fs::create_dir_all(&old_fzf_dir).unwrap();
+    exe(&old_fzf_dir.join("fzf"), "#!/bin/sh\n");
+    std::os::unix::fs::symlink(old_fzf_dir.join("fzf"), sb.dirs.bin_dir().join("fzf")).unwrap();
+    exe(&sb.home.join("sysbin/fzf"), "#!/bin/sh\n");
+
+    // Remove the fake starship from userbin (which Sandbox::new added for .zprofile tests)
+    // and ensure only managed starship is used, and disable syntax-highlighting so nothing else is missing.
+    let _ = std::fs::remove_file(sb.home.join("userbin/starship"));
+    // Also mark shell-setup-offered to verify outdated hints still surface after earlier GUI offers.
+    std::fs::create_dir_all(&sb.dirs.state).unwrap();
+    std::fs::write(sb.dirs.offer_marker(), "").unwrap();
+
+    let launch = sb.launch_with(no_highlighting(), None);
+    // Derive expectations from the sandbox child's environment (the runner's PATH,
+    // e.g. ~/.cargo/bin, isn't inherited, while /etc/profile may add /usr/bin).
+    let status_out = sb.run(&launch, "goatty-status");
+    let status = goatty_shell::doctor::parse_status(&stdout(&status_out));
+    let is_managed = |id: &str| {
+        status.iter().find(|f| f.name == id).is_some_and(|f| match &f.state {
+            goatty_shell::doctor::State::Ok(detail) => goatty_shell::setup::is_managed_detail(&sb.dirs, detail),
+            _ => false,
+        })
+    };
+    let mut expected_outdated = Vec::new();
+    if is_managed("fzf-tab") {
+        expected_outdated.push("fzf-tab");
+    }
+    if is_managed("starship") {
+        expected_outdated.push("starship");
+    }
+    let out = pty_session(&sb, &launch, &["goatty-setup"]);
+    if !expected_outdated.is_empty() {
+        assert!(out.contains(&format!("outdated: {}", expected_outdated.join(", "))), "expected outdated hint:\n{out}");
+        assert!(out.contains("to update"), "expected update verb:\n{out}");
+        assert!(out.contains("goatty-setup"), "expected goatty-setup hint:\n{out}");
+        let trace = sb.trace();
+        let setup = trace.iter().find(|l| l.starts_with("goattyd ")).expect("goatty-setup ran goattyd");
+        assert_eq!(setup, &format!("goattyd shell install -- {}", expected_outdated.join(" ")));
+    }
+    assert!(!out.contains("not installed:"), "missing tools suppressed by offer marker & everything else installed:\n{out}");
+
+    // Directly exercise `_goatty_outdated_tools` in real zsh for both a managed binary
+    // symlink (`bin/starship -> tools/starship/1.0.0/starship`), a managed script symlink,
+    // a current managed copy, and a system copy shadowing a managed copy.
+    let direct = stdout(&sb.run(
+        &launch,
+        "typeset -gA _goatty_state; \
+         _goatty_state[starship]=\"ok\t$_goatty_bin/starship\"; \
+         _goatty_state[fzf-tab]=\"ok\t$_goatty_pkgs/fzf-tab/fzf-tab.plugin.zsh\"; \
+         _goatty_state[autosuggestions]=\"ok\t$_goatty_pkgs/autosuggestions/zsh-autosuggestions.zsh\"; \
+         _goatty_state[fzf]=\"ok\t/usr/bin/fzf\"; \
+         _goatty_outdated_tools; \
+         print -r -- \"out=${(j:,:)reply}\"",
+    ));
+    assert!(direct.contains("out=fzf-tab,starship\n"), "direct _goatty_outdated_tools check failed:\n{direct}");
+
+    // Even when startup state shows nothing missing or outdated (e.g. goattyd was
+    // upgraded with a new pin while this shell stayed open), `goatty-setup` with
+    // no arguments delegates discovery to the current daemon.
+    let _ = std::fs::remove_file(sb.home.join("trace"));
+    let _ = sb.run(
+        &launch,
+        "typeset -gA _goatty_state; \
+         _goatty_state[fzf]=ok; _goatty_state[fzf-tab]=ok; _goatty_state[autosuggestions]=ok; _goatty_state[starship]=ok; \
+         goatty-setup",
+    );
+    assert_eq!(sb.trace(), ["goattyd shell install"]);
+
+    // Quiet in GUI sessions that offer setup themselves.
+    let mut gui_launch = sb.launch_with(no_highlighting(), None);
+    goatty_shell::setup::gui_offers_setup(&mut gui_launch);
+    let gui_out = pty_session(&sb, &gui_launch, &[]);
+    assert!(!gui_out.contains("outdated:"), "{gui_out:?}");
+
+    // Quiet when dismissed (`goatty-setup --dismiss`).
+    std::fs::write(sb.dirs.hint_marker(), "").unwrap();
+    let dismissed_out = pty_session(&sb, &launch, &[]);
+    assert!(!dismissed_out.contains("outdated:"), "{dismissed_out:?}");
+}

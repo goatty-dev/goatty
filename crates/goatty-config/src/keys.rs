@@ -42,6 +42,7 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "open_settings", label: "Open settings", group: "goatty" },
     ActionInfo { name: "command_palette", label: "Show the command palette", group: "goatty" },
     ActionInfo { name: "connect_to_host", label: "Connect to a host (SSH)", group: "goatty" },
+    ActionInfo { name: "list_sessions", label: "Sessions on this host (open or end one)", group: "goatty" },
     ActionInfo { name: "reload_shells", label: "Reload running shells with new shell settings", group: "goatty" },
     // Unbound by default: Escape belongs to the terminal (#86).
     ActionInfo { name: "dismiss_notifications", label: "Dismiss all notifications", group: "Notifications" },

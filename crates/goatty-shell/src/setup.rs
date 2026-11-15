@@ -201,9 +201,15 @@ impl Status {
         self.tools.iter().filter(|t| t.default_install && t.enabled && t.installable())
     }
 
-    /// Ask the user (no "don't ask again", something to install).
+    /// Enabled built-in tools whose managed copy differs from the pinned
+    /// version and that goatty can update here.
+    pub fn updates(&self) -> impl Iterator<Item = &Tool> {
+        self.tools.iter().filter(|t| t.enabled && t.updatable())
+    }
+
+    /// Ask the user (no "don't ask again", something to install or update).
     pub fn should_offer(&self) -> bool {
-        self.managed && !self.dismissed && self.offer().next().is_some()
+        self.managed && !self.dismissed && (self.offer().next().is_some() || self.updates().next().is_some())
     }
 
     pub fn tool(&self, id: &str) -> Option<&Tool> {
@@ -215,6 +221,20 @@ impl Tool {
     /// Missing, and goatty has a build to install.
     pub fn installable(&self) -> bool {
         self.location == ToolLocation::Missing && self.unavailable.is_none()
+    }
+
+    /// goatty's managed copy is on a different version than the pinned one.
+    pub fn outdated(&self) -> Option<&str> {
+        match &self.location {
+            ToolLocation::Managed { version } if *version != self.version => Some(version),
+            _ => None,
+        }
+    }
+
+    /// goatty's managed copy differs from the pinned version, and goatty
+    /// has a build to update it.
+    pub fn updatable(&self) -> bool {
+        self.outdated().is_some() && self.unavailable.is_none()
     }
 }
 
@@ -380,6 +400,13 @@ impl Feature {
     }
 }
 
+/// Whether `detail` (reported by `goatty-status`) points inside goatty's
+/// managed `bin/` or `plugins/` directories.
+pub fn is_managed_detail(dirs: &Dirs, detail: &str) -> bool {
+    let path = Path::new(detail);
+    path.starts_with(dirs.bin_dir()) || path.starts_with(dirs.plugins_dir())
+}
+
 fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
     let name = match id {
         "integration" => "Shell integration".to_owned(),
@@ -400,9 +427,8 @@ fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
         }
         State::Ok(detail) => {
             let path = Path::new(detail);
-            let is_managed = path.starts_with(dirs.bin_dir()) || path.starts_with(dirs.plugins_dir());
             let managed = builtins::get(id)
-                .filter(|_| is_managed)
+                .filter(|_| is_managed_detail(dirs, detail))
                 .and_then(|b| b.manifest().packages.iter().find_map(|p| packages::managed(dirs, p)).map(|(v, _)| v));
             FeatureState::Loaded { detail: tilde(path), managed }
         }
@@ -437,21 +463,20 @@ fn tool(b: &'static Builtin, plugins: &Plugins<'_>, host: &Effective<HostSetting
     };
     // The shell sees more of PATH than goattyd (the user's .zprofile ran).
     if let Some(State::Ok(detail)) = probe.and_then(|p| p.get(b.id))
-        && location == ToolLocation::Missing
+        && !is_managed_detail(plugins.dirs, detail)
     {
         location = ToolLocation::System { path: tilde(Path::new(detail)) };
     }
     t.location = location;
+    let needs_fetch = t.location == ToolLocation::Missing || t.outdated().is_some();
     match plugins.plan(&Candidate::builtin(b), &host.value) {
-        Ok(plan) => t.download = plan.downloads.iter().filter(|d| d.fetches()).map(|d| d.size).sum(),
+        Ok(plan) if needs_fetch => t.download = plan.downloads.iter().filter(|d| d.fetches()).map(|d| d.size).sum(),
+        Ok(_) => t.download = 0,
         Err(e) => {
-            if t.location == ToolLocation::Missing {
+            if needs_fetch {
                 t.unavailable = Some(format!("{e:#}"));
             }
         }
-    }
-    if t.location != ToolLocation::Missing {
-        t.download = 0;
     }
     t
 }
@@ -572,6 +597,74 @@ mod tests {
         s.dismissed = false;
         s.tools[0].enabled = false;
         assert!(!s.should_offer());
+    }
+
+    #[test]
+    fn updates_picks_outdated_enabled_managed_tools() {
+        let t = |id: &str, location: ToolLocation, unavailable: Option<&str>| Tool {
+            id: id.into(),
+            name: id.into(),
+            summary: String::new(),
+            enabled: true,
+            default_install: true,
+            location,
+            download: 1,
+            version: "1.27.0".into(),
+            unavailable: unavailable.map(Into::into),
+        };
+        let mut s = Status {
+            managed: true,
+            tools: vec![
+                t("starship", ToolLocation::Managed { version: "1.26.0".into() }, None),
+                t("fzf", ToolLocation::Managed { version: "1.27.0".into() }, None),
+                t("fzf-tab", ToolLocation::Managed { version: "1.25.0".into() }, Some("no build")),
+                t("autosuggestions", ToolLocation::System { path: "/usr/share/x".into() }, None),
+            ],
+            ..Status::default()
+        };
+        assert_eq!(s.tools[0].outdated(), Some("1.26.0"));
+        assert!(s.tools[0].updatable());
+        assert_eq!(s.tools[1].outdated(), None);
+        assert_eq!(s.tools[2].outdated(), Some("1.25.0"));
+        assert!(!s.tools[2].updatable());
+        assert!(s.offer().next().is_none());
+        assert_eq!(s.updates().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["starship"]);
+        assert!(s.should_offer());
+        s.dismissed = true;
+        assert!(!s.should_offer());
+        s.dismissed = false;
+        s.tools[0].enabled = false;
+        assert!(!s.should_offer());
+    }
+
+    #[test]
+    fn tool_reports_download_size_for_outdated_managed_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        // Install an outdated managed fzf-tab (target = "any", so plan always has an asset).
+        let old = dirs.tools_dir().join("fzf-tab/1.0.0/fzf-tab-1.0.0");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("fzf-tab.plugin.zsh"), "").unwrap();
+        std::fs::create_dir_all(dirs.plugins_dir()).unwrap();
+        std::os::unix::fs::symlink(&old, dirs.plugins_dir().join("fzf-tab")).unwrap();
+
+        let fetch = goatty_plugin::fetch::Fixed::default();
+        let plugins = Plugins { dirs: &dirs, fetch: &fetch, builtin: &[] };
+        let host = Effective::plain(HostSettings::default());
+        let b = builtins::get("fzf-tab").unwrap();
+        let mut p = b.manifest().packages[0].clone();
+        p.system_paths.clear();
+        // Force managed location check without host distro copy interfering.
+        assert_eq!(packages::managed(&dirs, &p).map(|(v, _)| v), Some("1.0.0".into()));
+
+        // When no system copy shadows it, tool() marks it Managed("1.0.0") with non-zero download.
+        let t = tool(b, &plugins, &host, None);
+        if let ToolLocation::Managed { version } = &t.location {
+            assert_eq!(version, "1.0.0");
+            assert_eq!(t.outdated(), Some("1.0.0"));
+            assert!(t.updatable());
+            assert!(t.download > 0);
+        }
     }
 
     #[test]

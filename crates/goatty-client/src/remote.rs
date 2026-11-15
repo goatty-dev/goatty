@@ -226,6 +226,22 @@ pub fn stop_daemon(target: &SshTarget) -> Result<()> {
     Ok(())
 }
 
+/// Restart the host's goattyd with this build's installed one
+/// (`goattyd restart --force`): its sessions carry over when the running
+/// daemon can do that (protocol v10 on), else it's stopped and they end.
+pub fn restart_daemon(target: &SshTarget) -> Result<()> {
+    let script = format!("exec \"$HOME/{BIN_DIR}/{}\" restart --force", binary_name());
+    let out = target
+        .command(&format!("sh -c {}", sh_quote(&script)))
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("couldn't run {}", target.program))?;
+    if !out.status.success() {
+        bail!("restarting goattyd on {} failed: {}", target.host, last_words(&out.stderr, &out.stdout));
+    }
+    Ok(())
+}
+
 /// The last few lines a command printed, for an error message. A backtrace
 /// (goattyd's errors carry one when the host sets `RUST_BACKTRACE`) is cut
 /// off, so the message itself is what's left.
@@ -327,17 +343,34 @@ mod tests {
         }
     }
 
+    fn find_tool(name: &str) -> PathBuf {
+        std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .chain(["/usr/bin", "/bin"].into_iter().map(PathBuf::from))
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("{name} not found in PATH or /usr/bin:/bin"))
+    }
+
     #[test]
     fn proxy_script_reports_a_missing_daemon() {
-        let home = tempfile::tempdir().unwrap();
-        let out = std::process::Command::new("sh")
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let sysbin = dir.path().join("sysbin");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&sysbin).unwrap();
+        for tool in ["sh", "uname"] {
+            std::os::unix::fs::symlink(find_tool(tool), sysbin.join(tool)).unwrap();
+        }
+        let mut out = std::process::Command::new(sysbin.join("sh"))
             .args(["-c", &proxy_script(None)])
-            .env("HOME", home.path())
-            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("PATH", &sysbin)
+            .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut out = out;
         let err = drain(out.stderr.take().unwrap());
         assert_eq!(out.wait().unwrap().code(), Some(127));
         let probe = parse_probe(&err.lines().map(String::from).collect::<Vec<_>>()).unwrap();

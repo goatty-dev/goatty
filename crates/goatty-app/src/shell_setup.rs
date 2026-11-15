@@ -136,7 +136,7 @@ pub fn offer(link: HostLink, cx: &mut App) {
         if !status.should_offer() {
             return;
         }
-        if !status.offered {
+        if !status.offered && status.offer().next().is_some() {
             let l = link.clone();
             cx.background_executor()
                 .spawn(async move {
@@ -152,22 +152,65 @@ pub fn offer(link: HostLink, cx: &mut App) {
 }
 
 fn show_offer(link: HostLink, status: &Status, cx: &mut App) {
-    let tools: Vec<Tool> = status.offer().cloned().collect();
-    let list: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let missing: Vec<Tool> = status.offer().cloned().collect();
+    let updates: Vec<Tool> = status.updates().cloned().collect();
+    let mut tools = missing.clone();
+    for u in &updates {
+        if !tools.iter().any(|t| t.id == u.id) {
+            tools.push(u.clone());
+        }
+    }
+    let missing_names: Vec<&str> = missing.iter().map(|t| t.name.as_str()).collect();
+    let update_names: Vec<&str> = updates.iter().map(|t| t.name.as_str()).collect();
     let bytes: u64 = tools.iter().map(|t| t.download).sum();
-    let title = if link.is_local() { "Finish setting up your shell".to_string() } else { format!("Set up the shell on {}", link.label()) };
-    let verb = if tools.len() == 1 { "isn't" } else { "aren't" };
-    let body = format!(
-        "{} {verb} installed yet. goatty can add them: {}, no sudo, nothing outside goatty's folder.",
-        names(&list),
-        setup::size(bytes)
-    );
+    let (title, body, action) = match (missing.is_empty(), updates.is_empty()) {
+        (false, true) => {
+            let title =
+                if link.is_local() { "Finish setting up your shell".to_string() } else { format!("Set up the shell on {}", link.label()) };
+            let verb = if missing.len() == 1 { "isn't" } else { "aren't" };
+            let body = format!(
+                "{} {verb} installed yet. goatty can add them: {}, no sudo, nothing outside goatty's folder.",
+                names(&missing_names),
+                setup::size(bytes)
+            );
+            (title, body, "Install")
+        }
+        (true, false) => {
+            let title = if link.is_local() {
+                "Update goatty's shell tools".to_string()
+            } else {
+                format!("Update the shell tools on {}", link.label())
+            };
+            let verb = if updates.len() == 1 { "has" } else { "have" };
+            let obj = if updates.len() == 1 { "it" } else { "them" };
+            let body = format!(
+                "{} {verb} an update in goatty. goatty can update {obj}: {}, no sudo, nothing outside goatty's folder.",
+                names(&update_names),
+                setup::size(bytes)
+            );
+            (title, body, "Update")
+        }
+        (false, false) => {
+            let title =
+                if link.is_local() { "Finish setting up your shell".to_string() } else { format!("Set up the shell on {}", link.label()) };
+            let miss_verb = if missing.len() == 1 { "isn't" } else { "aren't" };
+            let upd_verb = if updates.len() == 1 { "has" } else { "have" };
+            let body = format!(
+                "{} {miss_verb} installed yet, and {} {upd_verb} an update: {}, no sudo, nothing outside goatty's folder.",
+                names(&missing_names),
+                names(&update_names),
+                setup::size(bytes)
+            );
+            (title, body, "Install & update")
+        }
+        (true, true) => return,
+    };
     let (install_link, dismiss_link) = (link.clone(), link.clone());
     let t = Toast::info(title)
         .body(body)
         .key(toast_key(&link))
         .sticky()
-        .action("Install", move |_, cx| start_install(install_link.clone(), tools.clone(), cx))
+        .action(action, move |_, cx| start_install(install_link.clone(), tools.clone(), cx))
         .action("Not now", |_, _| {})
         .action("Don't ask again", move |_, cx| dismiss(dismiss_link.clone(), cx));
     toast::show(cx, t);
@@ -181,7 +224,7 @@ pub fn dismiss(link: HostLink, cx: &mut App) {
         cx.update(|cx| {
             let t = match result {
                 Ok(_) => Toast::info("goatty won't ask again")
-                    .body("Install the tools any time from Settings → Diagnostics, or with goatty-setup in a shell.")
+                    .body("Install or update tools any time from Settings → Diagnostics, or with goatty-setup in a shell.")
                     .action("Diagnostics", |_, cx| settings_window::open_at(cx, Some(Page::Diagnostics))),
                 Err(e) => Toast::error("Couldn't save that").body(format!("{e:#}")),
             };
@@ -194,6 +237,7 @@ pub fn dismiss(link: HostLink, cx: &mut App) {
 /// Install `tools` with a toast showing the progress and the result.
 pub fn start_install(link: HostLink, tools: Vec<Tool>, cx: &mut App) {
     let key = toast_key(&link);
+    let only_updates = !tools.is_empty() && tools.iter().all(|t| t.outdated().is_some());
     let progress = Progress::new(&tools);
     let id = toast::show(cx, Toast::loading(progress.status_line()).key(key.clone()));
     cx.spawn(async move |cx| {
@@ -207,17 +251,18 @@ pub fn start_install(link: HostLink, tools: Vec<Tool>, cx: &mut App) {
         .await;
         cx.update(|cx| {
             let failures = p.failures();
-            let installed: Vec<&str> = p.tools.iter().filter(|t| t.2 == Step::Done).map(|t| t.1.as_str()).collect();
+            let done: Vec<&str> = p.tools.iter().filter(|t| t.2 == Step::Done).map(|t| t.1.as_str()).collect();
+            let past = if only_updates { "Updated" } else { "Installed" };
             let t = if failures.is_empty() {
-                Toast::success(format!("Installed {}", names(&installed)))
+                Toast::success(format!("{past} {}", names(&done)))
                     .body("Your shells reload with them at their next idle prompt; new tabs have them right away.")
             } else {
                 let retry: Vec<Tool> =
                     tools.iter().filter(|t| p.tools.iter().any(|(id, _, s)| id == &t.id && *s != Step::Done)).cloned().collect();
-                Toast::error(if installed.is_empty() {
-                    "Couldn't install the tools".to_string()
+                Toast::error(if done.is_empty() {
+                    if only_updates { "Couldn't update the tools".to_string() } else { "Couldn't install the tools".to_string() }
                 } else {
-                    format!("Installed {}, but not everything", names(&installed))
+                    format!("{past} {}, but not everything", names(&done))
                 })
                 .body(failures.join("\n"))
                 .action("Retry", move |_, cx| start_install(retry_link.clone(), retry.clone(), cx))

@@ -147,6 +147,7 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_dir", &d.zsh_dir().to_string_lossy());
     scalar("_goatty_bin", &d.bin_dir().to_string_lossy());
     scalar("_goatty_pkgs", &d.plugins_dir().to_string_lossy());
+    scalar("_goatty_tools", &d.tools_dir().to_string_lossy());
     scalar("_goatty_fpath", &d.site_functions_dir().to_string_lossy());
     scalar("_goatty_cache", &d.cache.to_string_lossy());
     scalar("_goatty_user_zshrc", &d.user_zshrc().to_string_lossy());
@@ -183,6 +184,12 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     let defaults: Vec<&str> =
         builtins::BUILTINS.iter().filter(|b| b.default_install && s.plugins.get(b.id).is_none_or(|c| c.enabled)).map(|b| b.id).collect();
     out.push_str(&format!("typeset -ga _goatty_setup_defaults=({})\n", defaults.join(" ")));
+    // Pinned version per built-in plugin, so zshrc can tell when a managed copy is outdated.
+    let pins: Vec<String> = builtins::BUILTINS
+        .iter()
+        .filter_map(|b| b.manifest().packages.first().map(|p| format!("{} {}", b.id, quote(&p.version))))
+        .collect();
+    out.push_str(&format!("typeset -gA _goatty_pins=({})\n", pins.join(" ")));
     out
 }
 
@@ -225,8 +232,11 @@ mod tests {
         assert!(out.contains("_goatty_features=(integration)"));
         assert!(out.contains(r"_goatty_path=('~/my bin' '/opt/it'\''s')"), "{out}");
         assert!(out.contains(r"_goatty_pkgs='/r o/ot'\''s/data/plugins'"), "{out}");
+        assert!(out.contains(r"_goatty_tools='/r o/ot'\''s/data/tools'"), "{out}");
         assert!(out.contains(r"_goatty_fpath='/r o/ot'\''s/data/share/zsh/site-functions'"), "{out}");
         assert!(out.contains("_goatty_setup_defaults=(fzf fzf-tab autosuggestions syntax-highlighting)"), "starship is off: {out}");
+        let fzf_ver = builtins::get("fzf").unwrap().manifest().packages[0].version.as_str();
+        assert!(out.contains(&format!("typeset -gA _goatty_pins=(fzf '{}'", fzf_ver)), "{out}");
     }
 
     #[test]

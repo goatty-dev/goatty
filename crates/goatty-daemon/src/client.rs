@@ -21,10 +21,20 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Unbounded, but bounded in practice: stream frames are limited by each
     // subscriber's window, control replies are tiny.
     let (tx, rx) = flume::unbounded::<Frame>();
+    // An empty frame (real ones never are) asks the writer to flush and say
+    // so here: everything queued before it has been sent.
+    let (flushed_tx, flushed_rx) = flume::bounded::<()>(1);
     let wstream = stream.try_clone()?;
     let writer = std::thread::Builder::new().name(format!("c{conn}-writer")).spawn(move || {
         let mut w = BufWriter::with_capacity(128 << 10, &wstream);
         while let Ok(f) = rx.recv() {
+            if f.is_empty() {
+                if w.flush().is_err() {
+                    break;
+                }
+                let _ = flushed_tx.try_send(());
+                continue;
+            }
             if w.write_all(&f).is_err() {
                 break;
             }
@@ -132,6 +142,20 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(ServerMsg::Ok { req });
                     daemon.shutdown();
                 }
+                ClientMsg::Restart { req, exe } => match crate::restore::successor(&daemon, exe) {
+                    Ok(exe) => {
+                        reply(ServerMsg::Ok { req });
+                        // The exec closes the connection: let the reply out first.
+                        let _ = tx.send(Frame::from(&[][..]));
+                        if flushed_rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                            log::warn!("connection {conn}: the restart reply may not have gone out");
+                        }
+                        if let Err(e) = crate::restore::restart(&daemon, &exe) {
+                            log::error!("restart failed, going on as before: {e:#}");
+                        }
+                    }
+                    Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
+                },
                 ClientMsg::GetHostSettings { req } => reply(crate::settings::get(&daemon, req)),
                 ClientMsg::SetHostSettings { req, json, apply } => reply(crate::settings::set(&daemon, req, &json, apply)),
                 ClientMsg::ListGenerations { req } => reply(crate::settings::generations(&daemon, req)),
