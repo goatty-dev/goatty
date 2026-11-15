@@ -204,9 +204,41 @@ jobs:
           test -f /usr/share/icons/hicolor/scalable/apps/goatty.svg
           goatty completions zsh >/dev/null
 
+  # The AUR package goatty-bin (packaging/aur/PKGBUILD), built by makepkg
+  # from this run's archive and installed on a clean Arch.
+  test-aur:
+    name: AUR goatty-bin (makepkg)
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: archlinux:latest
+    steps:
+      # vulkan-swrast provides vulkan-driver without pulling in a GPU driver.
+      - run: pacman -Syu --noconfirm --needed base-devel git namcap vulkan-swrast
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+      - name: Build and install
+        run: |
+          useradd -m builder
+          scripts/aur-pkgbuild.sh /home/builder/aur packages/goatty-*-x86_64-linux.tar.gz --local
+          chown -R builder: /home/builder/aur
+          cd /home/builder/aur
+          su builder -c 'makepkg --cleanbuild --noconfirm'
+          namcap PKGBUILD goatty-bin-*.pkg.tar.zst || true
+          pacman -U --noconfirm goatty-bin-*.pkg.tar.zst
+          set -x
+          goatty --version
+          goattyd --version
+          /usr/lib/goatty/remote/goattyd-x86_64-linux --version
+          test -f /usr/share/applications/dev.goatty.goatty.desktop
+          test -f /usr/share/zsh/site-functions/_goatty
+
   publish:
     name: Publish
-    needs: [plan, remote-goattyd, linux, test-packages]
+    needs: [plan, remote-goattyd, linux, test-packages, test-aur]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -252,3 +284,64 @@ jobs:
           [ "$PRERELEASE" = true ] && flags+=(--prerelease)
           gh release create "$TAG" --target "$GITHUB_SHA" --title "goatty $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}" -- *
+
+  # Update goatty-bin on the AUR to a stable release. Needs the repository
+  # secret AUR_SSH_PRIVATE_KEY: the private half of an SSH key registered with
+  # the AUR account that maintains goatty-bin (docs/releasing.md).
+  aur:
+    name: Push goatty-bin to the AUR
+    needs: [plan, publish]
+    if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: archlinux:latest
+    env:
+      AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - id: key
+        run: |
+          if [ -z "$AUR_SSH_KEY" ]; then
+            echo "::warning::AUR_SSH_PRIVATE_KEY isn't set: goatty-bin on the AUR stays as it is (docs/releasing.md)."
+            echo "push=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "push=true" >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.key.outputs.push == 'true'
+        run: pacman -Syu --noconfirm --needed base-devel git openssh
+      - if: steps.key.outputs.push == 'true'
+        uses: actions/checkout@v7
+      - name: PKGBUILD and .SRCINFO for the published archive
+        if: steps.key.outputs.push == 'true'
+        run: |
+          archive="goatty-$VERSION-x86_64-linux.tar.gz"
+          curl -fsSLO "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$archive"
+          useradd -m builder
+          scripts/aur-pkgbuild.sh /home/builder/pkg "$archive"
+          chown -R builder: /home/builder/pkg
+          # --verifysource downloads the source again and checks its sha256.
+          su builder -c 'cd ~/pkg && makepkg --verifysource --noconfirm && makepkg --printsrcinfo >.SRCINFO'
+          cat /home/builder/pkg/PKGBUILD
+      - name: Push
+        if: steps.key.outputs.push == 'true'
+        run: |
+          ssh_dir="$RUNNER_TEMP/ssh"
+          install -dm700 "$ssh_dir"
+          printf '%s\n' "$AUR_SSH_KEY" >"$ssh_dir/key"
+          chmod 600 "$ssh_dir/key"
+          # The host key published on https://aur.archlinux.org (ED25519 SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4).
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' >"$ssh_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
+          git clone ssh://aur@aur.archlinux.org/goatty-bin.git "$RUNNER_TEMP/aur"
+          cp /home/builder/pkg/PKGBUILD /home/builder/pkg/.SRCINFO "$RUNNER_TEMP/aur/"
+          cd "$RUNNER_TEMP/aur"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "goatty-bin is already at $VERSION"
+            exit 0
+          fi
+          git commit -m "Update to $VERSION"
+          git push origin HEAD:master

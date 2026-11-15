@@ -36,14 +36,17 @@ for b in goatty goattyd; do
     "$bin/$b" completions fish >"$bin/completions/$b.fish"
 done
 
-# Release archive: what scripts/install.sh expects next to it.
+# Release archive: what scripts/install.sh expects next to it, plus the
+# launcher and completions that packages built from it (packaging/aur) install.
 name="goatty-$version-$machine-linux"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/$name/remote"
+mkdir -p "$stage/$name/remote" "$stage/$name/completions"
 install -m 755 "$bin/goatty" "$bin/goattyd" scripts/install.sh "$stage/$name/"
-install -m 644 README.md LICENSE-MIT LICENSE-APACHE crates/goatty-app/assets/brand/goatty.svg "$stage/$name/"
+install -m 644 README.md LICENSE-MIT LICENSE-APACHE crates/goatty-app/assets/brand/goatty.svg \
+    packaging/linux/dev.goatty.goatty.desktop "$stage/$name/"
 install -m 755 "${remotes[@]}" "$stage/$name/remote/"
+install -m 644 "$bin"/completions/* "$stage/$name/completions/"
 tar -C "$stage" -czf "$out/$name.tar.gz" --owner=0 --group=0 "$name"
 echo "$out/$name.tar.gz"
 

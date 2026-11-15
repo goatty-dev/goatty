@@ -43,7 +43,7 @@ To try reattaching: run something in goatty, close the window, start `goatty` ag
 
 [Releases](https://github.com/goatty-dev/goatty/releases) have packages for x86_64. Each release page lists the exact install commands:
 
-- Arch Linux: `sudo pacman -U goatty-<version>-1-x86_64.pkg.tar.zst`
+- Arch Linux: `paru -S goatty-bin` (or `yay -S goatty-bin`) from the AUR, or `sudo pacman -U goatty-<version>-1-x86_64.pkg.tar.zst`
 - Ubuntu 22.04+ / Debian 12+: `sudo apt install ./goatty_<version>-1_amd64.deb`
 - Fedora: `sudo dnf install ./goatty-<version>-1.x86_64.rpm`
 
