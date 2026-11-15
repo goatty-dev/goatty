@@ -1014,17 +1014,25 @@ fn outdated_managed_tools_hint_and_setup() {
     std::fs::create_dir_all(&sb.dirs.state).unwrap();
     std::fs::write(sb.dirs.offer_marker(), "").unwrap();
 
-    let host_tab = has_system_copy("fzf-tab");
-    let host_starship = goatty_shell::launch::which("starship").is_some();
     let launch = sb.launch_with(no_highlighting(), None);
-    let out = pty_session(&sb, &launch, &["goatty-setup"]);
+    // Derive expectations from the sandbox child's environment (the runner's PATH,
+    // e.g. ~/.cargo/bin, isn't inherited, while /etc/profile may add /usr/bin).
+    let status_out = sb.run(&launch, "goatty-status");
+    let status = goatty_shell::doctor::parse_status(&stdout(&status_out));
+    let is_managed = |id: &str| {
+        status.iter().find(|f| f.name == id).is_some_and(|f| match &f.state {
+            goatty_shell::doctor::State::Ok(detail) => goatty_shell::setup::is_managed_detail(&sb.dirs, detail),
+            _ => false,
+        })
+    };
     let mut expected_outdated = Vec::new();
-    if !host_tab {
+    if is_managed("fzf-tab") {
         expected_outdated.push("fzf-tab");
     }
-    if !host_starship {
+    if is_managed("starship") {
         expected_outdated.push("starship");
     }
+    let out = pty_session(&sb, &launch, &["goatty-setup"]);
     if !expected_outdated.is_empty() {
         assert!(out.contains(&format!("outdated: {}", expected_outdated.join(", "))), "expected outdated hint:\n{out}");
         assert!(out.contains("to update"), "expected update verb:\n{out}");
@@ -1049,6 +1057,18 @@ fn outdated_managed_tools_hint_and_setup() {
          print -r -- \"out=${(j:,:)reply}\"",
     ));
     assert!(direct.contains("out=fzf-tab,starship\n"), "direct _goatty_outdated_tools check failed:\n{direct}");
+
+    // Even when startup state shows nothing missing or outdated (e.g. goattyd was
+    // upgraded with a new pin while this shell stayed open), `goatty-setup` with
+    // no arguments delegates discovery to the current daemon.
+    let _ = std::fs::remove_file(sb.home.join("trace"));
+    let _ = sb.run(
+        &launch,
+        "typeset -gA _goatty_state; \
+         _goatty_state[fzf]=ok; _goatty_state[fzf-tab]=ok; _goatty_state[autosuggestions]=ok; _goatty_state[starship]=ok; \
+         goatty-setup",
+    );
+    assert_eq!(sb.trace(), ["goattyd shell install"]);
 
     // Quiet in GUI sessions that offer setup themselves.
     let mut gui_launch = sb.launch_with(no_highlighting(), None);

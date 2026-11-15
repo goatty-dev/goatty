@@ -234,7 +234,7 @@ Conflicts are refused at plan time: a plugin id, package id or executable of a b
 
 ## Built-in plugins
 
-fzf, fzf-tab, autosuggestions, syntax-highlighting and starship come with goatty (`crates/goatty-shell/plugins/<id>/`, compiled in by `goatty_shell::builtins`; table with pins and slots in [`managed-zsh.md`](managed-zsh.md#installing-tools)). They're ordinary manifests (validated by the same parser, `builtins::tests`), so they get install plans, settings on the Plugins page and load-order slots. The differences:
+fzf, fzf-tab, autosuggestions, syntax-highlighting and starship come with goatty (`crates/goatty-shell/plugins/<id>/`, compiled in by `goatty_shell::builtins`; table with pins and slots in [`managed-zsh.md`](managed-zsh.md#installing-and-updating-tools)). They're ordinary manifests (validated by the same parser, `builtins::tests`), so they get install plans, settings on the Plugins page and load-order slots. The differences:
 
 - **Always there.** No lock entry and no copy in `installed/`: their files are part of goatty, read from the binary when a generation is built. They're on unless `plugins.<id>.enabled` is `false`; `goattyd plugin disable fzf-tab` (or the switch on the Shell/Prompt/History page) turns one off, and `goatty-status` says `off`. Uninstalling is refused; `goattyd shell uninstall <id>` removes goatty's download of the tool.
 - **Planning one = its packages.** `find("fzf")` always resolves to the built-in plugin (a registry can't shadow it). Its plan lists each package as already on the system, already installed by goatty at the pinned version (`current`), or to download; installing downloads only the latter. `goattyd shell install` and `goatty-setup` use exactly this.

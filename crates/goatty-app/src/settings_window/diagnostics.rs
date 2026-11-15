@@ -14,6 +14,7 @@ use super::kit::{self, card, row, section};
 use super::{Page, SettingsWindow};
 use crate::shell_setup::{self, Progress, Step};
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button, button_with};
+use crate::ui::focus;
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
 
@@ -209,7 +210,10 @@ impl SettingsWindow {
                         format!("{verb} {} ({})", shell_setup::names(&names), size(bytes)),
                         ButtonKind::Primary,
                         ui,
-                        self.act(cx, move |v, cx| v.diag_install(ids.clone(), cx)),
+                        self.act_window(cx, move |v, window, cx| {
+                            focus::hand_over(&v.focus, focus::Handover::Control("diag-recheck".into()), window, cx);
+                            v.diag_install(ids.clone(), cx);
+                        }),
                     )
                     .when(installing, |d| d.opacity(0.5)),
                 ),
@@ -262,7 +266,10 @@ impl SettingsWindow {
                         let id = t.id.clone();
                         r.desc(format!("goatty's copy {v} (outdated; {} is {}) · {detail}", t.version, size(t.download))).control(
                             button("diag-update-".to_string() + &t.id, "Update", ButtonKind::Normal, ui, {
-                                self.act(cx, move |v, cx| v.diag_install(vec![id.clone()], cx))
+                                self.act_window(cx, move |v, window, cx| {
+                                    focus::hand_over(&v.focus, focus::Handover::Control("diag-recheck".into()), window, cx);
+                                    v.diag_install(vec![id.clone()], cx);
+                                })
                             })
                             .when(installing, |d| d.opacity(0.5)),
                         )
@@ -289,7 +296,10 @@ impl SettingsWindow {
                         let id = t.id.clone();
                         r.desc(format!("Not installed · {} {} is {}", t.name, t.version, size(t.download))).control(
                             button("diag-install-".to_string() + &t.id, "Install", ButtonKind::Normal, ui, {
-                                self.act(cx, move |v, cx| v.diag_install(vec![id.clone()], cx))
+                                self.act_window(cx, move |v, window, cx| {
+                                    focus::hand_over(&v.focus, focus::Handover::Control("diag-recheck".into()), window, cx);
+                                    v.diag_install(vec![id.clone()], cx);
+                                })
                             })
                             .when(installing, |d| d.opacity(0.5)),
                         )

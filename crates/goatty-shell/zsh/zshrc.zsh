@@ -247,11 +247,11 @@ goatty-setup() {
     _goatty_outdated_tools
     local -aU todo=($missing $reply)
     todo=(${(o)todo})
-    set -- $todo
-    if (( $# == 0 )); then
-      builtin print -r -- "goatty: nothing to install or update (see goatty-status)"
-      return 0
+    if (( ${#todo} == 0 )); then
+      "$daemon" shell install && goatty-reload
+      return
     fi
+    set -- $todo
   fi
   "$daemon" shell install -- "$@" && goatty-reload
 }

@@ -136,19 +136,28 @@ fn is_missing(b: &Builtin, dirs: &Dirs, path: Option<&str>, probe: Option<&docto
     }
 }
 
-/// Returns the older managed version if `b` uses a goatty-managed copy whose
+/// Returns the older managed version if `m` uses a goatty-managed copy whose
 /// version differs from its pinned version (and isn't shadowed by a system
 /// copy found by probing the shell).
-fn outdated_managed(b: &Builtin, dirs: &Dirs, path: Option<&str>, probe: Option<&doctor::Probe>) -> Option<String> {
-    if let Some(doctor::State::Ok(detail)) = probe.and_then(|p| p.get(b.id))
+fn outdated_managed_manifest(
+    m: &goatty_plugin::manifest::Manifest,
+    dirs: &Dirs,
+    path: Option<&str>,
+    probe: Option<&doctor::Probe>,
+) -> Option<String> {
+    if let Some(doctor::State::Ok(detail)) = probe.and_then(|p| p.get(&m.id))
         && !setup::is_managed_detail(dirs, detail)
     {
         return None;
     }
-    b.manifest().packages.iter().find_map(|p| match packages::locate(dirs, p, path) {
+    m.packages.iter().find_map(|p| match packages::locate(dirs, p, path) {
         Location::Managed { version, .. } if version != p.version => Some(version),
         _ => None,
     })
+}
+
+fn outdated_managed(b: &Builtin, dirs: &Dirs, path: Option<&str>, probe: Option<&doctor::Probe>) -> Option<String> {
+    outdated_managed_manifest(b.manifest(), dirs, path, probe)
 }
 
 /// Built-in plugins that `goattyd shell install` (without names) handles:
@@ -196,7 +205,7 @@ pub fn install(host: &Effective<HostSettings>, launcher: &Launcher, names: &[Str
     let dirs = dirs_of(launcher)?;
     let fetch = goatty_plugin::fetch::Curl { cache: dirs.cache.clone() };
     let requested = if names.is_empty() { default_install_targets(host, launcher, dirs) } else { resolve_names(names)? };
-    run_tool_plans(host, dirs, &fetch, requested, yes, false)
+    run_tool_plans(host, dirs, &fetch, requested.into_iter().map(Candidate::builtin).collect(), yes, false)
 }
 
 /// `goattyd shell update [NAME...]`: update goatty's managed copies of
@@ -216,50 +225,65 @@ fn update_with_fetch(
     names: &[String],
     yes: bool,
 ) -> Result<()> {
-    let requested = if names.is_empty() {
-        outdated_targets(host, launcher, dirs)
+    if names.is_empty() {
+        let requested = outdated_targets(host, launcher, dirs).into_iter().map(Candidate::builtin).collect();
+        run_tool_plans(host, dirs, fetch, requested, yes, true)
     } else {
         let path = std::env::var("PATH").ok();
-        let mut out = Vec::new();
-        for b in resolve_names(names)? {
-            if outdated_managed(b, dirs, path.as_deref(), None).is_some() {
-                out.push(b);
-                continue;
-            }
-            for p in &b.manifest().packages {
-                match packages::locate(dirs, p, path.as_deref()) {
-                    Location::System(sys) => println!("{} is already installed at {}; goatty uses that.", b.manifest().name, tilde(&sys)),
-                    Location::Managed { version, .. } => println!("{} {version} is already up to date.", b.manifest().name),
-                    Location::Missing => println!("{} isn't installed (`goattyd shell install {}` installs it).", b.manifest().name, b.id),
+        let requested = resolve_names(names)?.into_iter().map(Candidate::builtin).collect();
+        update_explicit_candidates(host, dirs, fetch, requested, path.as_deref(), yes)
+    }
+}
+
+fn update_explicit_candidates(
+    host: &Effective<HostSettings>,
+    dirs: &Dirs,
+    fetch: &dyn goatty_plugin::fetch::Fetch,
+    candidates: Vec<Candidate>,
+    path: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    let mut out = Vec::new();
+    for c in candidates {
+        if outdated_managed_manifest(&c.manifest, dirs, path, None).is_some() {
+            out.push(c);
+            continue;
+        }
+        for p in &c.manifest.packages {
+            match packages::locate(dirs, p, path) {
+                Location::System(sys) => println!("{} is already installed at {}; goatty uses that.", c.manifest.name, tilde(&sys)),
+                Location::Managed { version, .. } => println!("{} {version} is already up to date.", c.manifest.name),
+                Location::Missing => {
+                    println!("{} isn't installed (`goattyd shell install {}` installs it).", c.manifest.name, c.manifest.id);
                 }
             }
         }
-        out
-    };
-    run_tool_plans(host, dirs, fetch, requested, yes, true)
+    }
+    run_tool_plans(host, dirs, fetch, out, yes, true)
 }
 
 fn run_tool_plans(
     host: &Effective<HostSettings>,
     dirs: &Dirs,
     fetch: &dyn goatty_plugin::fetch::Fetch,
-    requested: Vec<&'static Builtin>,
+    requested: Vec<Candidate>,
     yes: bool,
     updating_only: bool,
 ) -> Result<()> {
     let plugins = Plugins { dirs, fetch, builtin: &[] };
     let mut todo = Vec::new();
-    for b in requested {
-        let c = Candidate::builtin(b);
+    let mut plan_failed = 0usize;
+    for c in requested {
         let plan = match plugins.plan(&c, &host.value) {
             Ok(plan) => plan,
             Err(e) => {
                 println!("{e:#}");
+                plan_failed += 1;
                 continue;
             }
         };
         if plan.downloads.iter().any(|d| d.fetches()) {
-            todo.push((b, c, plan));
+            todo.push((c, plan));
             continue;
         }
         for d in &plan.downloads {
@@ -270,6 +294,9 @@ fn run_tool_plans(
         }
     }
     if todo.is_empty() {
+        if plan_failed > 0 {
+            bail!("{plan_failed} {} failed", if updating_only { "updates" } else { "installs" });
+        }
         println!("{}", if updating_only { "Nothing to update." } else { "Nothing to install." });
         return Ok(());
     }
@@ -277,10 +304,10 @@ fn run_tool_plans(
     let mut rows: Vec<(String, u64, &str)> = Vec::new();
     let mut has_install = false;
     let mut has_update = false;
-    for (b, _, plan) in &todo {
+    for (c, plan) in &todo {
         for d in plan.downloads.iter().filter(|d| d.fetches()) {
-            let old = b
-                .manifest()
+            let old = c
+                .manifest
                 .packages
                 .iter()
                 .find(|p| p.id == d.package)
@@ -318,8 +345,8 @@ fn run_tool_plans(
         return Ok(());
     }
 
-    let mut failed = 0;
-    for (_, c, plan) in &todo {
+    let mut failed = 0usize;
+    for (c, plan) in &todo {
         print!("  {} ... ", plan.name);
         let _ = std::io::stdout().flush();
         match plugins.install(c, &plan.digest, &host.value) {
@@ -330,8 +357,9 @@ fn run_tool_plans(
             }
         }
     }
-    if failed > 0 {
-        bail!("{failed} of {} {} failed", todo.len(), if verb == "update" { "updates" } else { "installs" });
+    let total_failed = failed + plan_failed;
+    if total_failed > 0 {
+        bail!("{total_failed} of {} {} failed", todo.len() + plan_failed, if verb == "update" { "updates" } else { "installs" });
     }
     println!("Done. New goatty shells use them; `goatty-reload` restarts the current one.");
     Ok(())
@@ -582,20 +610,30 @@ mod tests {
         }
     }
 
+    fn isolated_candidate(id: &str) -> Candidate {
+        let mut c = Candidate::builtin(builtins::get(id).unwrap());
+        for p in &mut c.manifest.packages {
+            p.system_paths.clear();
+            p.prefer_system = false;
+        }
+        c
+    }
+
     #[test]
     fn outdated_managed_ignores_system_shadow_and_current_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
-        let fzf_tab = builtins::get("fzf-tab").unwrap();
-        let fzf = builtins::get("fzf").unwrap();
-        let pinned_tab = &fzf_tab.manifest().packages[0].version;
+        let fzf_tab = isolated_candidate("fzf-tab").manifest;
+        let mut fzf = isolated_candidate("fzf").manifest;
+        fzf.packages[0].prefer_system = true;
+        let pinned_tab = &fzf_tab.packages[0].version;
 
         // Missing -> None.
-        assert_eq!(outdated_managed(fzf_tab, &dirs, Some(""), None), None);
+        assert_eq!(outdated_managed_manifest(&fzf_tab, &dirs, Some(""), None), None);
 
         // Managed at an older version -> Some(old).
         seed_outdated_plugin(&dirs, "fzf-tab", "1.0.0", "fzf-tab-1.0.0", "fzf-tab.plugin.zsh", false);
-        assert_eq!(outdated_managed(fzf_tab, &dirs, Some(""), None).as_deref(), Some("1.0.0"));
+        assert_eq!(outdated_managed_manifest(&fzf_tab, &dirs, Some(""), None).as_deref(), Some("1.0.0"));
 
         // If the shell probe reports a system copy (e.g. added by .zprofile), skip updating.
         let mut probe = doctor::Probe {
@@ -606,15 +644,15 @@ mod tests {
             }],
             stderr: String::new(),
         };
-        assert_eq!(outdated_managed(fzf_tab, &dirs, Some(""), Some(&probe)), None);
+        assert_eq!(outdated_managed_manifest(&fzf_tab, &dirs, Some(""), Some(&probe)), None);
 
         // If the probe reports goatty's own managed copy, it's still outdated.
         probe.features[0].state = doctor::State::Ok(dirs.plugins_dir().join("fzf-tab/fzf-tab.plugin.zsh").to_string_lossy().into_owned());
-        assert_eq!(outdated_managed(fzf_tab, &dirs, Some(""), Some(&probe)).as_deref(), Some("1.0.0"));
+        assert_eq!(outdated_managed_manifest(&fzf_tab, &dirs, Some(""), Some(&probe)).as_deref(), Some("1.0.0"));
 
         // Managed at the pinned version -> None.
         seed_outdated_plugin(&dirs, "fzf-tab", pinned_tab, &format!("fzf-tab-{pinned_tab}"), "fzf-tab.plugin.zsh", false);
-        assert_eq!(outdated_managed(fzf_tab, &dirs, Some(""), None), None);
+        assert_eq!(outdated_managed_manifest(&fzf_tab, &dirs, Some(""), None), None);
 
         // System binary on PATH shadows a managed copy.
         seed_outdated_plugin(&dirs, "fzf", "0.50.0", "", "fzf", true);
@@ -626,40 +664,51 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(sysbin.join("fzf"), std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        assert_eq!(outdated_managed(fzf, &dirs, Some(sysbin.to_str().unwrap()), None), None);
+        assert_eq!(outdated_managed_manifest(&fzf, &dirs, Some(sysbin.to_str().unwrap()), None), None);
     }
 
     #[test]
     fn update_with_fetch_replaces_outdated_managed_package() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Dirs::under(tmp.path());
-        let b = builtins::get("fzf-tab").unwrap();
-        let pkg = &b.manifest().packages[0];
+        let base = isolated_candidate("fzf-tab");
+        let pkg = base.manifest.packages[0].clone();
         let asset = pkg.asset_for("any").unwrap();
         let root = asset.root.as_str();
         let source = pkg.source.as_deref().unwrap();
         let archive = targz(&[(&format!("{root}/{source}"), b"# updated fzf-tab\n", 0o644)]);
-        // Verify checksum matches if we mock with Fixed: wait — asset has real sha256!
-        // We can't change the built-in manifest's sha256 in a unit test, so
-        // test the no-op/skip paths and verify mismatch fails cleanly.
+        let archive_sha = goatty_plugin::bundle::sha256_hex(&archive);
         let mut map = BTreeMap::new();
         map.insert(asset.url.clone(), archive);
         let fetch = goatty_plugin::fetch::Fixed(map);
         let host = Effective::plain(HostSettings::default());
-        let launcher = Launcher::new(Some(dirs.clone()), None);
 
         // Missing -> no error, prints hint and returns Ok.
-        update_with_fetch(&host, &launcher, &dirs, &fetch, &["fzf-tab".into()], true).unwrap();
+        update_explicit_candidates(&host, &dirs, &fetch, vec![base.clone()], Some(""), true).unwrap();
+
+        // Outdated managed copy with invalid lock.json -> planning fails and update returns Err
+        // instead of silently returning Ok("Nothing to update.").
+        seed_outdated_plugin(&dirs, "fzf-tab", "1.0.0", "fzf-tab-1.0.0", source, false);
+        std::fs::create_dir_all(dirs.installed_dir()).unwrap();
+        let lock_file = dirs.installed_dir().join("lock.json");
+        std::fs::write(&lock_file, "{not valid json").unwrap();
+        let err = update_explicit_candidates(&host, &dirs, &fetch, vec![base.clone()], Some(""), true).unwrap_err();
+        assert!(err.to_string().contains("failed"), "{err:#}");
+        std::fs::remove_file(&lock_file).unwrap();
 
         // Outdated managed copy -> attempts update and validates sha256 against pinned checksum.
-        seed_outdated_plugin(&dirs, "fzf-tab", "1.0.0", "fzf-tab-1.0.0", source, false);
-        let err = update_with_fetch(&host, &launcher, &dirs, &fetch, &["fzf-tab".into()], true).unwrap_err();
+        let err = update_explicit_candidates(&host, &dirs, &fetch, vec![base.clone()], Some(""), true).unwrap_err();
         assert!(err.to_string().contains("failed"), "{err:#}");
         // Because install is staged, the older managed copy remains intact on failure.
         assert!(dirs.tools_dir().join("fzf-tab/1.0.0/fzf-tab-1.0.0/fzf-tab.plugin.zsh").exists());
 
+        // Matching checksum -> replaces the outdated managed copy with the pinned version.
+        let mut valid = base.clone();
+        valid.manifest.packages[0].assets.iter_mut().for_each(|a| a.sha256 = archive_sha.clone());
+        update_explicit_candidates(&host, &dirs, &fetch, vec![valid.clone()], Some(""), true).unwrap();
+        assert_eq!(packages::managed(&dirs, &valid.manifest.packages[0]).map(|(v, _)| v).as_deref(), Some(pkg.version.as_str()));
+
         // Already at pinned version -> succeeds as a no-op.
-        seed_outdated_plugin(&dirs, "fzf-tab", &pkg.version, root, source, false);
-        update_with_fetch(&host, &launcher, &dirs, &fetch, &["fzf-tab".into()], true).unwrap();
+        update_explicit_candidates(&host, &dirs, &fetch, vec![valid], Some(""), true).unwrap();
     }
 }
