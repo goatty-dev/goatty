@@ -188,21 +188,29 @@ if (( _goatty_user_rc )); then
     _goatty_rc_stub starship init starship
     _goatty_rc_stub oh-my-posh init starship
     _goatty_rc_stub fzf --zsh fzf
-    # goatty ran compinit; a second run is slow and resets completion.
-    if (( ! ${+functions[compinit]} )); then
-      compinit() { : }
-      _goatty_rc_stubs+=(compinit)
+    # goatty ran compinit; a second run is slow and resets completion. Its
+    # definition (if zsh kept one) comes back afterwards.
+    if (( ${+functions[compinit]} )); then
+      typeset -g _goatty_rc_compinit=$functions[compinit]
     fi
-    builtin alias source="builtin source ${(q)_goatty_dir}/rc-guard.zsh"
-    builtin alias .="builtin source ${(q)_goatty_dir}/rc-guard.zsh"
+    compinit() { : }
+    # The caller's argument count and arguments go along (see rc-guard.zsh).
+    builtin alias source="builtin source ${(q)_goatty_dir}/rc-guard.zsh \$# \"\$@\""
+    builtin alias .="builtin source ${(q)_goatty_dir}/rc-guard.zsh \$# \"\$@\""
     builtin source -- "$REPLY"
     builtin unalias source . 2>/dev/null
     (( $#_goatty_rc_stubs )) && builtin unfunction $_goatty_rc_stubs 2>/dev/null
+    if (( ${+_goatty_rc_compinit} )); then
+      functions[compinit]=$_goatty_rc_compinit
+      builtin unset _goatty_rc_compinit
+    else
+      builtin unfunction compinit 2>/dev/null
+    fi
     builtin unfunction _goatty_rc_blocked _goatty_rc_stub
     for REPLY in ${(u)_goatty_rc_skipped}; do
       _goatty_state[rc:$REPLY]=off
     done
-    builtin unset _goatty_rc_skipped _goatty_rc_stubs
+    builtin unset _goatty_rc_skipped _goatty_rc_stubs _goatty_rc_caller
   fi
   _goatty_zdotdir_capture
   builtin export ZDOTDIR=$_goatty_dir

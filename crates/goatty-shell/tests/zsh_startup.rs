@@ -1056,10 +1056,12 @@ fn guarded_zshrc_skips_frameworks_and_keeps_the_rest() {
     sb.file(".cache/p10k-instant-prompt-tester.zsh", "print -r -- P10K-LOADED >> $HOME/trace\n");
     sb.file(".oh-my-zsh/oh-my-zsh.sh", "print -r -- OMZ-LOADED >> $HOME/trace\nPROMPT='omz> '\n");
     sb.file(".zsh/mine.zsh", "typeset -A mine=(a 1)\nprint -r -- \"args=$#\" >> $HOME/trace\n");
-    sb.file(".zsh/with-args.zsh", "print -r -- \"with=$*\" >> $HOME/trace\n");
+    sb.file(".zsh/with-args.zsh", "print -r -- \"with=$*\" >> $HOME/trace\nsource ~/.zsh/nested.zsh\n");
+    // Sourced without arguments: sees the arguments of the file that sourced it.
+    sb.file(".zsh/nested.zsh", "print -r -- \"nested=$*\" >> $HOME/trace\n");
     sb.file(
         ".zshrc",
-        "source \"$HOME/.cache/p10k-instant-prompt-tester.zsh\"\nexport ZSH=$HOME/.oh-my-zsh\nsource $ZSH/oh-my-zsh.sh\n\
+        "source \"$HOME/.cache/p10k-instant-prompt-tester.zsh\"\nexport ZSH=$HOME/.oh-my-zsh\nsource -- $ZSH/oh-my-zsh.sh\n\
          . ~/.zsh/mine.zsh\nsource ~/.zsh/with-args.zsh one two\nautoload -Uz compinit && compinit\neval \"$(starship init zsh)\"\n\
          export FROM_RC=1\nalias foo=bar\nprint -r -- rc-done >> $HOME/trace\n",
     );
@@ -1073,8 +1075,9 @@ fn guarded_zshrc_skips_frameworks_and_keeps_the_rest() {
     let text = stdout(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.trim().is_empty(), "startup printed errors:\n{stderr}");
-    assert_eq!(sb.trace(), ["args=0", "with=one two", "rc-done"], "frameworks skipped, the rest ran with its arguments");
+    assert_eq!(sb.trace(), ["args=0", "with=one two", "nested=one two", "rc-done"], "frameworks skipped, the rest ran with its arguments");
     assert!(text.contains("rc=1 foo=bar mine=1 source=0 stub=0"), "typesets stay global, the guard is gone: {text}");
+    assert!(!text.contains("compinit: initialization aborted"), "{text}");
     assert!(!text.contains("P=omz> "), "goatty's prompt plugin, not oh-my-zsh's: {text}");
     let status = goatty_shell::doctor::parse_status(&text);
     let off: Vec<&str> = status.iter().filter(|f| f.name.starts_with("rc:")).map(|f| f.name.as_str()).collect();
@@ -1086,4 +1089,27 @@ fn guarded_zshrc_skips_frameworks_and_keeps_the_rest() {
     let launch = sb.launch_with(settings, None);
     let text = stdout(&sb.run(&launch, "print -r -- \"P=$PROMPT\""));
     assert!(text.contains("P=mine> "), "{text}");
+}
+
+/// Where zsh keeps `compinit` defined after goatty ran it (Ubuntu's), a
+/// guarded `.zshrc` calling it doesn't run it again (a second run asks
+/// about insecure directories without a terminal and resets completion),
+/// and the definition is back afterwards.
+#[test]
+fn guarded_zshrc_never_runs_compinit_twice() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    // A compinit that stays defined, like Ubuntu's.
+    sb.file(".zshenv", "compinit() { print -r -- compinit-ran >> $HOME/trace }\ncompdef() { : }\n");
+    sb.file(".zshrc", "autoload -Uz compinit\ncompinit\nprint -r -- rc-done >> $HOME/trace\n");
+    let mut settings = no_highlighting();
+    settings.edit_plugin("fzf-tab", |p| p.enabled = false);
+    settings.shell.zsh.user_rc = true;
+    let launch = sb.launch_with(settings, None);
+    let out = sb.run(&launch, "print -r -- \"defined=${+functions[compinit]} body=${functions[compinit]}\"");
+    let text = stdout(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.trim().is_empty(), "startup printed errors:\n{stderr}");
+    assert_eq!(sb.trace(), ["compinit-ran", "rc-done"], "goatty's run only");
+    assert!(text.contains("defined=1") && text.contains("compinit-ran"), "the user's definition is back: {text}");
 }

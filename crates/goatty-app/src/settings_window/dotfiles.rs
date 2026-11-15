@@ -14,6 +14,7 @@ use gpui::{
 use super::SettingsWindow;
 use super::kit::{self, card, chip, divider, opt, row, search_field, section};
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button_with, toggle};
+use crate::ui::focus;
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
 use crate::ui::text_input::{TextInput, TextInputEvent};
@@ -36,6 +37,11 @@ pub struct DotfilesPage {
     pub error: Option<String>,
     /// Asked for a check once for this host (no harvest yet).
     auto_checked: bool,
+    /// Numbers requests: a reply to an older one (another host, or before
+    /// a reset) is dropped.
+    request: u64,
+    /// The host's settings changed while a request ran: ask again after it.
+    stale: bool,
     /// The host generation the status belongs to.
     generation: Option<u32>,
     filter: Entity<TextInput>,
@@ -57,6 +63,8 @@ impl DotfilesPage {
             checking: false,
             error: None,
             auto_checked: false,
+            request: 0,
+            stale: false,
             generation: None,
             filter,
             show: Show::default(),
@@ -64,12 +72,17 @@ impl DotfilesPage {
         }
     }
 
-    /// Forget what the host said (another host).
+    /// Forget what the host said (another host). A request still running
+    /// is dropped when it replies.
     pub fn reset(&mut self) {
         self.status = None;
         self.error = None;
         self.auto_checked = false;
         self.generation = None;
+        self.loading = false;
+        self.checking = false;
+        self.stale = false;
+        self.request += 1;
     }
 }
 
@@ -154,6 +167,8 @@ impl SettingsWindow {
         } else {
             self.dotfiles.loading = true;
         }
+        self.dotfiles.request += 1;
+        let request = self.dotfiles.request;
         let generation = self.host.as_ref().and_then(|h| h.generation);
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -161,8 +176,15 @@ impl SettingsWindow {
             let result = cx.background_executor().spawn(async move { link.import_status(refresh) }).await;
             let _ = this.update(cx, |view, cx| {
                 let d = &mut view.dotfiles;
+                if d.request != request {
+                    return;
+                }
                 d.loading = false;
                 d.checking = false;
+                if std::mem::take(&mut d.stale) {
+                    view.load_dotfiles(false, cx);
+                    return;
+                }
                 match result {
                     Ok(s) => {
                         // Nothing checked yet, but there are files: look once, so the list isn't empty.
@@ -198,7 +220,9 @@ impl SettingsWindow {
     /// The host's settings changed (applied, rolled back): ask again.
     pub(super) fn dotfiles_host_changed(&mut self, cx: &mut Context<'_, Self>) {
         let generation = self.host.as_ref().and_then(|h| h.generation);
-        if self.dotfiles.status.is_some() && self.dotfiles.generation != generation {
+        if self.dotfiles.loading || self.dotfiles.checking {
+            self.dotfiles.stale = true;
+        } else if self.dotfiles.status.is_some() && self.dotfiles.generation != generation {
             if self.page == super::Page::Dotfiles {
                 self.load_dotfiles(false, cx);
             } else {
@@ -383,7 +407,7 @@ impl SettingsWindow {
             if k > 0 {
                 list = list.child(divider(ui));
             }
-            list = list.child(self.imported_row(ui, item, h.shell.import.aliases, &mono, cx));
+            list = list.child(self.imported_row(ui, item, h.shell.import.aliases, d.show == Show::Off, &mono, cx));
         }
         s = s.child(list);
         if !hv.stderr.is_empty() {
@@ -399,7 +423,17 @@ impl SettingsWindow {
         s.child(kit::hint(ui, note).px(px(4.))).into_any_element()
     }
 
-    fn imported_row(&self, ui: Ui, item: &Item, aliases_on: bool, mono: &SharedString, cx: &Context<'_, Self>) -> AnyElement {
+    /// `only_off`: the list shows switched-off entries, so switching this
+    /// one on removes its row.
+    fn imported_row(
+        &self,
+        ui: Ui,
+        item: &Item,
+        aliases_on: bool,
+        only_off: bool,
+        mono: &SharedString,
+        cx: &Context<'_, Self>,
+    ) -> AnyElement {
         let id = |what: &str| SharedString::from(format!("import-{what}-{}", item.key));
         let target = item.target.clone();
         let on = item.on;
@@ -408,7 +442,11 @@ impl SettingsWindow {
             id("on"),
             on,
             ui,
-            self.act(cx, move |v, cx| {
+            self.act_window(cx, move |v, window, cx| {
+                if only_off {
+                    // The row is going: focus waits on the filter that hid it.
+                    focus::hand_over(&v.focus, focus::Handover::Control("import-off".into()), window, cx);
+                }
                 let target = target.clone();
                 v.edit_host(cx, move |h| {
                     let imp = &mut h.shell.import;

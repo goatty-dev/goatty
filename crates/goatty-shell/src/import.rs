@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -338,15 +339,75 @@ impl Record {
     }
 }
 
+/// The import directory, private (0700): what's in it is the user's
+/// environment, tokens included.
+fn private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("chmod {}", dir.display()))
+}
+
+/// A new private (0600) file at `path`, replacing one that's there.
+fn private_file(path: &Path) -> Result<File> {
+    let _ = std::fs::remove_file(path);
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).with_context(|| format!("create {}", path.display()))
+}
+
+/// A name for a temporary file next to `path` that no other writer (thread
+/// or process) uses.
+fn temp_name(path: &Path, what: &str) -> PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    path.with_file_name(format!(".{name}.{what}-{}-{n}", std::process::id()))
+}
+
+/// Replace `path` with `text` (private, through a temporary file).
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let dir = path.parent().context("no parent")?;
-    std::fs::create_dir_all(dir)?;
+    private_dir(path.parent().context("no parent")?)?;
     if std::fs::read_to_string(path).is_ok_and(|old| old == text) {
-        return Ok(());
+        // Written before files were private.
+        return std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| format!("chmod {}", path.display()));
     }
-    let tmp = dir.join(format!(".{}.tmp-{}", path.file_name().and_then(|n| n.to_str()).unwrap_or("file"), std::process::id()));
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))
+    let tmp = temp_name(path, "tmp");
+    let written = private_file(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(text.as_bytes()).with_context(|| format!("write {}", tmp.display()))
+    });
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display())));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
+}
+
+/// Take the import lock within `wait` (zero: only if it's free now).
+/// `false`: another harvest holds it.
+fn lock_within(file: &File, wait: Duration) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if start.elapsed() >= wait {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn lock_file(dirs: &Dirs) -> Result<File> {
+    let dir = dirs.import_dir();
+    private_dir(&dir)?;
+    let path = dir.join(".lock");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))
 }
 
 fn now() -> u64 {
@@ -444,12 +505,15 @@ local k
 
 /// The file a login bash reads (the first of `.bash_profile`, `.bash_login`,
 /// `.profile`) mentions `.bashrc`.
+/// Comments don't count (`# . ~/.bashrc`). bash can't tell from outside
+/// whether that line really runs, and sourcing it from a wrapper function
+/// would make its `declare`s local, so this is a reading of the file.
 fn login_file_sources_bashrc(home: &Path) -> bool {
     [".bash_profile", ".bash_login", ".profile"]
         .iter()
         .map(|f| home.join(f))
         .find(|p| p.is_file())
-        .is_some_and(|p| std::fs::read_to_string(p).is_ok_and(|t| t.contains("bashrc")))
+        .is_some_and(|p| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.split('#').next().unwrap_or("").contains("bashrc"))))
 }
 
 /// Variables that belong to the shell or the terminal it runs in, not to
@@ -584,11 +648,12 @@ pub fn harvest(
     static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let fp = fingerprint(source, ctx, zdotdir);
     let fail = |message: String, stderr: String| Failure { at: now(), message, stderr, fingerprint: fp.clone() };
-    std::fs::create_dir_all(work).map_err(|e| fail(format!("can't create {}: {e}", work.display()), String::new()))?;
+    private_dir(work).map_err(|e| fail(format!("{e:#}"), String::new()))?;
     let id = format!("{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed));
     let out = work.join(format!(".dump-{id}"));
     let err = work.join(format!(".stderr-{id}"));
-    let result = run(source, ctx, &out, &err, timeout);
+    // The shell's `> out` keeps the mode of a file that's there: private.
+    let result = private_file(&out).and_then(|_| run(source, ctx, &out, &err, timeout));
     let stderr = clean_stderr(&std::fs::read_to_string(&err).unwrap_or_default());
     let dump = std::fs::read(&out).ok();
     let _ = std::fs::remove_file(&out);
@@ -603,6 +668,10 @@ pub fn harvest(
             stderr,
         ));
     };
+    // A startup file that changed while the shell ran: the harvest may
+    // have the old values, so its fingerprint stays the old one and the
+    // next session harvests again.
+    let changed = fingerprint(source, ctx, zdotdir) != fp;
     let base: BTreeMap<&str, &str> = ctx.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let vars = dump
         .env
@@ -619,7 +688,7 @@ pub fn harvest(
         base_path: split_path(ctx.var("PATH")),
         aliases: dump.aliases,
         // The fingerprint for later checks takes the ZDOTDIR the startup left.
-        fingerprint: fingerprint(source, ctx, dump.zdotdir.as_deref()),
+        fingerprint: if changed { fp.clone() } else { fingerprint(source, ctx, dump.zdotdir.as_deref()) },
         zdotdir: dump.zdotdir,
         stderr,
     })
@@ -628,7 +697,7 @@ pub fn harvest(
 /// Spawn the shell and wait for it (killing its process group afterwards,
 /// so nothing it left running in the background outlives the harvest).
 fn run(source: &Source, ctx: &Context, out: &Path, err: &Path, timeout: Duration) -> Result<Duration> {
-    let stderr = File::create(err).with_context(|| format!("create {}", err.display()))?;
+    let stderr = private_file(err)?;
     let start = Instant::now();
     let mut child = Command::new(&source.program)
         .args(["-l", "-i", "-c", &script(source.kind, out, ctx)])
@@ -732,13 +801,16 @@ pub enum Prepared {
     Failed,
     /// Cached, and a fresh harvest runs in the background.
     Refreshing,
+    /// Cached: another harvest held the lock past the deadline.
+    Busy,
     /// No shell to import from (fish, nothing installed).
     NoSource,
 }
 
 /// Make `import.zsh` current for a new session: harvest now when there's
-/// no harvest or a startup file changed (waiting up to [`SYNC_TIMEOUT`]),
-/// in the background when the last one is older than [`MAX_AGE`].
+/// no harvest or a startup file changed (waiting for the lock and the
+/// harvest up to [`SYNC_TIMEOUT`] in all), in the background when the
+/// last one is older than [`MAX_AGE`].
 pub fn prepare(dirs: &Dirs, settings: &HostSettings, ctx: &Context) -> Result<Prepared> {
     let source = match source(settings.shell.import.from, ctx) {
         Ok(s) => s,
@@ -747,7 +819,7 @@ pub fn prepare(dirs: &Dirs, settings: &HostSettings, ctx: &Context) -> Result<Pr
                 harvest: None,
                 failure: Some(Failure { at: now(), message: why, stderr: String::new(), fingerprint: String::new() }),
             };
-            write_atomic(&dirs.import_file(), &render(&record, Some(ctx)))?;
+            publish(dirs, &record, ctx)?;
             return Ok(Prepared::NoSource);
         }
     };
@@ -763,33 +835,69 @@ pub fn prepare(dirs: &Dirs, settings: &HostSettings, ctx: &Context) -> Result<Pr
                 Prepared::Cached
             }
         }
-        _ => {
-            let (ok, _) = refresh(dirs, settings.shell.import.from, ctx, SYNC_TIMEOUT, false)?;
-            if ok { Prepared::Harvested } else { Prepared::Failed }
-        }
+        _ => match refresh(dirs, settings.shell.import.from, ctx, Deadline::Within(SYNC_TIMEOUT), false)? {
+            Some((true, _)) => Prepared::Harvested,
+            Some((false, _)) => Prepared::Failed,
+            None => Prepared::Busy,
+        },
     };
-    // Written every time: a harvest by another process, or an older goatty's file.
-    write_atomic(&dirs.import_file(), &render(&Record::load(dirs), Some(ctx)))?;
+    // A harvest by another process, or an older goatty's file.
+    publish(dirs, &Record::load(dirs), ctx)?;
     Ok(outcome)
+}
+
+/// Write `import.zsh` from `record`, unless a harvest holds the lock (it
+/// writes the file itself when it's done, and newer).
+fn publish(dirs: &Dirs, record: &Record, ctx: &Context) -> Result<()> {
+    let lock = lock_file(dirs)?;
+    if lock_within(&lock, Duration::ZERO)? {
+        write_atomic(&dirs.import_file(), &render(record, Some(ctx)))?;
+    }
+    Ok(())
+}
+
+/// How long [`refresh`] may take.
+#[derive(Debug, Clone, Copy)]
+pub enum Deadline {
+    /// Waiting for the lock and the harvest together (a new session).
+    Within(Duration),
+    /// Only if no other harvest runs; the harvest may take this long.
+    IfFree(Duration),
+    /// Wait for the lock as long as it takes; the harvest may take this long.
+    Wait(Duration),
 }
 
 /// Harvest now (under the lock, so processes don't run the user's startup
 /// twice at once) and save the result. `force`: even when another process
-/// just harvested the same files. Returns whether it worked, and the record.
-pub fn refresh(dirs: &Dirs, from: ImportFrom, ctx: &Context, timeout: Duration, force: bool) -> Result<(bool, Record)> {
+/// harvested the same files while this one waited for the lock. Returns
+/// whether it worked and the record, or `None` when the lock wasn't free
+/// in time (another harvest runs).
+pub fn refresh(dirs: &Dirs, from: ImportFrom, ctx: &Context, deadline: Deadline, force: bool) -> Result<Option<(bool, Record)>> {
     let source = source(from, ctx).map_err(anyhow::Error::msg)?;
-    let dir = dirs.import_dir();
-    std::fs::create_dir_all(&dir)?;
-    let lock = File::create(dir.join(".lock"))?;
-    lock.lock()?;
+    let started = Instant::now();
+    let since = now();
+    let lock = lock_file(dirs)?;
+    let (locked, timeout) = match deadline {
+        Deadline::Within(total) => {
+            let locked = lock_within(&lock, total)?;
+            (locked, total.saturating_sub(started.elapsed()).max(Duration::from_secs(1)))
+        }
+        Deadline::IfFree(t) => (lock_within(&lock, Duration::ZERO)?, t),
+        Deadline::Wait(t) => {
+            lock.lock()?;
+            (true, t)
+        }
+    };
+    if !locked {
+        return Ok(None);
+    }
     let mut record = Record::load(dirs);
     let zdotdir = record.harvest.as_ref().and_then(|h| h.zdotdir.clone());
-    if !force
-        && record.newest().is_some_and(|(seen, at)| seen == fingerprint(&source, ctx, zdotdir.as_deref()) && now().saturating_sub(at) < 5)
-    {
-        return Ok((record.failure.is_none(), record));
+    // Another process harvested the same files while this one waited.
+    if !force && record.newest().is_some_and(|(seen, at)| seen == fingerprint(&source, ctx, zdotdir.as_deref()) && at >= since) {
+        return Ok(Some((record.failure.as_ref().is_none_or(|f| record.harvest.as_ref().is_some_and(|h| h.at > f.at)), record)));
     }
-    let ok = match harvest(&source, ctx, &dir, timeout, zdotdir.as_deref()) {
+    let ok = match harvest(&source, ctx, &dirs.import_dir(), timeout, zdotdir.as_deref()) {
         Ok(h) => {
             log::info!(
                 "import: {} variables, {} PATH folders, {} aliases from {} in {} ms",
@@ -811,7 +919,7 @@ pub fn refresh(dirs: &Dirs, from: ImportFrom, ctx: &Context, timeout: Duration, 
     record.save(dirs)?;
     write_atomic(&dirs.import_file(), &render(&record, Some(ctx)))?;
     drop(lock);
-    Ok((ok, record))
+    Ok(Some((ok, record)))
 }
 
 /// [`refresh`] on a thread of its own, unless one is running already.
@@ -820,7 +928,7 @@ pub fn refresh_in_background(dirs: Dirs, from: ImportFrom, ctx: Context) {
         return;
     }
     let spawned = std::thread::Builder::new().name("shell-import".into()).spawn(move || {
-        if let Err(e) = refresh(&dirs, from, &ctx, BACKGROUND_TIMEOUT, false) {
+        if let Err(e) = refresh(&dirs, from, &ctx, Deadline::IfFree(BACKGROUND_TIMEOUT), false) {
             log::warn!("import: {e:#}");
         }
         BACKGROUND.store(false, Ordering::Release);
@@ -868,6 +976,9 @@ pub struct Status {
     pub failure: Option<Failure>,
     /// Unix seconds on the host, to say how old the harvest is.
     pub now: u64,
+    /// Asked to check now: whether that worked (`None`: not asked).
+    #[serde(default)]
+    pub refreshed: Option<bool>,
 }
 
 /// The import's state; `refresh`: harvest now first (even while it's off,
@@ -877,8 +988,15 @@ pub fn status(dirs: &Dirs, settings: &HostSettings, managed: bool, ctx: &Context
     let mut s = Status { enabled: imp.enabled, managed, now: now(), ..Status::default() };
     match source(imp.from, ctx) {
         Ok(src) => {
-            if refresh_now && let Err(e) = refresh(dirs, imp.from, ctx, BACKGROUND_TIMEOUT, true) {
-                s.problem = Some(format!("{e:#}"));
+            if refresh_now {
+                match refresh(dirs, imp.from, ctx, Deadline::Wait(BACKGROUND_TIMEOUT), true) {
+                    Ok(Some((ok, _))) => s.refreshed = Some(ok),
+                    Ok(None) => {}
+                    Err(e) => {
+                        s.problem = Some(format!("{e:#}"));
+                        s.refreshed = Some(false);
+                    }
+                }
             }
             let record = Record::load(dirs);
             // A harvest of another shell (the setting changed) isn't this one's.
@@ -888,7 +1006,12 @@ pub fn status(dirs: &Dirs, settings: &HostSettings, managed: bool, ctx: &Context
             s.failure = record.failure;
             s.source = Some(src);
         }
-        Err(why) => s.problem = Some(why),
+        Err(why) => {
+            s.problem = Some(why);
+            if refresh_now {
+                s.refreshed = Some(false);
+            }
+        }
     }
     s
 }

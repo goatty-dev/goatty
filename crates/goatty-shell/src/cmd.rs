@@ -52,9 +52,11 @@ pub fn import(svc: &crate::HostService, refresh: bool) -> Result<()> {
             println!("              {}", f.stderr.replace('\n', "\n              "));
         }
     }
+    // `--refresh` that didn't work fails the command (after saying why).
+    let result = || if refresh && s.refreshed == Some(false) { anyhow::bail!("checking your shell setup failed") } else { Ok(()) };
     let Some(h) = &s.harvest else {
         println!("  harvest     none yet{}", if refresh { "" } else { " (--refresh runs your shell now)" });
-        return Ok(());
+        return result();
     };
     println!("  harvest     {} ago, took {} ms", ago(s.now.saturating_sub(h.at)), h.ms);
     let added = h.added_path();
@@ -75,7 +77,7 @@ pub fn import(svc: &crate::HostService, refresh: bool) -> Result<()> {
         println!("stderr");
         println!("  {}", h.stderr.replace('\n', "\n  "));
     }
-    Ok(())
+    result()
 }
 
 fn ago(secs: u64) -> String {
