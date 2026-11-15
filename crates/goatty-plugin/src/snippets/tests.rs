@@ -278,7 +278,7 @@ fn parses_source_output() {
     assert!(!more);
     assert_eq!(
         items,
-        [Item { value: "main".into(), detail: Some("Fix it".into()) }, Item { value: "feature/x".into(), detail: Some("WIP".into()) }]
+        [Item { value: "main".into(), label: None, detail: Some("Fix it".into()) }, Item { value: "feature/x".into(), label: None, detail: Some("WIP".into()) }]
     );
     let ps = Source { split: Some(" ".into()), column: Some(2), detail: Some(1), skip: 1, ..src.clone() };
     let (items, _) = parse_output("  PID COMMAND\n  12 zsh\n 345  cargo build\n", &ps);

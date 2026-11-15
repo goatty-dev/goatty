@@ -18,6 +18,9 @@ Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatt
 | Completions | `zsh.fpath` (directories in the plugin) | `fpath` entries before compinit | – |
 | Shell code | `zsh.init` (a `.zsh` file in the plugin) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
 | Palette commands | `[[command]]` + `[[command.input]]` (typed inputs: label, placeholder, checks) | an entry in goatty's command palette that asks for its inputs, then types its quoted `run` line into the focused terminal | `commands` |
+| Snippets | `[[snippet]]` + `[[snippet.input]]` (a command line with `{input}` blanks; typed inputs, flags, several values) | entries in the snippet picker (Ctrl+Shift+S) that ask for their blanks and put the quoted line on the prompt ([`snippets.md`](snippets.md)) | `snippets` |
+| Snippet suggestions | `[snippet.input.source]` (`run`: argv of a package executable or required command; `split`, `column`, `label`, `detail`, `skip`, `on_fail`, `timeout`) | the host runs it when the field opens, in the pane's directory, without a shell | `snippet-sources` (reason required) |
+| Expansions | `[[expansion]]` (`say` → `to`, placeholders typed `word`/`integer`) | a row in the generation's `expansions.zsh`, rewritten on Space by goatty's widget | `snippets` |
 | Needs a system program | `[requires] commands` | integration only when present (`plugin:x missing` otherwise) | – |
 
 Everything goatty writes itself is quoted: a setting value can never become shell syntax (`tests: values_cannot_escape_quotes` runs real zsh). The only code a plugin brings is its `zsh.init` file, which is shown in full before installing and re-checked against its approved checksum every time a configuration is built.
@@ -126,6 +129,22 @@ default = "."
 # placeholder, help, optional, min/max (integer, number), pattern + pattern_help (text),
 # choices = [{ value, label, help }] (choice), must_exist (path, folder)
 
+[[snippet]]                     # a command line with blanks for the snippet picker (#89, docs/snippets.md)
+id = "tree"
+title = "Show a folder as a tree"
+line = "eza --tree --level={depth} {dir}"   # shell text; every {input} becomes one quoted word
+safety = "safe"                 # safe | changes | destructive (else goatty guesses)
+[[snippet.input]]               # the [[command.input]] fields, plus source/strict/multiple, type = "flag" + on
+id = "dir"
+label = "Folder"
+type = "folder"
+[snippet.input.source]          # optional suggestions: run on the host (snippet-sources permission)
+run = ["eza", "-D", "-1"]
+
+[[expansion]]                   # plain words → a command, on Space
+say = "| as tree"
+to = "| eza --tree"
+
 [permissions]
 binaries = "eza is a program: goatty downloads its official release …"
 shell-code = "…"
@@ -178,6 +197,8 @@ Where a plugin's aliases, init code and package scripts go in the managed `.zshr
 Within a slot, a plugin loads after the ones its `zsh.after` names (when they're installed and on), otherwise built-in plugins first, then by id (`goatty_shell::plugins::load_order`; a cycle is broken, never hangs). An `after` naming a plugin in an earlier slot is always satisfied. In the generated block, the init code runs first, then each package's `source` script (found as `$_goatty_src[<pkg>]`), then the status is recorded.
 
 ## Permissions
+
+`snippets` (snippets and expansions) needs no reason either: nothing runs, a snippet's line is put on the prompt for the user to read and run, and an expansion is shown before it runs (Backspace undoes it); the plan lists every line and rewrite. `snippet-sources` needs a reason: it runs the listed programs with the listed arguments when a field opens (on the tab's host, in the pane's directory, without a shell, stopped after a few seconds), and the plan lists each one. Plugins can't use a shell pipeline as a source (`sh`, only for the user's own snippets).
 
 `commands` (palette commands) needs no reason: nothing runs until the user picks the command and fills in its inputs, and what runs is typed into their terminal. The plan lists each command with its `run` line.
 
@@ -234,7 +255,7 @@ Conflicts are refused at plan time: a plugin id, package id or executable of a b
 
 ## Built-in plugins
 
-fzf, fzf-tab, autosuggestions, syntax-highlighting and starship come with goatty (`crates/goatty-shell/plugins/<id>/`, compiled in by `goatty_shell::builtins`; table with pins and slots in [`managed-zsh.md`](managed-zsh.md#installing-and-updating-tools)). They're ordinary manifests (validated by the same parser, `builtins::tests`), so they get install plans, settings on the Plugins page and load-order slots. The differences:
+fzf, fzf-tab, autosuggestions, syntax-highlighting, starship and basics (snippets and expansions only, nothing to install; [`snippets.md`](snippets.md)) come with goatty (`crates/goatty-shell/plugins/<id>/`, compiled in by `goatty_shell::builtins`; table with pins and slots in [`managed-zsh.md`](managed-zsh.md#installing-and-updating-tools)). They're ordinary manifests (validated by the same parser, `builtins::tests`), so they get install plans, settings on the Plugins page and load-order slots. The differences:
 
 - **Always there.** No lock entry and no copy in `installed/`: their files are part of goatty, read from the binary when a generation is built. They're on unless `plugins.<id>.enabled` is `false`; `goattyd plugin disable fzf-tab` (or the switch on the Shell/Prompt/History page) turns one off, and `goatty-status` says `off`. Uninstalling is refused; `goattyd shell uninstall <id>` removes goatty's download of the tool.
 - **Planning one = its packages.** `find("fzf")` always resolves to the built-in plugin (a registry can't shadow it). Its plan lists each package as already on the system, already installed by goatty at the pinned version (`current`), or to download; installing downloads only the latter. `goattyd shell install` and `goatty-setup` use exactly this.
@@ -265,7 +286,7 @@ registry list|refresh|add NAME URL --key HEX|remove NAME
 
 ## Protocol (v5)
 
-`ClientMsg::Plugin { req, request }` → `ServerMsg::Plugin { req, reply }`, both JSON (`goatty_plugin::api::{Request, Reply}`: `catalog`, `plan`, `install` with the approved digest, `uninstall` → `Catalog`, `Plan`, `Changed`). goattyd answers on a separate thread (installs download; the connection's input must not wait), and the client waits up to 10 minutes. New operations or fields don't need a protocol bump. Plugin settings travel with the host settings (`SetHostSettings`).
+`ClientMsg::Plugin { req, request }` → `ServerMsg::Plugin { req, reply }`, both JSON (`goatty_plugin::api::{Request, Reply}`: `catalog`, `plan`, `install` with the approved digest, `uninstall`, `snippets`, `suggest` → `Catalog`, `Plan`, `Changed`, `Snippets`, `Suggestions`). goattyd answers on a separate thread (installs download; the connection's input must not wait), and the client waits up to 10 minutes. New operations or fields don't need a protocol bump. Plugin settings travel with the host settings (`SetHostSettings`).
 
 ## First-party plugins (registry index #1, 2026-11-08)
 
