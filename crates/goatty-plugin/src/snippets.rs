@@ -1043,8 +1043,10 @@ pub fn check_snippet(s: &Snippet, at: &str, owner: Owner<'_>) -> Vec<Problem> {
                     Piece::Text(_) => None,
                 })
                 .collect();
+            // An input may only narrow a later input's suggestions (a branch, then its commits).
+            let feeds: BTreeSet<String> = s.inputs.iter().flat_map(SnippetInput::depends).collect();
             for input in &s.inputs {
-                if !used.contains(input.id.as_str()) {
+                if !used.contains(input.id.as_str()) && !feeds.contains(&input.id) {
                     err(format!("{at}.line"), format!("doesn't use input {:?}: add {{{}}} where it goes", input.id, input.id));
                 }
             }

@@ -220,6 +220,11 @@ label = "Later"
     let p: Vec<String> = with_snippets(glued).unwrap_err().0.iter().map(ToString::to_string).collect();
     assert!(p.iter().any(|x| x.contains("word of its own")), "{p:?}");
 
+    // An input only a later source uses is fine (it narrows the suggestions).
+    let narrow = "[[snippet]]\nid = \"x\"\ntitle = \"X\"\nline = \"eza {f}\"\n[[snippet.input]]\nid = \"d\"\nlabel = \"D\"\n[[snippet.input]]\nid = \"f\"\nlabel = \"F\"\n[snippet.input.source]\nrun = [\"eza\", \"{d}\"]\n";
+    let m = with_snippets(narrow).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(m.snippets[0].render(&values(&[("d", "src"), ("f", "a.rs")])), "eza a.rs");
+
     // The user's own may use `sh`, and any program.
     let mine = snippet(
         "id = \"mine\"\ntitle = \"Mine\"\nline = \"git switch {b}\"\n[[input]]\nid = \"b\"\nlabel = \"B\"\nsource = { sh = \"git branch | cut -c3-\" }\n",
@@ -278,7 +283,10 @@ fn parses_source_output() {
     assert!(!more);
     assert_eq!(
         items,
-        [Item { value: "main".into(), label: None, detail: Some("Fix it".into()) }, Item { value: "feature/x".into(), label: None, detail: Some("WIP".into()) }]
+        [
+            Item { value: "main".into(), label: None, detail: Some("Fix it".into()) },
+            Item { value: "feature/x".into(), label: None, detail: Some("WIP".into()) }
+        ]
     );
     let ps = Source { split: Some(" ".into()), column: Some(2), detail: Some(1), skip: 1, ..src.clone() };
     let (items, _) = parse_output("  PID COMMAND\n  12 zsh\n 345  cargo build\n", &ps);
