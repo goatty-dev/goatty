@@ -44,6 +44,9 @@ actions!(
         ToggleCommandPalette,
         /// The command palette with only the hosts to connect to.
         ConnectToHost,
+        /// The command palette with the active tab's host's sessions (open
+        /// or end one without entering it).
+        ListSessions,
         /// Ask the host's running managed shells to reload their configuration.
         ReloadShells,
     ]
@@ -121,6 +124,7 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "open_settings" => Box::new(OpenSettings),
         "command_palette" => Box::new(ToggleCommandPalette),
         "connect_to_host" => Box::new(ConnectToHost),
+        "list_sessions" => Box::new(ListSessions),
         "reload_shells" => Box::new(ReloadShells),
         "dismiss_notifications" => Box::new(DismissNotifications),
         "press_notification_button" => Box::new(PressNotificationButton),

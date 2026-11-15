@@ -18,6 +18,14 @@
 //! The service has no `Requires=goattyd.socket`, so stopping or removing the
 //! socket never takes running sessions with it; only stopping the service
 //! (or `goattyd stop`) does.
+//!
+//! Sessions outlive the daemon process (#131): goattyd keeps every PTY in
+//! the service's fd store (`FileDescriptorStoreMax=`, `NotifyAccess=main`),
+//! and `KillMode=process` leaves the shells alone when the daemon process
+//! ends. So a crash (`Restart=on-failure`) or `systemctl --user restart
+//! goattyd` keeps the sessions, and `systemctl --user stop goattyd` ends
+//! them by emptying the store, which closes their terminals (SIGHUP, as when
+//! a window closes). Units written before that say so in [`Status`].
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -108,8 +116,13 @@ After={SOCKET_UNIT}
 
 [Service]
 ExecStart={} serve
-# The shells are the daemon's children: stopping the service ends them, like
-# `goattyd stop`. A crashed daemon has lost its sessions anyway; start fresh.
+# goattyd keeps each session's terminal in the fd store, and the shells stay
+# when the daemon process ends: a crash or `systemctl --user restart` keeps
+# the sessions. `systemctl --user stop` empties the store, which closes the
+# terminals and ends the shells (SIGHUP), like `goattyd stop`.
+NotifyAccess=main
+FileDescriptorStoreMax=4096
+KillMode=process
 Restart=on-failure
 RestartSec=2
 ",
@@ -161,15 +174,17 @@ pub struct Status {
     pub socket_active: bool,
     pub service_active: bool,
     pub linger: Option<bool>,
+    /// The installed service keeps sessions across daemon restarts (units
+    /// written by older goattyds don't; `install` again updates them).
+    pub keeps_sessions: bool,
 }
 
 pub fn status() -> Status {
     let unit_dir = unit_dir();
     let installed = installed();
-    let exec_start = unit_dir
-        .as_ref()
-        .and_then(|d| std::fs::read_to_string(d.join(SERVICE_UNIT)).ok())
-        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("ExecStart=").map(String::from)));
+    let service = unit_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join(SERVICE_UNIT)).ok());
+    let exec_start = service.as_ref().and_then(|s| s.lines().find_map(|l| l.strip_prefix("ExecStart=").map(String::from)));
+    let keeps_sessions = service.as_ref().is_some_and(|s| keeps_sessions(s));
     Status {
         unit_dir,
         installed,
@@ -177,7 +192,14 @@ pub fn status() -> Status {
         socket_active: is_active(SOCKET_UNIT),
         service_active: is_active(SERVICE_UNIT),
         linger: linger(),
+        keeps_sessions,
     }
+}
+
+/// A service unit that has the fd store and leaves the shells running.
+fn keeps_sessions(unit: &str) -> bool {
+    let has = |line: &str| unit.lines().any(|l| l.trim() == line);
+    unit.lines().any(|l| l.starts_with("FileDescriptorStoreMax=")) && has("NotifyAccess=main") && has("KillMode=process")
 }
 
 /// What [`install`] did.
@@ -260,6 +282,8 @@ mod tests {
         assert!(service.contains("ExecStart=\"/home/a b/100%%/$$x/goattyd\" serve\n"), "{service}");
         // Stopping the socket must not stop the sessions.
         assert!(!service.contains("Requires="));
+        assert!(keeps_sessions(&service));
+        assert!(!keeps_sessions("[Service]\nExecStart=goattyd serve\nRestart=on-failure\n"));
         assert_eq!(systemd_quote(r#"a"b\c"#), r#""a\"b\\c""#);
         let exec = service.lines().find_map(|l| l.strip_prefix("ExecStart=")).unwrap();
         assert_eq!(exec_program(exec).unwrap(), Path::new("/home/a b/100%/$x/goattyd"));

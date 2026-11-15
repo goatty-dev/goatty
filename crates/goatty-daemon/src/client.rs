@@ -132,6 +132,17 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(ServerMsg::Ok { req });
                     daemon.shutdown();
                 }
+                ClientMsg::Restart { req, exe } => match crate::restore::successor(&daemon, exe) {
+                    Ok(exe) => {
+                        reply(ServerMsg::Ok { req });
+                        // Let the writer flush the reply; the exec closes the connection.
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if let Err(e) = crate::restore::restart(&daemon, &exe) {
+                            log::error!("restart failed, going on as before: {e:#}");
+                        }
+                    }
+                    Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
+                },
                 ClientMsg::GetHostSettings { req } => reply(crate::settings::get(&daemon, req)),
                 ClientMsg::SetHostSettings { req, json, apply } => reply(crate::settings::set(&daemon, req, &json, apply)),
                 ClientMsg::ListGenerations { req } => reply(crate::settings::generations(&daemon, req)),

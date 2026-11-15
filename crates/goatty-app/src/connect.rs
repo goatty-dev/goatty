@@ -18,8 +18,9 @@
 //! The local daemon gets the same treatment: one that speaks no protocol
 //! this goatty does, or that runs an older build than the installed goattyd
 //! (after an update or a `cargo build`), is restarted with the installed
-//! one. Right away when it holds no sessions (nothing is lost), else only
-//! after asking; "Keep it running" is remembered for that daemon
+//! one. Right away when that keeps its sessions (goattyd re-executes itself
+//! with them, protocol v10 on) or it holds none; else only after asking,
+//! since they'd end. "Keep it running" is remembered for that daemon
 //! (`goatty_client::local`).
 //!
 //! ssh's own questions (passphrases, host keys) come up as separate windows
@@ -27,11 +28,11 @@
 //! second tab on a host reuses the first one's link.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use goatty_client::local::{self, LocalProblem, Outdated};
+use goatty_client::local::{self, LocalProblem, Outdated, Restarted};
 use goatty_client::remote::{self, Bundled, Platform, Probe};
 use goatty_client::{Connection, Endpoint, RemoteProblem, SshTarget};
 use goatty_shell::HostService;
@@ -283,38 +284,55 @@ pub fn describe_local(problem: &LocalProblem, installed: Option<&std::path::Path
     }
 }
 
-/// Stop the local daemon, then connect to the one that starts (the installed
-/// build). A connection to it that's in use (`conn`, else the pooled one)
-/// reconnects by itself; wait for that rather than racing it to start one.
-fn restart_local(conn: Option<Arc<Connection>>) -> Result<Arc<Connection>> {
+/// [`ConnectView::restarted`]: not restarted.
+const NOT_RESTARTED: u8 = 0;
+/// Restarted; it had no sessions.
+const RESTARTED_EMPTY: u8 = 1;
+/// Restarted with its sessions.
+const RESTARTED_KEPT: u8 = 2;
+
+/// Restart the local daemon with the installed build and connect to it. Its
+/// sessions carry over when it can do that, else they end (callers only get
+/// here with none, or after the user agreed). A connection to it that's in
+/// use (`conn`, else the pooled one) reconnects by itself; wait for that
+/// rather than racing it to start one. True when the sessions were kept.
+fn restart_local(conn: Option<Arc<Connection>>) -> Result<(Arc<Connection>, bool)> {
     let conn = conn.or_else(|| pool::live(&Endpoint::Local));
     let old = conn.as_ref().map(|c| c.daemon_pid());
-    local::stop_daemon(true).context("couldn't stop the running goattyd")?;
-    let Some(conn) = conn else { return pool::open(Endpoint::Local) };
+    let installed = local::installed_daemon();
+    let kept = match local::restart_daemon(installed.as_deref(), true).context("couldn't restart the running goattyd")? {
+        Restarted::Kept { .. } => true,
+        Restarted::NotRunning | Restarted::Stopped(_) => false,
+    };
+    let Some(conn) = conn else { return Ok((pool::open(Endpoint::Local)?, kept)) };
     conn.reconnect();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !(conn.is_connected() && Some(conn.daemon_pid()) != old) {
+    // Kept: the same pid answers again (the old link is gone, so a reply
+    // comes from the new image). Else a new daemon.
+    while !(conn.is_connected() && if kept { conn.list_sessions().is_ok() } else { Some(conn.daemon_pid()) != old }) {
         anyhow::ensure!(Instant::now() < deadline, "the new goattyd didn't come up");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Ok(conn)
+    Ok((conn, kept))
 }
 
 /// Check the local daemon is the installed build: restart it right away
-/// when it holds no sessions, else ask ([`LocalProblem::Outdated`]).
-/// `restarted` is set when it was restarted.
-fn check_local(conn: Arc<Connection>, restarted: &AtomicBool) -> Result<Arc<Connection>> {
+/// when that keeps its sessions or it holds none, else ask
+/// ([`LocalProblem::Outdated`]). `restarted` says how it was restarted.
+fn check_local(conn: Arc<Connection>, restarted: &AtomicU8) -> Result<Arc<Connection>> {
     let Some(outdated) = local::outdated(conn.daemon_pid()) else { return Ok(conn) };
-    if local::declined(&outdated) {
+    let keeps = local::can_keep_sessions(conn.protocol_version());
+    if !keeps && local::declined(&outdated) {
         return Ok(conn);
     }
     let sessions = conn.list_sessions()?.len();
-    if sessions > 0 {
+    if sessions > 0 && !keeps {
         return Err(LocalProblem::Outdated { outdated, sessions }.into());
     }
-    log::info!("restarting goattyd (no sessions): {} replaces {}", outdated.installed.display(), outdated.running.display());
-    let conn = restart_local(Some(conn))?;
-    restarted.store(true, Ordering::Relaxed);
+    log::info!("restarting goattyd ({sessions} sessions, kept): {} replaces {}", outdated.installed.display(), outdated.running.display());
+    let (conn, kept) = restart_local(Some(conn))?;
+    let how = if kept && sessions > 0 { RESTARTED_KEPT } else { RESTARTED_EMPTY };
+    restarted.store(how, Ordering::Relaxed);
     Ok(conn)
 }
 
@@ -338,8 +356,9 @@ pub struct ConnectView {
     check_local: bool,
     /// The outdated local daemon being asked about.
     outdated: Option<Outdated>,
-    /// The local daemon was restarted on the way (tell the user).
-    restarted: Arc<AtomicBool>,
+    /// The local daemon was restarted on the way (tell the user):
+    /// [`NOT_RESTARTED`], [`RESTARTED_EMPTY`] or [`RESTARTED_KEPT`].
+    restarted: Arc<AtomicU8>,
     /// goattyd is being installed on the host (a fresh install, not an update).
     installing: bool,
     /// It was, and the connection works: the shell setup comes along.
@@ -437,11 +456,13 @@ impl ConnectView {
     fn finish(&mut self, result: Result<Ready>, _window: &mut Window, cx: &mut Context<'_, Self>) {
         match result {
             Ok(ready) => {
-                if self.restarted.swap(false, Ordering::Relaxed) {
-                    toast::show(
-                        cx,
-                        Toast::success("Restarted goattyd").body("It was an older build and had no sessions.").key("goattyd-restarted"),
-                    );
+                let body = match self.restarted.swap(NOT_RESTARTED, Ordering::Relaxed) {
+                    RESTARTED_EMPTY => Some("It was an older build and had no sessions."),
+                    RESTARTED_KEPT => Some("It was an older build. Your sessions kept running."),
+                    _ => None,
+                };
+                if let Some(body) = body {
+                    toast::show(cx, Toast::success("Restarted goattyd").body(body).key("goattyd-restarted"));
                 }
                 self.installed = std::mem::take(&mut self.installing);
                 self.ready = Some(ready);
@@ -512,7 +533,7 @@ impl ConnectView {
                 self.outdated = None;
                 let mode = self.plan.mode;
                 self.work("Restarting goattyd…".into(), window, cx, move || {
-                    let conn = restart_local(None)?;
+                    let (conn, _) = restart_local(None)?;
                     let startup = saved::startup(&conn, initial_size(), mode)?;
                     Ok((startup, Spawner::Daemon(conn)))
                 });
@@ -536,7 +557,7 @@ impl ConnectView {
                         remote::install(&target, &bundled.path)?;
                     }
                     if restart {
-                        remote::stop_daemon(&target)?;
+                        remote::restart_daemon(&target)?;
                     }
                     let conn = Connection::open(endpoint, crate::CLIENT)?;
                     pool::add(&conn);

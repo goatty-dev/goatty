@@ -15,7 +15,10 @@
 //! `user@host` that isn't one of them. Picking a host lists its sessions
 //! ([`Scope::Sessions`], fetched off the UI thread, connecting first when
 //! needed): Enter opens one, or a new one, where `ssh.open_in` says (a new
-//! tab or window), Shift+Enter the other way. Escape goes back to the hosts.
+//! tab or window), Shift+Enter the other way. Shift+Delete (or the row's
+//! trash button), pressed twice, ends a session without opening it: the
+//! daemon keeps sessions even across its own restarts, so old ones pile up
+//! otherwise. Escape goes back to the hosts.
 //!
 //! The palette also asks for input ([`input`], #91): a command (or any
 //! code) hands it an [`input::Ask`], and it shows one field at a time with
@@ -33,7 +36,7 @@ use std::sync::Arc;
 
 use goatty_client::Connection;
 use goatty_config::{CommandHistory, OpenIn};
-use goatty_proto::SessionInfo;
+use goatty_proto::{SessionId, SessionInfo};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyBinding, ScrollStrategy, SharedString,
     StyledText, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
@@ -68,7 +71,10 @@ const RECENT_BONUS: i32 = 8;
 /// specific: "sett" prefers "Settings: Open settings" over "Settings: Shell".
 const TITLE_BONUS: i32 = 10;
 
-actions!(command_palette, [SelectNext, SelectPrevious, SelectFirst, SelectLast, PageDown, PageUp, Dismiss, ConfirmOther, Complete]);
+actions!(
+    command_palette,
+    [SelectNext, SelectPrevious, SelectFirst, SelectLast, PageDown, PageUp, Dismiss, ConfirmOther, Complete, EndSession]
+);
 
 /// Key bindings inside the palette. `toggle_keys` are the keystrokes bound
 /// to opening it, which close it again.
@@ -87,6 +93,7 @@ pub fn bindings(toggle_keys: &[String], cx: &App) -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-end", SelectLast, c),
         KeyBinding::new("escape", Dismiss, c),
         KeyBinding::new("shift-enter", ConfirmOther, c),
+        KeyBinding::new("shift-delete", EndSession, c),
     ];
     for k in toggle_keys {
         match KeyBinding::load(k, Box::new(Dismiss), gpui::KeyBindingContextPredicate::parse(CONTEXT).ok().map(Rc::new), false, None, cx) {
@@ -346,6 +353,8 @@ pub struct CommandPalette {
     sessions: Vec<Rc<Command>>,
     status: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
+    /// The session the next Shift+Delete ends (the first one asks).
+    ending: Option<SessionId>,
     asking: Option<Asking>,
     _subscriptions: Vec<Subscription>,
 }
@@ -395,6 +404,7 @@ impl CommandPalette {
             sessions: Vec::new(),
             status: None,
             _load: None,
+            ending: None,
             asking: None,
             _subscriptions: vec![sub, hosts_changed, commands_changed],
         };
@@ -505,7 +515,11 @@ impl CommandPalette {
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
-        self.selected = ix.min(self.hits.len().saturating_sub(1));
+        let ix = ix.min(self.hits.len().saturating_sub(1));
+        if ix != self.selected || self.ending.is_some_and(|id| self.session_at(ix) != Some(id)) {
+            self.disarm_end();
+        }
+        self.selected = ix;
         if !self.hits.is_empty() {
             self.scroll.scroll_to_item(self.selected, ScrollStrategy::Nearest);
         }
@@ -847,6 +861,85 @@ impl CommandPalette {
         }));
     }
 
+    /// The session listed at hit `ix` ([`Scope::Sessions`]).
+    fn session_at(&self, ix: usize) -> Option<SessionId> {
+        let hit = self.hits.get(ix)?;
+        match session_choice(&self.commands[hit.index].id)? {
+            AttachMode::Id(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Forget a pending "end this session?".
+    fn disarm_end(&mut self) {
+        if self.ending.take().is_some() {
+            self.status = None;
+        }
+    }
+
+    fn end_selected(&mut self, _: &EndSession, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.end_session_at(self.selected, cx);
+    }
+
+    /// End the session at hit `ix` without opening it: the first time
+    /// asks, the second ends it.
+    fn end_session_at(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
+        let Scope::Sessions(host) = self.scope.clone() else { return };
+        if self.asking.is_some() {
+            return;
+        }
+        let (Some(id), Some(conn)) = (self.session_at(ix), self.conn.clone()) else { return };
+        let title = self.commands[self.hits[ix].index].title.clone();
+        if self.selected != ix {
+            self.select(ix, cx);
+        }
+        if self.ending != Some(id) {
+            self.ending = Some(id);
+            let msg = format!("Shift+Delete again ends “{title}”: whatever runs in it stops, and a window showing it closes the pane.");
+            self.status = Some((msg.into(), false));
+            cx.notify();
+            return;
+        }
+        self.ending = None;
+        self.status = Some((format!("Ending “{title}”…").into(), true));
+        cx.notify();
+        self._load = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    conn.kill(id)?;
+                    // It's gone once the shell exited; list what's left then.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    loop {
+                        let list = conn.list_sessions()?;
+                        if !list.iter().any(|s| s.id == id) || std::time::Instant::now() > deadline {
+                            return anyhow::Ok(list);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.scope != Scope::Sessions(host.clone()) {
+                    return;
+                }
+                match result {
+                    Ok(list) => {
+                        this.status = Some((format!("Ended “{title}”").into(), false));
+                        this.sessions = session_commands(list, &host, unix_now());
+                    }
+                    Err(e) => {
+                        let first = format!("{e:#}").lines().next().unwrap_or_default().to_string();
+                        this.status = Some((format!("Couldn't end “{title}”: {first}").into(), false));
+                    }
+                }
+                this.load_commands(cx);
+                let q = std::mem::take(&mut this.query);
+                this.set_query(&q, cx);
+            });
+        }));
+    }
+
     fn run_hit(&mut self, ix: usize, other_place: bool, cx: &mut Context<'_, Self>) {
         // A suggestion: a folder completes, anything else is the answer.
         if let Some(a) = &mut self.asking {
@@ -925,6 +1018,9 @@ impl CommandPalette {
                 let keys = self.shortcuts[hit.index].clone();
                 let detail = self.commands[hit.index].detail.clone();
                 let recent = hit.recent && self.query.trim().is_empty();
+                // Sessions can be ended from the list (twice: ask, then end).
+                let endable = self.conn.is_some() && self.session_at(ix).is_some();
+                let armed = endable && self.ending == self.session_at(ix);
                 Some(
                     div()
                         .id(ix)
@@ -954,7 +1050,28 @@ impl CommandPalette {
                                 .children(
                                     keys.into_iter()
                                         .map(|k| div().px_1p5().rounded_sm().border_1().border_color(ui.border).bg(ui.surface).child(k)),
-                                ),
+                                )
+                                .when(endable, |d| {
+                                    d.child(
+                                        div()
+                                            .id(("end-session", ix))
+                                            .p_1()
+                                            .rounded_sm()
+                                            .text_color(if armed { ui.danger } else { ui.muted })
+                                            .when(armed, |d| d.bg(ui.surface))
+                                            .hover(|s| s.bg(ui.surface).text_color(ui.danger))
+                                            .tooltip(crate::ui::controls::tooltip(if armed {
+                                                "Click again to end it"
+                                            } else {
+                                                "End this session  (Shift+Delete)"
+                                            }))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.end_session_at(ix, cx);
+                                            }))
+                                            .child(Icon::Trash.svg().size(px(13.)).text_color(if armed { ui.danger } else { ui.muted })),
+                                    )
+                                }),
                         )
                         .into_any_element(),
                 )
@@ -996,6 +1113,7 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::confirm_other))
             .on_action(cx.listener(Self::complete))
+            .on_action(cx.listener(Self::end_selected))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismissed)))
             .occlude()
             .w(px(WIDTH))
@@ -1056,7 +1174,11 @@ impl Render for CommandPalette {
                     OpenIn::Tab => "a new tab",
                     OpenIn::Window => "a new window",
                 };
-                let hint = format!("Enter: open in {} · Shift+Enter: {} · Esc: back to the hosts", name(open_in), name(open_in.flip()));
+                let hint = format!(
+                    "Enter: open in {} · Shift+Enter: {} · Shift+Delete: end it · Esc: back to the hosts",
+                    name(open_in),
+                    name(open_in.flip())
+                );
                 d.child(div().px_4().pt_1().border_t_1().border_color(ui.border).text_xs().text_color(ui.muted).child(hint))
             })
     }

@@ -7,11 +7,13 @@
 //! most one connection: the one that saved it last or claimed it. When that
 //! connection ends, the layout is free and the next window that asks
 //! ([`Layouts::claim`]) gets it. Layouts live as long as the daemon (their
-//! sessions do too).
+//! sessions do too), and carry over to the next one on a restart
+//! ([`Layouts::export`]).
 
 use std::collections::HashMap;
 
 use goatty_proto::{LayoutId, LayoutInfo, SessionId};
+use serde::{Deserialize, Serialize};
 
 /// Larger layouts are ignored (a window with hundreds of panes is still far
 /// below this).
@@ -34,7 +36,38 @@ pub(crate) struct Layouts {
     seq: u64,
 }
 
+/// A layout as the next goattyd gets it (see `crate::restore`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedLayout {
+    pub id: LayoutId,
+    pub json: String,
+    pub sessions: Vec<SessionId>,
+    pub saved_unix: u64,
+    pub seq: u64,
+}
+
 impl Layouts {
+    /// Every layout, for the next goattyd.
+    pub(crate) fn export(&self) -> Vec<SavedLayout> {
+        let mut list: Vec<SavedLayout> = self
+            .map
+            .iter()
+            .map(|(&id, r)| SavedLayout { id, json: r.json.clone(), sessions: r.sessions.clone(), saved_unix: r.saved_unix, seq: r.seq })
+            .collect();
+        list.sort_by_key(|l| l.seq);
+        list
+    }
+
+    /// The previous goattyd's layouts, all free: its connections are gone.
+    pub(crate) fn import(list: Vec<SavedLayout>) -> Self {
+        let seq = list.iter().map(|l| l.seq).max().unwrap_or(0);
+        let map = list
+            .into_iter()
+            .map(|l| (l.id, Record { json: l.json, sessions: l.sessions, owner: None, saved_unix: l.saved_unix, seq: l.seq }))
+            .collect();
+        Self { map, seq }
+    }
+
     /// Store `conn`'s layout `id` (and give it to `conn`). No sessions:
     /// forget it.
     pub(crate) fn save(&mut self, conn: u64, id: LayoutId, sessions: Vec<SessionId>, json: String, now_unix: u64) {
@@ -131,6 +164,19 @@ mod tests {
         l.release(1);
         save(&mut l, 5, 11, &[1]);
         assert!(l.claim(2, |_| true).is_none());
+    }
+
+    #[test]
+    fn layouts_carry_over_free() {
+        let mut l = Layouts::default();
+        save(&mut l, 1, 10, &[1]);
+        save(&mut l, 2, 20, &[2]);
+        let mut next = Layouts::import(l.export());
+        // The newest one first, though both were held before.
+        assert_eq!(next.claim(5, |_| true).unwrap().id, 20);
+        assert_eq!(next.claim(6, |_| true).unwrap().id, 10);
+        save(&mut next, 7, 30, &[3]);
+        assert_eq!(next.export().last().unwrap().id, 30, "save order continues");
     }
 
     #[test]

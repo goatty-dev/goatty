@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -42,6 +42,11 @@ pub const LAYOUT_SINCE: u32 = 8;
 
 /// v9: `Shell` (setup and diagnostics of the managed shell).
 pub const SHELL_SINCE: u32 = 9;
+
+/// v10: `Restart` (the daemon re-executes itself and keeps its sessions).
+/// Daemons from v10 on also keep their sessions across a crash or
+/// `systemctl --user restart` under the systemd service.
+pub const RESTART_SINCE: u32 = 10;
 
 /// The version to use with a peer whose newest version is `peer`, or
 /// `None` when the ranges don't overlap.
@@ -222,6 +227,16 @@ pub enum ClientMsg {
     Shell {
         req: ReqId,
         request: String,
+    },
+    /// v10: replace the daemon with `exe` (default: the goattyd it was
+    /// started as, which after an update is the new build) without ending
+    /// any session: the PTYs, the screens and the saved layouts carry over.
+    /// The reply `Ok` comes before the switch; every connection closes with
+    /// it and clients reconnect to the same socket. `Error` when it can't
+    /// (e.g. `exe` isn't a goattyd).
+    Restart {
+        req: ReqId,
+        exe: Option<String>,
     },
 }
 

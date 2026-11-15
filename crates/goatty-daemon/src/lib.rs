@@ -10,16 +10,21 @@
 //! * `session`: PTY + terminal + subscribers with flow control,
 //! * `layouts`: each window's tabs and splits, restored by the next window,
 //! * `settings`: host settings, generations and rollback over the protocol,
-//! * [`proxy`]: stdio ⇄ socket relay for remote transports.
+//! * [`proxy`]: stdio ⇄ socket relay for remote transports,
+//! * `restore`: sessions that outlive goattyd (restart, upgrade, crash),
+//! * [`systemd`]: socket activation and the fd store.
 //!
 //! The `goattyd` binary is a thin CLI over this crate.
 
 mod client;
 mod layouts;
 pub mod proxy;
+mod restore;
 pub mod server;
 mod session;
 mod settings;
+pub mod systemd;
 
 pub use proxy::proxy;
-pub use server::serve;
+pub use restore::STATE_VERSION;
+pub use server::{Start, serve};

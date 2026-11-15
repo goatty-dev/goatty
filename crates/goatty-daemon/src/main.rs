@@ -15,7 +15,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the daemon in the foreground (default).
-    Serve,
+    Serve {
+        /// Take over from the previous goattyd (what a restart runs).
+        #[arg(long, hide = true, value_name = "FILE")]
+        restore: Option<std::path::PathBuf>,
+    },
     /// Relay stdin/stdout to the daemon, starting it if needed (`ssh host goattyd proxy`).
     Proxy,
     /// List sessions.
@@ -24,6 +28,15 @@ enum Cmd {
     Kill { id: SessionId },
     /// Type text into a session. `\r`, `\n` and `\e` are unescaped (`\r` = Enter).
     Send { id: SessionId, text: String },
+    /// Restart the daemon with this goattyd (e.g. after an update). Sessions keep running.
+    Restart {
+        /// Also restart a daemon too old to keep its sessions (they end).
+        #[arg(long)]
+        force: bool,
+    },
+    /// The newest restore format this goattyd reads (a restart checks it).
+    #[command(hide = true)]
+    RestoreVersion,
     /// Stop the daemon and all its sessions.
     Stop {
         /// Also stop a daemon this goattyd can't talk to (another protocol
@@ -251,18 +264,23 @@ const CLIENT: &str = concat!("goattyd-cli ", env!("CARGO_PKG_VERSION"));
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cmd = cli.cmd.unwrap_or(Cmd::Serve);
+    let cmd = cli.cmd.unwrap_or(Cmd::Serve { restore: None });
+    if matches!(cmd, Cmd::Serve { .. }) {
+        // systemd's variables, before any thread starts.
+        goatty_daemon::systemd::capture_env();
+    }
     // The proxy's stderr goes back over ssh into the GUI's log: keep it quiet.
     // Silence rio_vt's [unhandled osc_dispatch] warnings (e.g. systemd OSC 3008) by default (#20).
-    let default_level = if matches!(cmd, Cmd::Proxy | Cmd::Shell(_) | Cmd::Settings(_) | Cmd::Plugin(_) | Cmd::Alias(_)) {
-        "warn,rio_vt=error"
-    } else {
-        "info,rio_vt=error"
-    };
+    let default_level =
+        if matches!(cmd, Cmd::Proxy | Cmd::RestoreVersion | Cmd::Shell(_) | Cmd::Settings(_) | Cmd::Plugin(_) | Cmd::Alias(_)) {
+            "warn,rio_vt=error"
+        } else {
+            "info,rio_vt=error"
+        };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
 
     match cmd {
-        Cmd::Serve => {
+        Cmd::Serve { restore } => {
             // Keep goattyd's completions (and those of goatty's tool copies)
             // in the managed shell current, off the startup path.
             let _ = std::thread::Builder::new().name("completions".into()).spawn(|| {
@@ -272,8 +290,17 @@ fn main() -> Result<()> {
                     goatty_shell::completions::backfill(dirs);
                 }
             });
-            goatty_daemon::serve(&goatty_proto::socket_path())
+            let start = match restore {
+                Some(file) => goatty_daemon::Start::Restore(file),
+                None => goatty_daemon::Start::Normal,
+            };
+            goatty_daemon::serve(&goatty_proto::socket_path(), start)
         }
+        Cmd::RestoreVersion => {
+            println!("{}", goatty_daemon::STATE_VERSION);
+            Ok(())
+        }
+        Cmd::Restart { force } => restart(force),
         Cmd::Completions { shell } => {
             print!("{}", completion_script(shell));
             Ok(())
@@ -391,6 +418,24 @@ fn completion_script(shell: clap_complete::Shell) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// `goattyd restart`: replace the running daemon with this goattyd.
+fn restart(force: bool) -> Result<()> {
+    use goatty_client::local::{Restarted, Stopped, restart_daemon};
+    let exe = std::env::current_exe()?;
+    match restart_daemon(Some(&exe), force)? {
+        Restarted::NotRunning => eprintln!("goattyd isn't running"),
+        Restarted::Kept { sessions } => eprintln!("goattyd runs {} now; its {sessions} session(s) kept running", exe.display()),
+        Restarted::Stopped(how) => {
+            let why = match how {
+                Stopped::Service { why } | Stopped::Killed { why, .. } => format!(" ({why})"),
+                Stopped::NotRunning | Stopped::Asked => String::new(),
+            };
+            eprintln!("stopped the old goattyd{why}, which ended its sessions; the next connection starts this one");
+        }
+    }
+    Ok(())
+}
+
 /// `goattyd stop`: ask the daemon to shut down; with `force`, stop one that
 /// doesn't speak our protocol too (old versions, after an upgrade).
 fn stop(force: bool) -> Result<()> {
@@ -455,6 +500,11 @@ fn service_status() -> Result<()> {
     let state = |on: bool| if on { "active" } else { "inactive" };
     println!("socket    {}", state(s.socket_active));
     println!("service   {}", state(s.service_active));
+    if s.keeps_sessions {
+        println!("sessions  survive daemon restarts and crashes; `systemctl --user stop goattyd` ends them");
+    } else {
+        println!("sessions  end when the daemon does: units from an older goattyd (`goattyd service install` updates them)");
+    }
     print_linger(s.linger);
     Ok(())
 }

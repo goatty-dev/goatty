@@ -59,6 +59,7 @@ use crate::app::Initial;
 use crate::close_confirm::{CloseConfirm, CloseConfirmEvent, Closing};
 use crate::command_palette::{CommandPalette, PaletteEvent, Scope};
 use crate::connect::{ConnectEvent, ConnectPlan, ConnectView};
+use crate::hosts::HostRef;
 use crate::paste_confirm::{PasteConfirm, PasteConfirmEvent};
 use crate::session::AttachMode;
 use crate::session::{Session, Spawner};
@@ -1273,6 +1274,19 @@ impl Workspace {
         self.open_palette(Scope::Hosts, window, cx);
     }
 
+    /// The active tab's host's sessions (this computer's for a local or
+    /// plain SSH tab, whose sessions live in the local goattyd or nowhere).
+    fn list_sessions(&mut self, _: &ListSessions, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let host = match self.active_tab().and_then(|t| t.host.as_ref()) {
+            Some(Spawner::Daemon(conn)) => match conn.endpoint() {
+                goatty_client::Endpoint::Ssh(t) => HostRef::Ssh(t.host.clone()),
+                _ => HostRef::Local,
+            },
+            _ => HostRef::Local,
+        };
+        self.open_palette(Scope::Sessions(host), window, cx);
+    }
+
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_recent(window, cx);
         let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
@@ -1489,6 +1503,7 @@ impl Render for Workspace {
                 toast::press_primary(window, cx);
             })
             .on_action(cx.listener(Self::connect_to_host))
+            .on_action(cx.listener(Self::list_sessions))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_pane))
             .on_action(cx.listener(Self::close_tab))
