@@ -226,7 +226,8 @@ jobs:
           scripts/aur-pkgbuild.sh /home/builder/aur packages/goatty-*-x86_64-linux.tar.gz --local
           chown -R builder: /home/builder/aur
           cd /home/builder/aur
-          su builder -c 'makepkg --cleanbuild --noconfirm'
+          # --nodeps: pacman -U below installs the dependencies, which tests their names.
+          su builder -c 'makepkg --cleanbuild --nodeps --noconfirm'
           namcap PKGBUILD goatty-bin-*.pkg.tar.zst || true
           pacman -U --noconfirm goatty-bin-*.pkg.tar.zst
           set -x
