@@ -476,7 +476,8 @@ mod tests {
         generation::activate(&dirs, &files("b\n", None), r#"{"history": {"size": 5000}}"#).unwrap();
         // As written before #55: no parent, no changes.
         let g2 = dirs.generations_dir().join("2");
-        std::fs::write(g2.join("info.json"), "{\"created\": 5, \"goatty\": \"0.0.1\"}\n").unwrap();
+        let info = format!("{{\"created\": 5, \"goatty\": \"{}\"}}\n", env!("CARGO_PKG_VERSION"));
+        std::fs::write(g2.join("info.json"), info).unwrap();
         let l = list(&dirs);
         assert_eq!(l[1].summary(), "history.size 100000 → 5000");
         assert_eq!(l[1].created_unix, 5);
