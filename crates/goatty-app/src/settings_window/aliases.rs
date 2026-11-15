@@ -8,6 +8,12 @@
 //! applied with Preview/Apply. What the list shows (active, replaced, the
 //! plugin's condition) comes from `goatty_shell::aliases::table`, the same
 //! table `goattyd alias list` prints.
+//!
+//! The aliases the user's own `.zshrc`/`.bashrc` defines can be copied in
+//! once ("From your ~/.zshrc"): goatty's shell never applies them live. The
+//! list comes from the host's import check (`goatty_shell::import`, the
+//! Dotfiles page's data); the user's own are picked, the ones frameworks
+//! like oh-my-zsh bring are behind "Show more".
 
 use std::collections::HashSet;
 
@@ -65,6 +71,11 @@ pub struct AliasesPage {
     toggled: HashSet<String>,
     /// The form's frame: Tab stays inside it.
     pub(super) modal_focus: gpui::FocusHandle,
+    /// Choosing aliases to copy from the user's shell: the names picked
+    /// (`None`: the list is closed).
+    import_picks: Option<HashSet<String>>,
+    /// The list shows the aliases of frameworks and plugins too.
+    import_more: bool,
     /// What had focus when the form opened.
     opener: Option<gpui::FocusHandle>,
     /// Where focus goes on the next frame, after the form closed (its
@@ -99,6 +110,8 @@ impl AliasesPage {
             form_error: None,
             scope: Scope::All,
             toggled: HashSet::new(),
+            import_picks: None,
+            import_more: false,
             modal_focus: cx.focus_handle(),
             opener: None,
             restore: None,
@@ -362,7 +375,12 @@ impl SettingsWindow {
         let mut shown = 0;
         if scope != Scope::Plugins {
             let mut s = section(ui, "My aliases").plain();
-            if mine.is_empty() && query.is_empty() {
+            let from_shell = if query.is_empty() { self.alias_import(ui, &h, cx) } else { None };
+            let offering = from_shell.is_some();
+            if let Some(el) = from_shell {
+                s = s.child(el);
+            }
+            if mine.is_empty() && query.is_empty() && !offering {
                 s = s.child(self.suggestions(ui, cx));
             }
             for g in &mine {
@@ -415,6 +433,177 @@ impl SettingsWindow {
             )));
         }
         page.child(kit::hint(ui, "From a shell on the host: goattyd alias list, add, edit, disable, remove.").px(px(4.))).into_any_element()
+    }
+
+    /// The startup file the user's aliases come from (`~/.zshrc`), for labels.
+    fn alias_import_file(&self) -> String {
+        let Some(st) = &self.dotfiles.status else { return "your startup files".into() };
+        let found: Vec<&str> = st.files.iter().filter(|f| f.exists).map(|f| f.path.as_str()).collect();
+        found.iter().find(|f| f.ends_with("rc")).or(found.last()).map_or_else(|| "your startup files".into(), |f| (*f).to_owned())
+    }
+
+    /// Copying the aliases the user's shell defines into goatty's, once:
+    /// `None` when there are none goatty doesn't have.
+    fn alias_import(&self, ui: Ui, h: &HostSettings, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        let hv = self.dotfiles.status.as_ref()?.harvest.as_ref()?;
+        let offer = goatty_shell::import::offer_aliases(hv, h);
+        if offer.is_empty() {
+            return None;
+        }
+        let file = self.alias_import_file();
+        let own = offer.iter().filter(|a| a.own).count();
+        let others = offer.len() - own;
+        let Some(picks) = &self.aliases.import_picks else {
+            let desc = if own > 0 {
+                format!(
+                    "{own} {} you defined there. Copy them once; goatty keeps them from then on",
+                    if own == 1 { "alias" } else { "aliases" }
+                )
+            } else {
+                format!("{others} from frameworks and plugins you load there. Pick the ones you want")
+            };
+            let names: HashSet<String> = offer.iter().filter(|a| a.own).map(|a| a.name.clone()).collect();
+            let open = button_with(
+                "alias-import-open",
+                Some(Icon::Download),
+                "Choose…",
+                ButtonKind::Normal,
+                ui,
+                self.act(cx, move |v, cx| {
+                    v.aliases.import_picks = Some(names.clone());
+                    v.aliases.import_more = false;
+                    cx.notify();
+                }),
+            );
+            return Some(
+                card(ui)
+                    .child(kit::row(ui, format!("Your aliases from {file}")).icon(Icon::Link2).desc(desc).control(open))
+                    .into_any_element(),
+            );
+        };
+        let mono = kit::mono(cx);
+        let mut list = card(ui);
+        let shown: Vec<_> = offer.iter().filter(|a| a.own || self.aliases.import_more || own == 0).collect();
+        for (k, a) in shown.iter().enumerate() {
+            if k > 0 {
+                list = list.child(divider(ui));
+            }
+            let on = picks.contains(&a.name);
+            let name = a.name.clone();
+            let switch = toggle(
+                SharedString::from(format!("alias-import-{}", a.name)),
+                on,
+                ui,
+                self.act(cx, move |v, cx| {
+                    if let Some(p) = v.aliases.import_picks.as_mut()
+                        && !p.remove(&name)
+                    {
+                        p.insert(name.clone());
+                    }
+                    cx.notify();
+                }),
+            )
+            .aria_label(SharedString::from(format!("Copy alias {}", a.name)));
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .min_h(px(44.))
+                    .px(px(16.))
+                    .py(px(8.))
+                    .child(switch)
+                    .child(
+                        div()
+                            .w(px(140.))
+                            .min_w(px(60.))
+                            .flex_shrink(1.)
+                            .truncate()
+                            .font_family(mono.clone())
+                            .text_size(px(text::BODY))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if on { ui.text } else { ui.faint })
+                            .child(SharedString::from(a.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(mono.clone())
+                            .text_size(px(text::LABEL))
+                            .text_color(if on { ui.muted } else { ui.faint })
+                            .child(SharedString::from(a.value.clone())),
+                    )
+                    .when(!a.own, |d| d.child(badge("Framework", Tone::Neutral, ui))),
+            );
+        }
+        let picked: Vec<(String, String)> =
+            offer.iter().filter(|a| picks.contains(&a.name)).map(|a| (a.name.clone(), a.value.clone())).collect();
+        let n = picked.len();
+        let group = format!("From {file}");
+        let add = button_with(
+            "alias-import-add",
+            Some(Icon::Plus),
+            if n == 1 { "Add 1 alias".to_string() } else { format!("Add {n} aliases") },
+            ButtonKind::Primary,
+            ui,
+            self.act_window(cx, move |v, window, cx| {
+                if picked.is_empty() {
+                    return;
+                }
+                let (picked, group) = (picked.clone(), group.clone());
+                focus::hand_over(&v.focus, focus::Handover::Control("alias-new".into()), window, cx);
+                v.aliases.import_picks = None;
+                v.edit_host(cx, move |h| {
+                    for (name, command) in picked {
+                        h.aliases.entry(name).or_insert_with(|| UserAlias { group: group.clone(), ..UserAlias::new(command) });
+                    }
+                });
+            }),
+        );
+        let cancel = button(
+            "alias-import-cancel",
+            "Cancel",
+            ButtonKind::Ghost,
+            ui,
+            self.act_window(cx, |v, window, cx| {
+                focus::hand_over(&v.focus, focus::Handover::Control("alias-new".into()), window, cx);
+                v.aliases.import_picks = None;
+                cx.notify();
+            }),
+        );
+        let mut bar = div().flex().flex_wrap().items_center().gap(px(8.)).px(px(4.));
+        if own > 0 && others > 0 {
+            let more = self.aliases.import_more;
+            bar = bar.child(button(
+                "alias-import-more",
+                if more { "Only mine".to_string() } else { format!("Show {others} from frameworks") },
+                ButtonKind::Ghost,
+                ui,
+                self.act(cx, move |v, cx| {
+                    v.aliases.import_more = !more;
+                    cx.notify();
+                }),
+            ));
+        }
+        bar = bar.child(div().flex_1()).child(cancel).child(add);
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(
+                    kit::hint(
+                        ui,
+                        format!("Copy aliases from {file} into goatty's. They're yours to edit from then on; your file stays as it is."),
+                    )
+                    .px(px(4.)),
+                )
+                .child(list)
+                .child(bar)
+                .into_any_element(),
+        )
     }
 
     /// Quick starts while the user has no aliases.

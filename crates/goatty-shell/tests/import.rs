@@ -115,6 +115,8 @@ fn zsh_harvest_sees_what_the_zshrc_sets_up() {
     assert_eq!(alias(&h, "-"), Some(("cd -", AliasKind::Regular)));
     assert_eq!(alias(&h, "G"), Some(("| grep", AliasKind::Global)));
     assert_eq!(alias(&h, "pdf"), Some(("zathura", AliasKind::Suffix)));
+    let own = |name: &str| h.aliases.iter().find(|a| a.name == name).map(|a| a.own);
+    assert_eq!((own("ll"), own("gst")), (Some(true), Some(false)), "the .zshrc's own, not the framework's");
     assert!(h.stderr.contains("a warning"), "{}", h.stderr);
     assert!(!h.stderr.contains("welcome"), "stdout isn't kept: {}", h.stderr);
 }
@@ -146,6 +148,23 @@ fn bash_harvest_reads_bashrc_once() {
     sb.file(".profile", "export FROM_PROFILE=1\nif [ -n \"$BASH_VERSION\" ] && [ -f \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n");
     let h = sb.harvest("bash", ImportFrom::Auto, Duration::from_secs(20)).unwrap_or_else(|f| panic!("{f:?}"));
     assert_eq!(var(&h, "RUNS"), Some("1"));
+}
+
+/// `set -o noclobber` in the startup doesn't stop the dump from writing
+/// into the (already created, private) file.
+#[test]
+fn noclobber_in_the_startup_is_fine() {
+    let sb = Sandbox::new();
+    if find("bash").is_some() {
+        sb.file(".bashrc", "set -o noclobber\nexport FROM_BASHRC=1\n");
+        let h = sb.harvest("bash", ImportFrom::Bash, Duration::from_secs(20)).unwrap_or_else(|f| panic!("{f:?}"));
+        assert_eq!(var(&h, "FROM_BASHRC"), Some("1"));
+    }
+    if find("zsh").is_some() {
+        sb.file(".zshrc", "setopt no_clobber\nexport FROM_ZSHRC=1\n");
+        let h = sb.harvest("zsh", ImportFrom::Zsh, Duration::from_secs(20)).unwrap_or_else(|f| panic!("{f:?}"));
+        assert_eq!(var(&h, "FROM_ZSHRC"), Some("1"));
+    }
 }
 
 /// A zsh login shell whose user only ever configured bash: Automatic takes

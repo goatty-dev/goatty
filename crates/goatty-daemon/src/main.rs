@@ -245,8 +245,8 @@ enum ShellCmd {
     /// Ask the daemon's running managed shells to restart with the active
     /// configuration (idle ones now, busy ones at their next prompt).
     Reload,
-    /// What goatty imports from your own shell (PATH, variables, aliases
-    /// from .zshrc or .bashrc; `goattyd settings set shell.import.enabled true`).
+    /// What goatty imports from your own shell (PATH folders and variables
+    /// from .zshrc or .bashrc), and the aliases it can copy into goatty's.
     Import {
         /// Run your shell now to see what it sets up (also while the import is off).
         #[arg(long)]

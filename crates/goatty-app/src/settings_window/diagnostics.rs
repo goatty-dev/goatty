@@ -250,9 +250,9 @@ impl SettingsWindow {
                     r.desc("Your .zshrc loads it; goatty's shell skips it and uses its own").control(badge("Skipped", Tone::Neutral, ui))
                 }
                 FeatureState::Off => r.desc("Turned off in the settings").control(badge("Off", Tone::Neutral, ui)),
-                FeatureState::Missing if f.is_import() => {
-                    r.desc("Nothing imported yet: see Dotfiles for what happened").control(badge("Nothing yet", Tone::Warning, ui))
-                }
+                FeatureState::Missing if f.is_import() => r
+                    .desc("Nothing imported from your .zshrc or .bashrc: Dotfiles says why")
+                    .control(badge("Nothing yet", Tone::Neutral, ui)),
                 FeatureState::Missing if f.is_helper() => r
                     .desc(format!("Optional: {}. Install the {} plugin, or your distribution's package", helper_use(&f.id), f.name))
                     .control(badge("Not installed", Tone::Neutral, ui)),

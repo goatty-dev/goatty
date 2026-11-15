@@ -6,12 +6,17 @@
 //! goatty runs the user's login shell the way their old terminal did
 //! (`zsh -l -i -c …` or `bash -l -i -c …`) in a separate process, without
 //! a terminal, and notes what it ends up with: the exported variables that
-//! changed, PATH and the aliases. That *harvest* is cached
-//! (`$XDG_STATE_HOME/goatty/import/`) and written as `import.zsh`, which
-//! goatty's `.zshrc` applies: variables and PATH early (so the plugins find
-//! the user's tools), aliases at the very end (goatty's own and the user's
-//! additions win). The settings (`ImportSettings`: on/off, aliases, names to
-//! skip) are applied by the `.zshrc`, so the harvest doesn't depend on them.
+//! changed, the PATH folders it added and the aliases. That *harvest* is
+//! cached (`$XDG_STATE_HOME/goatty/import/`) and written as `import.zsh`,
+//! which goatty's `.zshrc` applies early (so the plugins find the user's
+//! tools): the variables, and the added PATH folders that aren't on PATH
+//! yet. The settings (`ImportSettings`: on/off, names to skip) are applied
+//! by the `.zshrc`, so the harvest doesn't depend on them.
+//!
+//! Aliases are never applied live: the Aliases page offers to copy them
+//! into goatty's own (`aliases` in `host.json`) once ([`offer_aliases`]),
+//! the ones defined in the user's own files picked ([`Alias::own`]), the
+//! ones frameworks like oh-my-zsh bring left to choose.
 //!
 //! A harvest runs again when one of the startup files changed (the session
 //! waits for it, up to [`SYNC_TIMEOUT`]), and in the background once the
@@ -46,8 +51,10 @@ use crate::zsh::quote;
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 /// The limit for a harvest nobody waits for (background, "Check again").
 pub const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30);
-/// A harvest older than this is redone in the background when a session starts.
-pub const MAX_AGE: Duration = Duration::from_secs(60 * 60);
+/// A harvest older than this is redone in the background when a session
+/// starts. Installers edit the startup files themselves (a change there
+/// harvests at once), so this only catches files those source.
+pub const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Set in the harvested shell's environment, so a `.zshrc` can tell.
 pub const MARKER_ENV: &str = "GOATTY_IMPORT";
@@ -272,6 +279,11 @@ pub struct Alias {
     pub name: String,
     pub value: String,
     pub kind: AliasKind,
+    /// Defined in one of the user's own files (an `alias NAME=` line in a
+    /// startup file, `~/.bash_aliases`, oh-my-zsh's `custom/`, …), not by a
+    /// framework or plugin they load.
+    #[serde(default)]
+    pub own: bool,
 }
 
 /// What the user's shell ended up with.
@@ -287,6 +299,7 @@ pub struct Harvest {
     /// The PATH the shell ended with, and the one it started with.
     pub path: Vec<String>,
     pub base_path: Vec<String>,
+    /// For the one-time offer on the Aliases page, never applied live.
     pub aliases: Vec<Alias>,
     /// The ZDOTDIR the startup files left (zsh; `None`: unset).
     pub zdotdir: Option<String>,
@@ -297,10 +310,74 @@ pub struct Harvest {
 }
 
 impl Harvest {
-    /// PATH folders the startup files added, in order.
+    /// PATH folders the startup files added, in order. Only these are
+    /// imported: what the shell started with is goattyd's own PATH (maybe
+    /// from a venv or `nix develop` it was started in), not the user's setup.
     pub fn added_path(&self) -> Vec<&str> {
         self.path.iter().filter(|d| !self.base_path.contains(d)).map(String::as_str).collect()
     }
+}
+
+/// The aliases worth copying into goatty's own (`aliases` in `host.json`):
+/// plain ones (goatty has no global or suffix aliases) with a name goatty
+/// accepts, not defined there yet. The user's own first, then the rest by
+/// name.
+pub fn offer_aliases<'a>(h: &'a Harvest, settings: &HostSettings) -> Vec<&'a Alias> {
+    let mut out: Vec<&Alias> = h
+        .aliases
+        .iter()
+        .filter(|a| a.kind == AliasKind::Regular && goatty_config::is_alias_name(&a.name) && !settings.aliases.contains_key(&a.name))
+        .filter(|a| !a.value.trim().is_empty())
+        .collect();
+    out.sort_by(|a, b| (!a.own, &a.name).cmp(&(!b.own, &b.name)));
+    out
+}
+
+/// Files the user writes aliases in themselves: their startup files,
+/// the usual alias files, oh-my-zsh's and prezto's custom folders.
+fn own_alias_files(kind: Kind, home: &Path, zdotdir: &Path) -> Vec<PathBuf> {
+    let mut files = user_files(kind, home, zdotdir);
+    for f in [".bash_aliases", ".aliases", ".zsh_aliases", ".zshrc.local", ".bashrc.local", ".config/zsh/aliases.zsh"] {
+        files.push(home.join(f));
+    }
+    for d in [".oh-my-zsh/custom", ".zprezto/modules/custom"] {
+        if let Ok(rd) = std::fs::read_dir(home.join(d)) {
+            files.extend(rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "zsh")));
+        }
+    }
+    files
+}
+
+/// Names that `alias` lines in `text` define (`alias ll='ls -l' la=…`,
+/// `alias -g G='| grep'`). A reading of the text: good enough to tell the
+/// user's own aliases from a framework's.
+fn alias_names_in(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split(" #").next().unwrap_or_default().trim_start();
+        // `alias` at the start of a command: a line, or after `;`, `&&`, `then`.
+        for part in line.split([';', '&', '|']).map(str::trim_start) {
+            let part = part.strip_prefix("then ").or_else(|| part.strip_prefix("do ")).unwrap_or(part).trim_start();
+            let Some(rest) = part.strip_prefix("alias ") else { continue };
+            for word in rest.split_whitespace() {
+                if word.starts_with('-') {
+                    continue;
+                }
+                let Some((name, _)) = word.split_once('=') else { break };
+                let name = name.trim_matches(|c| c == '\'' || c == '"');
+                if !name.is_empty() {
+                    out.push(name.to_owned());
+                }
+                // Values with spaces: only the first name is certain.
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn own_alias_names(kind: Kind, home: &Path, zdotdir: &Path) -> std::collections::HashSet<String> {
+    own_alias_files(kind, home, zdotdir).iter().filter_map(|f| std::fs::read_to_string(f).ok()).flat_map(|t| alias_names_in(&t)).collect()
 }
 
 /// A harvest that didn't work out.
@@ -476,7 +553,7 @@ local k
   for k in ${{(k)saliases}}; do builtin print -rn -- "S$k=${{saliases[$k]}}"$'\0'; done
   if (( ${{+ZDOTDIR}} )); then builtin print -rn -- "Z$ZDOTDIR"$'\0'; fi
   builtin print -rn -- "{END}"$'\0'
-}} > {out}"#
+}} >| {out}"#
             );
             format!(r"\builtin unsetopt aliases; () {{ \builtin eval {} }}", quote(&body))
         }
@@ -488,7 +565,7 @@ local k
   for k in $(compgen -e); do builtin printf 'E%s=%s\0' "$k" "${{!k}}"; done
   for k in "${{!BASH_ALIASES[@]}}"; do builtin printf 'A%s=%s\0' "$k" "${{BASH_ALIASES[$k]}}"; done
   builtin printf '%s\0' "{END}"
-}} > {out}"#
+}} >| {out}"#
             );
             // A login bash reads .bashrc only when the login file sources
             // it; a terminal's bash reads it anyway, so do too.
@@ -558,9 +635,50 @@ pub fn is_shell_state(name: &str) -> bool {
         "SSH_AUTH_SOCK",
         "SSH_AGENT_PID",
         "SSH_TTY",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
         "DISABLE_AUTO_UPDATE",
+        "STARSHIP_SHELL",
+        "STARSHIP_SESSION_KEY",
+        // The desktop session or the terminal the variable was set in.
+        "DISPLAY",
+        "WINDOWID",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "XAUTHORITY",
+        "VTE_VERSION",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        // A virtualenv, conda or nix shell activated by the startup is the
+        // shell's, not something every new shell should start in.
+        "VIRTUAL_ENV",
+        "VIRTUAL_ENV_PROMPT",
+        "IN_NIX_SHELL",
+        // Short-lived credentials go stale.
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
     ];
-    const PREFIXES: &[&str] = &["GOATTY_", "ZSH_", "STARSHIP_", "P9K_", "_P9K", "POWERLEVEL9K_", "BASH_FUNC_"];
+    const PREFIXES: &[&str] = &[
+        "GOATTY_",
+        "ZSH_",
+        "P9K_",
+        "_P9K",
+        "POWERLEVEL9K_",
+        "BASH_FUNC_",
+        "XDG_SESSION_",
+        "WAYLAND_",
+        "CONDA_",
+        "DIRENV_",
+        "KITTY_",
+        "WEZTERM_",
+        "ITERM_",
+        "ALACRITTY_",
+        "KONSOLE_",
+        "VSCODE_",
+        "GHOSTTY_",
+        "TERMINAL_",
+    ];
     EXACT.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
@@ -595,7 +713,7 @@ fn parse_dump(bytes: &[u8]) -> Option<Dump> {
         let Some(tag) = chars.next() else { continue };
         let rest = chars.as_str();
         let pair = || rest.split_once('=').filter(|(k, _)| !k.is_empty()).map(|(k, v)| (k.to_owned(), v.to_owned()));
-        let alias = |kind| pair().map(|(name, value)| Alias { name, value, kind });
+        let alias = |kind| pair().map(|(name, value)| Alias { name, value, kind, own: false });
         match tag {
             'E' => {
                 if let Some((k, v)) = pair() {
@@ -652,7 +770,8 @@ pub fn harvest(
     let id = format!("{}-{}", std::process::id(), RUNS.fetch_add(1, Ordering::Relaxed));
     let out = work.join(format!(".dump-{id}"));
     let err = work.join(format!(".stderr-{id}"));
-    // The shell's `> out` keeps the mode of a file that's there: private.
+    // The shell's `>| out` (noclobber can't stop it) keeps the mode of a
+    // file that's there: private.
     let result = private_file(&out).and_then(|_| run(source, ctx, &out, &err, timeout));
     let stderr = clean_stderr(&std::fs::read_to_string(&err).unwrap_or_default());
     let dump = std::fs::read(&out).ok();
@@ -672,6 +791,8 @@ pub fn harvest(
     // have the old values, so its fingerprint stays the old one and the
     // next session harvests again.
     let changed = fingerprint(source, ctx, zdotdir) != fp;
+    let own = own_alias_names(source.kind, &ctx.home, &ctx.zdotdir(dump.zdotdir.as_deref()));
+    let aliases = dump.aliases.into_iter().map(|a| Alias { own: own.contains(&a.name), ..a }).collect();
     let base: BTreeMap<&str, &str> = ctx.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let vars = dump
         .env
@@ -686,7 +807,7 @@ pub fn harvest(
         vars,
         path: split_path(dump.env.get("PATH").map(String::as_str)),
         base_path: split_path(ctx.var("PATH")),
-        aliases: dump.aliases,
+        aliases,
         // The fingerprint for later checks takes the ZDOTDIR the startup left.
         fingerprint: if changed { fp.clone() } else { fingerprint(source, ctx, dump.zdotdir.as_deref()) },
         zdotdir: dump.zdotdir,
@@ -744,14 +865,14 @@ fn run(source: &Source, ctx: &Context, out: &Path, err: &Path, timeout: Duration
 pub fn render(record: &Record, ctx: Option<&Context>) -> String {
     let mut out = String::from(
         "# goatty: what your own shell sets up, imported (shell.import).\n\
-         # Rewritten by goatty: change what's imported in goatty's settings (Shell → From your shell).\n",
+         # Rewritten by goatty: change what's imported in goatty's settings (Shell → Dotfiles).\n",
     );
     let Some(h) = &record.harvest else {
         out.push_str("# Nothing imported yet.\n");
         if let Some(f) = &record.failure {
             out.push_str(&format!("# {}\n", f.message.replace('\n', " ")));
         }
-        out.push_str("typeset -ga _goatty_imported_vars=() _goatty_imported_path=() _goatty_imported_aliases=()\ntypeset -g _goatty_imported_from=''\n");
+        out.push_str("typeset -ga _goatty_imported_vars=() _goatty_imported_path=()\ntypeset -g _goatty_imported_from=''\n");
         return out;
     };
     let from = ctx.map_or_else(
@@ -773,17 +894,7 @@ pub fn render(record: &Record, ctx: Option<&Context>) -> String {
         "typeset -ga _goatty_imported_vars=({})\n",
         words(h.vars.iter().flat_map(|v| [v.name.as_str(), v.value.as_str()]).collect())
     ));
-    let path: Vec<&str> = if h.path == h.base_path { Vec::new() } else { h.path.iter().map(String::as_str).collect() };
-    out.push_str(&format!("typeset -ga _goatty_imported_path=({})\n", words(path)));
-    let kind = |k: AliasKind| match k {
-        AliasKind::Regular => "a",
-        AliasKind::Global => "g",
-        AliasKind::Suffix => "s",
-    };
-    out.push_str(&format!(
-        "typeset -ga _goatty_imported_aliases=({})\n",
-        words(h.aliases.iter().flat_map(|a| [kind(a.kind), a.name.as_str(), a.value.as_str()]).collect())
-    ));
+    out.push_str(&format!("typeset -ga _goatty_imported_path=({})\n", words(h.added_path())));
     out
 }
 
@@ -1103,7 +1214,10 @@ mod tests {
         for n in ["PWD", "SHLVL", "ZSH", "ZSH_CACHE_DIR", "STARSHIP_SHELL", "P9K_TTY", "GOATTY_X", "HISTFILE", "SSH_AUTH_SOCK", "PS1"] {
             assert!(is_shell_state(n), "{n}");
         }
-        for n in ["EDITOR", "NVM_DIR", "CARGO_HOME", "FZF_DEFAULT_OPTS", "LANG", "PAGER", "LESS"] {
+        for n in ["DISPLAY", "WAYLAND_DISPLAY", "VIRTUAL_ENV", "CONDA_PREFIX", "DIRENV_DIR", "TMUX", "AWS_SESSION_TOKEN", "KITTY_PID"] {
+            assert!(is_shell_state(n), "session state: {n}");
+        }
+        for n in ["EDITOR", "NVM_DIR", "CARGO_HOME", "FZF_DEFAULT_OPTS", "LANG", "PAGER", "LESS", "STARSHIP_CONFIG", "GOPATH"] {
             assert!(!is_shell_state(n), "{n}");
         }
         assert!(is_var_name("A_1") && is_var_name("_x"));
@@ -1129,7 +1243,7 @@ mod tests {
             vars: vec![Var { name: "EDITOR".into(), value: "it's vim".into() }],
             path: vec!["/home/u/.cargo/bin".into(), "/usr/bin".into()],
             base_path: vec!["/usr/bin".into()],
-            aliases: vec![Alias { name: "ll".into(), value: "ls -l".into(), kind: AliasKind::Regular }],
+            aliases: vec![Alias { name: "ll".into(), value: "ls -l".into(), kind: AliasKind::Regular, own: true }],
             zdotdir: None,
             stderr: String::new(),
             fingerprint: "x".into(),
@@ -1142,8 +1256,8 @@ mod tests {
         assert_eq!(h.added_path(), ["/home/u/.cargo/bin"]);
         let text = render(&Record { harvest: Some(h.clone()), failure: None }, None);
         assert!(text.contains(r"_goatty_imported_vars=('EDITOR' 'it'\''s vim')"), "{text}");
-        assert!(text.contains("_goatty_imported_path=('/home/u/.cargo/bin' '/usr/bin')"), "{text}");
-        assert!(text.contains("_goatty_imported_aliases=('a' 'll' 'ls -l')"), "{text}");
+        assert!(text.contains("_goatty_imported_path=('/home/u/.cargo/bin')\n"), "only what the startup added: {text}");
+        assert!(!text.contains("alias") && !text.contains("ls -l"), "aliases aren't applied live: {text}");
         let same = Harvest { path: h.base_path.clone(), ..h };
         assert!(
             render(&Record { harvest: Some(same), failure: None }, None).contains("_goatty_imported_path=()"),
@@ -1157,6 +1271,29 @@ mod tests {
             None,
         );
         assert!(none.contains("# boom") && none.contains("_goatty_imported_vars=()"), "{none}");
+    }
+
+    #[test]
+    fn alias_lines_name_the_users_own() {
+        let text = "alias ll='ls -l'\n  alias -g G='| grep' \nif x; then alias gs=\"git status\"; fi\n# alias no=x\nexport A=1 # alias nope=1\nalias\n";
+        assert_eq!(alias_names_in(text), ["ll", "G", "gs"]);
+    }
+
+    #[test]
+    fn offered_aliases_put_the_users_own_first() {
+        let mut h = sample();
+        let a = |name: &str, own: bool, kind: AliasKind| Alias { name: name.into(), value: "x".into(), kind, own };
+        h.aliases = vec![
+            a("gco", false, AliasKind::Regular),
+            a("ll", true, AliasKind::Regular),
+            a("G", true, AliasKind::Global),
+            a("mine", true, AliasKind::Regular),
+            a("bad name", true, AliasKind::Regular),
+        ];
+        let mut s = HostSettings::default();
+        s.aliases.insert("mine".into(), goatty_config::UserAlias::new("y"));
+        let names: Vec<&str> = offer_aliases(&h, &s).iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["ll", "gco"], "own first; global, taken and unusable names left out");
     }
 
     #[test]

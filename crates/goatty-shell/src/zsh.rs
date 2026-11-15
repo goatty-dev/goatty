@@ -157,7 +157,6 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_user_rc", flag(s.shell.zsh.user_rc));
     let imp = &s.shell.import;
     scalar("_goatty_import", flag(imp.enabled));
-    scalar("_goatty_import_aliases", flag(imp.aliases));
     scalar("_goatty_import_file", &d.import_file().to_string_lossy());
     scalar("_goatty_hist_size", &s.history.size.to_string());
     scalar("_goatty_prompt_two_line", flag(s.prompt.two_line));
@@ -180,7 +179,6 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     out.push_str(&format!("typeset -ga _goatty_path=({})\n", path.join(" ")));
     let words = |list: &[String]| list.iter().map(|n| quote(n)).collect::<Vec<_>>().join(" ");
     out.push_str(&format!("typeset -ga _goatty_import_skip_vars=({})\n", words(&imp.skip_vars)));
-    out.push_str(&format!("typeset -ga _goatty_import_skip_aliases=({})\n", words(&imp.skip_aliases)));
     // What goatty-setup installs when they're missing (built-in plugins that are on).
     let defaults: Vec<&str> =
         builtins::BUILTINS.iter().filter(|b| b.default_install && s.plugins.get(b.id).is_none_or(|c| c.enabled)).map(|b| b.id).collect();
@@ -218,9 +216,9 @@ mod tests {
         let out = render_settings(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: Some(Path::new("/usr/bin/goattyd")), plugins: &[] });
         assert!(out.contains(r"_goatty_dir='/r o/ot'\''s/data/current/zsh'"), "{out}");
         assert!(out.contains("_goatty_user_rc='1'"));
-        assert!(out.contains("_goatty_import='1'") && out.contains("_goatty_import_aliases='1'"), "{out}");
+        assert!(out.contains("_goatty_import='1'"), "{out}");
         assert!(out.contains(r"_goatty_import_file='/r o/ot'\''s/state/import/import.zsh'"), "{out}");
-        assert!(out.contains("_goatty_import_skip_vars=('LESS')") && out.contains("_goatty_import_skip_aliases=()"), "{out}");
+        assert!(out.contains("_goatty_import_skip_vars=('LESS')"), "{out}");
         assert!(out.contains("_goatty_hist_size='5000'"));
         assert!(out.contains("hist_ignore_space share_history)"), "{out}");
         assert!(out.contains("_goatty_daemon='/usr/bin/goattyd'"));

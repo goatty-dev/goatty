@@ -104,7 +104,19 @@ impl Sandbox {
         Launcher::new(Some(self.dirs.clone()), Some(self.home.join("goattyd"))).with_import_context(ctx)
     }
 
+    /// The import (on by default) is off here, so the other tests' traces
+    /// only show goatty's shell: [`Self::launch_importing`] keeps it.
     fn launch_with(&self, mut settings: HostSettings, orig_zdotdir: Option<&Path>) -> Launch {
+        settings.shell.import.enabled = false;
+        self.launch_inner(settings, orig_zdotdir)
+    }
+
+    fn launch_importing(&self, mut settings: HostSettings) -> Launch {
+        settings.shell.import.enabled = true;
+        self.launch_inner(settings, None)
+    }
+
+    fn launch_inner(&self, mut settings: HostSettings, orig_zdotdir: Option<&Path>) -> Launch {
         settings.shell.program = Some(self.zsh.clone());
         let mut l = self.launcher().launch(&Effective::plain(settings));
         assert!(l.managed);
@@ -978,58 +990,68 @@ fn reloads_when_signaled_while_the_prompt_draws() {
     sh.pty.write(b"exit\r").unwrap();
 }
 
-/// The import of the user's shell setup in a real managed shell: what the
-/// user's `.zshrc` sets up (harvested in its own process) is there, its
-/// prompt framework never ran, goatty's own aliases and the user's
-/// additions win, and skipped names stay out.
+/// The import of the user's shell setup in a real managed shell: the PATH
+/// folders and variables the user's `.zshrc` adds (harvested in its own
+/// process) are there, its prompt framework never ran, its aliases aren't
+/// applied (they're offered once instead), skipped names stay out, and
+/// PATH folders goatty's shell has already keep their place.
 #[test]
 fn imported_setup_applies_in_the_managed_shell() {
     let Some(zsh) = zsh() else { return };
     let sb = Sandbox::new(zsh);
-    for d in ["tools/bin", "late/bin"] {
+    for d in ["tools/bin", "late/bin", "early/bin"] {
         std::fs::create_dir_all(sb.home.join(d)).unwrap();
     }
     exe(&sb.home.join("tools/bin/my-tool"), "#!/bin/sh\necho my-tool ran\n");
     sb.file(".oh-my-zsh/oh-my-zsh.sh", "print -r -- OMZ-LOADED >> $HOME/trace\nalias gst='git status'\nalias -g G='| grep'\n");
+    // .zprofile puts early/bin after the system folders; the .zshrc moves it
+    // to the front, which goatty's shell leaves as .zprofile had it.
+    sb.file(".zprofile", "path+=($HOME/early/bin)\n");
     sb.file(
         ".zshrc",
         &traced(
             "zshrc",
-            "source $HOME/.oh-my-zsh/oh-my-zsh.sh\nexport PATH=\"$HOME/tools/bin:$PATH\"\nexport EDITOR=nvim\nexport SECRET=x\n\
-             alias ll='ls -l'\nalias say='print -r -- from-zshrc'\nalias hi='print -r -- from-zshrc'\n",
+            "source $HOME/.oh-my-zsh/oh-my-zsh.sh\nexport PATH=\"$HOME/tools/bin:$HOME/early/bin:$PATH\"\nexport EDITOR=nvim\nexport SECRET=x\n\
+             alias ll='ls -l'\n",
         ),
     );
-    std::fs::create_dir_all(&sb.dirs.config).unwrap();
-    std::fs::write(sb.dirs.user_zshrc(), "alias hi='print -r -- from-additions'\n").unwrap();
     let mut settings = no_highlighting();
-    settings.shell.import.enabled = true;
     settings.shell.import.skip_vars = vec!["SECRET".into()];
-    settings.shell.import.skip_aliases = vec!["ll".into()];
-    settings.aliases.insert("say".into(), goatty_config::UserAlias::new("print -r -- from-goatty"));
     settings.shell.path = vec!["~/late/bin".into()];
-    let launch = sb.launch_with(settings.clone(), None);
+    let launch = sb.launch_importing(settings.clone());
     // The harvest ran the .zshrc (with oh-my-zsh) once, in its own process.
     assert_eq!(sb.trace(), ["zshrc:unset", "OMZ-LOADED"]);
     std::fs::remove_file(sb.home.join("trace")).unwrap();
 
+    let record = goatty_shell::import::Record::load(&sb.dirs);
+    let h = record.harvest.expect("harvested");
+    let mine: Vec<(&str, bool)> = h.aliases.iter().map(|a| (a.name.as_str(), a.own)).collect();
+    assert!(mine.contains(&("ll", true)) && mine.contains(&("gst", false)), "own aliases told apart: {mine:?}");
+    let offer: Vec<&str> = goatty_shell::import::offer_aliases(&h, &settings).iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(offer.first(), Some(&"ll"), "{offer:?}");
+    assert!(!offer.contains(&"G"), "no global aliases: {offer:?}");
+
     let out = sb.run(
         &launch,
-        "my-tool; say; hi; print -r -- \"E=$EDITOR S=${SECRET-unset} gst=$aliases[gst] G=$galiases[G] ll=${+aliases[ll]}\"; \
+        "my-tool; print -r -- \"E=$EDITOR S=${SECRET-unset} gst=${+aliases[gst]} G=${+galiases[G]} ll=${+aliases[ll]}\"; \
          print -rl -- $path; goatty-status",
     );
     let text = stdout(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.trim().is_empty(), "startup printed errors:\n{stderr}");
     assert!(sb.trace().is_empty(), "neither the .zshrc nor oh-my-zsh ran in goatty's shell: {:?}", sb.trace());
-    assert!(text.contains("my-tool ran\nfrom-goatty\nfrom-additions\n"), "{text}");
-    assert!(text.contains("E=nvim S=unset gst=git status G=| grep ll=0"), "{text}");
+    assert!(text.contains("my-tool ran\n"), "{text}");
+    assert!(text.contains("E=nvim S=unset gst=0 G=0 ll=0"), "{text}");
     let path: Vec<&str> = text.lines().filter(|l| l.starts_with('/')).collect();
     let at = |d: &Path| path.iter().position(|p| Path::new(p) == d).unwrap_or_else(|| panic!("{} not in {path:?}", d.display()));
+    assert!(at(&sb.home.join("tools/bin")) < at(&sb.home.join("sysbin")), "added folders in front: {path:?}");
+    assert!(at(&sb.home.join("sysbin")) < at(&sb.home.join("early/bin")), ".zprofile's place kept: {path:?}");
     assert!(at(&sb.home.join("tools/bin")) < at(&sb.home.join("late/bin")), "{path:?}");
     assert!(at(&sb.home.join("late/bin")) < at(&sb.dirs.bin_dir()), "goatty's tools still last: {path:?}");
+    assert_eq!(path.iter().filter(|p| Path::new(p) == sb.home.join("sysbin")).count(), 1, "{path:?}");
     let status = goatty_shell::doctor::parse_status(&text);
     let import = status.iter().find(|f| f.name == "import").map(|f| f.state.clone());
-    assert_eq!(import, Some(goatty_shell::doctor::State::Ok("~/.zshrc".into())), "{status:?}");
+    assert_eq!(import, Some(goatty_shell::doctor::State::Ok("~/.zprofile, ~/.zshrc".into())), "{status:?}");
 
     // PATH page: imported folders are attributed to the .zshrc.
     let marks = stdout(&sb.run(&launch, goatty_shell::path_report::COMMAND));
@@ -1039,10 +1061,9 @@ fn imported_setup_applies_in_the_managed_shell() {
     assert_eq!(found.iter().find(|(d, _)| *d == tools).map(|(_, s)| *s), Some("imported"), "{found:?}");
 
     // Off: nothing of it.
-    settings.shell.import.enabled = false;
     let launch = sb.launch_with(settings, None);
-    let text = stdout(&sb.run(&launch, "print -r -- \"E=${EDITOR-unset} gst=${+aliases[gst]}\""));
-    assert!(text.contains("E=unset gst=0"), "{text}");
+    let text = stdout(&sb.run(&launch, "print -r -- \"E=${EDITOR-unset}\""));
+    assert!(text.contains("E=unset"), "{text}");
 }
 
 /// "Also use ~/.zshrc" runs it guarded: frameworks and prompts it sources
@@ -1063,6 +1084,7 @@ fn guarded_zshrc_skips_frameworks_and_keeps_the_rest() {
         ".zshrc",
         "source \"$HOME/.cache/p10k-instant-prompt-tester.zsh\"\nexport ZSH=$HOME/.oh-my-zsh\nsource -- $ZSH/oh-my-zsh.sh\n\
          . ~/.zsh/mine.zsh\nsource ~/.zsh/with-args.zsh one two\nautoload -Uz compinit && compinit\neval \"$(starship init zsh)\"\n\
+         source ~/.zinit/zinit.zsh\nzinit light zsh-users/zsh-completions\nomz update\n(( ! ${+functions[p10k]} )) || p10k finalize\n\
          export FROM_RC=1\nalias foo=bar\nprint -r -- rc-done >> $HOME/trace\n",
     );
     let mut settings = no_highlighting();
@@ -1070,18 +1092,18 @@ fn guarded_zshrc_skips_frameworks_and_keeps_the_rest() {
     let launch = sb.launch_with(settings.clone(), None);
     let out = sb.run(
         &launch,
-        "print -r -- \"rc=$FROM_RC foo=$aliases[foo] mine=$mine[a] source=${+aliases[source]} stub=${+functions[starship]}\"; print -r -- \"P=$PROMPT\"; goatty-status",
+        "print -r -- \"rc=$FROM_RC foo=$aliases[foo] mine=$mine[a] source=${+aliases[source]} stub=${+functions[starship]} zinit=${+functions[zinit]}\"; print -r -- \"P=$PROMPT\"; goatty-status",
     );
     let text = stdout(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.trim().is_empty(), "startup printed errors:\n{stderr}");
     assert_eq!(sb.trace(), ["args=0", "with=one two", "nested=one two", "rc-done"], "frameworks skipped, the rest ran with its arguments");
-    assert!(text.contains("rc=1 foo=bar mine=1 source=0 stub=0"), "typesets stay global, the guard is gone: {text}");
+    assert!(text.contains("rc=1 foo=bar mine=1 source=0 stub=0 zinit=0"), "typesets stay global, the guard and stubs are gone: {text}");
     assert!(!text.contains("compinit: initialization aborted"), "{text}");
     assert!(!text.contains("P=omz> "), "goatty's prompt plugin, not oh-my-zsh's: {text}");
     let status = goatty_shell::doctor::parse_status(&text);
     let off: Vec<&str> = status.iter().filter(|f| f.name.starts_with("rc:")).map(|f| f.name.as_str()).collect();
-    assert_eq!(off, ["rc:oh-my-zsh", "rc:powerlevel10k", "rc:starship"], "{status:?}");
+    assert_eq!(off, ["rc:oh-my-zsh", "rc:powerlevel10k", "rc:starship", "rc:zinit"], "{status:?}");
 
     // Without a prompt plugin, the .zshrc's own prompt stays.
     sb.file(".zshrc", "PROMPT='mine> '\n");

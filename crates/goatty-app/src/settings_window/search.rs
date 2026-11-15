@@ -97,13 +97,13 @@ pub const INDEX: &[Entry] = &[
         Page::Dotfiles,
         "Import from your shell",
         "Use what your shell sets up",
-        "import zshrc bashrc path editor aliases existing oh-my-zsh installer nvm conda",
+        "import zshrc bashrc path editor existing oh-my-zsh installer nvm conda command not found",
     )
     .keys(&["shell.import.enabled"]),
     e(Page::Dotfiles, "Import from your shell", "Read from", "import zsh bash login shell").keys(&["shell.import.from"]),
-    e(Page::Dotfiles, "Import from your shell", "Import aliases", "import aliases zshrc bashrc").keys(&["shell.import.aliases"]),
-    e(Page::Dotfiles, "What your shell sets up", "What your shell sets up", "import check variables aliases path skip")
-        .keys(&["shell.import.skip_vars", "shell.import.skip_aliases"]),
+    e(Page::Dotfiles, "Your aliases", "Copy your aliases", "import aliases zshrc bashrc copy"),
+    e(Page::Dotfiles, "What your shell sets up", "What your shell sets up", "import check variables path skip")
+        .keys(&["shell.import.skip_vars"]),
     e(Page::Dotfiles, "Run your files in goatty's shell", "Use ~/.zshenv and ~/.zprofile", "dotfiles environment path")
         .keys(&["shell.zsh.user_env"]),
     e(Page::Dotfiles, "Run your files in goatty's shell", "Also run ~/.zshrc", "zshrc dotfiles functions key bindings oh-my-zsh")

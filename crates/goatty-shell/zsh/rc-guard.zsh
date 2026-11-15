@@ -7,7 +7,8 @@
 # as with plain `source`. Sourcing (not a function) keeps FILE at top level,
 # so its `typeset`s stay global. Frameworks and prompts that would fight
 # goatty's, and second copies of goatty's own plugins, are skipped and
-# listed in goatty-status.
+# listed in goatty-status; a skipped framework's commands (`zinit light …`)
+# do nothing for the rest of the .zshrc.
 
 typeset -ga _goatty_rc_caller=("${@[2,$1+1]}")
 builtin shift $(( $1 + 1 ))
@@ -18,6 +19,7 @@ if (( $# == 0 )); then
 fi
 if _goatty_rc_blocked "$1"; then
   _goatty_rc_skipped+=("$REPLY")
+  _goatty_rc_quiet "$REPLY"
   builtin return 0
 fi
 REPLY=$1

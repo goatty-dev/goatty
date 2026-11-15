@@ -5,8 +5,9 @@
 //! 1. **Look**: a theme (or follow the desktop's light/dark) and the text size.
 //! 2. **Shell**: goatty's built-in tools on the window's host, preselected
 //!    when missing, installed with progress (no sudo, pinned checksums),
-//!    whether to import what the user's own `.zshrc`/`.bashrc` sets up
-//!    (opt-in; shown when they have one), and the prompt style.
+//!    whether to import the PATH folders and variables the user's own
+//!    `.zshrc`/`.bashrc` sets up (on by default; shown when they have one,
+//!    with what it brings), and the prompt style.
 //! 3. **Ready**: the few shortcuts worth knowing, links onward.
 //!
 //! It opens by itself once, on the very first start (no client settings
@@ -391,9 +392,6 @@ impl Welcome {
                         None => format!("{n} {word}"),
                     });
                 }
-                if !h.aliases.is_empty() {
-                    parts.push(format!("{} {}", h.aliases.len(), if h.aliases.len() == 1 { "alias" } else { "aliases" }));
-                }
                 if parts.is_empty() {
                     "It sets nothing up that goatty's shell doesn't have already".to_string()
                 } else {
@@ -402,7 +400,7 @@ impl Welcome {
             }
             (None, Some(f)) => format!("Couldn't check it: {}", f.message),
             (None, None) if self.import_checking => "Checking what it sets up…".to_string(),
-            (None, None) => "PATH folders, variables and aliases it sets up".to_string(),
+            (None, None) => "The PATH folders and variables it sets up".to_string(),
         };
         let on = s.enabled;
         let mut sec = settings_section(ui, "Your dotfiles").desc(format!("goatty found {}", found.join(", "))).child(
@@ -417,7 +415,12 @@ impl Welcome {
             Some(e) if e.starts_with("Saved") => sec.footer(e.clone()),
             Some(e) => sec.footer(format!("Couldn't change it: {e}")),
             None => {
-                sec.footer("Your prompt and plugin frameworks in it stay out of goatty's shell. Change it later under Settings → Dotfiles.")
+                let own = s.harvest.as_ref().map_or(0, |h| h.aliases.iter().filter(|a| a.own).count());
+                sec.footer(if own > 0 {
+                    format!("Your prompt and plugin frameworks in it stay out of goatty's shell. Your {own} aliases: copy them under Settings → Aliases.")
+                } else {
+                    "Your prompt and plugin frameworks in it stay out of goatty's shell. Change it later under Settings → Dotfiles.".to_string()
+                })
             }
         };
         Some(sec)

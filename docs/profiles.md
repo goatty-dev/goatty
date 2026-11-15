@@ -105,7 +105,7 @@ Settings travel as JSON documents rather than typed structs, so a schema change 
 | Shortcuts | a table of every action: grouped or sorted by name or keys, search by name or keys (typed, or pressed with the keyboard button), filters for changed and unbound; per action: keycaps (× removes), + records a keystroke, reset; warnings when a recorded key took over another action's key, when a key you added is one the shell uses, and when a keystroke doesn't parse | live |
 | Hosts | open hosts in a new window or tab (`ssh.open_in`), add hosts (`user@host` or an ssh alias, optional name), plain SSH per host, list the hosts in `~/.ssh/config`, connect | saved immediately |
 | Shell | managed zsh, program, shell integration (the built-in tools are on Plugins), links to Dotfiles and PATH | staged → preview → apply |
-| Dotfiles | importing what your shell sets up (on/off, zsh or bash, aliases; what the last check found, each entry switchable, "Check again"), running `~/.zshenv`/`~/.zprofile` and (guarded) `~/.zshrc` | staged |
+| Dotfiles | importing what your shell sets up (on/off, zsh or bash; the PATH folders and variables the last check found, each switchable, "Check again"), a link to copying your aliases, running `~/.zshenv`/`~/.zprofile` and (guarded) `~/.zshrc` | staged |
 | Prompt | live preview; Starship, rich/minimal style, own starship.toml (off by default), two-line, blank line, duration threshold | staged |
 | History | size, duplicates, leading space, sharing, fzf history search, fzf-tab completion and its previews | staged |
 | Aliases | yours first, then each plugin's (folded); filters All / Mine / From plugins; add/edit in a dialog (group completes existing groups) | staged |

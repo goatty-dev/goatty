@@ -60,7 +60,8 @@ pub enum Request {
     /// The PATH a new shell gets, where each folder came from, and what
     /// became of the folders in `shell.path` (starts a shell). Reply: `Path`.
     Path,
-    /// What goatty imports from the user's own shell (`shell.import`);
+    /// What goatty imports from the user's own shell (`shell.import`) and
+    /// the aliases it can copy into goatty's;
     /// `refresh`: run their shell now to see what it sets up (also while
     /// the import is off). Reply: `Import`.
     Import {
@@ -266,7 +267,7 @@ impl HostService {
     /// What goatty imports from the user's shell; `refresh` runs it first.
     pub fn import_status(&self, refresh: bool) -> Result<crate::import::Status> {
         let dirs = dirs_of(self)?;
-        let ctx = self.launcher.import_context().context("$HOME is not set")?;
+        let ctx = self.launcher.import_context().context("no home directory to import from")?;
         let host = self.settings();
         let shell = &host.value.shell;
         let managed = shell.managed && crate::launch::is_zsh(&crate::launch::resolve_program(shell.program.as_deref()));
@@ -392,7 +393,7 @@ fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
     };
     let state = match state {
         State::Ok(from) if id == "import" => {
-            FeatureState::Loaded { detail: format!("PATH, variables and aliases from {from}"), managed: None }
+            FeatureState::Loaded { detail: format!("PATH folders and variables from {from}"), managed: None }
         }
         State::Ok(_) if id == "integration" => {
             FeatureState::Loaded { detail: "Prompt marks (OSC 133) and the working directory (OSC 7)".into(), managed: None }

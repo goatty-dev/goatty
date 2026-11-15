@@ -129,7 +129,7 @@ pub struct ShellSettings {
     /// order (`~/…` is the home directory). Folders that don't exist when
     /// a shell starts are skipped.
     pub path: Vec<String>,
-    /// Bring what the user's own shell sets up (PATH, variables, aliases
+    /// Bring what the user's own shell sets up (PATH folders and variables
     /// from `.zshrc` or `.bashrc`) into goatty's managed zsh.
     pub import: ImportSettings,
 }
@@ -142,27 +142,25 @@ impl Default for ShellSettings {
 
 /// Importing the user's own shell setup (`shell.import`): goatty runs their
 /// login shell with its startup files in a separate process, notes the
-/// environment and aliases it ends up with, and goatty's managed zsh
-/// applies them. Their prompt and plugin frameworks never run in goatty's
-/// shell this way.
+/// PATH folders and variables it adds, and goatty's managed zsh applies
+/// them. Their prompt and plugin frameworks never run in goatty's shell
+/// this way. On by default, so tools an installer put on PATH in `.zshrc`
+/// or `.bashrc` work in goatty too. (Aliases aren't imported live: the
+/// Aliases page offers to copy them into goatty's own, once.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImportSettings {
-    /// Apply the imported PATH, variables and aliases in new shells.
+    /// Apply the imported PATH folders and variables in new shells.
     pub enabled: bool,
     /// Whose startup files: the login shell's, zsh's or bash's.
     pub from: ImportFrom,
-    /// Also the aliases (variables and PATH always come along).
-    pub aliases: bool,
     /// Variables left out, by name (`PATH` too).
     pub skip_vars: Vec<String>,
-    /// Aliases left out, by name.
-    pub skip_aliases: Vec<String>,
 }
 
 impl Default for ImportSettings {
     fn default() -> Self {
-        Self { enabled: false, from: ImportFrom::Auto, aliases: true, skip_vars: Vec::new(), skip_aliases: Vec::new() }
+        Self { enabled: true, from: ImportFrom::Auto, skip_vars: Vec::new() }
     }
 }
 
@@ -279,12 +277,10 @@ impl Document for HostSettings {
                 None => self.shell.path.push(dir),
             }
         }
-        let imp = &mut self.shell.import;
-        for list in [&mut imp.skip_vars, &mut imp.skip_aliases] {
-            list.retain(|n| !n.trim().is_empty());
-            list.sort();
-            list.dedup();
-        }
+        let skip = &mut self.shell.import.skip_vars;
+        skip.retain(|n| !n.trim().is_empty());
+        skip.sort();
+        skip.dedup();
         let empty: Vec<String> = self.aliases.iter().filter(|(_, a)| a.command.trim().is_empty()).map(|(n, _)| n.clone()).collect();
         for name in empty {
             issues.push(Issue::new(format!("aliases.{name}.command"), "empty; alias ignored"));
@@ -460,16 +456,15 @@ mod tests {
     #[test]
     fn import_settings() {
         let s = HostSettings::default();
-        assert!(!s.shell.import.enabled, "opt-in for now");
-        assert!(s.shell.import.aliases);
+        assert!(s.shell.import.enabled, "on by default");
         let mut s: HostSettings =
-            serde_json::from_str(r#"{"shell": {"import": {"enabled": true, "from": "bash", "skip_vars": ["X", "", "A", "X"]}}}"#).unwrap();
+            serde_json::from_str(r#"{"shell": {"import": {"enabled": false, "from": "bash", "skip_vars": ["X", "", "A", "X"]}}}"#).unwrap();
         assert!(s.validate().is_empty());
         assert_eq!(s.shell.import.from, ImportFrom::Bash);
         assert_eq!(s.shell.import.skip_vars, ["A", "X"], "sorted, no blanks or repeats");
         let json = crate::store::to_json(&s, &[]);
-        assert!(json.contains("\"from\": \"bash\"") && !json.contains("aliases\": true"), "sparse: {json}");
-        assert!(crate::store::is_known_key::<HostSettings>("shell.import.skip_aliases"));
+        assert!(json.contains("\"from\": \"bash\"") && json.contains("\"enabled\": false"), "sparse: {json}");
+        assert!(crate::store::is_known_key::<HostSettings>("shell.import.skip_vars"));
     }
 
     #[test]

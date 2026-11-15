@@ -1,18 +1,20 @@
 //! The Dotfiles page: what goatty's zsh uses from the user's own startup
-//! files on the connected host. The import (`shell.import`): goatty runs
-//! their login shell in a separate process and brings the PATH, variables
-//! and aliases it ends up with into new shells, each one switchable
-//! (`goatty_shell::import`). Below that, running `.zshenv`/`.zprofile` and
-//! (guarded) `.zshrc` in goatty's shell itself.
+//! files on the connected host. The import (`shell.import`, on by
+//! default): goatty runs their login shell in a separate process and
+//! brings the PATH folders and variables it adds into new shells, each one
+//! switchable (`goatty_shell::import`). Their aliases are copied once, on
+//! the Aliases page (this page links there). Below that, the advanced part:
+//! running `.zshenv`/`.zprofile` and (guarded) `.zshrc` in goatty's shell
+//! itself.
 
 use goatty_config::{HostSettings, ImportFrom};
-use goatty_shell::import::{AliasKind, Harvest, Status};
+use goatty_shell::import::{Harvest, Status};
 use gpui::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*, px,
 };
 
-use super::SettingsWindow;
 use super::kit::{self, card, chip, divider, opt, row, search_field, section};
+use super::{Page, SettingsWindow};
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button_with, toggle};
 use crate::ui::focus;
 use crate::ui::icons::Icon;
@@ -24,8 +26,6 @@ use crate::ui::text_input::{TextInput, TextInputEvent};
 pub enum Show {
     #[default]
     All,
-    Vars,
-    Aliases,
     Off,
 }
 
@@ -51,7 +51,7 @@ pub struct DotfilesPage {
 
 impl DotfilesPage {
     pub fn new(cx: &mut Context<'_, SettingsWindow>) -> Self {
-        let filter = cx.new(|cx| TextInput::new("Find a variable or alias", "", cx).bare());
+        let filter = cx.new(|cx| TextInput::new("Find a folder or variable", "", cx).bare());
         let subs = vec![cx.subscribe(&filter, |_, _, ev: &TextInputEvent, cx| {
             if let TextInputEvent::Changed(_) = ev {
                 cx.notify();
@@ -86,23 +86,17 @@ impl DotfilesPage {
     }
 }
 
-/// One entry of the list: PATH, a variable or an alias.
+/// One entry of the list: PATH or a variable.
 struct Item {
     /// Unique among items (the element ids).
     key: String,
+    /// The variable (`PATH` too): switching it adds or removes it in
+    /// `shell.import.skip_vars`.
     name: String,
     /// Lines of the value (PATH: one folder each).
     value: Vec<String>,
     kind: &'static str,
     on: bool,
-    /// What switching it changes in `shell.import`.
-    target: Target,
-}
-
-#[derive(Clone)]
-enum Target {
-    Var(String),
-    Alias(String),
 }
 
 fn items(h: &Harvest, s: &HostSettings) -> Vec<Item> {
@@ -116,7 +110,6 @@ fn items(h: &Harvest, s: &HostSettings) -> Vec<Item> {
             value: added.iter().map(|d| goatty_shell::setup::tilde(std::path::Path::new(d))).collect(),
             kind: "PATH",
             on: !imp.skip_vars.iter().any(|n| n == "PATH"),
-            target: Target::Var("PATH".into()),
         });
     }
     out.extend(h.vars.iter().map(|v| Item {
@@ -125,19 +118,6 @@ fn items(h: &Harvest, s: &HostSettings) -> Vec<Item> {
         value: vec![v.value.clone()],
         kind: "Variable",
         on: !imp.skip_vars.contains(&v.name),
-        target: Target::Var(v.name.clone()),
-    }));
-    out.extend(h.aliases.iter().map(|a| Item {
-        key: format!("alias-{:?}-{}", a.kind, a.name),
-        name: a.name.clone(),
-        value: vec![a.value.clone()],
-        kind: match a.kind {
-            AliasKind::Regular => "Alias",
-            AliasKind::Global => "Global alias",
-            AliasKind::Suffix => "Suffix alias",
-        },
-        on: imp.aliases && !imp.skip_aliases.contains(&a.name),
-        target: Target::Alias(a.name.clone()),
     }));
     out
 }
@@ -237,6 +217,7 @@ impl SettingsWindow {
             vec![
                 self.import_section(ui, h, managed, cx),
                 self.imported_list(ui, h, window, cx),
+                self.aliases_offer(ui, h, cx),
                 self.startup_files_section(ui, h, managed, cx),
             ]
         })
@@ -250,12 +231,12 @@ impl SettingsWindow {
             _ => "~/.profile, ~/.bash_profile, ~/.bashrc",
         };
         section(ui, "Import from your shell")
-            .desc("PATH, variables and aliases from your startup files, without running them in goatty's shell")
+            .desc("Tools you installed and variables you set, without running your startup files in goatty's shell")
             .child(
                 row(ui, "Use what your shell sets up")
                     .icon(Icon::Download)
                     .desc(if managed {
-                        "New shells get the PATH folders, variables and aliases listed below"
+                        "New shells get the PATH folders and variables listed below"
                     } else {
                         "Only with goatty's managed zsh: turn it on in Shell"
                     })
@@ -276,13 +257,7 @@ impl SettingsWindow {
                     let _ = this.update(cx, |v, cx| v.edit_host(cx, |h| h.shell.import.from = from));
                 },
             )))
-            .child(
-                row(ui, "Import aliases")
-                    .desc("goatty's aliases and the ones in ~/.config/goatty/zshrc win over imported ones with the same name")
-                    .disabled(!managed)
-                    .control(toggle("import-aliases", imp.aliases, ui, self.host(cx, |h| h.shell.import.aliases = !h.shell.import.aliases))),
-            )
-            .footer("goatty runs your shell without a terminal and notes what it ends up with; your prompt and plugin frameworks never run in goatty's shell. It checks again when your startup files change.")
+            .footer("goatty runs your shell without a terminal and notes the PATH folders and variables it adds; your prompt and plugin frameworks never run in goatty's shell. It checks again when your startup files change.")
             .into_any_element()
     }
 
@@ -351,14 +326,13 @@ impl SettingsWindow {
                     ui,
                     Icon::FileText,
                     "Your startup files set nothing up",
-                    "No PATH folders, variables or aliases beyond what goatty's shell has anyway.",
+                    "No PATH folders or variables beyond what goatty's shell has anyway.",
                 )))
                 .into_any_element();
         }
         let query = d.filter.read(cx).text().trim().to_lowercase();
         let count = |f: &dyn Fn(&Item) -> bool| all.iter().filter(|i| f(i)).count();
-        let is_alias = |i: &Item| matches!(i.target, Target::Alias(_));
-        let (n_vars, n_aliases, n_off) = (count(&|i| !is_alias(i)), count(&is_alias), count(&|i| !i.on));
+        let n_off = count(&|i| !i.on);
         let chip_for = |show: Show, id: &'static str, label: &'static str, n: usize| {
             chip(
                 ui,
@@ -380,16 +354,12 @@ impl SettingsWindow {
                 .gap(px(8.))
                 .child(div().flex_1().min_w(px(200.)).child(search_field(ui, "import-search", &d.filter, window, cx)))
                 .child(chip_for(Show::All, "import-all", "All", all.len()))
-                .child(chip_for(Show::Vars, "import-vars", "PATH and variables", n_vars))
-                .child(chip_for(Show::Aliases, "import-aliases-chip", "Aliases", n_aliases))
                 .child(chip_for(Show::Off, "import-off", "Off", n_off)),
         );
         let shown: Vec<&Item> = all
             .iter()
             .filter(|i| match d.show {
                 Show::All => true,
-                Show::Vars => !is_alias(i),
-                Show::Aliases => is_alias(i),
                 Show::Off => !i.on,
             })
             .filter(|i| {
@@ -407,7 +377,7 @@ impl SettingsWindow {
             if k > 0 {
                 list = list.child(divider(ui));
             }
-            list = list.child(self.imported_row(ui, item, h.shell.import.aliases, d.show == Show::Off, &mono, cx));
+            list = list.child(self.imported_row(ui, item, d.show == Show::Off, &mono, cx));
         }
         s = s.child(list);
         if !hv.stderr.is_empty() {
@@ -425,19 +395,10 @@ impl SettingsWindow {
 
     /// `only_off`: the list shows switched-off entries, so switching this
     /// one on removes its row.
-    fn imported_row(
-        &self,
-        ui: Ui,
-        item: &Item,
-        aliases_on: bool,
-        only_off: bool,
-        mono: &SharedString,
-        cx: &Context<'_, Self>,
-    ) -> AnyElement {
+    fn imported_row(&self, ui: Ui, item: &Item, only_off: bool, mono: &SharedString, cx: &Context<'_, Self>) -> AnyElement {
         let id = |what: &str| SharedString::from(format!("import-{what}-{}", item.key));
-        let target = item.target.clone();
+        let name = item.name.clone();
         let on = item.on;
-        let locked = matches!(item.target, Target::Alias(_)) && !aliases_on;
         let switch = toggle(
             id("on"),
             on,
@@ -447,17 +408,13 @@ impl SettingsWindow {
                     // The row is going: focus waits on the filter that hid it.
                     focus::hand_over(&v.focus, focus::Handover::Control("import-off".into()), window, cx);
                 }
-                let target = target.clone();
+                let name = name.clone();
                 v.edit_host(cx, move |h| {
-                    let imp = &mut h.shell.import;
-                    let (list, name) = match &target {
-                        Target::Var(n) => (&mut imp.skip_vars, n),
-                        Target::Alias(n) => (&mut imp.skip_aliases, n),
-                    };
-                    if let Some(at) = list.iter().position(|x| x == name) {
+                    let list = &mut h.shell.import.skip_vars;
+                    if let Some(at) = list.iter().position(|x| *x == name) {
                         list.remove(at);
                     } else {
-                        list.push(name.clone());
+                        list.push(name);
                         list.sort();
                     }
                 });
@@ -472,7 +429,7 @@ impl SettingsWindow {
             .min_h(px(48.))
             .px(px(16.))
             .py(px(10.))
-            .child(div().when(locked, |d| d.opacity(0.5)).child(switch))
+            .child(switch)
             .child(
                 div()
                     .w(px(150.))
@@ -503,11 +460,38 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// Running the user's files in goatty's shell itself.
+    /// Where the user's aliases went: copied once on the Aliases page.
+    fn aliases_offer(&self, ui: Ui, h: &HostSettings, cx: &Context<'_, Self>) -> AnyElement {
+        let offer = self.dotfiles.status.as_ref().and_then(|s| s.harvest.as_ref()).map(|hv| {
+            let list = goatty_shell::import::offer_aliases(hv, h);
+            (list.iter().filter(|a| a.own).count(), list.len())
+        });
+        let desc = match offer {
+            Some((_, 0)) => "Every alias your shell defines is in goatty already".to_string(),
+            Some((0, n)) => format!("{n} from frameworks and plugins you load; pick the ones you want"),
+            Some((own, _)) => format!("{own} of your own to copy into goatty's aliases, once"),
+            None => "Copy the ones your startup files define into goatty's aliases, once".to_string(),
+        };
+        section(ui, "Your aliases")
+            .child(
+                row(ui, "Copy your aliases")
+                    .icon(Icon::Link2)
+                    .desc(desc)
+                    .on_click("import-aliases-go", self.listener_go(cx, Page::Aliases)),
+            )
+            .into_any_element()
+    }
+
+    /// Running the user's files in goatty's shell itself (advanced: the
+    /// import covers what most people need).
     fn startup_files_section(&self, ui: Ui, h: &HostSettings, managed: bool, cx: &Context<'_, Self>) -> AnyElement {
         let z = &h.shell.zsh;
         section(ui, "Run your files in goatty's shell")
-            .desc(if managed { "What goatty's zsh sources from your own configuration" } else { "Only with goatty's managed zsh" })
+            .desc(if managed {
+                "Advanced: most setups only need the import above"
+            } else {
+                "Only with goatty's managed zsh"
+            })
             .child(row(ui, "Use ~/.zshenv and ~/.zprofile").desc("Your environment: PATH, EDITOR, …").disabled(!managed).control(toggle(
                 "user-env",
                 z.user_env,
@@ -516,7 +500,7 @@ impl SettingsWindow {
             )))
             .child(
                 row(ui, "Also run ~/.zshrc")
-                    .desc("For its functions and key bindings. Frameworks and prompts it loads (oh-my-zsh, Powerlevel10k, zinit, …) are skipped")
+                    .desc("For functions and key bindings the import can't bring. Frameworks and prompts it loads (oh-my-zsh, Powerlevel10k, zinit, …) are skipped")
                     .disabled(!managed)
                     .control(toggle("user-rc", z.user_rc, ui, self.host(cx, |h| h.shell.zsh.user_rc = !h.shell.zsh.user_rc))),
             )
@@ -528,7 +512,7 @@ impl SettingsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use goatty_shell::import::{Alias, Kind, Source, Var};
+    use goatty_shell::import::{Alias, AliasKind, Kind, Source, Var};
 
     fn harvest() -> Harvest {
         Harvest {
@@ -538,7 +522,7 @@ mod tests {
             vars: vec![Var { name: "EDITOR".into(), value: "nvim".into() }],
             path: vec!["/opt/a".into(), "/usr/bin".into()],
             base_path: vec!["/usr/bin".into()],
-            aliases: vec![Alias { name: "ll".into(), value: "ls -l".into(), kind: AliasKind::Regular }],
+            aliases: vec![Alias { name: "ll".into(), value: "ls -l".into(), kind: AliasKind::Regular, own: true }],
             zdotdir: None,
             stderr: String::new(),
             fingerprint: String::new(),
@@ -551,10 +535,8 @@ mod tests {
         s.shell.import.skip_vars = vec!["PATH".into()];
         let list = items(&harvest(), &s);
         let names: Vec<_> = list.iter().map(|i| (i.name.as_str(), i.on)).collect();
-        assert_eq!(names, [("PATH", false), ("EDITOR", true), ("ll", true)]);
+        assert_eq!(names, [("PATH", false), ("EDITOR", true)], "aliases aren't imported live");
         assert_eq!(list[0].value, ["/opt/a"], "only the folders the startup added");
-        s.shell.import.aliases = false;
-        assert!(!items(&harvest(), &s)[2].on, "aliases off: every alias is off");
         assert_eq!(ago(30), "just now");
         assert_eq!(ago(7200), "2 h ago");
     }

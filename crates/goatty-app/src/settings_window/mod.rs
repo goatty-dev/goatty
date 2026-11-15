@@ -607,7 +607,14 @@ impl SettingsWindow {
         self.drawer = false;
         self.recording = None;
         match page {
-            Page::Plugins | Page::Aliases => self.load_plugins(false, cx),
+            Page::Plugins => self.load_plugins(false, cx),
+            Page::Aliases => {
+                self.load_plugins(false, cx);
+                // For the aliases the user's own shell defines.
+                if self.dotfiles.status.is_none() {
+                    self.load_dotfiles(false, cx);
+                }
+            }
             Page::Hosts => crate::hosts::refresh(cx),
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),

@@ -128,7 +128,7 @@ impl SettingsWindow {
                     .desc(if off {
                         "Only with goatty's managed zsh".to_string()
                     } else if used.is_empty() {
-                        "PATH, variables and aliases from your .zshrc or .bashrc · nothing used".to_string()
+                        "PATH folders and variables from your .zshrc or .bashrc · nothing used".to_string()
                     } else {
                         format!("Using {}", used.join(", "))
                     })

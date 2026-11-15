@@ -57,7 +57,7 @@ Threads per session: `s{id}-reader` (PTY → terminal → subscribers) and `s{id
 | `install` | download (curl/wget), verify, unpack, activate `bin/` and `plugins/` symlinks, uninstall packages |
 | `completions` | zsh completion functions in `share/zsh/site-functions/` (on fpath): goatty's and goattyd's own (written when they start), packages' `completions` command after an install (removed with the package, backfilled when goattyd starts); drops the compinit dump on changes |
 | `doctor`  | start a real managed shell and parse `goatty-status` (or what another command prints) |
-| `import`  | importing the user's own shell setup (`shell.import`): `Context` (home, login shell, environment; injectable), `source` (which shell), `harvest` (run it without a terminal, parse the NUL-separated dump, keep changed variables, PATH, aliases), `prepare` (fingerprint the startup files: cached, harvest now, or in the background), `import.zsh`, `Status` for the Dotfiles page and `goattyd shell import` |
+| `import`  | importing the user's own shell setup (`shell.import`): `Context` (home, login shell, environment; injectable), `source` (which shell), `harvest` (run it without a terminal, parse the NUL-separated dump, keep changed variables, the PATH folders it added, aliases marked as the user's own or a framework's), `offer_aliases` (the one-time copy into goatty's aliases), `prepare` (fingerprint the startup files: cached, harvest now, or in the background), `import.zsh`, `Status` for the Dotfiles page and `goattyd shell import` |
 | `path_report` | the PATH a new shell gets and where each folder came from (the startup files' `_goatty_path_marks`), what became of each `shell.path` folder; the PATH page's `path` request |
 | `generation` | build → validate (`zsh -n`) → activate generations; list, rollback, diff; `info.json` |
 | `history` | what each generation changed against its base (settings, plugins, files), one-line summaries, names, file diffs |
@@ -94,7 +94,7 @@ settings_window/
   appearance.rs  live preview, theme gallery + color editor, font picker, cursor, padding per side, opacity
   terminal.rs  the Terminal page (links, selection, pasting) and the Workspace page (startup, tabs, panes)
   shell.rs     Shell, History
-  dotfiles.rs  Dotfiles: the import of what the user's shell sets up (on/off, which shell, aliases; the last check with search, filter chips and a switch per PATH/variable/alias; failures with stderr; "Check again" runs it on the host) and running ~/.zshenv, ~/.zprofile and (guarded) ~/.zshrc in goatty's shell
+  dotfiles.rs  Dotfiles: the import of what the user's shell sets up (on/off, which shell; the last check with search, filter chips and a switch per PATH/variable; failures with stderr; "Check again" runs it on the host), a link to copying the aliases, and (advanced) running ~/.zshenv, ~/.zprofile and (guarded) ~/.zshrc in goatty's shell
   path.rs      PATH: your folders (`shell.path`: add with a live check, browse when local, reorder, remove; each folder's state on the host) and the PATH a new shell gets, each folder with its origin, searchable, "Doesn't exist" filter
   prompt.rs    Prompt: live preview, style cards (Starship/Lean/Classic/Rainbow), symbols, segment ends, layout (frame, connection, transient), directory, prompt character, colors (`color_select`: theme colors, grays, custom); the module list as a sub-page (search, filters, categories) and a module's dialog (side, symbol, color)
   shortcuts.rs the Shortcuts table: groups or sorting, search by name or pressed keys, changed/unbound filters
@@ -138,7 +138,7 @@ shell_path.rs  "Shell: Add/Remove a folder to/from PATH…": asks, then changes 
 hosts.rs       hosts to connect to: `ssh.hosts` + `~/.ssh/config` (`HostList` global, read in the background), palette commands, `pool` (one shared Connection per host), `open` → a connecting tab of the last active window or a new window (`ssh.open_in`)
 shell_setup.rs installing a host's built-in tools with progress (`install`), the per-host install offer toast after a tab connects (`offer`)
 shell_sync.rs  bringing this computer's shell setup to the host a tab connects to (`on_connect`: compare off the UI thread, ask with a toast once per change made here, or sync right away per `ssh.sync`/`ssh.hosts[].sync` and after a fresh goattyd install), the progress/result toast, "Sync shell setup to this host" (`sync_now`)
-welcome.rs     the welcome window (first-run setup): theme and text size, the host's tools, importing what your .zshrc/.bashrc sets up (when you have one), prompt style, shortcuts
+welcome.rs     the welcome window (first-run setup): theme and text size, the host's tools, importing the PATH and variables your .zshrc/.bashrc sets up (on by default; shown when you have one), prompt style, shortcuts
 askpass.rs     goatty as ssh's SSH_ASKPASS: one window per prompt (passphrase, host key, confirm), answer on stdout
 paste_confirm.rs  "Paste this?" dialog: risks, preview with control/invisible chars marked, paste as is / cleaned / as one line
 session.rs     a pane's data: local PTY or goattyd session → mirror Terminal; coalescing waker; foreground program; `Spawner` for a tab's new panes (goattyd, local PTY, plain `ssh host`)

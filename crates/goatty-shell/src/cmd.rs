@@ -26,8 +26,6 @@ fn dirs_of(launcher: &Launcher) -> Result<&Dirs> {
     launcher.dirs().context("$HOME is not set, so goatty has nowhere to keep its shell environment")
 }
 
-/// `goattyd shell status`: configuration, what a real shell loads, startup
-/// time. The same [`setup::Status`] the GUI's Diagnostics page shows.
 /// `goattyd shell import [--refresh]`.
 pub fn import(svc: &crate::HostService, refresh: bool) -> Result<()> {
     let s = svc.import_status(refresh)?;
@@ -69,9 +67,10 @@ pub fn import(svc: &crate::HostService, refresh: bool) -> Result<()> {
     for v in &h.vars {
         println!("  {}={}", v.name, v.value);
     }
-    println!("aliases ({})", h.aliases.len());
-    for a in &h.aliases {
-        println!("  {}={}", a.name, a.value);
+    let offer = crate::import::offer_aliases(h, &svc.settings().value);
+    println!("aliases goatty doesn't have yet ({}; not imported: copy them under Settings → Aliases, or goattyd alias add)", offer.len());
+    for a in offer {
+        println!("  {}={}{}", a.name, a.value, if a.own { "" } else { "  (from a framework or plugin)" });
     }
     if !h.stderr.is_empty() {
         println!("stderr");
@@ -89,6 +88,8 @@ fn ago(secs: u64) -> String {
     }
 }
 
+/// `goattyd shell status`: configuration, what a real shell loads, startup
+/// time. The same [`setup::Status`] the GUI's Diagnostics page shows.
 pub fn status(svc: &crate::HostService) -> Result<()> {
     let s = setup::status(svc)?;
     println!("goatty shell");
