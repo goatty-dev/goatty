@@ -2,10 +2,12 @@
 //! registry.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,11 +15,11 @@ use anyhow::{Context, Result, bail};
 use goatty_proto::{HostInfo, SessionId, SessionInfo, WinSize};
 use goatty_shell::HostService;
 use goatty_term::pty::{Pty, ShellCommand};
-use goatty_term::{Palette, Terminal};
-use parking_lot::Mutex;
+use goatty_term::{Palette, Terminal, TerminalChannels};
+use parking_lot::{Mutex, RwLock};
 
 use crate::layouts::Layouts;
-use crate::session::{Session, pump_output, to_size};
+use crate::session::{Pause, Session, pump_output, to_size};
 
 /// The session registry shared by every connection.
 pub(crate) struct Daemon {
@@ -30,12 +32,43 @@ pub(crate) struct Daemon {
     pub(crate) sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
     /// The windows' tabs and splits.
     pub(crate) layouts: Mutex<Layouts>,
-    next_session: AtomicU64,
+    pub(crate) next_session: AtomicU64,
     pub(crate) next_conn: AtomicU64,
+    /// The listening socket the accept loop serves (a restart passes it on).
+    pub(crate) listener_fd: Mutex<Option<RawFd>>,
+    /// The goattyd file this process was started as: what a restart runs by
+    /// default, so after an update it's the new build.
+    pub(crate) exe: Option<PathBuf>,
+    /// A restart is under way: no new sessions.
+    pub(crate) restarting: AtomicBool,
+    /// Held (shared) while a session is created, from the `restarting`
+    /// check to its registration; a restart takes it exclusively to set
+    /// `restarting`, so it never misses a session being started.
+    pub(crate) admission: RwLock<()>,
+}
+
+/// What [`Daemon::start`] makes a session of: a PTY with its process, and
+/// the terminal that mirrors it.
+pub(crate) struct NewSession {
+    pub id: SessionId,
+    pub pty: Pty,
+    pub reader: File,
+    pub term: Terminal,
+    pub chans: TerminalChannels,
+    pub created_unix: u64,
+    pub managed: bool,
+}
+
+/// The program this process runs, as a path a restart can run again (not
+/// `/proc/self/exe`, which stays the old file after an update).
+fn own_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let s = exe.to_string_lossy();
+    Some(s.strip_suffix(" (deleted)").map(PathBuf::from).unwrap_or(exe))
 }
 
 impl Daemon {
-    fn new(socket: PathBuf) -> Self {
+    pub(crate) fn new(socket: PathBuf) -> Self {
         Self {
             // `goatty-setup` in a managed shell runs this goattyd's `shell install`.
             host: HostService::from_env(std::env::current_exe().ok()),
@@ -44,6 +77,10 @@ impl Daemon {
             layouts: Mutex::default(),
             next_session: AtomicU64::new(0),
             next_conn: AtomicU64::new(0),
+            listener_fd: Mutex::new(None),
+            exe: own_exe(),
+            restarting: AtomicBool::new(false),
+            admission: RwLock::new(()),
         }
     }
 
@@ -77,6 +114,10 @@ impl Daemon {
     }
 
     fn spawn(self: &Arc<Self>, mut cmd: ShellCommand, managed: bool, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
+        let _admitted = self.admission.read();
+        if self.restarting.load(Ordering::SeqCst) {
+            bail!("goattyd is restarting; try again in a moment");
+        }
         let size = to_size(ws);
         if let Some(cwd) = cwd.filter(|c| std::path::Path::new(c).is_dir()) {
             cmd.cwd = Some(cwd.into());
@@ -87,20 +128,40 @@ impl Daemon {
         // Over a remote link this also means query replies never pay the RTT.
         let (term, chans) = Terminal::new(size, true, Arc::new(Palette::default()));
         let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
+        let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let pid = pty.pid();
+        log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
+        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed })?;
+        if crate::systemd::has_fd_store() {
+            crate::systemd::store(&session.stored(), session.master_fd);
+        }
+        Ok(session)
+    }
+
+    /// Register a session and start its threads: query replies → PTY, and
+    /// PTY → terminal + subscribers until the process exits.
+    pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
+        let NewSession { id, pty, reader, term, chans, created_unix, managed } = n;
+        let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
         let session = Arc::new(Session {
             id,
             term,
             pty: Mutex::new(pty),
             subs: Mutex::new(Vec::new()),
-            created_unix: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            created_unix,
             process: Mutex::new(None),
             fg: OnceLock::new(),
+            managed,
+            pause: Pause::new()?,
+            pid,
+            master_fd,
+            replies: chans.replies.clone(),
+            replies_taken: AtomicU64::new(0),
+            replies_written: AtomicU64::new(0),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");
         }
-        let pid = session.pty.lock().pid();
-        log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
         // Only goatty's zsh handles the reload request.
         let managed_pid = pid.filter(|_| managed);
         if let Some(pid) = managed_pid {
@@ -113,7 +174,9 @@ impl Daemon {
             std::thread::Builder::new().name(format!("s{id}-replies")).spawn(move || {
                 while let Ok(bytes) = chans.replies.recv() {
                     let Some(s) = s.upgrade() else { break };
+                    s.replies_taken.fetch_add(1, Ordering::SeqCst);
                     let _ = s.pty.lock().write(&bytes);
+                    s.replies_written.fetch_add(1, Ordering::SeqCst);
                 }
             })?;
         }
@@ -126,6 +189,9 @@ impl Daemon {
                 let code = s.pty.lock().try_wait();
                 log::info!("session {}: exited ({code:?})", s.id);
                 daemon.sessions.lock().remove(&s.id);
+                if crate::systemd::has_fd_store() {
+                    crate::systemd::unstore(&s.stored());
+                }
                 if let Some(pid) = managed_pid {
                     daemon.host.untrack_shell(pid);
                 }
@@ -191,6 +257,7 @@ fn bind(path: &Path) -> Result<(UnixListener, u64)> {
 }
 
 fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
+    *daemon.listener_fd.lock() = Some(listener.as_raw_fd());
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -208,51 +275,47 @@ fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
-/// The listening socket systemd passed us (`goattyd.socket`, see
-/// `goatty_client::service`), per `sd_listen_fds(3)`: `LISTEN_PID` is us and
-/// `LISTEN_FDS` ≥ 1 means fd 3 is it. The variables are removed so the
-/// shells don't inherit them, and the fd is closed on exec.
-fn listener_from_systemd() -> Option<UnixListener> {
-    use std::os::fd::FromRawFd;
-    const SD_LISTEN_FDS_START: i32 = 3;
-    let pid = std::env::var("LISTEN_PID").ok()?;
-    let fds = std::env::var("LISTEN_FDS").ok();
-    // SAFETY: called from `serve` before the daemon starts any thread.
-    unsafe {
-        std::env::remove_var("LISTEN_PID");
-        std::env::remove_var("LISTEN_FDS");
-        std::env::remove_var("LISTEN_FDNAMES");
-    }
-    if pid.parse::<u32>().ok()? != std::process::id() || fds?.parse::<u32>().ok()? < 1 {
-        return None;
-    }
-    // SAFETY: fd 3 is ours: systemd passed it and nothing in this process
-    // has opened or adopted it.
-    unsafe {
-        let flags = libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD);
-        if flags < 0 {
-            return None;
-        }
-        libc::fcntl(SD_LISTEN_FDS_START, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-        Some(UnixListener::from_raw_fd(SD_LISTEN_FDS_START))
-    }
+/// How `serve` starts.
+pub enum Start {
+    /// Fresh, or with the socket and PTYs systemd passed (`LISTEN_FDS`: the
+    /// socket of `goattyd.socket`, and after a crash or `systemctl --user
+    /// restart` the PTYs from the fd store).
+    Normal,
+    /// Taking over from the previous goattyd (`goattyd serve --restore
+    /// FILE`, run by `Restart`): its socket and PTYs are inherited fds.
+    Restore(PathBuf),
 }
 
 /// Run the daemon on the socket at `path` until `goattyd stop`. Never returns
 /// `Ok`; startup errors (socket in use, permissions) are returned. Under
 /// systemd socket activation it serves the socket it was given.
-pub fn serve(path: &Path) -> Result<()> {
+pub fn serve(path: &Path, start: Start) -> Result<()> {
+    crate::systemd::capture_env();
     let path = path.to_path_buf();
-    let (listener, mut ino) = match listener_from_systemd() {
-        Some(l) => {
-            log::info!("using the socket from systemd");
-            (l, std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0))
+    let daemon = Arc::new(Daemon::new(path.clone()));
+    let listener = match start {
+        Start::Restore(state) => {
+            let listener = crate::restore::take_over(&daemon, &state)?;
+            log::info!("took over from the previous goattyd ({} sessions)", daemon.sessions.lock().len());
+            listener
         }
+        Start::Normal => {
+            let passed = crate::systemd::take_passed();
+            crate::restore::adopt_stored(&daemon, passed.ptys);
+            passed.listener.map(|fd| {
+                log::info!("using the socket from systemd");
+                UnixListener::from(fd)
+            })
+        }
+    };
+    let (listener, mut ino) = match listener {
+        Some(l) => (l, std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0)),
         None => bind(&path)?,
     };
     log::info!("goattyd {} listening on {} (pid {})", env!("CARGO_PKG_VERSION"), path.display(), std::process::id());
-
-    let daemon = Arc::new(Daemon::new(path.clone()));
+    if crate::systemd::has_fd_store() {
+        crate::restore::save_on_sigterm(daemon.clone())?;
+    }
     {
         let d = daemon.clone();
         std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, listener))?;
@@ -266,7 +329,7 @@ pub fn serve(path: &Path) -> Result<()> {
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let current = std::fs::metadata(&path).ok().map(|m| m.ino());
-        if current == Some(ino) {
+        if current == Some(ino) || daemon.restarting.load(Ordering::SeqCst) {
             continue;
         }
         // Someone else listens there now (another daemon, or a systemd
@@ -289,4 +352,12 @@ pub fn serve(path: &Path) -> Result<()> {
             Err(e) => log::error!("re-bind failed: {e:#}"),
         }
     }
+}
+
+/// An inherited listening socket, close-on-exec from now on.
+pub(crate) fn listener_from_fd(fd: RawFd) -> Result<UnixListener> {
+    goatty_term::pty::set_cloexec(fd, true).with_context(|| format!("the inherited socket (fd {fd}) isn't open"))?;
+    // SAFETY: the previous goattyd passed this fd for exactly this, and
+    // nothing in this process has adopted it before.
+    Ok(UnixListener::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }

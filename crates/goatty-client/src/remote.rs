@@ -226,6 +226,22 @@ pub fn stop_daemon(target: &SshTarget) -> Result<()> {
     Ok(())
 }
 
+/// Restart the host's goattyd with this build's installed one
+/// (`goattyd restart --force`): its sessions carry over when the running
+/// daemon can do that (protocol v10 on), else it's stopped and they end.
+pub fn restart_daemon(target: &SshTarget) -> Result<()> {
+    let script = format!("exec \"$HOME/{BIN_DIR}/{}\" restart --force", binary_name());
+    let out = target
+        .command(&format!("sh -c {}", sh_quote(&script)))
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("couldn't run {}", target.program))?;
+    if !out.status.success() {
+        bail!("restarting goattyd on {} failed: {}", target.host, last_words(&out.stderr, &out.stdout));
+    }
+    Ok(())
+}
+
 /// The last few lines a command printed, for an error message. A backtrace
 /// (goattyd's errors carry one when the host sets `RUST_BACKTRACE`) is cut
 /// off, so the message itself is what's left.

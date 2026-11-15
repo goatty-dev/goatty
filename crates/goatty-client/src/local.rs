@@ -3,8 +3,9 @@
 //!
 //! After an update (or a `cargo build`) the daemon that's still running is
 //! the old build. It keeps the sessions, so nothing replaces it silently:
-//! [`outdated`] tells the GUI, which restarts it right away when it holds no
-//! sessions and asks otherwise (see `goatty-app/src/connect.rs`).
+//! [`outdated`] tells the GUI (see `goatty-app/src/connect.rs`), which
+//! restarts it right away when that keeps the sessions ([`restart_daemon`],
+//! protocol v10 on) or there are none, and asks otherwise.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::UnixStream;
@@ -123,6 +124,67 @@ pub fn diagnose(err: anyhow::Error) -> anyhow::Error {
     match err.downcast_ref::<VersionMismatch>() {
         Some(m) => LocalProblem::Incompatible(m.clone()).into(),
         None => err,
+    }
+}
+
+/// How [`restart_daemon`] went.
+#[derive(Debug)]
+pub enum Restarted {
+    NotRunning,
+    /// The daemon runs `exe` now, with every session it had.
+    Kept {
+        sessions: usize,
+    },
+    /// It was too old to keep its sessions over a restart (or spoke no
+    /// protocol this build does) and was stopped: they ended. The next
+    /// connection starts a new one.
+    Stopped(Stopped),
+}
+
+/// The running local daemon can restart without ending its sessions.
+pub fn can_keep_sessions(protocol: u32) -> bool {
+    protocol >= goatty_proto::RESTART_SINCE
+}
+
+/// Restart the local daemon as `exe` (default: the goattyd it was started
+/// as) and wait until it answers again. Sessions carry over when the daemon
+/// can do that (protocol v10 on). One that can't is stopped only with
+/// `force`, which ends its sessions; without it that's an error.
+pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
+    let mut control = match Control::connect_local("goatty-restart") {
+        Ok(c) => c,
+        Err(e) => {
+            if UnixStream::connect(goatty_proto::socket_path()).is_err() {
+                return Ok(Restarted::NotRunning);
+            }
+            anyhow::ensure!(force, "{e:#}");
+            return stop_daemon(true).map(Restarted::Stopped);
+        }
+    };
+    if !can_keep_sessions(control.protocol_version()) {
+        let n = control.list_sessions()?.len();
+        anyhow::ensure!(
+            force,
+            "goattyd (pid {}, protocol v{}) is too old to keep its {n} session(s) over a restart; stopping it ends them",
+            control.pid(),
+            control.protocol_version()
+        );
+        drop(control);
+        return stop_daemon(true).map(Restarted::Stopped);
+    }
+    let pid = control.pid();
+    let sessions = control.list_sessions()?.len();
+    control.restart(exe)?;
+    // The new image accepts on the same socket once it took the sessions over.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(50));
+        match Control::connect_within(&goatty_proto::socket_path(), "goatty-restart", Some(left)) {
+            Ok(c) if c.pid() == pid => return Ok(Restarted::Kept { sessions }),
+            Ok(c) => anyhow::bail!("another goattyd (pid {}) answers now", c.pid()),
+            Err(e) if Instant::now() > deadline => return Err(e.context("goattyd didn't come back after restarting")),
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
     }
 }
 

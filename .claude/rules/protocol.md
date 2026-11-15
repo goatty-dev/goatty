@@ -20,5 +20,6 @@ paths:
 - Remote hosts:
   - goattyd is the default and plain SSH the only fallback. Don't add a third mode.
   - Change nothing on a host outside `~/.local/share/goatty`, and install only after the user agreed.
-  - Never restart a daemon (which ends its sessions) without telling the user.
+  - Never restart a daemon in a way that ends its sessions (`stop`, or a daemon older than protocol v10) without telling the user. A `Restart` keeps them.
 - The e2e tests in `crates/goatty-daemon/tests/` each use their own `GOATTY_SOCKET` and a sandboxed `HOME`.
+- The restore state (`goatty-daemon/src/restore.rs`) is a format between two goattyd builds, like the wire. New fields get `#[serde(default)]`. A change that older builds can't read bumps `STATE_VERSION`, and a restart refuses to hand sessions to a build that reads an older format.

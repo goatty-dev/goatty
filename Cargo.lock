@@ -2077,6 +2077,7 @@ dependencies = [
  "libc",
  "log",
  "parking_lot 0.13.0",
+ "serde",
  "serde_json",
  "tempfile",
 ]
@@ -2136,6 +2137,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flume",
+ "libc",
  "log",
  "memchr",
  "parking_lot 0.13.0",
