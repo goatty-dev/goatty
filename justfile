@@ -57,6 +57,10 @@ bench-net *args:
 deps:
     ./scripts/ci-deps.sh
 
+# Open the pull request that releases VERSION (e.g. `just bump 0.2.0`); merging it tags vVERSION and publishes.
+bump version:
+    scripts/bump-version.sh {{version}}
+
 # Bump the pinned Zed revision: edit `rev` in Cargo.toml first, then run this.
 update-gpui:
     cargo update -p gpui

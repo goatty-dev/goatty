@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Goatty
+Comment=A GPU-rendered terminal with persistent sessions
+Exec=goatty
+Icon=goatty
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=dev.goatty.goatty

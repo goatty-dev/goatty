@@ -41,7 +41,13 @@ To try reattaching: run something in goatty, close the window, start `goatty` ag
 
 ## Install a Linux release
 
-Download and extract the Linux release archive, then run `./install.sh` from its directory. It installs `goatty` and `goattyd` into `~/.local/bin`, the bundled remote daemons into `~/.local/lib/goatty/remote`, and a Goatty launcher and SVG icon in your XDG data directory. The launcher should appear in your desktop application menu. Add `~/.local/bin` to `PATH` to start Goatty from a terminal.
+[Releases](https://github.com/goatty-dev/goatty/releases) have packages for x86_64. Each release page lists the exact install commands:
+
+- Arch Linux: `paru -S goatty-bin` (or `yay -S goatty-bin`) from the AUR, or `sudo pacman -U goatty-<version>-1-x86_64.pkg.tar.zst`
+- Ubuntu 22.04+ / Debian 12+: `sudo apt install ./goatty_<version>-1_amd64.deb`
+- Fedora: `sudo dnf install ./goatty-<version>-1.x86_64.rpm`
+
+The packages install into `/usr`, with a launcher, an icon and shell completions. On any other distro, or without root, download and extract the release archive (`goatty-<version>-x86_64-linux.tar.gz`), then run `./install.sh` from its directory. It installs `goatty` and `goattyd` into `~/.local/bin`, the bundled remote daemons into `~/.local/lib/goatty/remote`, and a Goatty launcher and SVG icon in your XDG data directory. The launcher should appear in your desktop application menu. Add `~/.local/bin` to `PATH` to start Goatty from a terminal.
 
 Environment variables: `GOATTY_FONT`, `GOATTY_FONT_SIZE`, `GOATTY_SHELL`, `GOATTY_SOCKET`, `GOATTY_STATS=1` (prints per-second frame stats to stderr), `GOATTY_RENDER=shaped` (ligature-capable line shaping instead of the glyph cache).
 

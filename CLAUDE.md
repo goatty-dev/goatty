@@ -2,11 +2,11 @@
 
 A fast (GPU-rendered via GPUI), batteries-included, opinionated terminal: managed zsh with curated defaults, a GUI for every setting, declarative plugins, and a GUI that is always a client of a `goattyd` (local, or remote over SSH). goatty never takes over the host.
 
-Read the relevant doc before larger work: `docs/architecture.md` (crate rules and **where new work goes**), `docs/goatty-project-plan.md` (stages, roadmap), `docs/remote-architecture.md`, `docs/managed-zsh.md`, `docs/profiles.md`, `docs/plugins.md`, `docs/stage0-findings.md`. Per-crate conventions load from `.claude/rules/` when you work in that crate. Progress lives in GitHub issues/milestones and `git log`, not here.
+Read the relevant doc before larger work: `docs/architecture.md` (crate rules and **where new work goes**), `docs/goatty-project-plan.md` (stages, roadmap), `docs/remote-architecture.md`, `docs/managed-zsh.md`, `docs/profiles.md`, `docs/plugins.md`, `docs/stage0-findings.md`, `docs/releasing.md`. Per-crate conventions load from `.claude/rules/` when you work in that crate. Progress lives in GitHub issues/milestones and `git log`, not here.
 
 ## Workflow
 
-- Repo https://github.com/goatty-dev/goatty, default branch `main`. Do feature work on branches and open PRs. CI (`.github/workflows/ci.yml`) must be green. Releases come from `v*` tags.
+- Repo https://github.com/goatty-dev/goatty, default branch `main`. Do feature work on branches and open PRs. CI (`.github/workflows/ci.yml`) must be green. Releases: `just bump X.Y.Z` opens a version-bump PR, and merging it tags `vX.Y.Z` and publishes packages (`docs/releasing.md`). The version lives only in the root `Cargo.toml`.
 - Keep this file and `.claude/rules/*` current when conventions change. Don't add status or progress notes.
 - Back performance claims with measurements and record the numbers in the relevant doc: `cargo run --release -p goatty-term --example vtbench` (VT parsing), `cargo run --release -p goatty-daemon --example netbench [proxy | slow 2m | ssh HOST]` (latency, flood), `FLOOD=big.txt scripts/bench.sh goatty ./target/release/goatty --local` (GUI throughput).
 - The test build compiles gpui and is slow the first time, so run long cargo commands in the background. `scripts/ci-deps.sh` installs the GPUI system libraries on Debian/Ubuntu.
