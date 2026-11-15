@@ -35,8 +35,14 @@ struct Host {
 impl Host {
     fn new() -> Self {
         let dir = tempfile::Builder::new().prefix("goatty-host-").tempdir().unwrap();
-        for d in ["home", "run", "bin"] {
+        for d in ["home", "run", "bin", "sysbin"] {
             std::fs::create_dir(dir.path().join(d)).unwrap();
+        }
+        for tool in ["sh", "uname", "mkdir", "cat", "wc", "chmod", "mv", "readlink", "rm"] {
+            let src = which(tool)
+                .or_else(|()| ["/usr/bin", "/bin"].into_iter().map(|d| Path::new(d).join(tool)).find(|p| p.is_file()).ok_or(()))
+                .unwrap_or_else(|()| panic!("{tool} not found in PATH or /usr/bin:/bin"));
+            std::os::unix::fs::symlink(src, dir.path().join("sysbin").join(tool)).unwrap();
         }
         let ssh = dir.path().join("bin/ssh");
         let p = dir.path().display();
@@ -46,7 +52,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --) shift; break;; -e|-o) shift 2;; -*) shift;; *) break;; esac
 done
 shift
-export HOME="{p}/home" XDG_RUNTIME_DIR="{p}/run" GOATTY_SOCKET="{p}/run/d.sock" GOATTY_SHELL=/bin/sh PATH=/usr/bin:/bin RUST_LOG=warn,rio_vt=error
+export HOME="{p}/home" XDG_RUNTIME_DIR="{p}/run" GOATTY_SOCKET="{p}/run/d.sock" GOATTY_SHELL=/bin/sh PATH="{p}/sysbin" RUST_LOG=warn,rio_vt=error
 unset XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
 exec sh -c "$*"
 "#
