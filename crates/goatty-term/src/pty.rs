@@ -50,6 +50,29 @@ enum Process {
     Adopted { pid: u32, pidfd: Option<OwnedFd>, exited: Option<u32> },
 }
 
+/// Turn off XON/XOFF output flow control (`stty -ixon`) on a new PTY.
+/// Otherwise Ctrl+S stops all output until Ctrl+Q, which looks like a hung
+/// terminal (#192). Nothing needs it on a local PTY, and it frees Ctrl+S
+/// for the shell (zsh's forward history search) and other programs. Setting
+/// it on the master changes the pair's shared termios. Best effort: if it
+/// fails, the PTY keeps its defaults.
+fn disable_flow_control(fd: RawFd) {
+    let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `fd` is the PTY master, open for the duration of the call,
+    // and `t` is a valid pointer to termios-sized storage.
+    if unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } != 0 {
+        log::warn!("tcgetattr on a new pty: {}", std::io::Error::last_os_error());
+        return;
+    }
+    // SAFETY: tcgetattr succeeded, so it filled in `t`.
+    let mut t = unsafe { t.assume_init() };
+    t.c_iflag &= !libc::IXON;
+    // SAFETY: as above; `t` is an initialized termios.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) } != 0 {
+        log::warn!("tcsetattr on a new pty: {}", std::io::Error::last_os_error());
+    }
+}
+
 /// A running child process attached to a PTY.
 pub struct Pty {
     master: OwnedFd,
@@ -68,6 +91,9 @@ impl Pty {
     pub fn spawn(cmd: &ShellCommand, size: TermSize) -> Result<(Self, File)> {
         let sys = native_pty_system();
         let pair = sys.openpty(pty_size(size)).context("openpty")?;
+        if let Some(fd) = pair.master.as_raw_fd() {
+            disable_flow_control(fd);
+        }
         let mut b = CommandBuilder::new(&cmd.program);
         b.args(&cmd.args);
         if let Some(cwd) = &cmd.cwd {
@@ -308,5 +334,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(code, Some(128 + libc::SIGHUP as u32));
+    }
+
+    /// Ctrl+S must reach the program instead of freezing output (#192).
+    #[test]
+    fn flow_control_is_off() {
+        let cmd = ShellCommand { program: "stty".into(), args: vec!["-a".into()], cwd: None, env: Vec::new() };
+        let (mut pty, mut reader) = Pty::spawn(&cmd, TermSize::new(80, 24)).unwrap();
+        let mut out = String::new();
+        let mut buf = [0u8; 4096];
+        // EIO once the child exits and the slave closes.
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        pty.try_wait();
+        assert!(out.split_whitespace().any(|w| w == "-ixon"), "{out}");
     }
 }
