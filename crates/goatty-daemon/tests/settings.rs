@@ -297,6 +297,7 @@ fn request_msg(sock: &Path, msg: impl FnOnce(u32) -> ClientMsg) -> ServerMsg {
 /// shell, and the "offered" / "don't ask again" markers.
 #[test]
 fn shell_status_over_the_protocol() {
+    use goatty_shell::path_report::{FolderState as PathState, Origin};
     use goatty_shell::setup::{FeatureState, Reply, Request};
     let call = |d: &Daemon, r: Request| -> Reply {
         let request = serde_json::to_string(&r).unwrap();
@@ -327,4 +328,14 @@ fn shell_status_over_the_protocol() {
     let startup = s.startup.as_ref().unwrap_or_else(|| panic!("no startup: {:?}", s.startup_error));
     assert!(startup.features.iter().any(|f| f.id == "integration" && matches!(f.state, FeatureState::Loaded { .. })), "{startup:?}");
     assert!(s.generation.is_some(), "the probe built the configuration");
+
+    // The PATH page's report: a real shell's PATH, attributed.
+    std::fs::create_dir_all(d.home.join("bin")).unwrap();
+    let (issues, _, applied, _) = set(&d, r#"{"shell": {"path": ["~/bin", "~/missing"]}}"#, true);
+    assert!(applied, "{issues:?}");
+    let Reply::Path(p) = call(&d, Request::Path) else { panic!() };
+    assert!(p.probed && p.managed, "{p:?}");
+    let states: Vec<_> = p.folders.iter().map(|f| (f.entry.as_str(), &f.state)).collect();
+    assert_eq!(states, [("~/bin", &PathState::Used), ("~/missing", &PathState::Missing)], "{p:?}");
+    assert!(p.entries.iter().any(|e| e.shown == "~/bin" && e.origin == Origin::Settings), "{p:?}");
 }

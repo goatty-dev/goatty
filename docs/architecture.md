@@ -56,7 +56,8 @@ Threads per session: `s{id}-reader` (PTY → terminal → subscribers) and `s{id
 | `packages`| where a plugin's package is: system copy, goatty's managed copy, or missing |
 | `install` | download (curl/wget), verify, unpack, activate `bin/` and `plugins/` symlinks, uninstall packages |
 | `completions` | zsh completion functions in `share/zsh/site-functions/` (on fpath): goatty's and goattyd's own (written when they start), packages' `completions` command after an install (removed with the package, backfilled when goattyd starts); drops the compinit dump on changes |
-| `doctor`  | start a real managed shell and parse `goatty-status`                    |
+| `doctor`  | start a real managed shell and parse `goatty-status` (or what another command prints) |
+| `path_report` | the PATH a new shell gets and where each folder came from (the startup files' `_goatty_path_marks`), what became of each `shell.path` folder; the PATH page's `path` request |
 | `generation` | build → validate (`zsh -n`) → activate generations; list, rollback, diff; `info.json` |
 | `history` | what each generation changed against its base (settings, plugins, files), one-line summaries, names, file diffs |
 | `sync`    | bringing this computer's shell setup to another host (#159): `LocalSetup` (settings without machine-specific values, installed plugins, registries with keys; no network) and its fingerprint, `fetch` a host's setup through the `Remote` trait (the GUI's `HostLink`, or a `HostService`), `plan` (settings to apply, plugins to install/update from the same signed registry, tools, skips with reasons), `Step::run` |
@@ -92,6 +93,7 @@ settings_window/
   appearance.rs  live preview, theme gallery + color editor, font picker, cursor, padding per side, opacity
   terminal.rs  the Terminal page (links, selection, pasting) and the Workspace page (startup, tabs, panes)
   shell.rs     Shell, History
+  path.rs      PATH: your folders (`shell.path`: add with a live check, browse when local, reorder, remove; each folder's state on the host) and the PATH a new shell gets, each folder with its origin, searchable, "Doesn't exist" filter
   prompt.rs    Prompt: live preview, style cards (Starship/Lean/Classic/Rainbow), symbols, segment ends, layout (frame, connection, transient), directory, prompt character, colors (`color_select`: theme colors, grays, custom); the module list as a sub-page (search, filters, categories) and a module's dialog (side, symbol, color)
   shortcuts.rs the Shortcuts table: groups or sorting, search by name or pressed keys, changed/unbound filters
   aliases.rs   the Aliases page: mine first, plugin groups folded, filters, the add/edit dialog
@@ -130,7 +132,7 @@ workspace/
 close_confirm.rs  "Close this pane?" dialog when a program other than the shell still runs (`panes.confirm_close`, "Don't ask again")
 connect.rs     ConnectView, the connect screen in a tab: connects off the UI thread (local daemon or remote), turns RemoteProblem into questions (install / update and restart / plain SSH) and LocalProblem too (a local goattyd that's incompatible or an older build than the installed one: restarted right away without sessions, else asked), hands the tab its session or restored layout
 plugin_commands.rs  the active host's plugins' `[[command]]`s in the palette (`plugin.<id>.<cmd>`): catalog fetched off the UI thread when the host link changes or plugins change; picking one asks for its inputs and types the quoted line into the focused pane (a busy pane: offer to copy it)
-shell_path.rs  "Shell: Add/Remove a folder to/from PATH…": asks, then changes `shell.path` on the active tab's host through its goattyd
+shell_path.rs  "Shell: Add/Remove a folder to/from PATH…": asks, then changes `shell.path` on the active tab's host through its goattyd (the PATH page edits the same setting)
 hosts.rs       hosts to connect to: `ssh.hosts` + `~/.ssh/config` (`HostList` global, read in the background), palette commands, `pool` (one shared Connection per host), `open` → a connecting tab of the last active window or a new window (`ssh.open_in`)
 shell_setup.rs installing a host's built-in tools with progress (`install`), the per-host install offer toast after a tab connects (`offer`)
 shell_sync.rs  bringing this computer's shell setup to the host a tab connects to (`on_connect`: compare off the UI thread, ask with a toast once per change made here, or sync right away per `ssh.sync`/`ssh.hosts[].sync` and after a fresh goattyd install), the progress/result toast, "Sync shell setup to this host" (`sync_now`)

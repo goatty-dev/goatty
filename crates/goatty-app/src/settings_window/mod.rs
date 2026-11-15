@@ -20,6 +20,7 @@ mod diagnostics;
 mod host;
 mod hosts;
 pub(crate) mod kit;
+mod path;
 mod plugins;
 mod problems;
 mod profile;
@@ -165,6 +166,7 @@ pub enum Page {
     Shortcuts,
     Hosts,
     Shell,
+    Path,
     Prompt,
     History,
     Aliases,
@@ -177,13 +179,14 @@ pub enum Page {
 impl Page {
     /// Sidebar order: this computer's pages, the host's shell pages, then
     /// the files and About.
-    pub const ALL: [Page; 13] = [
+    pub const ALL: [Page; 14] = [
         Page::Appearance,
         Page::Terminal,
         Page::Workspace,
         Page::Shortcuts,
         Page::Hosts,
         Page::Shell,
+        Page::Path,
         Page::Prompt,
         Page::History,
         Page::Aliases,
@@ -201,6 +204,7 @@ impl Page {
             Page::Shortcuts => "Shortcuts",
             Page::Hosts => "Hosts",
             Page::Shell => "Shell",
+            Page::Path => "PATH",
             Page::Prompt => "Prompt",
             Page::History => "History",
             Page::Aliases => "Aliases",
@@ -220,6 +224,7 @@ impl Page {
             Page::Shortcuts => "Keys for terminal windows",
             Page::Hosts => "Machines to open sessions on over SSH",
             Page::Shell => "The shell goatty starts",
+            Page::Path => "Where the shell looks for programs",
             Page::Prompt => "What the prompt shows",
             Page::History => "What the shell remembers",
             Page::Aliases => "Short names for longer commands",
@@ -238,6 +243,7 @@ impl Page {
             Page::Shortcuts => Icon::Keyboard,
             Page::Hosts => Icon::Server,
             Page::Shell => Icon::Shell,
+            Page::Path => Icon::FolderOpen,
             Page::Prompt => Icon::TextCursorInput,
             Page::History => Icon::History,
             Page::Aliases => Icon::Link2,
@@ -255,6 +261,7 @@ impl Page {
             "theme" | "themes" | "colors" | "font" => Some(Page::Appearance),
             "tabs" | "panes" => Some(Page::Workspace),
             "ssh" => Some(Page::Hosts),
+            "path" | "env" | "environment" => Some(Page::Path),
             "profiles" | "files" => Some(Page::Profile),
             "doctor" | "status" | "setup" => Some(Page::Diagnostics),
             _ => None,
@@ -264,7 +271,7 @@ impl Page {
 
     /// Edits the connected host's settings (staged, then applied).
     pub fn is_host(self) -> bool {
-        matches!(self, Page::Shell | Page::Prompt | Page::History | Page::Aliases | Page::Plugins | Page::Diagnostics)
+        matches!(self, Page::Shell | Page::Path | Page::Prompt | Page::History | Page::Aliases | Page::Plugins | Page::Diagnostics)
     }
 }
 
@@ -341,7 +348,7 @@ pub struct SettingsWindow {
     font_filter: Entity<TextInput>,
     ui_font_filter: Entity<TextInput>,
     shell_path: Entity<TextInput>,
-    /// The Shell page's "Add a folder" field (shell.path).
+    /// The PATH page's "Add a folder" field (shell.path).
     path_entry: Entity<TextInput>,
     file_opener: Entity<TextInput>,
     show_all_fonts: bool,
@@ -368,6 +375,7 @@ pub struct SettingsWindow {
     shortcut_note: Option<(&'static str, String)>,
     plugins: plugins::PluginsPage,
     diag: diagnostics::DiagPage,
+    path: path::PathPage,
     aliases: aliases::AliasesPage,
     prompt: prompt::PromptPage,
     hosts: hosts::HostsPage,
@@ -453,11 +461,13 @@ impl SettingsWindow {
                     AppSettings::update(cx, |s| s.links.file_opener = (!text.is_empty()).then_some(text));
                 }
             }),
-            cx.subscribe(&path_entry, |this, _, ev: &TextInputEvent, cx| {
-                if let TextInputEvent::Submitted(text) = ev {
+            cx.subscribe(&path_entry, |this, _, ev: &TextInputEvent, cx| match ev {
+                TextInputEvent::Submitted(text) => {
                     let text = text.clone();
                     this.add_path_entry(&text, cx);
                 }
+                // The hint under the field follows what's typed.
+                _ => cx.notify(),
             }),
             cx.subscribe(&shell_path, |this, _, ev: &TextInputEvent, cx| {
                 if let TextInputEvent::Submitted(text) = ev {
@@ -513,6 +523,7 @@ impl SettingsWindow {
             shortcut_note: None,
             plugins: plugins::PluginsPage::default(),
             diag: diagnostics::DiagPage::default(),
+            path: path::PathPage::new(cx),
             aliases: aliases::AliasesPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
             hosts: hosts::HostsPage::new(cx),
@@ -557,10 +568,13 @@ impl SettingsWindow {
         self.gen_diff = None;
         self.plugins = plugins::PluginsPage::default();
         self.diag = diagnostics::DiagPage::default();
+        self.path.reset();
         self.load_host(cx);
         self.load_plugins(false, cx);
-        if self.page == Page::Diagnostics {
-            self.load_diagnostics(cx);
+        match self.page {
+            Page::Diagnostics => self.load_diagnostics(cx),
+            Page::Path => self.load_path_report(cx),
+            _ => {}
         }
         cx.notify();
     }
@@ -582,6 +596,7 @@ impl SettingsWindow {
             Page::Plugins | Page::Aliases => self.load_plugins(false, cx),
             Page::Hosts => crate::hosts::refresh(cx),
             Page::Diagnostics => self.load_diagnostics(cx),
+            Page::Path => self.load_path_report(cx),
             _ => {}
         }
         cx.notify();
@@ -959,6 +974,7 @@ impl SettingsWindow {
                         view.generations = gens;
                         view.host_error = None;
                         view.sync_prompt_inputs(cx);
+                        view.path_host_changed(cx);
                     }
                     Err(e) => view.host_error = Some(format!("{e:#}")),
                 }

@@ -19,6 +19,7 @@
 //! * [`install`]: user-space installs of packages (no sudo),
 //! * [`completions`]: zsh completion functions of goatty and goatty's tools,
 //! * [`doctor`]: asks a real managed shell what it loaded,
+//! * [`path_report`]: the shell's PATH and where each folder came from,
 //! * [`service`]: host settings operations (goattyd's API, `goatty --local`),
 //! * [`setup`]: diagnostics and installing the built-in tools, for the GUI,
 //! * [`sync`]: what bringing this computer's shell setup to another host takes,
@@ -38,6 +39,7 @@ pub mod history;
 pub mod install;
 pub mod launch;
 pub mod packages;
+pub mod path_report;
 pub mod plugins;
 pub mod service;
 pub mod setup;

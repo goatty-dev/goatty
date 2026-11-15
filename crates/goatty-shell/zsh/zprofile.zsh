@@ -4,6 +4,7 @@
 # Sources the user's .zprofile (PATH and other environment), then keeps
 # ZDOTDIR here so zsh reads goatty's .zshrc next.
 
+_goatty_path_marks+=("etc-zprofile"$'\t'"$PATH")
 if (( _goatty_user_env )); then
   _goatty_zdotdir_user
   if _goatty_user_file .zprofile; then
@@ -12,3 +13,4 @@ if (( _goatty_user_env )); then
   _goatty_zdotdir_capture
   builtin export ZDOTDIR=$_goatty_dir
 fi
+_goatty_path_marks+=("zprofile"$'\t'"$PATH")

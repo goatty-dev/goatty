@@ -13,6 +13,9 @@
 # Every feature is optional: a missing tool is skipped and shows up in
 # `goatty-status` and `goattyd shell status`.
 
+# PATH after each startup step (started in .zshenv): the system's zshrc ran.
+_goatty_path_marks+=("etc-zshrc"$'\t'"$PATH")
+
 # feature -> "ok<TAB>detail" | "missing" | "off"
 typeset -gA _goatty_state
 # package -> the zsh script found for it (system copy or goatty's)
@@ -53,7 +56,9 @@ typeset -gU path fpath
     [[ -d $dir ]] && path+=("$dir")
   done
 }
+_goatty_path_marks+=("settings"$'\t'"$PATH")
 path+=("$_goatty_bin")
+_goatty_path_marks+=("tools"$'\t'"$PATH")
 # Completion functions of goatty and goatty's tools (goattyd's, starship's
 # when goatty installed it), after the system's for the same reason.
 fpath+=("$_goatty_fpath")
@@ -62,6 +67,7 @@ fpath+=("$_goatty_fpath")
 # Before compinit, so plugin completions are found. `goattyd plugin list`
 # shows what's installed.
 builtin source -- "$_goatty_dir/plugins-early.zsh"
+_goatty_path_marks+=("plugins"$'\t'"$PATH")
 
 # --- Keys -------------------------------------------------------------------
 bindkey -e
@@ -114,6 +120,7 @@ if (( _goatty_user_rc )); then
   fi
   _goatty_zdotdir_capture
   builtin export ZDOTDIR=$_goatty_dir
+  _goatty_path_marks+=("zshrc"$'\t'"$PATH")
 fi
 
 # --- Plugins: line editor tools --------------------------------------------
@@ -144,6 +151,7 @@ builtin source -- "$_goatty_dir/plugins.zsh"
 # --- Your aliases from goatty's settings (Aliases page, `goattyd alias`) ----
 # After the plugins' aliases, so one of yours with the same name wins.
 builtin source -- "$_goatty_dir/aliases.zsh"
+_goatty_path_marks+=("plugins"$'\t'"$PATH")
 
 # --- Shell integration: OSC 133 prompt marks, OSC 7 working directory -------
 if _goatty_on integration && builtin source -- "$_goatty_dir/integration.zsh"; then
@@ -189,6 +197,7 @@ _goatty_zdotdir_user
 if [[ -r $_goatty_user_zshrc ]]; then
   builtin source -- "$_goatty_user_zshrc"
 fi
+_goatty_path_marks+=("additions"$'\t'"$PATH")
 
 # --- Plugins that load last: syntax highlighting ---------------------------
 # It wraps every line editor widget defined before it, yours included.
