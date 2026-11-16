@@ -19,6 +19,7 @@ mod listener;
 mod marks;
 mod mode;
 pub mod paste;
+pub mod predict;
 pub mod process;
 pub mod pty;
 pub mod snapshot;

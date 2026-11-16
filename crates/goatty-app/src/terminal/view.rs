@@ -155,6 +155,9 @@ pub struct TerminalView {
     drag_pos: Option<Point<Pixels>>,
     /// Scrolls while a selecting drag is past the top or bottom edge (#26).
     autoscroll: Option<Task<()>>,
+    /// Drops predicted echo (#16) the host didn't confirm in time; runs
+    /// while there are predictions.
+    expiring: bool,
     scroll_accum: f32,
     cursor_visible: bool,
     last_activity: Instant,
@@ -282,6 +285,7 @@ impl TerminalView {
             selecting: false,
             drag_pos: None,
             autoscroll: None,
+            expiring: false,
             scroll_accum: 0.0,
             cursor_visible: true,
             last_activity: Instant::now(),
@@ -321,6 +325,7 @@ impl TerminalView {
         self.padding = edges(s.terminal.padding);
         self.opacity = s.terminal.opacity;
         self.glyph_mode = s.terminal.renderer == Renderer::Glyphs;
+        self.session.set_local_echo(s.ssh.local_echo);
         self.cursor_blink = s.terminal.cursor_blink;
         if !self.cursor_blink {
             self.cursor_visible = true;
@@ -417,9 +422,36 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn send(&mut self, bytes: &[u8]) {
+    fn send(&mut self, bytes: &[u8], cx: &mut Context<'_, Self>) {
         self.session.terminal.scroll_to_bottom();
         self.session.write(bytes);
+        self.arm_expiry(cx);
+    }
+
+    /// Predicted echo (#16) the host doesn't confirm in time disappears:
+    /// one task follows the earliest deadline until no prediction is left
+    /// (confirming the earliest guess moves the deadline later).
+    fn arm_expiry(&mut self, cx: &mut Context<'_, Self>) {
+        if self.expiring || self.session.prediction_deadline().is_none() {
+            return;
+        }
+        self.expiring = true;
+        cx.spawn(async move |this, cx| {
+            while let Ok(Some(at)) = this.update(cx, |view, _| view.session.prediction_deadline()) {
+                cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
+                let alive = this.update(cx, |view, cx| {
+                    if view.session.expire_predictions() {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+            // No await since the last check: nothing was predicted meanwhile.
+            let _ = this.update(cx, |view, _| view.expiring = false);
+        })
+        .detach();
     }
 
     /// Show the cursor solid and restart the blink timer.
@@ -474,7 +506,7 @@ impl TerminalView {
             self.session.terminal.selection_clear();
         } else if let Some(bytes) = encode_key(&Key::Text("c"), Mods { ctrl: true, ..Mods::default() }, self.session.terminal.mode()) {
             self.poke_cursor();
-            self.send(&bytes);
+            self.send(&bytes, cx);
         }
         cx.notify();
     }
@@ -516,7 +548,7 @@ impl TerminalView {
         let bytes = encode_paste(text, self.session.terminal.mode());
         self.session.terminal.selection_clear();
         self.poke_cursor();
-        self.send(&bytes);
+        self.send(&bytes, cx);
         cx.notify();
     }
 
@@ -534,9 +566,9 @@ impl TerminalView {
     /// goes to the kill ring, Ctrl+Y brings it back), so it can't join the
     /// command. The line is sent as a paste, so nothing in it acts as a key.
     pub fn run_line(&mut self, line: &str, cx: &mut Context<'_, Self>) {
-        self.send(b"\x05\x15");
+        self.send(b"\x05\x15", cx);
         self.paste_text(line, cx);
-        self.send(b"\r");
+        self.send(b"\r", cx);
     }
 
     // ---- the command line (#186) ----------------------------------------------
@@ -553,7 +585,7 @@ impl TerminalView {
             return false;
         }
         self.poke_cursor();
-        self.send(edit.keys());
+        self.send(edit.keys(), cx);
         cx.notify();
         true
     }
@@ -969,7 +1001,7 @@ impl TerminalView {
         let Some((key, mods)) = terminal_key(&ev.keystroke) else { return };
         if let Some(bytes) = encode_key(&key, mods, self.session.terminal.mode()) {
             self.session.terminal.selection_clear();
-            self.send(&bytes);
+            self.send(&bytes, cx);
         }
     }
 

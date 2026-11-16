@@ -5,15 +5,18 @@
 
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use goatty_client::{Connection, History, PaneEvent, PaneSink, TopLineCause};
+use goatty_config::LocalEcho;
 use goatty_proto::WinSize;
 use goatty_shell::HostService;
+use goatty_term::predict::Predictor;
 use goatty_term::process::ForegroundWatch;
 use goatty_term::pty::{Pty, ShellCommand};
-use goatty_term::{HistoryRows, Palette, TermSize, Terminal, UiEvent};
+use goatty_term::{Frame, HistoryRows, Palette, TermMode, TermSize, Terminal, UiEvent};
 use parking_lot::Mutex;
 
 /// Coalescing wake-up: many output chunks → one UI notification per frame.
@@ -78,6 +81,11 @@ pub struct Session {
     waker: Arc<Waker>,
     /// A `fetch_history` is on its way.
     fetching: AtomicBool,
+    /// Local echo prediction (#16). Lock order:
+    /// `predictor`, then the terminal.
+    predictor: Mutex<Predictor>,
+    /// `ssh.local_echo` as `LocalEcho as u8`.
+    local_echo: AtomicU8,
 }
 
 /// Makes the sessions for new tabs and panes: on a goattyd connection, as
@@ -161,6 +169,7 @@ impl PaneSink for Sink {
             PaneEvent::Resynced { skipped } => log::debug!("resynced, {skipped} bytes skipped"),
             PaneEvent::Disconnected(why) => {
                 *s.status.lock() = LinkStatus::Reconnecting;
+                s.predictor.lock().reset();
                 // Shown locally only: the reattach snapshot starts with RIS
                 // and wipes this line again.
                 s.terminal.feed(format!("\r\n\x1b[0;2m[goatty: connection lost ({why}); reconnecting…]\x1b[0m").as_bytes());
@@ -171,7 +180,10 @@ impl PaneSink for Sink {
                     format!("\r\n\x1b[0;33m[goatty: can't reconnect without asking ({why}); press Enter to reconnect]\x1b[0m").as_bytes(),
                 );
             }
-            PaneEvent::Reconnected => *s.status.lock() = LinkStatus::Connected,
+            PaneEvent::Reconnected => {
+                s.predictor.lock().reset();
+                *s.status.lock() = LinkStatus::Connected;
+            }
             PaneEvent::Lost(why) => {
                 s.terminal.feed(format!("\r\n\x1b[0;31m[goatty: session lost: {why}]\x1b[0m\r\n").as_bytes());
                 *s.status.lock() = LinkStatus::Lost(why);
@@ -223,6 +235,8 @@ impl Session {
             fg: std::sync::OnceLock::new(),
             waker,
             fetching: AtomicBool::new(false),
+            predictor: Mutex::new(Predictor::new()),
+            local_echo: AtomicU8::new(LocalEcho::default() as u8),
         }
     }
 
@@ -277,7 +291,7 @@ impl Session {
         std::thread::Builder::new().name("pty-replies".into()).spawn(move || {
             while let Ok(bytes) = chans.replies.recv() {
                 let Some(s) = weak.upgrade() else { break };
-                s.write(&bytes);
+                s.write_raw(&bytes);
             }
         })?;
         let s2 = s.clone();
@@ -363,12 +377,20 @@ impl Session {
 
     fn ingest(&self, bytes: &[u8]) {
         self.bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if self.terminal.feed(bytes) {
+        let redraw = self.terminal.feed(bytes);
+        self.predictor.lock().output(&self.terminal, Instant::now());
+        if redraw {
             self.waker.wake();
         }
     }
 
+    /// Input from the user (keys, pastes, mouse reports).
     pub fn write(&self, bytes: &[u8]) {
+        self.predict(bytes);
+        self.write_raw(bytes);
+    }
+
+    fn write_raw(&self, bytes: &[u8]) {
         match &self.backend {
             Backend::Local(pty) => {
                 let _ = pty.lock().write(bytes);
@@ -391,6 +413,63 @@ impl Session {
         }
     }
 
+    /// Guess the echo of input on its way to the shell (#16), not in the
+    /// alt screen and while connected. The guesses are drawn when
+    /// `ssh.local_echo` wants it for the link's round trip or the echo
+    /// delay measured from earlier guesses (a slow host, `ssh` inside a
+    /// session), whichever is longer.
+    fn predict(&self, bytes: &[u8]) {
+        let setting = match self.local_echo.load(Ordering::Relaxed) {
+            x if x == LocalEcho::Always as u8 => LocalEcho::Always,
+            x if x == LocalEcho::Never as u8 => LocalEcho::Never,
+            _ => LocalEcho::Auto,
+        };
+        let mut p = self.predictor.lock();
+        let on = setting != LocalEcho::Never
+            && *self.status.lock() == LinkStatus::Connected
+            && !self.terminal.mode().contains(TermMode::ALT_SCREEN);
+        if !on {
+            if p.deadline().is_some() {
+                p.reset();
+            }
+            return;
+        }
+        let rtt = match &self.backend {
+            Backend::Daemon { conn, .. } => conn.rtt(),
+            Backend::Local(_) => None,
+        };
+        let slow = rtt.max(p.echo_delay());
+        p.set_visible(setting.wanted(slow));
+        // A few round trips, plus room for a busy host.
+        let timeout = slow.unwrap_or_default() * 3 + Duration::from_millis(400);
+        p.input(&self.terminal, bytes, Instant::now(), timeout);
+    }
+
+    pub fn set_local_echo(&self, setting: LocalEcho) {
+        self.local_echo.store(setting as u8, Ordering::Relaxed);
+        if setting == LocalEcho::Never {
+            self.predictor.lock().reset();
+        }
+    }
+
+    /// Draw the predicted echo over a frame of the terminal.
+    pub fn overlay_predictions(&self, frame: &mut Frame) {
+        if !frame.mode.contains(TermMode::ALT_SCREEN) {
+            self.predictor.lock().overlay(frame);
+        }
+    }
+
+    /// When predicted echo times out; call [`Self::expire_predictions`] then.
+    pub fn prediction_deadline(&self) -> Option<Instant> {
+        self.predictor.lock().deadline()
+    }
+
+    /// Drop predictions the host didn't confirm in time. Returns whether
+    /// the screen changed.
+    pub fn expire_predictions(&self) -> bool {
+        self.predictor.lock().expire(Instant::now())
+    }
+
     /// Fetch scrollback the daemon has and this terminal lacks, when the
     /// viewport is near it (older lines, or what a resync skipped). Cheap;
     /// call it whenever the view is scrolled up. Never blocks.
@@ -407,6 +486,7 @@ impl Session {
     }
 
     pub fn resize(&self, size: TermSize) {
+        self.predictor.lock().reset();
         self.terminal.resize(size);
         match &self.backend {
             Backend::Local(pty) => {
