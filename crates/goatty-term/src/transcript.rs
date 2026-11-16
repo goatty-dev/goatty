@@ -225,7 +225,7 @@ fn build(t: &Term, pal: &Palette, shell: ShellState) -> Transcript {
         running: shell == ShellState::Running,
         awaiting_prompt: shell == ShellState::Finished,
         commands_started: 0,
-        alt_screen: t.mode().contains(TermMode::ALT_SCREEN),
+        alt_screen: TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN),
     }
 }
 
