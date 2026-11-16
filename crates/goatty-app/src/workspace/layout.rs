@@ -168,6 +168,24 @@ impl Node {
         }
     }
 
+    /// Let panes `a` and `b` trade places (sizes stay where they are).
+    /// Returns false unless both are in the tree.
+    pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
+        if a == b || !self.contains(a) || !self.contains(b) {
+            return false;
+        }
+        fn walk(n: &mut Node, a: PaneId, b: PaneId) {
+            match n {
+                Node::Leaf(id) if *id == a => *id = b,
+                Node::Leaf(id) if *id == b => *id = a,
+                Node::Leaf(_) => {}
+                Node::Split { children, .. } => children.iter_mut().for_each(|c| walk(c, a, b)),
+            }
+        }
+        walk(self, a, b);
+        true
+    }
+
     /// Take `target` out; its space goes to the part before it (or after,
     /// for the first part). The root leaf can't be removed (close the tab
     /// instead): returns false then, and when `target` isn't in the tree.
@@ -514,6 +532,24 @@ mod tests {
         assert_eq!(sizes, [0.5, 0.5]);
         let empty = Node::Split { axis: Axis::Vertical, children: vec![], sizes: vec![] };
         assert_eq!(empty.map_leaves(&mut Some), None);
+    }
+
+    #[test]
+    fn swapping_trades_places_and_keeps_sizes() {
+        // 1 | (2 / 3), with the left part wider.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Direction::Right);
+        t.split(2, 3, Direction::Down);
+        t.resize(1, Direction::Right, 0.2);
+        let before = t.layout(Rect::FULL).0;
+        assert!(t.swap(1, 3));
+        assert_eq!(t.leaves(), [3, 2, 1]);
+        let after = t.layout(Rect::FULL).0;
+        assert_eq!(after[0].1, before[0].1, "3 is where 1 was, as wide");
+        assert_eq!(t.neighbor(3, Direction::Right), Some(2));
+        assert!(!t.swap(1, 9));
+        assert!(!t.swap(2, 2));
+        assert_eq!(t.leaves(), [3, 2, 1]);
     }
 
     #[test]

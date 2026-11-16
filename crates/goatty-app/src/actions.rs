@@ -51,6 +51,17 @@ actions!(
         ListSessions,
         /// Ask the host's running managed shells to reload their configuration.
         ReloadShells,
+        /// The terminal's menu (what a right click shows), at the cursor.
+        OpenContextMenu,
+        /// The command typed at the prompt (not run yet) to the clipboard.
+        CopyCommandLine,
+        /// The command typed at the prompt into a new snippet.
+        SaveCommandLine,
+        /// `sudo` in front of the typed command, or taken away.
+        ToggleSudo,
+        /// The typed command in `$VISUAL`/`$EDITOR`.
+        EditCommandLine,
+        ClearCommandLine,
     ]
 );
 
@@ -107,6 +118,11 @@ actions!(
         /// Let the focused pane fill the tab, or go back to the split.
         TogglePaneZoom,
         EqualizePanes,
+        SwapPaneLeft,
+        SwapPaneRight,
+        SwapPaneUp,
+        SwapPaneDown,
+        MovePaneToNewTab,
     ]
 );
 
@@ -129,6 +145,12 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "snippets" => Box::new(OpenSnippets),
         "list_sessions" => Box::new(ListSessions),
         "reload_shells" => Box::new(ReloadShells),
+        "context_menu" => Box::new(OpenContextMenu),
+        "copy_command_line" => Box::new(CopyCommandLine),
+        "save_command_line" => Box::new(SaveCommandLine),
+        "toggle_sudo" => Box::new(ToggleSudo),
+        "edit_command_line" => Box::new(EditCommandLine),
+        "clear_command_line" => Box::new(ClearCommandLine),
         "dismiss_notifications" => Box::new(DismissNotifications),
         "press_notification_button" => Box::new(PressNotificationButton),
         "show_recent_notifications" => Box::new(ShowRecentNotifications),
@@ -165,6 +187,11 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "resize_pane_down" => Box::new(ResizePaneDown),
         "toggle_pane_zoom" => Box::new(TogglePaneZoom),
         "equalize_panes" => Box::new(EqualizePanes),
+        "swap_pane_left" => Box::new(SwapPaneLeft),
+        "swap_pane_right" => Box::new(SwapPaneRight),
+        "swap_pane_up" => Box::new(SwapPaneUp),
+        "swap_pane_down" => Box::new(SwapPaneDown),
+        "move_pane_to_new_tab" => Box::new(MovePaneToNewTab),
         _ => return None,
     })
 }

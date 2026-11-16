@@ -24,6 +24,7 @@ pub struct ClientSettings {
     pub links: LinkSettings,
     pub paste: PasteSettings,
     pub selection: SelectionSettings,
+    pub mouse: MouseSettings,
     pub ssh: SshSettings,
     pub debug: DebugSettings,
 }
@@ -547,6 +548,45 @@ pub enum CopyOnSelect {
 #[serde(default)]
 pub struct SelectionSettings {
     pub copy_on_select: CopyOnSelect,
+}
+
+/// What a right click on the terminal does (#186). Programs that use the
+/// mouse (vim, tmux, htop with mouse support on) get the click unless the
+/// setting says otherwise, and Shift+right-click always does the other
+/// thing: goatty's menu where the program would get the click, and the
+/// program where the menu would open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RightClick {
+    /// goatty's menu; programs that use the mouse get the click.
+    #[default]
+    Menu,
+    /// goatty's menu, in programs that use the mouse too.
+    Always,
+    /// Copy the selection, or paste when nothing is selected (Windows
+    /// Terminal, PuTTY).
+    Paste,
+    /// Nothing (programs that use the mouse still get the click).
+    Off,
+}
+
+impl RightClick {
+    /// Whether a right click opens goatty's menu, given whether the
+    /// program uses the mouse and Shift is held. Otherwise the click goes
+    /// to the program, or (without one) does the setting's own thing.
+    pub fn opens_menu(self, program_uses_mouse: bool, shift: bool) -> bool {
+        match self {
+            RightClick::Always => !(shift && program_uses_mouse),
+            RightClick::Menu => shift || !program_uses_mouse,
+            RightClick::Paste | RightClick::Off => shift,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MouseSettings {
+    pub right_click: RightClick,
 }
 
 /// The hosts goatty offers to connect to (command palette, settings).
@@ -1147,5 +1187,27 @@ mod tests {
         let paths: Vec<_> = issues.iter().map(|i| i.path.as_str()).collect();
         assert_eq!(paths, ["font.size", "terminal.padding", "terminal.opacity", "keybindings.ctrl-x"]);
         assert!(ClientSettings::default().validate().is_empty());
+    }
+
+    #[test]
+    fn shift_right_click_does_the_other_thing() {
+        use RightClick::*;
+        // (setting, program uses the mouse, shift) → menu?
+        for (rc, mouse, shift, menu) in [
+            (Menu, false, false, true),
+            (Menu, true, false, false),
+            (Menu, true, true, true),
+            (Always, true, false, true),
+            (Always, true, true, false),
+            (Always, false, true, true),
+            (Paste, false, false, false),
+            (Paste, false, true, true),
+            (Off, true, false, false),
+            (Off, false, true, true),
+        ] {
+            assert_eq!(rc.opens_menu(mouse, shift), menu, "{rc:?} mouse={mouse} shift={shift}");
+        }
+        let s: ClientSettings = serde_json::from_str(r#"{"mouse":{"right_click":"paste"}}"#).unwrap();
+        assert_eq!(s.mouse.right_click, Paste);
     }
 }

@@ -22,6 +22,10 @@ use crate::marks::ShellState;
 use crate::terminal::Term;
 use crate::{TermMode, Terminal};
 
+/// The shell's state, how many commands started, and whether goatty's
+/// command-line widgets are bound (see `Terminal::line_editing`).
+pub(crate) type ShellInfo = (ShellState, u64, bool);
+
 /// Upper bound on replayed history lines; keeps attach latency bounded.
 pub const MAX_REPLAY_HISTORY: usize = 5_000;
 
@@ -34,7 +38,7 @@ impl Terminal {
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), (self.shell_state(), self.commands_started())))
+        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info()))
     }
 
     /// Everything another process needs to rebuild this terminal (goattyd
@@ -44,7 +48,7 @@ impl Terminal {
     /// snapshot leaves out. Leaves the terminal as it was.
     pub fn restore_snapshot(&self) -> Vec<u8> {
         self.with_term(|t| {
-            let shell = (self.shell_state(), self.commands_started());
+            let shell = self.shell_info();
             if !t.mode().contains(TermMode::ALT_SCREEN) {
                 return serialize(t, MAX_REPLAY_HISTORY, shell);
             }
@@ -73,11 +77,11 @@ impl Terminal {
     /// (rio's `ED 2` on the primary screen pushes the viewport up) and the
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
-        self.with_term(|t| resync(t, (self.shell_state(), self.commands_started())))
+        self.with_term(|t| resync(t, self.shell_info()))
     }
 }
 
-fn resync(t: &mut Term, shell: (ShellState, u64)) -> Vec<u8> {
+fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
@@ -94,7 +98,7 @@ fn resync(t: &mut Term, shell: (ShellState, u64)) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn serialize(t: &Term, max_history: usize, shell: (ShellState, u64)) -> Vec<u8> {
+fn serialize(t: &Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
     let mode = t.mode();
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
@@ -184,13 +188,15 @@ fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, o
 /// With how many commands started, so the client tells commands apart
 /// like the session does (a command whose prompt the replay left out is
 /// still one).
-fn write_shell_state((shell, started): (ShellState, u64), out: &mut String) {
+/// Then whether the command-line widgets are there (both ways: a resync
+/// may have to clear it).
+fn write_shell_state((shell, started, zle): ShellInfo, out: &mut String) {
     let state = match shell {
         ShellState::Prompt => "prompt",
         ShellState::Running => "run",
         ShellState::Finished => "done",
     };
-    let _ = write!(out, "\x1b]133;C;goatty={state};n={started}\x07");
+    let _ = write!(out, "\x1b]133;C;goatty={state};n={started}\x07\x1b]7337;zle={}\x07", u8::from(zle));
 }
 
 /// The OSC 133 mark that gives the row at the cursor `line`'s mark.
@@ -477,6 +483,22 @@ mod tests {
         // The old screen is in the client's history now; the last command is still the right one.
         let tb = b.transcript();
         assert_eq!(tb.command_line(tb.last_command().unwrap()), Some("$ sleep 9"));
+    }
+
+    #[test]
+    fn snapshots_carry_the_line_editing_widgets() {
+        let size = TermSize::new(20, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        a.feed(b"\x1b]7337;zle=1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(a.line_editing());
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&a.reattach_snapshot());
+        assert!(b.line_editing());
+        // A command runs: no widgets until the next prompt says so.
+        a.feed(b"vim\r\n\x1b]133;C\x07");
+        assert!(!a.line_editing());
+        b.feed(&a.resync_snapshot());
+        assert!(!b.line_editing());
     }
 
     #[test]

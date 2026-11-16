@@ -95,7 +95,7 @@ settings_window/
   chrome.rs    sidebar (rail + drawer below 920 px), page header, the floating bar for unapplied host changes, `Render`
   search.rs    "Search settings": the index of every setting (row label, section, keywords) + pages + shortcut actions
   appearance.rs  live preview, theme gallery + color editor, font picker, cursor, padding per side, opacity
-  terminal.rs  the Terminal page (links, selection, pasting) and the Workspace page (startup, tabs, panes)
+  terminal.rs  the Terminal page (links, selection, mouse: what a right click does, pasting) and the Workspace page (startup, tabs, panes)
   shell.rs     Shell, History
   dotfiles.rs  Dotfiles: the import of what the user's shell sets up (on/off, which shell; the last check with search, filter chips and a switch per PATH/variable; failures with stderr; "Check again" runs it on the host), a link to copying the aliases, and (advanced) running ~/.zshenv, ~/.zprofile and (guarded) ~/.zshrc in goatty's shell
   path.rs      PATH: your folders (`shell.path`: add with a live check, browse when local, reorder, remove; each folder's state on the host) and the PATH a new shell gets, each folder with its origin, searchable, "Doesn't exist" filter
@@ -121,7 +121,8 @@ toast/
   recent.rs    "Notifications: Show recent": an overlay like the palette that lists, filters and copies the history
 ui/
   style.rs     UI colors derived from the terminal theme
-  icons.rs     Icon enum + Assets (SVGs from assets/icons/, embedded, served to svg())
+  icons.rs     Icon enum + Assets (SVGs from assets/icons/, embedded, served to svg()); `Icon::by_name` for plugins' menu icons
+  context_menu.rs  the right-click menu widget (#186): `Entry`s (items with icon, label, shortcut, disabled reason; separators, headings, notes; one level of submenus), keyboard (arrows, first letter, Right/Left for submenus, Esc) and screen readers (menu items, active descendant, shortcuts), a backdrop that swallows the click outside; emits `MenuEvent::Run(handler)` for its owner to run after closing
   controls.rs  toggle, segmented, stepper, button, rows
   text_input.rs single-line text field (IME-aware; adapted from GPUI's example)
   prompt_preview.rs draws a prompt from `PromptSettings::layout` with sample values (Prompt page, style cards, welcome window)
@@ -131,7 +132,7 @@ workspace/
   layout.rs    a tab's split tree (pure, unit-tested): n-ary splits with weights, split/remove/normalize, layout → leaf rects + dividers, neighbor, resize
   tab_bar.rs   the horizontal strip (`tabs.style`: modern / compact; scrolls when the tabs don't fit) and what every style shares: switch, close, rename, live drag to reorder, the mouse wheel (`tabs.scroll_to_switch`), activity markers on background tabs
   sidebar.rs   the vertical style (#168): a sidebar of rows (icon, title, directory and host) that folds into a rail of icons, resized or folded by dragging its edge (saved shortly after the drag stops), next to the panes drawn as a rounded card
-  tab_menu.rs  a tab's right-click menu: rename, duplicate, close it / the others / the ones after it (one confirmation for all)
+  menu.rs      the right-click menus on `ui::context_menu`: a tab's (rename, duplicate, close it / the others / the ones after it) and a pane's (`TerminalView::menu_entries`: link, clipboard, the command line at a goatty zsh prompt, output; then split, a Pane submenu: swap with a neighbour, move to a new tab, zoom, equalize, close; plugin commands with `[command.menu]`; palette and settings; a note in programs that use the mouse); swapping panes and moving one to a new tab
   gestures.rs  the tabs' pointer maths (pure, unit-tested): where a dragged tab goes, wheel notches and touchpad distance → tab switches, the sidebar's width limits and fold thresholds
   icons.rs     process name → Nerd Font glyph + theme color, drawn with the bundled font (tests check every code point against it)
   saved.rs     the window's layout as goattyd keeps it (JSON: tabs, split trees with session ids, names, focus, zoom, window size and state); `restore` claims and reattaches it
@@ -141,7 +142,7 @@ snippets/
   mod.rs       the active host's snippets (`Store`: `Request::Snippets`, refetched on host and plugin changes), the fill-in steps (`ask_for`: palette input mode with the line as preview, suggestions via `Request::Suggest`), putting the line on the prompt, "Save the last command as a snippet"
   picker.rs    the Ctrl+Shift+S overlay: fuzzy search, topic chips, recently used first, missing programs last, preview with blanks and the safety badge
 typing.rs      which pane goatty may type a command into (the focused one, on the command's host, at a prompt); otherwise a toast offers to copy it (plugin commands and snippets)
-plugin_commands.rs  the active host's plugins' `[[command]]`s in the palette (`plugin.<id>.<cmd>`): catalog fetched off the UI thread when the host link changes or plugins change; picking one asks for its inputs and types the quoted line into the focused pane (a busy pane: offer to copy it)
+plugin_commands.rs  the active host's plugins' `[[command]]`s in the palette (`plugin.<id>.<cmd>`): catalog fetched off the UI thread when the host link changes or plugins change; picking one asks for its inputs and types the quoted line into the focused pane (a busy pane: offer to copy it); `MenuCommands`: those with a `[command.menu]`, for the pane menu (`start` fills in the selected text)
 shell_path.rs  "Shell: Add/Remove a folder to/from PATH…": asks, then changes `shell.path` on the active tab's host through its goattyd (the PATH page edits the same setting)
 hosts.rs       hosts to connect to: `ssh.hosts` + `~/.ssh/config` (`HostList` global, read in the background), palette commands, `pool` (one shared Connection per host), `open` → a connecting tab of the last active window or a new window (`ssh.open_in`)
 shell_setup.rs installing a host's built-in tools with progress (`install`), the per-host install offer toast after a tab connects (`offer`)

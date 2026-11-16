@@ -9,7 +9,7 @@
 //!   icon and title; the active tab in the accent color.
 //!
 //! Every style: click to switch, middle-click to close, double-click to
-//! rename, right-click for the tab's menu (`tab_menu`), double-click the
+//! rename, right-click for the tab's menu (`menu`), double-click the
 //! empty space for a new tab. Dragging a tab moves it live: the others make
 //! room as it passes their middle (`gestures::reorder_target`). With
 //! `tabs.scroll_to_switch` the mouse wheel over the tabs switches tabs;

@@ -7,7 +7,12 @@
 //!     mark grid rows, which the [transcript](crate::transcript) uses to find
 //!     each command's output,
 //!   * `C` (command output starts) and `D [; status]` (command finished): the
-//!     shell's state, and activity markers on tabs (#122).
+//!     shell's state, and activity markers on tabs (#122),
+//!   * goatty's own `OSC 7337` (#186): `zle=1|0` (the managed zsh's
+//!     command-line widgets are there: it says so at each prompt) and
+//!     `line=<percent-encoded>` (the unsent command line, which the shell
+//!     reports when goatty asks for it). Only `line=` payloads are kept past
+//!     the first few bytes, up to [`MAX_LINE`].
 //!
 //! The scanner keeps its state between chunks, so a mark split across two
 //! reads is still found. Outside escape sequences it only runs `memchr` for
@@ -18,7 +23,7 @@
 use memchr::{memchr, memchr2};
 
 /// A shell-integration mark found in the output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mark {
     /// `OSC 133 ; A`, or `P` without `k=c`/`k=s`: a prompt starts here.
     PromptStart,
@@ -34,6 +39,12 @@ pub(crate) enum Mark {
     /// commands started, without marking rows or reporting a finished
     /// command.
     Restore(ShellState, Option<u64>),
+    /// `OSC 7337 ; zle=1|0`: whether goatty's command-line widgets are
+    /// bound in the shell at this prompt.
+    Zle(bool),
+    /// `OSC 7337 ; line=<percent-encoded bytes>`: the command line typed at
+    /// the prompt and not sent yet, reported on request.
+    Line(String),
 }
 
 /// What the shell last said about its command.
@@ -66,6 +77,11 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 /// The longest OSC prefix we look at: `133;C;goatty=prompt;n=<u64::MAX>`.
 const KEEP: usize = 48;
+/// goatty's command-line report; the only OSC kept whole.
+const LINE: &[u8] = b"7337;line=";
+/// The longest command line report kept (percent-encoded); a longer one
+/// is dropped.
+pub(crate) const MAX_LINE: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -84,11 +100,15 @@ pub(crate) struct MarkScanner {
     /// The OSC payload's first [`KEEP`] bytes.
     buf: [u8; KEEP],
     len: usize,
+    /// A [`LINE`] report's payload after the prefix, while one is read
+    /// (`None` for every other OSC); `overflow` once it passed [`MAX_LINE`].
+    line: Option<Vec<u8>>,
+    overflow: bool,
 }
 
 impl Default for MarkScanner {
     fn default() -> Self {
-        Self { state: State::Ground, buf: [0; KEEP], len: 0 }
+        Self { state: State::Ground, buf: [0; KEEP], len: 0, line: None, overflow: false }
     }
 }
 
@@ -110,6 +130,8 @@ impl MarkScanner {
                     self.state = match bytes[i] {
                         b']' => {
                             self.len = 0;
+                            self.line = None;
+                            self.overflow = false;
                             State::Osc
                         }
                         ESC => State::Esc,
@@ -123,6 +145,7 @@ impl MarkScanner {
                     let take = end.min(KEEP - self.len);
                     self.buf[self.len..self.len + take].copy_from_slice(&rest[..take]);
                     self.len += take;
+                    self.collect_line(&rest[..end], take);
                     i += end;
                     if let Some(&b) = bytes.get(i) {
                         i += 1;
@@ -146,16 +169,48 @@ impl MarkScanner {
         }
     }
 
+    /// Keep a [`LINE`] report's payload past [`KEEP`]: `seg` is this
+    /// chunk's part of the OSC, of which the first `took` bytes also went
+    /// into `buf`.
+    fn collect_line(&mut self, seg: &[u8], took: usize) {
+        if self.line.is_none() {
+            if self.len < LINE.len() || !self.buf.starts_with(LINE) {
+                return;
+            }
+            // Everything so far: `buf` after the prefix, then what didn't fit.
+            let mut v = self.buf[LINE.len()..self.len].to_vec();
+            v.extend_from_slice(&seg[took..]);
+            self.line = Some(v);
+        } else if let Some(v) = self.line.as_mut() {
+            v.extend_from_slice(seg);
+        }
+        if self.line.as_ref().is_some_and(|v| v.len() > MAX_LINE) {
+            self.line = Some(Vec::new());
+            self.overflow = true;
+        }
+    }
+
     fn finish(&mut self, end: usize, on: &mut impl FnMut(usize, Mark)) {
         self.state = State::Ground;
+        if let Some(line) = self.line.take() {
+            if !self.overflow {
+                on(end, Mark::Line(percent_decode(&line)));
+            }
+            return;
+        }
         if let Some(mark) = parse(&self.buf[..self.len]) {
             on(end, mark);
         }
     }
 }
 
-/// `133;<letter>[;params…]`.
+/// `133;<letter>[;params…]`, or goatty's `7337;zle=…`.
 fn parse(payload: &[u8]) -> Option<Mark> {
+    match payload {
+        b"7337;zle=1" => return Some(Mark::Zle(true)),
+        b"7337;zle=0" => return Some(Mark::Zle(false)),
+        _ => {}
+    }
     let rest = payload.strip_prefix(b"133;")?;
     let (&kind, rest) = rest.split_first()?;
     if !rest.is_empty() && rest[0] != b';' {
@@ -178,6 +233,25 @@ fn parse(payload: &[u8]) -> Option<Mark> {
         b'D' => Some(finished(rest)),
         _ => None,
     }
+}
+
+/// `%XX` → the byte; anything else as it is. Invalid UTF-8 is replaced.
+fn percent_decode(s: &[u8]) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'%'
+            && let (Some(h), Some(l)) = (s.get(i + 1).copied().and_then(hex), s.get(i + 2).copied().and_then(hex))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The rest of `133;D`: nothing, or `;<status>[;more…]`.
@@ -218,7 +292,7 @@ mod tests {
     fn finds_every_mark_and_where_it_ends() {
         let stream: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x1b\\out\r\n\x1b]133;D;0\x07\x1b]133;P;k=s\x07";
         let found = all_marks(stream);
-        let kinds: Vec<Mark> = found.iter().map(|(_, m)| *m).collect();
+        let kinds: Vec<Mark> = found.iter().map(|(_, m)| m.clone()).collect();
         assert_eq!(kinds, [Mark::PromptStart, Mark::CommandStart, Mark::CommandFinished(Some(0)), Mark::PromptContinuation]);
         for (end, _) in &found {
             let before = &stream[..*end];
@@ -264,6 +338,35 @@ mod tests {
         // An OSC cut short by another escape sequence.
         assert_eq!(marks(&[b"\x1b]2;title\x1b[0m\x1b]133;D;3\x07"]), [Mark::CommandFinished(Some(3))]);
         assert_eq!(marks(&[b"\x1b\x1b]133;D;4\x07"]), [Mark::CommandFinished(Some(4))]);
+    }
+
+    #[test]
+    fn reads_goattys_own_marks() {
+        let found: Vec<Mark> =
+            all_marks(b"\x1b]7337;zle=1\x07\x1b]7337;zle=0\x1b\\\x1b]7337;zle=2\x07").into_iter().map(|(_, m)| m).collect();
+        assert_eq!(found, [Mark::Zle(true), Mark::Zle(false)]);
+        let found = all_marks(b"\x1b]7337;line=sudo%20ls%0a%e2%9c%93%zz\x07");
+        assert_eq!(found, [(37, Mark::Line("sudo ls\n\u{2713}%zz".into()))]);
+        assert_eq!(all_marks(b"\x1b]7337;line=\x07").into_iter().map(|(_, m)| m).collect::<Vec<_>>(), [Mark::Line(String::new())]);
+    }
+
+    #[test]
+    fn long_command_lines_survive_any_split() {
+        let line: String = (0..300).map(|i| format!("w{i}%20")).collect();
+        let stream = format!("\x1b]7337;line={line}\x1b\\\x1b]133;D;0\x07");
+        let want = line.replace("%20", " ");
+        for cut in [0, 3, 9, 12, 15, 47, 48, 49, 60, stream.len() - 1] {
+            let (a, b) = stream.as_bytes().split_at(cut);
+            let mut s = MarkScanner::default();
+            let mut out = Vec::new();
+            s.scan(a, |_, m| out.push(m));
+            s.scan(b, |_, m| out.push(m));
+            assert_eq!(out, [Mark::Line(want.clone()), Mark::CommandFinished(Some(0))], "cut at {cut}");
+        }
+        // Too long: dropped, and the next mark is still found.
+        let huge = [b"\x1b]7337;line=".as_slice(), &vec![b'a'; MAX_LINE + 10], b"\x07\x1b]133;D;1\x07"].concat();
+        assert_eq!(marks(&[&huge]), [Mark::CommandFinished(Some(1))]);
+        assert_eq!(all_marks(&huge).len(), 1);
     }
 
     #[test]

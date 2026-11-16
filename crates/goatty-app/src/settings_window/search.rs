@@ -70,6 +70,7 @@ pub const INDEX: &[Entry] = &[
     e(Page::Terminal, "Links", "Open links", "url hyperlink click osc 8").keys(&["links.open_on"]),
     e(Page::Terminal, "Links", "Open files with", "editor file opener path vscode").keys(&["links.file_opener"]),
     e(Page::Terminal, "Selection", "Copy selected text", "copy on select primary clipboard").keys(&["selection.copy_on_select"]),
+    e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),
     e(Page::Terminal, "Pasting", "Ask before pasting", "paste confirm protection bracketed multiline").keys(&["paste.confirm"]),
     e(Page::Workspace, "Startup", "When goatty starts", "restore reattach session launch open").keys(&["workspace.on_launch"]),

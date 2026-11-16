@@ -26,12 +26,18 @@ pub struct ActionInfo {
 }
 
 /// Action groups in display order.
-pub const GROUPS: &[&str] = &["Clipboard", "Scrolling", "Output", "Text size", "goatty", "Notifications", "Tabs", "Panes"];
+pub const GROUPS: &[&str] = &["Clipboard", "Command line", "Scrolling", "Output", "Text size", "goatty", "Notifications", "Tabs", "Panes"];
 
 pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "copy", label: "Copy the selection", group: "Clipboard" },
     ActionInfo { name: "copy_or_interrupt", label: "Copy the selection, or interrupt when there's none", group: "Clipboard" },
     ActionInfo { name: "paste", label: "Paste", group: "Clipboard" },
+    // The line typed at the prompt (managed zsh with shell integration, #186).
+    ActionInfo { name: "copy_command_line", label: "Copy the command typed at the prompt", group: "Command line" },
+    ActionInfo { name: "save_command_line", label: "Save the command typed at the prompt as a snippet", group: "Command line" },
+    ActionInfo { name: "toggle_sudo", label: "Put sudo in front of the command (or take it away)", group: "Command line" },
+    ActionInfo { name: "edit_command_line", label: "Edit the command in your editor ($EDITOR)", group: "Command line" },
+    ActionInfo { name: "clear_command_line", label: "Clear the command typed at the prompt", group: "Command line" },
     ActionInfo { name: "scroll_page_up", label: "Scroll back one screen", group: "Scrolling" },
     ActionInfo { name: "scroll_page_down", label: "Scroll forward one screen", group: "Scrolling" },
     ActionInfo { name: "find", label: "Find in the output", group: "Output" },
@@ -45,6 +51,7 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "snippets", label: "Find a snippet and fill it in", group: "goatty" },
     ActionInfo { name: "list_sessions", label: "Sessions on this host (open or end one)", group: "goatty" },
     ActionInfo { name: "reload_shells", label: "Reload running shells with new shell settings", group: "goatty" },
+    ActionInfo { name: "context_menu", label: "Open the terminal's menu (what a right click shows)", group: "goatty" },
     // Unbound by default: Escape belongs to the terminal (#86).
     ActionInfo { name: "dismiss_notifications", label: "Dismiss all notifications", group: "Notifications" },
     ActionInfo { name: "press_notification_button", label: "Press the newest notification's main button", group: "Notifications" },
@@ -82,6 +89,11 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "resize_pane_down", label: "Move the pane's divider down", group: "Panes" },
     ActionInfo { name: "toggle_pane_zoom", label: "Zoom the pane (fill the tab) or back", group: "Panes" },
     ActionInfo { name: "equalize_panes", label: "Make the tab's panes the same size", group: "Panes" },
+    ActionInfo { name: "swap_pane_left", label: "Swap the pane with the one on the left", group: "Panes" },
+    ActionInfo { name: "swap_pane_right", label: "Swap the pane with the one on the right", group: "Panes" },
+    ActionInfo { name: "swap_pane_up", label: "Swap the pane with the one above", group: "Panes" },
+    ActionInfo { name: "swap_pane_down", label: "Swap the pane with the one below", group: "Panes" },
+    ActionInfo { name: "move_pane_to_new_tab", label: "Move the pane to a new tab", group: "Panes" },
 ];
 
 pub fn find_action(name: &str) -> Option<&'static ActionInfo> {
@@ -113,6 +125,9 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl-shift-p", "command_palette"),
     ("ctrl-shift-h", "connect_to_host"),
     ("ctrl-shift-s", "snippets"),
+    // The keyboard's way to a context menu (the Menu key, Shift+F10).
+    ("shift-f10", "context_menu"),
+    ("menu", "context_menu"),
     // Tabs. Alt+digit and Alt+arrows fall through to the shell when there's
     // no such tab or pane, so a single pane loses nothing.
     ("ctrl-shift-t", "new_tab"),

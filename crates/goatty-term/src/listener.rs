@@ -23,6 +23,9 @@ pub enum UiEvent {
     CommandFinished {
         exit: Option<i32>,
     },
+    /// The shell reported the command line typed at its prompt (goatty
+    /// asked for it with `Terminal::LINE_KEYS`; `OSC 7337;line=`).
+    CommandLine(String),
     Exit,
 }
 

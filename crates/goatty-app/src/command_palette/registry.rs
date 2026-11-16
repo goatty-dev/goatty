@@ -211,7 +211,7 @@ pub fn builtins() -> Vec<Command> {
             "settings.terminal",
             "Links and pasting",
             Page::Terminal,
-            &["terminal", "urls", "hyperlinks", "paste", "confirm", "open files"],
+            &["terminal", "urls", "hyperlinks", "paste", "confirm", "open files", "right click", "mouse", "context menu"],
         ),
         page(
             "settings.workspace",
@@ -315,6 +315,37 @@ pub fn builtins() -> Vec<Command> {
             .keywords(&["copy", "mirror", "remote", "plugins", "aliases", "prompt", "dotfiles", "same"]),
         Command::action("terminal.copy", "Terminal", "Copy the selection", "copy").keywords(&["clipboard"]),
         Command::action("terminal.paste", "Terminal", "Paste", "paste").keywords(&["clipboard"]),
+        Command::action("terminal.context_menu", "Terminal", "Open the terminal's menu", "context_menu").keywords(&[
+            "right click",
+            "context menu",
+            "actions",
+            "mouse",
+        ]),
+        Command::action("line.copy", "Command line", "Copy the command typed at the prompt", "copy_command_line").keywords(&[
+            "clipboard",
+            "unsent",
+            "current",
+            "buffer",
+        ]),
+        Command::action("line.save", "Command line", "Save the typed command as a snippet…", "save_command_line")
+            .keywords(&["snippet", "remember", "template", "current", "new"]),
+        Command::action("line.sudo", "Command line", "Add or remove sudo in front of the command", "toggle_sudo").keywords(&[
+            "root",
+            "admin",
+            "administrator",
+            "permission denied",
+            "elevate",
+            "sudo !!",
+        ]),
+        Command::action("line.edit", "Command line", "Edit the command in your editor", "edit_command_line").keywords(&[
+            "$EDITOR",
+            "vim",
+            "nano",
+            "long",
+            "multiline",
+        ]),
+        Command::action("line.clear", "Command line", "Clear the command typed at the prompt", "clear_command_line")
+            .keywords(&["delete", "erase", "empty", "kill"]),
         Command::action("terminal.scroll_page_up", "Terminal", "Scroll back one screen", "scroll_page_up"),
         Command::action("terminal.scroll_page_down", "Terminal", "Scroll forward one screen", "scroll_page_down"),
         Command::action("output.find", "Output", "Find in the output", "find").keywords(&[
@@ -382,6 +413,20 @@ pub fn builtins() -> Vec<Command> {
             "fill",
         ]),
         Command::action("pane.equalize", "Panes", "Make all panes the same size", "equalize_panes").keywords(&["balance", "even", "reset"]),
+        Command::action("pane.swap_left", "Panes", "Swap the pane with the one on the left", "swap_pane_left")
+            .keywords(&["move", "reorder", "exchange"]),
+        Command::action("pane.swap_right", "Panes", "Swap the pane with the one on the right", "swap_pane_right")
+            .keywords(&["move", "reorder", "exchange"]),
+        Command::action("pane.swap_up", "Panes", "Swap the pane with the one above", "swap_pane_up")
+            .keywords(&["move", "reorder", "exchange"]),
+        Command::action("pane.swap_down", "Panes", "Swap the pane with the one below", "swap_pane_down")
+            .keywords(&["move", "reorder", "exchange"]),
+        Command::action("pane.move_to_new_tab", "Panes", "Move the pane to a new tab", "move_pane_to_new_tab").keywords(&[
+            "detach",
+            "break out",
+            "split off",
+            "own tab",
+        ]),
         Command::action("notifications.dismiss_all", "Notifications", "Dismiss all", "dismiss_notifications")
             .keywords(&["toasts", "clear", "close", "hide"]),
         Command::action("notifications.press", "Notifications", "Press the newest one's main button", "press_notification_button")

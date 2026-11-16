@@ -2,6 +2,7 @@
 //! the terminal theme, basic controls, a text field, a color picker, icons.
 
 pub mod color_picker;
+pub mod context_menu;
 pub mod controls;
 pub mod focus;
 pub mod icons;

@@ -17,7 +17,7 @@ Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatt
 | Config files | `[[file]]` (`lines` or `text`, optional `env` pointing at it) | a file in the generation, e.g. bat's `BAT_CONFIG_PATH` | `config-files` |
 | Completions | `zsh.fpath` (directories in the plugin) | `fpath` entries before compinit | – |
 | Shell code | `zsh.init` (a `.zsh` file in the plugin) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
-| Palette commands | `[[command]]` + `[[command.input]]` (typed inputs: label, placeholder, checks) | an entry in goatty's command palette that asks for its inputs, then types its quoted `run` line into the focused terminal | `commands` |
+| Palette commands | `[[command]]` + `[[command.input]]` (typed inputs: label, placeholder, checks), `[command.menu]` | an entry in goatty's command palette (and, with `menu`, the terminal's right-click menu) that asks for its inputs, then types its quoted `run` line into the focused terminal | `commands` |
 | Snippets | `[[snippet]]` + `[[snippet.input]]` (a command line with `{input}` blanks; typed inputs, flags, several values) | entries in the snippet picker (Ctrl+Shift+S) that ask for their blanks and put the quoted line on the prompt ([`snippets.md`](snippets.md)) | `snippets` |
 | Snippet suggestions | `[snippet.input.source]` (`run`: argv of a package executable or required command; `split`, `column`, `label`, `detail`, `skip`, `on_fail`, `timeout`) | the host runs it when the field opens, in the pane's directory, without a shell | `snippet-sources` (reason required) |
 | Expansions | `[[expansion]]` (`say` → `to`, placeholders typed `word`/`integer`) | a row in the generation's `expansions.zsh`, rewritten on Space by goatty's widget | `snippets` |
@@ -159,7 +159,18 @@ A `[[command]]` is an entry in goatty's command palette, shown as "<plugin name>
 
 With the answers, goatty types the `run` line into the focused terminal and presses Enter, so the user sees exactly what runs (it's in their history too). Each `run` word is a template with `{input}` (inside a word too: `--level={depth}`); goatty quotes every word for the shell, a whole-word `{input}` whose optional value is empty is left out, and a path or folder value starting with `~/` keeps the `~/` unquoted so the shell expands it (inside a word, `--out={dir}`, it becomes `"$HOME"`). Values can't contain control characters, which would act as keys when typed. A value can't become shell syntax (`commands::tests::quoted_lines_survive_a_real_shell`). Before typing, goatty clears what was typed at the prompt (Ctrl+E Ctrl+U; Ctrl+Y brings it back). When another program runs in the focused pane (or shell integration reports a running command), or the active tab is on another host than the one the command came from, goatty doesn't type and offers to copy the line instead. Relative path answers are checked in the focused pane's directory, where the command runs.
 
-The commands come from the plugins installed and enabled on the active tab's host, so a remote host's plugins bring their commands while a tab on it is active. Validation checks ids, that `run`'s first word is one of the plugin's executables or required commands (no template), that every `{x}` is an input, and each input's type-specific fields (`min` ≤ `max`, a valid `pattern`, `choices` only and always for `choice`, `default` passing the input's own check).
+A command can also be in the terminal's right-click menu (#186), under a heading with the plugin's name (more than three plugin entries fold into a "Plugins" submenu):
+
+```toml
+[command.menu]
+icon = "search"        # one of goatty_plugin::commands::MENU_ICONS; default: the plugin icon
+when = "selection"     # always (default) | selection (text is selected) | prompt (a shell waits)
+fill = "container"     # when = "selection": the text or path input the selected text fills in
+```
+
+The selected text (its first non-empty line, without control characters) only fills in the input's starting value: the inputs are still asked, so the user sees and can change it before anything is typed. The install plan lists such commands with "(also in the right-click menu)". `menu` is only serialized when present, but a goatty older than this one refuses manifests that use it, so set `compat.goatty` accordingly.
+
+The commands come from the plugins installed and enabled on the active tab's host, so a remote host's plugins bring their commands while a tab on it is active. Validation checks ids, that `run`'s first word is one of the plugin's executables or required commands (no template), that every `{x}` is an input, and each input's type-specific fields (`min` ≤ `max`, a valid `pattern`, `choices` only and always for `choice`, `default` passing the input's own check), and for `[command.menu]` the icon name and that `fill` is a text, path or folder input of a `when = "selection"` command.
 
 ### Templates
 
