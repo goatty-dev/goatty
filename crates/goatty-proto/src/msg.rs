@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -47,6 +47,11 @@ pub const SHELL_SINCE: u32 = 9;
 /// Daemons from v10 on also keep their sessions across a crash or
 /// `systemctl --user restart` under the systemd service.
 pub const RESTART_SINCE: u32 = 10;
+
+/// v11: line numbers (`ServerMsg::TopLine`), scrollback on demand
+/// (`FetchHistory` / `History`) and zstd-compressed snapshots
+/// (`Compress` / `ServerMsg::Zstd`).
+pub const HISTORY_SINCE: u32 = 11;
 
 /// The version to use with a peer whose newest version is `peer`, or
 /// `None` when the ranges don't overlap.
@@ -238,6 +243,36 @@ pub enum ClientMsg {
         req: ReqId,
         exe: Option<String>,
     },
+    /// v11: up to `count` rows of the session's primary screen just before
+    /// host line `before` (see `ServerMsg::TopLine`), to fill the client's
+    /// scrollback. Answered with `History` even when the daemon has none
+    /// of them any more.
+    FetchHistory {
+        req: ReqId,
+        session: SessionId,
+        before: u64,
+        count: u32,
+    },
+    /// v11: from now on, send snapshots and history on this connection
+    /// zstd-compressed (`ServerMsg::Zstd`) when that makes them smaller.
+    /// Live output is never compressed. Remote clients ask for it; on the
+    /// local socket it would only cost time. No reply.
+    Compress {
+        zstd: bool,
+    },
+}
+
+/// Why the daemon sent `ServerMsg::TopLine`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TopLineCause {
+    /// Right after `Attached`: every row of the client's terminal came from
+    /// the snapshot.
+    Attach,
+    /// Right after `Resync`: the screen is current, the history above it
+    /// misses what was skipped.
+    Resync,
+    /// The session was resized: rows reflowed on both sides.
+    Resize,
 }
 
 /// A saved window layout (see `ClientMsg::SaveLayout`).
@@ -385,6 +420,38 @@ pub enum ServerMsg {
         req: ReqId,
         reply: String,
     },
+    /// v11: the top row of the session's primary screen is host line
+    /// `line`, as of this point in the stream. Rows count from the
+    /// session's start, so a number keeps meaning the same row while output
+    /// scrolls; the client pins its terminal's rows to them and asks for
+    /// what it misses with `FetchHistory`. Sent after `Attached`, `Resync`
+    /// and a resize, while the primary screen is active. Not stream data.
+    TopLine {
+        session: SessionId,
+        line: u64,
+        cause: TopLineCause,
+    },
+    /// v11: reply to `FetchHistory`: the rows from host line `first` up to
+    /// `before` as VT text (each row ends with a newline; a soft-wrapped
+    /// row doesn't, so it wraps again), for the client to insert into its
+    /// scrollback. `oldest` is the oldest line the daemon still has; empty
+    /// `data` means it has none of them.
+    History {
+        req: ReqId,
+        session: SessionId,
+        before: u64,
+        first: u64,
+        oldest: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// v11: another `ServerMsg` (postcard), zstd-compressed. Only after the
+    /// client sent `Compress`, and only for `Attached`, `Resync` and
+    /// `History`. Flow control counts the inner message's stream bytes.
+    Zstd {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
 }
 
 impl ServerMsg {
@@ -400,7 +467,8 @@ impl ServerMsg {
             | ServerMsg::ShellsReloaded { req, .. }
             | ServerMsg::Plugin { req, .. }
             | ServerMsg::Layout { req, .. }
-            | ServerMsg::Shell { req, .. } => Some(*req),
+            | ServerMsg::Shell { req, .. }
+            | ServerMsg::History { req, .. } => Some(*req),
             ServerMsg::Error { req, .. } => *req,
             _ => None,
         }
@@ -414,6 +482,14 @@ impl ServerMsg {
             ServerMsg::Attached { snapshot, .. } | ServerMsg::Resync { snapshot, .. } => snapshot.len(),
             ServerMsg::Output { data, .. } => data.len(),
             _ => 0,
+        }
+    }
+
+    /// Bytes of snapshot or history it carries (what compression is for).
+    pub fn payload_len(&self) -> usize {
+        match self {
+            ServerMsg::History { data, .. } => data.len(),
+            m => m.stream_len(),
         }
     }
 }
@@ -453,5 +529,13 @@ mod tests {
         // v9 additions come after v8's.
         assert_eq!(postcard::to_allocvec(&ClientMsg::Shell { req: 1, request: String::new() }).unwrap()[0], 22);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Shell { req: 1, reply: String::new() }).unwrap()[0], 16);
+        // v11 additions come after v10's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Restart { req: 1, exe: None }).unwrap()[0], 23);
+        let fetch = ClientMsg::FetchHistory { req: 1, session: 1, before: 9, count: 1 };
+        assert_eq!(postcard::to_allocvec(&fetch).unwrap()[0], 24);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Compress { zstd: true }).unwrap()[0], 25);
+        let top = ServerMsg::TopLine { session: 1, line: 9, cause: TopLineCause::Attach };
+        assert_eq!(postcard::to_allocvec(&top).unwrap()[0], 17);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Zstd { data: vec![] }).unwrap()[0], 19);
     }
 }

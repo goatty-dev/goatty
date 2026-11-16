@@ -23,6 +23,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 serde_bytes = "0.11"
+# Snapshots and history over remote links (goatty-proto).
+zstd = { version = "0.14", default-features = false }
 libc = "0.2"
 log = "0.4"
 env_logger = "0.11"

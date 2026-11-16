@@ -1,6 +1,6 @@
 # Remote goattyd: architecture and plan
 
-**Date:** 2026-11-07, updated 2026-11-09 · **Status:** R0 implemented (protocol v2, SSH/stdio transports, flow control, reconnect). R1 in progress: version negotiation, goattyd auto-install, plain SSH fallback, SSH prompts in the GUI and the systemd user service are done (§5a, §5b).
+**Date:** 2026-11-07, updated 2026-11-09 · **Status:** R0 implemented (protocol v2, SSH/stdio transports, flow control, reconnect). R1 in progress: version negotiation, goattyd auto-install, plain SSH fallback, SSH prompts in the GUI, the systemd user service, lazy history and compression are done (§4a, §5a, §5b).
 
 **Goal:** the GUI connects to *any* goattyd: on this machine, on a home server over Tailscale, on a cloud box over SSH, or in a container. Rendering stays local on the GPU. Sessions live on the host and survive the client. Local performance must not regress, and remote must stay usable on poor links.
 
@@ -85,9 +85,22 @@ Effects:
 - **Remote flood** (`cat 1GB.log` over a 2 MB/s link): bandwidth use is bounded, the screen shows current output every round, and **Ctrl+C → prompt visible ≈ window / bandwidth + RTT** (256 KiB at 2 MB/s ≈ 130 ms). With unbounded forwarding (plain ssh, or our Stage 0 queues) that is "after the whole backlog drained".
 - **Many panes on one link:** worst-case head-of-line delay ≈ Σ windows / bandwidth. Bounded, and see R1 "interactive priority".
 - **Memory:** daemon queues are bounded by Σ windows. Stage 0 had unbounded per-client queues, which a stalled SSH client could grow to gigabytes.
-- **Cost of skipping:** lines skipped during a flood are missing from the *client's* scrollback. The daemon still has them (R1: lazy history fetch fills the gap on scroll-up).
+- **Cost of skipping:** lines skipped during a flood are missing from the *client's* scrollback until the user scrolls up to the gap; then the client fetches them from the daemon (§4a).
 
 Covered by `slow_client_is_skipped_forward_with_resync`: an 8 MB flood to a non-acking client delivers < 1 MB, and the subsequent `Resync` shows the final screen.
+
+## 4a. Scrollback on demand and compression (v11, #10, #11)
+
+The attach snapshot replays only the newest lines (2000 remote, 5000 local; the daemon keeps 10 000), and a resync skips lines. Both are fetched when the user scrolls up to them, so attaching stays fast and nothing the daemon has is lost.
+
+- **Host lines.** Every row of a session's primary screen has a number: rows count from the session's start (rio-vt's evicted-row count plus the position in the scrollback), so a number keeps meaning the same row while output scrolls and old rows drop off. Column reflow renumbers rows, on both sides alike.
+- **`TopLine{session, line, cause}`** (in stream order, not stream data): "the top row of the screen is host line `line`". The daemon sends it after `Attached`, after `Resync` and after a resize (to every v11 subscriber when the size changed, else to the client that asked), while the primary screen is active. The client's screen matches the daemon's at that point, so it pins the mirror's rows to host lines (`goatty_term::history`): after an attach every row is the daemon's, after a resync the screen starts a new run, and rows that came in as live output continue the numbering. Missing lines are host lines older than the oldest mapped row, and jumps between two runs (what a resync skipped).
+- **`FetchHistory{req, session, before, count}` → `History{req, session, before, first, oldest, data}`**: the rows `first..before` as VT text (styles, prompt marks, soft wraps and OSC 8 links, like a snapshot), at most 5000 per request; `oldest` stops the client asking for lines the daemon dropped. The GUI asks whenever a frame is drawn scrolled up and the viewport is within two screens of missing lines (`Session::fill_history`, 1000 lines a time, one request in flight per pane).
+- **Inserting** rebuilds the mirror's primary grid from a snapshot of its own rows with the fetched ones spliced in (rio-vt can't insert rows into its scrollback), on a scratch terminal, then swaps the grid in under the lock. Modes, the cursor and its pen stay; the viewport keeps showing the same rows. The parser lock is held throughout, so no output gets in between.
+- **Limits.** A reflow (column change) loses track of a resync gap: the client then keeps only the screen's run and fetches nothing above it. Nothing is fetched while the alternate screen is active, nor after a resize there until the next resync or reattach. The mirror keeps at most 10 000 lines, like the daemon.
+- **Compression.** A v11 client on a remote link sends `Compress{zstd: true}` right after the handshake. From then on the daemon sends `Attached`, `Resync` and `History` of at least 1 KiB wrapped in `Zstd{data}` (zstd level 3 over the postcard message) when that's smaller. Live output stays uncompressed: chunks are small, and latency matters more. Flow control counts the inner message's stream bytes on both sides, so windows mean the same as before. The local socket doesn't compress (it would only cost time).
+
+Covered by `goatty-term`'s `history` tests (trimmed attach, resync gap, resize, hyperlinks and the pen surviving an insert), `scrollback_is_fetched_from_the_daemon_on_demand` (4000 lines over `goattyd proxy`: the second client attaches with 2000, scrolls up and ends with all 4000 in order) and `snapshots_and_history_are_compressed_when_asked`.
 
 ## 5. Transports
 
@@ -186,6 +199,18 @@ Headless client feeding a real mirror VT (the GUI's work minus rendering), 200×
 
 Echo latency includes the PTY round trip and the benchmark's 0.2 ms polling. On the throttled link, naive forwarding would need ~100 s to drain the flood before the prompt (or a Ctrl+C) became visible. With skip-and-resync the prompt shows when the command finishes, and keystrokes stay fast during the flood. Local throughput is lossless and well above what the GUI renders (~100 MB/s end to end in Stage 0), so the protocol is not the bottleneck.
 
+### Snapshots and history (`cargo run --release -p goatty-daemon --example snapbench [FILE]`)
+
+120×40 terminal fed with this repository's Rust sources (lightly colored), 10 000 lines of history:
+
+| | Time | Size |
+|---|---|---|
+| Attach snapshot, 2000 lines: zstd level 3 | 0.23 ms (decompress 0.06 ms) | 95 KB → 25 KB (3.7×) |
+| `History`, 1000 lines: serialize / zstd | 0.39 / 0.11 ms | 44 KB → 13 KB (3.4×) |
+| Insert 1000 fetched lines above 2000 / 8000 (client) | 1.9 / 4.4 ms | |
+
+Compression costs far less than sending the bytes over any remote link (25 KB less is 12 ms at 2 MB/s). Inserting rebuilds the whole grid, so it grows with the mirror's scrollback; at the 10 000-line cap it stays a few milliseconds per 1000 fetched lines, on the reader thread.
+
 ### Budget
 
 | Path | Budget | Notes |
@@ -193,7 +218,7 @@ Echo latency includes the PTY round trip and the benchmark's 0.2 ms polling. On 
 | Local flood throughput | ≥ Stage 0 | One encode per chunk shared by all subscribers, batched writes with flush-on-idle, acks only every ≥2 MiB or per drained read. Still to do: re-run the GUI `scripts/bench.sh` |
 | Local keystroke → PTY | < 0.2 ms added | Writer thread flushes as soon as its queue is empty |
 | Remote keystroke echo | RTT + ~1 ms | R3 adds prediction to hide the RTT |
-| Remote attach | ≤ 2000 lines of history | ~100–300 KB uncompressed. R1: zstd plus lazy history |
+| Remote attach | ≤ 2000 lines of history | ~100 KB of source code, 25 KB with zstd (§7 snapbench); older lines on scroll-up |
 | Remote flood: Ctrl+C visible | ≈ window/bandwidth + RTT | 256 KiB window |
 | Daemon memory per subscriber | ≤ window | Was unbounded |
 | Idle | 0 wakeups locally, 1 ping per 5 s remote | |
@@ -215,8 +240,8 @@ Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow con
 4. ✅ **Daemon as systemd user service** (opt-in, socket-activated) with linger guidance (§5b). FDSTORE: #131.
 5. **Interactive priority in the daemon writer**: small frames (echo, prompts) jump ahead of bulk frames from flooding panes. This removes most cross-pane head-of-line delay on one link.
 6. **Adaptive window**: measure delivery rate from acks and RTT from pings, then set `window ≈ max(64 KiB, rate × 50 ms)`. A fast LAN streams losslessly, a slow link skips early.
-7. **Lazy history**: `FetchHistory{session, before_line, count}` fills the client's scrollback on demand. It covers both the trimmed attach snapshot and lines skipped by resync. It needs stable line numbering (absolute line index since session start) in the snapshot.
-8. **Compression** for snapshots and history (zstd, negotiated). Live output stays uncompressed (it's small, and latency matters more). Users can also set `Compression yes` in ssh_config.
+7. ✅ **Lazy history**: `FetchHistory` fills the client's scrollback on demand, for the trimmed attach snapshot and for lines skipped by resync, with stable host line numbers (§4a).
+8. ✅ **Compression** for snapshots and history (zstd, negotiated per connection; §4a). Live output stays uncompressed (it's small, and latency matters more).
 9. **Size policy for multiple clients**: one *controlling* client per session sets the PTY size. Others watch (letterboxed) or take over explicitly. Today, last resize wins.
 10. **Daemon-side liveness**: drop subscribers whose connection has been silent for >60 s (pings), so the attached count and size control are correct after a client vanished without FIN.
 11. **Client vs host settings split** in the profile model (font/keys/theme are client; shell/plugins/env are host). The plugin manager always acts on the connected host.
@@ -236,7 +261,7 @@ Mosh-style **local echo prediction** using the client's mirror VT, which we alre
 |---|---|
 | Version skew between GUI and remote daemon | Version range negotiation; install/restart from the connect screen (§5a) |
 | Head-of-line blocking across panes on one SSH stream | Bounded by Σ windows; R1 interactive priority; R2 QUIC streams |
-| Scrollback gaps after resync | R1 lazy history from the daemon's authoritative scrollback |
+| Scrollback gaps after resync | Fetched from the daemon's scrollback on scroll-up (§4a); lost after a column resize |
 | Security: proxy access = full control of the daemon | Same trust as an SSH shell on that host; the daemon socket stays 0600 and is never exposed |
 | `$XDG_RUNTIME_DIR` removed on logout | Watchdog re-bind (done); systemd user unit + linger (done, opt-in) |
 | `goattyd` not in PATH for non-interactive SSH | Script searches common dirs; `--remote-daemon`; auto-install (done) |

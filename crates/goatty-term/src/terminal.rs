@@ -45,7 +45,8 @@ pub(crate) type Term = Crosswords<Listener>;
 
 pub(crate) struct Inner {
     pub(crate) term: Mutex<Term>,
-    parser: Mutex<Parser>,
+    /// Lock order: `parser`, `term`, `lines`.
+    pub(crate) parser: Mutex<Parser>,
     size: Arc<AtomicU32>,
     /// For the marks rio-vt doesn't report (see `marks`).
     ui: flume::Sender<UiEvent>,
@@ -58,12 +59,14 @@ pub(crate) struct Inner {
     /// The shell said at its prompt that goatty's command-line widgets are
     /// bound (`OSC 7337;zle=1`); cleared when a command starts.
     pub(crate) zle: AtomicBool,
+    /// Which host line each row shows (clients; see `history`).
+    pub(crate) lines: Mutex<crate::history::LineMap>,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
 /// see every byte, in order.
 #[derive(Default)]
-struct Parser {
+pub(crate) struct Parser {
     vt: Processor,
     marks: MarkScanner,
     /// The marks found in the chunk being fed (kept for its allocation).
@@ -109,6 +112,7 @@ impl Terminal {
             shell: AtomicU8::new(0),
             started: AtomicU64::new(0),
             zle: AtomicBool::new(false),
+            lines: Mutex::new(Default::default()),
         };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
@@ -251,8 +255,9 @@ impl Terminal {
     }
 
     pub fn resize(&self, size: TermSize) {
-        self.inner.size.store(pack(size), Ordering::Relaxed);
+        let old = self.inner.size.swap(pack(size), Ordering::Relaxed);
         self.inner.term.lock().resize(size.to_crosswords());
+        self.line_map_resized(old >> 16 != size.cols as u32);
     }
 
     pub fn size(&self) -> (u16, u16) {

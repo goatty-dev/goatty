@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use goatty_proto::{Frame, ReqId, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode};
+use goatty_proto::{Frame, ReqId, ServerMsg, SessionId, SessionInfo, StreamOpts, TopLineCause, WinSize, encode, encode_server};
 use goatty_term::process::ForegroundWatch;
 use goatty_term::pty::Pty;
 use goatty_term::{TermSize, Terminal};
@@ -31,6 +31,17 @@ pub(crate) struct Subscriber {
     acked: AtomicU64,
     lagging: AtomicBool,
     skipped: AtomicU64,
+    /// The client speaks v11: it gets `TopLine`s.
+    lines: bool,
+    /// Compress snapshots (the connection sent `Compress`).
+    pub(crate) zstd: AtomicBool,
+}
+
+/// What a connection's subscriptions get besides the stream.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SubFeatures {
+    pub(crate) lines: bool,
+    pub(crate) zstd: bool,
 }
 
 impl Subscriber {
@@ -41,6 +52,13 @@ impl Subscriber {
 
     fn in_flight(&self) -> u64 {
         self.sent.load(Ordering::Acquire).saturating_sub(self.acked.load(Ordering::Acquire))
+    }
+
+    /// A snapshot message, compressed if the client asked for it.
+    fn push_snapshot(&self, msg: &ServerMsg) {
+        if let Ok(f) = encode_server(msg, self.zstd.load(Ordering::Relaxed)) {
+            self.push(f, msg.stream_len());
+        }
     }
 }
 
@@ -211,18 +229,61 @@ impl Session {
         }
     }
 
-    pub(crate) fn resize(&self, ws: WinSize) {
+    /// Resize for connection `from` (`None`: before it subscribes). Rows
+    /// reflow, so subscribers that number lines hear the new top line: all
+    /// of them when the size changed, else just `from`. Lagging ones don't:
+    /// they lack output the line counts, and their `Resync` brings the line.
+    pub(crate) fn resize(&self, ws: WinSize, from: Option<u64>) {
         let size = to_size(ws);
-        if self.term.size() != (size.cols, size.rows) {
-            self.term.resize(size);
+        {
+            // The reflow and its top line are one point in the stream, like a
+            // snapshot and its top line in `subscribe`/`resync`.
+            let subs = self.subs.lock();
+            let changed = self.term.size() != (size.cols, size.rows);
+            if changed {
+                self.term.resize(size);
+            }
+            self.push_resized(&subs, changed, from);
         }
         if let Err(e) = self.pty.lock().resize(size) {
             log::warn!("session {}: resize failed: {e}", self.id);
         }
     }
 
+    /// Caller holds `subs`.
+    fn push_resized(&self, subs: &[Arc<Subscriber>], changed: bool, from: Option<u64>) {
+        if let Some(line) = self.term.top_line() {
+            let frame = encode(&ServerMsg::TopLine { session: self.id, line, cause: TopLineCause::Resize }).ok();
+            let wants = |s: &Subscriber| s.lines && !s.lagging.load(Ordering::Acquire) && (changed || Some(s.conn) == from);
+            for sub in subs.iter().filter(|s| wants(s)) {
+                if let Some(f) = &frame {
+                    sub.push(f.clone(), 0);
+                }
+            }
+        }
+    }
+
+    /// The top line message after a snapshot, for clients that number lines.
+    fn push_top_line(&self, sub: &Subscriber, cause: TopLineCause) {
+        if !sub.lines {
+            return;
+        }
+        if let Some(line) = self.term.top_line()
+            && let Ok(f) = encode(&ServerMsg::TopLine { session: self.id, line, cause })
+        {
+            sub.push(f, 0);
+        }
+    }
+
     /// Snapshot + subscribe under one lock. Returns the subscriber.
-    pub(crate) fn subscribe(&self, conn: u64, req: ReqId, opts: StreamOpts, tx: &flume::Sender<Frame>) -> Arc<Subscriber> {
+    pub(crate) fn subscribe(
+        &self,
+        conn: u64,
+        req: ReqId,
+        opts: StreamOpts,
+        features: SubFeatures,
+        tx: &flume::Sender<Frame>,
+    ) -> Arc<Subscriber> {
         let mut subs = self.subs.lock();
         subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
         let snapshot = self.term.reattach_snapshot_with_history(opts.history as usize);
@@ -234,11 +295,11 @@ impl Session {
             acked: AtomicU64::new(0),
             lagging: AtomicBool::new(false),
             skipped: AtomicU64::new(0),
+            lines: features.lines,
+            zstd: AtomicBool::new(features.zstd),
         });
-        let len = snapshot.len();
-        if let Ok(f) = encode(&ServerMsg::Attached { req, session: self.id, snapshot }) {
-            sub.push(f, len);
-        }
+        sub.push_snapshot(&ServerMsg::Attached { req, session: self.id, snapshot });
+        self.push_top_line(&sub, TopLineCause::Attach);
         let name = self.process.lock().clone();
         if name.is_some()
             && let Ok(f) = encode(&ServerMsg::Process { session: self.id, name })
@@ -269,10 +330,8 @@ impl Session {
     pub(crate) fn resync(&self, sub: &Subscriber) {
         let snapshot = self.term.resync_snapshot();
         let skipped = sub.skipped.swap(0, Ordering::AcqRel);
-        let len = snapshot.len();
-        if let Ok(f) = encode(&ServerMsg::Resync { session: self.id, skipped, snapshot }) {
-            sub.push(f, len);
-        }
+        sub.push_snapshot(&ServerMsg::Resync { session: self.id, skipped, snapshot });
+        self.push_top_line(sub, TopLineCause::Resync);
         sub.lagging.store(false, Ordering::Release);
     }
     /// The shell exited: let every subscriber see the final screen, then

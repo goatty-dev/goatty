@@ -20,6 +20,44 @@ pub fn encode<M: Serialize>(msg: &M) -> io::Result<Frame> {
     Ok(buf.into())
 }
 
+/// zstd level for snapshots and history: fast enough that compressing a
+/// 2000-line snapshot costs about a millisecond (see `remote-architecture.md` §7).
+pub const ZSTD_LEVEL: i32 = 3;
+
+/// Payloads smaller than this go uncompressed (they fit a few packets anyway).
+const COMPRESS_MIN: usize = 1024;
+
+/// Encode `msg`, compressed into a [`ServerMsg::Zstd`](crate::ServerMsg::Zstd)
+/// when `compress` is set, it's large enough and that makes it smaller.
+pub fn encode_server(msg: &crate::ServerMsg, compress: bool) -> io::Result<Frame> {
+    if compress && msg.payload_len() >= COMPRESS_MIN {
+        let plain = postcard::to_allocvec(msg).map_err(io::Error::other)?;
+        let packed = zstd::bulk::compress(&plain, ZSTD_LEVEL)?;
+        if packed.len() < plain.len() {
+            return encode(&crate::ServerMsg::Zstd { data: packed });
+        }
+    }
+    encode(msg)
+}
+
+impl crate::ServerMsg {
+    /// The message inside a [`ServerMsg::Zstd`](crate::ServerMsg::Zstd)
+    /// (anything else is returned as it is).
+    pub fn unpack(self) -> io::Result<Self> {
+        match self {
+            crate::ServerMsg::Zstd { data } => {
+                let plain = zstd::bulk::decompress(&data, MAX_FRAME)?;
+                match postcard::from_bytes(&plain) {
+                    Ok(crate::ServerMsg::Zstd { .. }) => Err(io::Error::new(io::ErrorKind::InvalidData, "nested zstd frame")),
+                    Ok(m) => Ok(m),
+                    Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+                }
+            }
+            m => Ok(m),
+        }
+    }
+}
+
 /// Encode and write one message (no flush; callers decide batching).
 pub fn write_msg<W: Write, M: Serialize>(w: &mut W, msg: &M) -> io::Result<()> {
     w.write_all(&encode(msg)?)
@@ -51,6 +89,21 @@ mod tests {
         assert!(matches!(read_msg::<_, ClientMsg>(&mut r).unwrap(), ClientMsg::Input { session: 7, data } if data == b"ls\r"));
         assert!(matches!(read_msg::<_, ServerMsg>(&mut r).unwrap(), ServerMsg::Exited { session: 3, code: Some(0) }));
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn snapshots_compress_when_asked() {
+        let snapshot: Vec<u8> = (0..2000).flat_map(|i| format!("\x1b[32mline {i}\x1b[0m some output\r\n").into_bytes()).collect();
+        let msg = ServerMsg::Attached { req: 3, session: 1, snapshot: snapshot.clone() };
+        let plain = encode_server(&msg, false).unwrap();
+        let packed = encode_server(&msg, true).unwrap();
+        assert!(packed.len() * 4 < plain.len(), "{} vs {}", packed.len(), plain.len());
+        let read = read_msg::<_, ServerMsg>(&mut &packed[..]).unwrap();
+        assert!(matches!(read, ServerMsg::Zstd { .. }));
+        assert!(matches!(read.unpack().unwrap(), ServerMsg::Attached { req: 3, session: 1, snapshot: s } if s == snapshot));
+        // Small or incompressible payloads go as they are.
+        let small = ServerMsg::Resync { session: 1, skipped: 0, snapshot: b"x".to_vec() };
+        assert!(matches!(read_msg::<_, ServerMsg>(&mut &encode_server(&small, true).unwrap()[..]).unwrap(), ServerMsg::Resync { .. }));
     }
 
     #[test]

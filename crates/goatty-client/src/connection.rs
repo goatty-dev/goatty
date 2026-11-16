@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
-    ClientMsg, FileDiff, Frame, GenerationInfo, HostInfo, LayoutId, LayoutInfo, PROTOCOL_VERSION, RUN_SINCE, ReqId, SHELL_SINCE, ServerMsg,
-    SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
+    ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, PROTOCOL_VERSION, RUN_SINCE, ReqId,
+    SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
 };
 use parking_lot::Mutex;
 
 use crate::handshake::Outcome;
 use crate::transport::{Closer, Endpoint, Transport};
-use crate::{PaneEvent, PaneSink, handshake, remote};
+use crate::{History, PaneEvent, PaneSink, handshake, remote};
 
 /// How long to wait for a failed transport command's last words on stderr.
 const STDERR_GRACE: Duration = Duration::from_secs(2);
@@ -61,8 +61,14 @@ pub struct HostSettingsApplied {
 
 enum Pending {
     Reply(flume::Sender<ServerMsg>),
-    Attach { tx: flume::Sender<ServerMsg>, sink: Arc<dyn PaneSink>, size: WinSize },
+    Attach {
+        tx: flume::Sender<ServerMsg>,
+        sink: Arc<dyn PaneSink>,
+        size: WinSize,
+    },
     Reattach(SessionId),
+    /// `fetch_history`: the answer goes to the pane's sink.
+    History(SessionId),
 }
 
 type Reader = std::io::BufReader<Box<dyn Read + Send>>;
@@ -153,6 +159,11 @@ impl Shared {
                 self.daemon_pid.store(g.pid, Ordering::Relaxed);
                 self.last_rx_us.store(self.now_us(), Ordering::Relaxed);
                 self.connected.store(true, Ordering::Release);
+                // Snapshots and history are mostly repetitive text: worth
+                // compressing on a remote link, not on the local socket.
+                if g.version >= HISTORY_SINCE && !self.endpoint.is_local() {
+                    self.send(&ClientMsg::Compress { zstd: true });
+                }
                 Ok(Some((t.reader, g.host, g.pid)))
             }
             Ok(Outcome::RetryWith(v)) => {
@@ -327,6 +338,26 @@ impl Connection {
             ServerMsg::Attached { .. } => Ok(()),
             other => bail!("unexpected reply {other:?}"),
         }
+    }
+
+    /// Ask for up to `count` rows of `session`'s history before host line
+    /// `before` (what `goatty_term::Terminal::wanted_history` says). Never
+    /// blocks: the answer goes to the pane's [`PaneSink::history`]. False
+    /// when it wasn't sent (no link, or a daemon older than protocol v11).
+    pub fn fetch_history(&self, session: SessionId, before: u64, count: u32) -> bool {
+        let req = self.shared.req_id();
+        {
+            // Checked under the lock the disconnect drain takes: a request
+            // registered here is either drained (and answered with `None`) or
+            // goes out on a live link.
+            let mut pending = self.shared.pending.lock();
+            if !self.is_connected() || self.protocol_version() < HISTORY_SINCE {
+                return false;
+            }
+            pending.insert(req, Pending::History(session));
+        }
+        self.shared.send(&ClientMsg::FetchHistory { req, session, before, count });
+        true
     }
 
     pub fn detach(&self, session: SessionId) {
@@ -533,7 +564,14 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
         }
         log::warn!("link to goattyd lost: {err}");
         // Fail in-flight requests; keep panes for reattach.
-        s.pending.lock().clear();
+        let failed: Vec<Pending> = s.pending.lock().drain().map(|(_, p)| p).collect();
+        for p in failed {
+            if let Pending::History(session) = p
+                && let Some(sink) = s.panes.lock().get(&session).map(|p| p.sink.clone())
+            {
+                sink.history(None);
+            }
+        }
         let sinks: Vec<_> = s.panes.lock().values().map(|p| p.sink.clone()).collect();
         for sink in &sinks {
             sink.event(PaneEvent::Disconnected(err.to_string()));
@@ -604,7 +642,7 @@ fn needs_user_input(e: &anyhow::Error) -> bool {
 
 fn read_loop(s: &Shared, reader: &mut Reader) -> anyhow::Error {
     loop {
-        let msg: ServerMsg = match read_msg(reader) {
+        let msg: ServerMsg = match read_msg(reader).and_then(ServerMsg::unpack) {
             Ok(m) => m,
             Err(e) => return e.into(),
         };
@@ -688,6 +726,20 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 sink.event(PaneEvent::Process(name));
             }
         }
+        ServerMsg::TopLine { session, line, cause } => {
+            let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+            if let Some(sink) = sink {
+                sink.top_line(line, cause);
+            }
+        }
+        ServerMsg::History { req, session, before, first, oldest, data } => {
+            let pending = s.pending.lock().remove(&req);
+            let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+            if let (Some(Pending::History(_)), Some(sink)) = (pending, sink) {
+                sink.history(Some(History { before, first, oldest, data }));
+            }
+        }
+        ServerMsg::Zstd { .. } => log::warn!("nested compressed frame"),
         ServerMsg::Pong { nonce } => {
             s.rtt_us.store(s.now_us().saturating_sub(nonce).max(1), Ordering::Relaxed);
         }
@@ -713,6 +765,13 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 Some(Pending::Reattach(session)) => {
                     if let Some(p) = s.panes.lock().remove(&session) {
                         p.sink.event(PaneEvent::Lost(message.clone()));
+                    }
+                }
+                Some(Pending::History(session)) => {
+                    log::debug!("session {session}: no history: {message}");
+                    let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+                    if let Some(sink) = sink {
+                        sink.history(None);
                     }
                 }
                 None => {}

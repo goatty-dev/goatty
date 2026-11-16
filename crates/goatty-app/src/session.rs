@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use goatty_client::{Connection, PaneEvent, PaneSink};
+use goatty_client::{Connection, History, PaneEvent, PaneSink, TopLineCause};
 use goatty_proto::WinSize;
 use goatty_shell::HostService;
 use goatty_term::process::ForegroundWatch;
 use goatty_term::pty::{Pty, ShellCommand};
-use goatty_term::{Palette, TermSize, Terminal, UiEvent};
+use goatty_term::{HistoryRows, Palette, TermSize, Terminal, UiEvent};
 use parking_lot::Mutex;
 
 /// Coalescing wake-up: many output chunks → one UI notification per frame.
@@ -76,6 +76,8 @@ pub struct Session {
     /// Local sessions watch their own PTY; daemon sessions hear it from goattyd.
     fg: std::sync::OnceLock<ForegroundWatch>,
     waker: Arc<Waker>,
+    /// A `fetch_history` is on its way.
+    fetching: AtomicBool,
 }
 
 /// Makes the sessions for new tabs and panes: on a goattyd connection, as
@@ -179,6 +181,30 @@ impl PaneSink for Sink {
         }
         s.waker.wake();
     }
+
+    fn top_line(&self, line: u64, cause: TopLineCause) {
+        if let Some(s) = self.0.upgrade() {
+            let cause = match cause {
+                TopLineCause::Attach => goatty_term::TopLineCause::Attach,
+                TopLineCause::Resync => goatty_term::TopLineCause::Resync,
+                TopLineCause::Resize => goatty_term::TopLineCause::Resize,
+            };
+            s.terminal.set_top_line(line, cause);
+        }
+    }
+
+    fn history(&self, history: Option<History>) {
+        let Some(s) = self.0.upgrade() else { return };
+        if let Some(h) = history {
+            let rows = HistoryRows { first: h.first, oldest: h.oldest, data: h.data };
+            if !s.terminal.insert_history(h.before, &rows) {
+                log::debug!("history before line {} no longer fits; asking again", h.before);
+            }
+        }
+        s.fetching.store(false, Ordering::Release);
+        // Redraw, which also asks for more if the viewport is still near a gap.
+        s.waker.wake();
+    }
 }
 
 impl Session {
@@ -196,6 +222,7 @@ impl Session {
             process: Mutex::new(None),
             fg: std::sync::OnceLock::new(),
             waker,
+            fetching: AtomicBool::new(false),
         }
     }
 
@@ -361,6 +388,21 @@ impl Session {
                 }
                 conn.input(id.load(Ordering::Relaxed), bytes)
             }
+        }
+    }
+
+    /// Fetch scrollback the daemon has and this terminal lacks, when the
+    /// viewport is near it (older lines, or what a resync skipped). Cheap;
+    /// call it whenever the view is scrolled up. Never blocks.
+    pub fn fill_history(&self) {
+        let Backend::Daemon { conn, id } = &self.backend else { return };
+        if self.fetching.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let margin = self.terminal.size().1 as usize * 2;
+        let sent = self.terminal.wanted_history(margin).is_some_and(|w| conn.fetch_history(id.load(Ordering::Relaxed), w.before, w.count));
+        if !sent {
+            self.fetching.store(false, Ordering::Release);
         }
     }
 

@@ -6,7 +6,9 @@
 //!   of buffering without bound,
 //! * the remote path (`goattyd proxy` over stdio, exactly what ssh runs)
 //!   works, including transparent reconnect + reattach,
-//! * a window's saved layout goes to exactly one later window.
+//! * a window's saved layout goes to exactly one later window,
+//! * a client fills its scrollback from the daemon on demand (compressed
+//!   over the remote path).
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -15,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use goatty_client::{Connection, Control, Endpoint, PaneEvent, PaneSink};
+use goatty_client::{Connection, Control, Endpoint, History, PaneEvent, PaneSink, TopLineCause};
 use goatty_proto::{ClientMsg, PROTOCOL_VERSION, ServerMsg, SessionId, StreamOpts, WinSize, encode, read_msg};
 use goatty_term::{Frame, Palette, TermSize, Terminal};
 use parking_lot::Mutex;
@@ -96,7 +98,7 @@ fn pump_until(s: &mut UnixStream, session: SessionId, t: &Terminal, consumed: &m
             ServerMsg::Attached { session: id, snapshot, .. } | ServerMsg::Resync { session: id, snapshot, .. } if id == session => {
                 t.feed(&snapshot);
             }
-            ServerMsg::Output { .. } | ServerMsg::Pong { .. } | ServerMsg::Process { .. } => {}
+            ServerMsg::Output { .. } | ServerMsg::Pong { .. } | ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
         send(s, &ClientMsg::Ack { session, consumed: *consumed });
@@ -108,8 +110,8 @@ fn create(s: &mut UnixStream, opts: StreamOpts) -> (SessionId, u64) {
     loop {
         match read_msg::<_, ServerMsg>(s).unwrap() {
             ServerMsg::Attached { req: 1, session, snapshot } => return (session, snapshot.len() as u64),
-            // Another session's foreground program (multiplexed connection).
-            ServerMsg::Process { .. } => {}
+            // Another session's foreground program or line numbers (multiplexed connection).
+            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
             other => panic!("{other:?}"),
         }
     }
@@ -206,7 +208,7 @@ fn sessions_multiplex_over_one_connection() {
                 c2 += data.len() as u64;
                 t2.feed(&data);
             }
-            ServerMsg::Process { .. } => {}
+            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
             other => panic!("{other:?}"),
         }
     }
@@ -301,6 +303,9 @@ fn foreground_program_changes_are_reported() {
 struct TestSink {
     term: Mutex<Option<Terminal>>,
     events: Mutex<Vec<String>>,
+    /// History answers and top lines received.
+    histories: Mutex<u32>,
+    tops: Mutex<u32>,
 }
 
 impl PaneSink for TestSink {
@@ -309,6 +314,21 @@ impl PaneSink for TestSink {
     }
     fn event(&self, ev: PaneEvent) {
         self.events.lock().push(format!("{ev:?}"));
+    }
+    fn top_line(&self, line: u64, cause: TopLineCause) {
+        let cause = match cause {
+            TopLineCause::Attach => goatty_term::TopLineCause::Attach,
+            TopLineCause::Resync => goatty_term::TopLineCause::Resync,
+            TopLineCause::Resize => goatty_term::TopLineCause::Resize,
+        };
+        self.term.lock().get_or_insert_with(term).set_top_line(line, cause);
+        *self.tops.lock() += 1;
+    }
+    fn history(&self, history: Option<History>) {
+        let h = history.expect("history answer");
+        let rows = goatty_term::HistoryRows { first: h.first, oldest: h.oldest, data: h.data };
+        assert!(self.term.lock().as_ref().unwrap().insert_history(h.before, &rows));
+        *self.histories.lock() += 1;
     }
 }
 
@@ -364,6 +384,106 @@ fn client_over_proxy_reconnects_and_reattaches() {
     conn.input(id, b"echo still-$MARK\r");
     sink.wait_for("still-proxied2");
     assert_eq!(session_info(&d.sock, id).pid, pid, "same shell process");
+}
+
+#[test]
+fn scrollback_is_fetched_from_the_daemon_on_demand() {
+    let d = start_daemon();
+    let conn = Connection::open(proxy_endpoint(&d), "test").unwrap();
+    let sink = Arc::new(TestSink::default());
+    // The first client sees the whole output live.
+    let id = conn.create(SIZE, None, sink.clone()).unwrap();
+    conn.input(id, b"i=0; while [ $i -lt 4000 ]; do i=$((i+1)); echo \"row $i\"; done; echo done-$((1+1))\r");
+    sink.wait_for("done-2");
+    conn.detach(id);
+
+    // A second client attaches over the remote path: the snapshot replays
+    // the newest 2000 lines only (compressed).
+    let conn = Connection::open(proxy_endpoint(&d), "test").unwrap();
+    let sink = Arc::new(TestSink::default());
+    conn.attach(id, SIZE, sink.clone()).unwrap();
+    let rows = |sink: &TestSink| -> Vec<String> {
+        let t = sink.term.lock();
+        let t = t.as_ref().unwrap();
+        // dash prints its prompt after the echoed command: `$ row 1`.
+        let row =
+            |l: &str| l.rfind("row ").map(|i| l[i..].to_string()).filter(|r| r[4..].bytes().all(|b| b.is_ascii_digit()) && r.len() > 4);
+        t.transcript().lines.iter().filter_map(|l| row(&l.text)).collect()
+    };
+    eventually("the attach snapshot and its top line", || rows(&sink).len() > 1000 && *sink.tops.lock() > 0);
+    assert!(!rows(&sink).contains(&"row 1".to_string()));
+    let mut fetches = 0;
+    loop {
+        let wanted = {
+            let t = sink.term.lock();
+            let t = t.as_ref().unwrap();
+            t.scroll(i32::MAX / 2);
+            t.wanted_history(24)
+        };
+        let Some(w) = wanted else { break };
+        let before = *sink.histories.lock();
+        assert!(conn.fetch_history(id, w.before, w.count));
+        eventually("a history answer", || *sink.histories.lock() > before);
+        fetches += 1;
+        assert!(fetches < 20, "keeps fetching");
+    }
+    let got = rows(&sink);
+    let want: Vec<String> = (1..=4000).map(|i| format!("row {i}")).collect();
+    assert_eq!(got, want);
+    assert!(fetches >= 2, "{fetches} fetches");
+}
+
+#[test]
+fn snapshots_and_history_are_compressed_when_asked() {
+    let d = start_daemon();
+    let mut c = connect(&d.sock);
+    let (id, _) = create(&mut c, StreamOpts::LOCAL);
+    send(&mut c, &ClientMsg::Input { session: id, data: b"i=0; while [ $i -lt 3000 ]; do i=$((i+1)); echo \"row $i\"; done\r".to_vec() });
+    let mut c2 = connect(&d.sock);
+    send(&mut c2, &ClientMsg::Compress { zstd: true });
+    // Wait for the output to finish, then attach with a short history.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let top = loop {
+        assert!(Instant::now() < deadline, "no output");
+        send(&mut c2, &ClientMsg::Attach { req: 7, session: id, size: SIZE, opts: StreamOpts { window: 8 << 20, history: 100 } });
+        // (Output still queued from the last attach comes first.)
+        let attached = std::iter::repeat_with(|| read_msg::<_, ServerMsg>(&mut c2).unwrap())
+            .find(|m| matches!(m, ServerMsg::Zstd { .. } | ServerMsg::Attached { .. }))
+            .unwrap();
+        // (Snapshots under 1 KiB go as they are.)
+        let compressed = matches!(attached, ServerMsg::Zstd { .. });
+        let ServerMsg::Attached { snapshot, .. } = attached.unpack().unwrap() else { panic!() };
+        let line = loop {
+            match read_msg::<_, ServerMsg>(&mut c2).unwrap() {
+                ServerMsg::TopLine { line, cause: goatty_proto::TopLineCause::Attach, .. } => break line,
+                ServerMsg::Process { .. } | ServerMsg::Output { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        };
+        if String::from_utf8_lossy(&snapshot).contains("row 3000") {
+            assert!(compressed, "a 100-line snapshot is compressed");
+            break line;
+        }
+        send(&mut c2, &ClientMsg::Detach { session: id });
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    send(&mut c2, &ClientMsg::FetchHistory { req: 8, session: id, before: top - 100, count: 1000 });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline);
+        match read_msg::<_, ServerMsg>(&mut c2).unwrap() {
+            m @ ServerMsg::Zstd { .. } => {
+                let ServerMsg::History { req: 8, first, before, data, .. } = m.unpack().unwrap() else { panic!() };
+                assert_eq!(before - first, 1000);
+                let text = String::from_utf8_lossy(&data);
+                assert_eq!(text.lines().count(), 1000);
+                assert!(text.ends_with("\r\n"));
+                break;
+            }
+            ServerMsg::Process { .. } | ServerMsg::Output { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 /// Wait until `f` holds.
