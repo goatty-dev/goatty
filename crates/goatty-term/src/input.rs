@@ -238,6 +238,38 @@ pub fn encode_mouse(button: MouseButton, action: MouseAction, col: usize, row: u
     Some(vec![0x1b, b'[', b'M', 32 + code as u8, 32 + x as u8, 32 + y as u8])
 }
 
+/// What goatty can do to the command line typed at a managed zsh's prompt
+/// (#186). Each is a private key sequence that goatty's shell integration
+/// binds to a zle widget (`goatty-shell/zsh/integration.zsh`); send it only
+/// while `Terminal::line_editing` says the widgets are there, since another
+/// shell or program would take it as typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEdit {
+    /// Report the line (`OSC 7337;line=`, arriving as `UiEvent::CommandLine`).
+    Report,
+    /// Put `sudo ` in front of the line, or take it away; on an empty line,
+    /// the previous command with `sudo`.
+    ToggleSudo,
+    /// Edit the line in `$VISUAL`/`$EDITOR` (zsh's `edit-command-line`).
+    OpenEditor,
+    /// Empty the line (it goes to the kill ring: Ctrl+Y brings it back).
+    Clear,
+}
+
+impl LineEdit {
+    pub const ALL: [LineEdit; 4] = [LineEdit::Report, LineEdit::ToggleSudo, LineEdit::OpenEditor, LineEdit::Clear];
+
+    /// The key sequence (a CSI no keyboard sends).
+    pub fn keys(self) -> &'static [u8] {
+        match self {
+            LineEdit::Report => b"\x1b[7337;1~",
+            LineEdit::ToggleSudo => b"\x1b[7337;2~",
+            LineEdit::OpenEditor => b"\x1b[7337;3~",
+            LineEdit::Clear => b"\x1b[7337;4~",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +299,14 @@ mod tests {
     fn paste_strips_injected_end_marker() {
         let out = encode_paste("rm -rf x\x1b[201~; echo pwned\n", TermMode::BRACKETED_PASTE);
         assert_eq!(out, b"\x1b[200~rm -rf x; echo pwned\n\x1b[201~");
+    }
+
+    #[test]
+    fn the_shell_binds_every_line_edit() {
+        let zsh = include_str!("../../goatty-shell/zsh/integration.zsh");
+        for e in LineEdit::ALL {
+            let seq = std::str::from_utf8(e.keys()).unwrap().replace('\x1b', "^[");
+            assert!(zsh.contains(&format!("'{seq}'")), "{e:?}: {seq} isn't bound in integration.zsh");
+        }
     }
 }

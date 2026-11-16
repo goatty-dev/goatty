@@ -6,6 +6,8 @@
 #   A  prompt starts            B  prompt ends, input starts
 #   C  command output starts    D;<status>  command finished
 # OSC 7 reports the working directory as a file:// URL.
+# OSC 7337 is goatty's own: zle=1 at each prompt says the command-line
+# widgets below are bound; line=… answers goatty asking for the typed line.
 #
 # Reference: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
 
@@ -25,6 +27,8 @@ _goatty_precmd() {
     _goatty_running=0
   fi
   _goatty_report_cwd
+  # goatty's menus may use the widgets below at this prompt.
+  builtin print -rn -- $'\e]7337;zle=1\a'
   # Mark the prompt inside PS1 so a redraw (e.g. after a resize) re-marks
   # it. Prompt themes set PS1 before this hook runs; checking every time
   # keeps the marks when a theme rebuilds PS1.
@@ -40,3 +44,52 @@ _goatty_preexec() {
 builtin autoload -Uz add-zsh-hook
 add-zsh-hook precmd _goatty_precmd
 add-zsh-hook preexec _goatty_preexec
+
+# --- Command-line actions for goatty's right-click menu (#186) ---------------
+# goatty sends these private key sequences (no keyboard sends them), and
+# only while a prompt said the widgets are here (zle=1 above).
+
+# Report the typed line, percent-encoded byte by byte, as OSC 7337;line=…
+# (no LC_ALL=C here: zle would turn what C can't spell into "?").
+_goatty_line_report() {
+  emulate -L zsh -o no_multibyte -o extended_glob
+  builtin print -rn -- $'\e]7337;line='"${BUFFER//(#m)[^A-Za-z0-9\/._~ -]/%${(l:2::0:)$(( [##16] #MATCH ))}}"$'\a'
+}
+
+# Put sudo in front of the line, or take it away. An empty line gets the
+# previous command first ("sudo !!").
+_goatty_line_sudo() {
+  [[ -z $BUFFER ]] && zle .up-history
+  if [[ $BUFFER == sudo\ * ]]; then
+    # Shortening BUFFER clamps CURSOR: take it first.
+    local cursor=$CURSOR
+    BUFFER=${BUFFER#sudo }
+    (( CURSOR = cursor > 5 ? cursor - 5 : 0 ))
+  else
+    BUFFER="sudo $BUFFER"
+    (( CURSOR += 5 ))
+  fi
+}
+
+# Edit the line in $VISUAL/$EDITOR. The editor owns the terminal meanwhile:
+# goatty mustn't send it the keys above.
+_goatty_line_editor() {
+  builtin print -rn -- $'\e]7337;zle=0\a'
+  zle edit-command-line
+  builtin print -rn -- $'\e]7337;zle=1\a'
+}
+
+builtin autoload -Uz edit-command-line
+zle -N edit-command-line
+zle -N _goatty_line_report
+zle -N _goatty_line_sudo
+zle -N _goatty_line_editor
+() {
+  local km
+  for km in emacs viins vicmd; do
+    bindkey -M $km '^[[7337;1~' _goatty_line_report
+    bindkey -M $km '^[[7337;2~' _goatty_line_sudo
+    bindkey -M $km '^[[7337;3~' _goatty_line_editor
+    bindkey -M $km '^[[7337;4~' kill-buffer
+  done
+}

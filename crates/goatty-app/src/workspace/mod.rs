@@ -11,7 +11,7 @@
 //!   to reorder, the mouse wheel.
 //! - `sidebar`: the vertical tab style, a resizable sidebar that folds into
 //!   a rail of icons, next to the panes drawn as a rounded card.
-//! - `tab_menu`: a tab's right-click menu.
+//! - `menu`: the right-click menus of tabs and panes (#186).
 //! - `gestures`: the pointer maths of the above (pure, unit-tested).
 //! - `icons`: Nerd Font icons for the program running in a tab.
 //! - `saved`: the layout goattyd keeps for the window, so the next
@@ -37,10 +37,10 @@
 mod gestures;
 pub(crate) mod icons;
 mod layout;
+mod menu;
 pub mod saved;
 mod sidebar;
 mod tab_bar;
-mod tab_menu;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -74,7 +74,6 @@ use crate::ui::text_input::{TextInput, TextInputEvent};
 use gestures::{Sidebar, WheelSwitch};
 use layout::{Axis, Direction, Node, PaneId, Rect};
 use saved::{SavedTab, SavedWindow, SavedWorkspace, Startup};
-use tab_menu::TabMenu;
 
 /// Width of the line between panes.
 const DIVIDER: f32 = 1.0;
@@ -229,8 +228,8 @@ pub struct Workspace {
     /// stops and when the drag ends.
     sidebar_drag: Option<(Sidebar, Sidebar)>,
     save_sidebar: Option<Task<()>>,
-    /// A tab's right-click menu.
-    tab_menu: Option<TabMenu>,
+    /// The open right-click menu (a tab's or a pane's).
+    menu: Option<menu::OpenMenu>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -286,7 +285,7 @@ impl Workspace {
             moved_unpainted: false,
             sidebar_drag: None,
             save_sidebar: None,
-            tab_menu: None,
+            menu: None,
             _subscriptions: vec![appearance, settings, activation, bounds],
         };
         match initial {
@@ -497,7 +496,9 @@ impl Workspace {
     /// Focus the active tab's pane (or connect screen); an open palette or
     /// list of recent notifications keeps the keyboard until it closes.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some((view, _)) = &self.recent {
+        if let Some(menu) = self.menu_focus(cx) {
+            menu.focus(window, cx);
+        } else if let Some((view, _)) = &self.recent {
             view.focus_handle(cx).focus(window, cx);
         } else if let Some((picker, _)) = &self.snippets {
             picker.focus_handle(cx).focus(window, cx);
@@ -768,6 +769,10 @@ impl Workspace {
     /// with its last pane, the window with its last tab.
     fn remove_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some((index, _)) = self.find_pane(id) else { return };
+        // Its menu's items would act on whatever pane has focus next.
+        if self.menu.as_ref().is_some_and(|m| m.owner == menu::MenuOwner::Pane(id)) {
+            self.close_menu(window, cx);
+        }
         let tab = &mut self.tabs[index];
         if tab.tree == Node::Leaf(id) {
             self.remove_tab(index, window, cx);
@@ -797,15 +802,15 @@ impl Workspace {
     }
 
     fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(id) = self.tabs.get(index).map(|t| t.id) {
+            self.close_menu_of_tab(id, window, cx);
+        }
         let tab = self.tabs.remove(index);
         if self.rename.as_ref().is_some_and(|r| r.tab == tab.id) {
             self.rename = None;
         }
         if self.paste.as_ref().is_some_and(|(_, pane, _)| tab.pane(*pane).is_some()) {
             self.paste = None;
-        }
-        if self.tab_menu.as_ref().is_some_and(|m| m.tab == tab.id) {
-            self.tab_menu = None;
         }
         if self.close.as_ref().is_some_and(|(_, target, _)| match target {
             CloseTarget::Tab(t) => *t == tab.id,
@@ -949,6 +954,7 @@ impl Workspace {
             TerminalEvent::Exited => self.remove_pane(id, window, cx),
             TerminalEvent::ConfirmPaste(request) => self.confirm_paste(id, request.clone(), window, cx),
             TerminalEvent::Activity(activity) => self.mark_activity(id, *activity, cx),
+            TerminalEvent::ContextMenu { at, keyboard } => self.open_pane_menu(id, *at, *keyboard, window, cx),
         }
     }
 
@@ -1632,7 +1638,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ResizePaneDown, _, cx| this.resize_pane(Direction::Down, cx)))
             .on_action(cx.listener(Self::toggle_pane_zoom))
             .on_action(cx.listener(Self::equalize_panes))
-            .children(self.render_tab_menu(window, cx))
+            .on_action(cx.listener(|this, _: &SwapPaneLeft, _, cx| this.swap_pane(Direction::Left, cx)))
+            .on_action(cx.listener(|this, _: &SwapPaneRight, _, cx| this.swap_pane(Direction::Right, cx)))
+            .on_action(cx.listener(|this, _: &SwapPaneUp, _, cx| this.swap_pane(Direction::Up, cx)))
+            .on_action(cx.listener(|this, _: &SwapPaneDown, _, cx| this.swap_pane(Direction::Down, cx)))
+            .on_action(cx.listener(|this, _: &MovePaneToNewTab, w, cx| this.move_pane_to_new_tab(w, cx)))
+            .children(self.render_menu())
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {
                 d.child(div().absolute().top(px(48.)).left(px(panes_left)).right_0().px_4().flex().justify_center().child(palette.clone()))

@@ -1315,3 +1315,56 @@ fn expansions_can_be_turned_off() {
     let out = stdout(&sb.run(&launch, "print -r -- ${_goatty_state[expansions]%%$'\\t'*} ${widgets[goatty-expand-space]}"));
     assert_eq!(out.trim(), "ok user:goatty-expand-space");
 }
+
+/// goatty's right-click menu (#186) reads and changes the typed line
+/// through private key sequences bound to zle widgets.
+#[test]
+fn command_line_widgets_report_and_change_the_line() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    let launch = sb.launch_with(no_highlighting(), None);
+    let mut sh = PtyShell::start(&sb, &launch);
+    assert!(sh.text().contains("\x1b]7337;zle=1\x07"), "the prompt says the widgets are there");
+    // An "editor" that leaves the file as it is.
+    sh.run("export VISUAL=true");
+
+    // The typed line comes back percent-encoded, multibyte and all.
+    let start = sh.out.len();
+    sh.pty.write("echo 'a%b' ✓".as_bytes()).unwrap();
+    sh.pty.write(b"\x1b[7337;1~").unwrap();
+    sh.wait_for_from(start, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93\x07");
+
+    // sudo goes in front, and comes off again; the line stays as typed.
+    sh.pty.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
+    sh.wait_for_from(start, b"\x1b]7337;line=sudo echo %27a%25b%27 %E2%9C%93\x07");
+    sh.pty.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
+    let again = sh.out.len();
+    sh.wait_for_from(again, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93\x07");
+
+    // Taking sudo away with the cursor at the end keeps it at the end.
+    sh.pty.write(b"\x1b[7337;2~X\x1b[7337;1~").unwrap();
+    let again = sh.out.len();
+    sh.wait_for_from(again, b"\x1b]7337;line=sudo echo %27a%25b%27 %E2%9C%93X\x07");
+    sh.pty.write(b"\x1b[7337;2~Y\x1b[7337;1~").unwrap();
+    let again = sh.out.len();
+    sh.wait_for_from(again, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93XY\x07");
+
+    // The editor owns the terminal while it runs: goatty hears so.
+    let start = sh.out.len();
+    sh.pty.write(b"\x1b[7337;3~").unwrap();
+    sh.wait_for_from(start, b"\x1b]7337;zle=0\x07");
+    sh.wait_for_from(start, b"\x1b]7337;zle=1\x07");
+    sh.wait_for_idle();
+    sh.pty.write(b"\x1b[7337;1~").unwrap();
+    sh.wait_for_from(start, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93XY\x07");
+
+    // Clearing empties it; on an empty line, sudo takes the last command.
+    sh.pty.write(b"\x1b[7337;4~\x1b[7337;1~").unwrap();
+    sh.wait_for_from(again, b"\x1b]7337;line=\x07");
+    sh.run("true marker");
+    let start = sh.out.len();
+    sh.pty.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
+    sh.wait_for_from(start, b"\x1b]7337;line=sudo true marker\x07");
+    sh.pty.write(b"\x1b[7337;4~").unwrap();
+    let _ = sh.pty.write(b"exit\r");
+}

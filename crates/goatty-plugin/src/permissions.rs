@@ -250,7 +250,14 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                 }
                 Permission::Env => m.env.iter().map(|e| e.name.clone()).chain(m.files.iter().filter_map(|f| f.env.clone())).collect(),
                 Permission::ConfigFiles => m.files.iter().map(|f| f.name.clone()).collect(),
-                Permission::Commands => m.commands.iter().map(|c| format!("{}: {}", c.title, crate::commands::describe(c))).collect(),
+                Permission::Commands => m
+                    .commands
+                    .iter()
+                    .map(|c| {
+                        let menu = if c.menu.is_some() { " (also in the right-click menu)" } else { "" };
+                        format!("{}: {}{menu}", c.title, crate::commands::describe(c))
+                    })
+                    .collect(),
                 Permission::Snippets => m
                     .snippets
                     .iter()

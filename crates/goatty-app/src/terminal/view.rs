@@ -11,6 +11,14 @@
 //! Find (Ctrl+Shift+F) and "View the last command's output" (Ctrl+Shift+L)
 //! cover the grid with an [`OutputView`]; output keeps flowing into the
 //! terminal underneath, and Esc brings it back.
+//!
+//! Right click (#186, `mouse.right_click`): goatty's menu, which the
+//! workspace opens on [`TerminalEvent::ContextMenu`] with this pane's part
+//! from [`TerminalView::menu_entries`] (the link under the pointer, the
+//! clipboard, the command line, the output). Programs that use the mouse get
+//! the click instead, and Shift does the other thing. The command line
+//! typed at a managed zsh prompt is read and changed through goatty's zle
+//! widgets ([`LineEdit`]): its text comes back as `UiEvent::CommandLine`.
 
 use std::cell::{Cell as StdCell, RefCell};
 use std::path::{Path, PathBuf};
@@ -19,15 +27,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use goatty_config::{ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, Renderer};
-use goatty_term::input::{Key, Mods, MouseAction, MouseButton, encode_key, encode_mouse, encode_paste};
+use goatty_config::{ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, Renderer, RightClick};
+use goatty_term::input::{Key, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_mouse, encode_paste};
 use goatty_term::paste::{self, PasteRisk};
 use goatty_term::{CursorKind, Frame, Link, SelectKind, TermMode, UiEvent};
 use gpui::{
     App, AppContext, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, Font,
     InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseButton as GMouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, canvas, div, prelude::FluentBuilder, px,
+    Subscription, Task, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 
 use super::element::{Geom, TerminalElement, hsla};
@@ -36,13 +44,15 @@ use super::keys::{mods, terminal_key};
 use super::links::{self, Place, Target};
 use super::stats::Stats;
 use crate::actions::{
-    Copy, CopyOrInterrupt, DecreaseFontSize, Find, IncreaseFontSize, Paste, ResetFontSize, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT,
-    ViewLastOutput,
+    ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, OpenContextMenu,
+    Paste, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo, ViewLastOutput,
 };
 use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::Session;
 use crate::settings::{AppSettings, palette};
 use crate::toast::{self, Toast};
+use crate::ui::context_menu::{Entry, Item};
+use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
 
 /// Cursor blink half-period (xterm/GTK default is ~530 ms).
@@ -52,9 +62,11 @@ const DEFAULT_TITLE: &str = "goatty";
 const ZOOM_TOAST: Duration = Duration::from_millis(1800);
 /// How often a selecting drag past the edge scrolls.
 const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
+/// How long goatty waits for the shell to report the command line.
+const LINE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// What a pane tells its parent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TerminalEvent {
     /// [`TerminalView::title`], the foreground program or the link state
     /// changed (what tabs and the window title show).
@@ -66,6 +78,17 @@ pub enum TerminalEvent {
     ConfirmPaste(PasteRequest),
     /// Something happened that a background tab can show (#122).
     Activity(Activity),
+    /// Open goatty's menu for this pane at `at` (window coordinates):
+    /// [`TerminalView::menu_entries`] plus the workspace's own. `keyboard`:
+    /// opened with a key (the first item starts out picked).
+    ContextMenu { at: Point<Pixels>, keyboard: bool },
+}
+
+/// What the command line the shell reports is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineUse {
+    Copy,
+    Snippet,
 }
 
 /// What happened in a pane, for the tab's activity marker. Ordered by how
@@ -157,6 +180,12 @@ pub struct TerminalView {
     hostname: Option<String>,
     /// The output viewer, while it covers the grid.
     viewer: Option<(Entity<OutputView>, Subscription)>,
+    /// Asked the shell for the command line (and gives up when this ends).
+    line_request: Option<(LineUse, Task<()>)>,
+    /// The cell a right click opened the menu on (for its link).
+    menu_cell: Option<(usize, usize)>,
+    /// A right press went to the program: its release goes there too.
+    right_to_program: bool,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -269,6 +298,9 @@ impl TerminalView {
             pressed_link: None,
             hostname: links::hostname(),
             viewer: None,
+            line_request: None,
+            menu_cell: None,
+            right_to_program: false,
         };
         view.apply_settings(&app);
         view
@@ -353,6 +385,7 @@ impl TerminalView {
                     let failed = exit.is_some_and(|code| code != 0);
                     cx.emit(TerminalEvent::Activity(if failed { Activity::Failed } else { Activity::Finished }));
                 }
+                UiEvent::CommandLine(line) => self.command_line_arrived(line, cx),
                 UiEvent::Exit => {}
             }
         }
@@ -504,6 +537,229 @@ impl TerminalView {
         self.send(b"\x05\x15");
         self.paste_text(line, cx);
         self.send(b"\r");
+    }
+
+    // ---- the command line (#186) ----------------------------------------------
+
+    /// Send `edit`'s keys to the shell, if it's at a prompt with goatty's
+    /// widgets; otherwise say why not and return false.
+    fn line_edit(&mut self, edit: LineEdit, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
+        if !self.can_edit_line() {
+            let body = match self.process.as_deref() {
+                Some(p) if !crate::workspace::icons::is_shell(p) => format!("{p} is running in this pane. Use it at a shell prompt."),
+                _ => "This works at a prompt of goatty's shell (with shell integration on).".to_string(),
+            };
+            toast::show_in(window, cx, Toast::info("No command line here").body(body).key("terminal.command_line"));
+            return false;
+        }
+        self.poke_cursor();
+        self.send(edit.keys());
+        cx.notify();
+        true
+    }
+
+    /// Whether goatty's widgets take keys here: the shell says so, and no
+    /// other program is in the foreground (an editor started from the line,
+    /// a job the shell integration doesn't know about).
+    fn can_edit_line(&self) -> bool {
+        self.session.terminal.line_editing() && self.process.as_deref().is_none_or(crate::workspace::icons::is_shell)
+    }
+
+    /// Ask the shell for the command line; [`Self::command_line_arrived`]
+    /// does the rest. One question at a time: a second one while the first
+    /// waits would take over its answer.
+    fn request_line(&mut self, what: LineUse, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.line_request.is_some() {
+            return;
+        }
+        if !self.line_edit(LineEdit::Report, window, cx) {
+            return;
+        }
+        let timeout = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LINE_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.line_request.take().is_some() {
+                    let toast = Toast::warning("The shell didn't answer").body("It may be busy. Try again at the prompt.");
+                    toast::show(cx, toast.key("terminal.command_line"));
+                }
+            });
+        });
+        self.line_request = Some((what, timeout));
+    }
+
+    /// The shell reported its command line (only what goatty asked for
+    /// counts: a program could print the same sequence).
+    fn command_line_arrived(&mut self, line: String, cx: &mut Context<'_, Self>) {
+        let Some((what, _)) = self.line_request.take() else { return };
+        let line = line.trim_end_matches('\n').to_string();
+        match what {
+            LineUse::Copy if line.trim().is_empty() => {
+                toast::show(cx, Toast::info("Nothing typed at the prompt").body("Type a command first.").key("terminal.command_line"));
+            }
+            LineUse::Copy => {
+                cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
+                toast::show(cx, Toast::success("Copied the command").body(line).key("terminal.command_line"));
+            }
+            LineUse::Snippet if line.trim().is_empty() => match self.last_command_line() {
+                Some(last) => crate::settings_window::snippets::new_from_line(last, cx),
+                None => {
+                    toast::show(
+                        cx,
+                        Toast::info("No command to save yet").body("Type or run a command first.").key("terminal.command_line"),
+                    );
+                }
+            },
+            LineUse::Snippet => crate::settings_window::snippets::new_from_line(line, cx),
+        }
+    }
+
+    /// The last command run in this pane, from the prompt marks.
+    fn last_command_line(&self) -> Option<String> {
+        let t = self.session.terminal.transcript();
+        let b = t.last_command()?;
+        t.command_line(b).map(crate::settings_window::snippets::strip_prompt).filter(|l| !l.is_empty())
+    }
+
+    fn copy_command_line(&mut self, _: &CopyCommandLine, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.request_line(LineUse::Copy, window, cx);
+    }
+
+    /// The typed command into a new snippet; without one (or outside
+    /// goatty's shell), the last command run.
+    fn save_command_line(&mut self, _: &SaveCommandLine, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.can_edit_line() {
+            self.request_line(LineUse::Snippet, window, cx);
+        } else {
+            crate::snippets::save_last(window, cx);
+        }
+    }
+
+    fn toggle_sudo(&mut self, _: &ToggleSudo, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.line_edit(LineEdit::ToggleSudo, window, cx);
+    }
+
+    fn edit_command_line(&mut self, _: &EditCommandLine, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.line_edit(LineEdit::OpenEditor, window, cx);
+    }
+
+    fn clear_command_line(&mut self, _: &ClearCommandLine, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.line_edit(LineEdit::Clear, window, cx);
+    }
+
+    // ---- the menu (#186) ------------------------------------------------------
+
+    /// Shift+F10 / the Menu key: the menu at the text cursor (or the
+    /// pane's top left corner when the cursor is hidden).
+    fn open_context_menu(&mut self, _: &OpenContextMenu, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        let g = self.geom.get();
+        let at = match self.frame.borrow().cursor.as_ref() {
+            Some(c) => point(g.origin.x + g.cell.width * (c.col + 1) as f32, g.origin.y + g.cell.height * (c.row + 1) as f32),
+            None => point(g.origin.x + px(8.), g.origin.y + px(8.)),
+        };
+        self.menu_cell = None;
+        cx.emit(TerminalEvent::ContextMenu { at, keyboard: true });
+    }
+
+    /// The program in this pane uses the mouse (and gets right clicks).
+    pub fn program_uses_mouse(&self) -> bool {
+        self.session.terminal.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// This pane's part of the menu: the link that was right-clicked, the
+    /// clipboard, the command line at a prompt of goatty's shell, and the
+    /// output. Items run after the menu closed and this pane has focus.
+    pub fn menu_entries(&mut self, cx: &mut Context<'_, Self>) -> Vec<Entry> {
+        let me = cx.entity().downgrade();
+        let mut out: Vec<Entry> = Vec::new();
+        let link = self.menu_cell.take().and_then(|(c, r)| self.session.terminal.link_at(c, r)).and_then(|l| self.resolve_link(&l));
+        if let Some(target) = link {
+            let (label, icon) = match &target {
+                Target::Url(_) | Target::Other(_) => ("Open the link", Icon::ExternalLink),
+                Target::File { .. } => ("Open the file", Icon::FileText),
+                Target::Remote { .. } => ("Copy the remote path", Icon::Copy),
+            };
+            let (open, me2) = (target.clone(), me.clone());
+            out.push(
+                Item::new(label, move |window, cx| {
+                    let _ = me2.update(cx, |v, cx| v.open_link(open.clone(), window, cx));
+                })
+                .icon(icon)
+                .into(),
+            );
+            if !matches!(target, Target::Remote { .. }) {
+                let text = match &target {
+                    Target::Url(u) | Target::Other(u) => u.clone(),
+                    t => t.describe(),
+                };
+                let label = if matches!(target, Target::File { .. }) { "Copy the path" } else { "Copy the link" };
+                out.push(
+                    Item::new(label, move |window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        toast::show_in(window, cx, Toast::success("Copied").body(text.clone()).key("terminal.link"));
+                    })
+                    .icon(Icon::Link)
+                    .into(),
+                );
+            }
+            out.push(Entry::Separator);
+        }
+
+        let selection = self.session.terminal.has_selection();
+        out.push(Item::action("Copy", "copy", cx).icon(Icon::Copy).disabled((!selection).then_some("Select text first")).into());
+        let can_paste = cx.read_from_clipboard().and_then(|c| c.text()).is_some_and(|t| !t.is_empty());
+        out.push(
+            Item::action("Paste", "paste", cx)
+                .icon(Icon::ClipboardPaste)
+                .disabled((!can_paste).then_some("The clipboard has no text"))
+                .into(),
+        );
+
+        out.push(Entry::Separator);
+        if self.can_edit_line() {
+            out.push(Entry::Header("Command line".into()));
+            out.push(Item::action("Copy the command", "copy_command_line", cx).icon(Icon::Copy).into());
+            out.push(Item::action("Save as a snippet…", "save_command_line", cx).icon(Icon::BookmarkPlus).into());
+            out.push(Item::action("Add or remove sudo", "toggle_sudo", cx).icon(Icon::Shield).into());
+            out.push(Item::action("Edit in your editor", "edit_command_line", cx).icon(Icon::Pencil).into());
+            out.push(Item::action("Clear the command", "clear_command_line", cx).icon(Icon::Eraser).into());
+            out.push(Item::action("Find a snippet…", "snippets", cx).icon(Icon::BookOpen).into());
+        } else if !self.session.terminal.command_running() && self.process.as_deref().is_none_or(crate::workspace::icons::is_shell) {
+            // A shell without goatty's widgets (plain SSH, bash): what works anyway.
+            out.push(Item::action("Find a snippet…", "snippets", cx).icon(Icon::BookOpen).into());
+            if self.last_command_line().is_some() {
+                out.push(Item::action("Save the last command as a snippet…", "save_command_line", cx).icon(Icon::BookmarkPlus).into());
+            }
+        }
+
+        out.push(Entry::Separator);
+        out.push(Item::action("Find in the output…", "find", cx).icon(Icon::Search).into());
+        out.push(Item::action("View the last command's output", "view_last_output", cx).icon(Icon::FileText).into());
+        out
+    }
+
+    /// A right click that doesn't open the menu: the program's when it
+    /// uses the mouse, else `mouse.right_click`'s own action.
+    fn right_click(&mut self, ev: &MouseDownEvent, col: usize, row: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let setting = cx.global::<AppSettings>().client.mouse.right_click;
+        let uses_mouse = self.program_uses_mouse();
+        if setting.opens_menu(uses_mouse, ev.modifiers.shift) {
+            self.menu_cell = Some((col, row));
+            cx.emit(TerminalEvent::ContextMenu { at: ev.position, keyboard: false });
+            return;
+        }
+        if uses_mouse {
+            self.right_to_program = true;
+            self.report_mouse(MouseButton::Right, MouseAction::Press, col, row, &ev.modifiers);
+            return;
+        }
+        if setting == RightClick::Paste {
+            if self.copy_selection(cx) {
+                self.session.terminal.selection_clear();
+                cx.notify();
+            } else {
+                self.paste(&Paste, window, cx);
+            }
+        }
     }
 
     // ---- links --------------------------------------------------------------
@@ -744,6 +1000,10 @@ impl TerminalView {
                 self.pressed_link = Some(target);
             }
         }
+        if ev.button == GMouseButton::Right {
+            self.right_click(ev, col, row, window, cx);
+            return;
+        }
         if self.mouse_mode_active(ev.modifiers.shift) {
             if let Some(btn) = mouse_button(Some(ev.button)) {
                 self.report_mouse(btn, MouseAction::Press, col, row, &ev.modifiers);
@@ -771,6 +1031,12 @@ impl TerminalView {
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         let (col, row, _) = self.geom.get().cell_at(ev.position);
+        if ev.button == GMouseButton::Right {
+            if std::mem::take(&mut self.right_to_program) {
+                self.report_mouse(MouseButton::Right, MouseAction::Release, col, row, &ev.modifiers);
+            }
+            return;
+        }
         if self.mouse_mode_active(ev.modifiers.shift)
             && let Some(btn) = mouse_button(Some(ev.button))
         {
@@ -976,12 +1242,20 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::view_last_output))
+            .on_action(cx.listener(Self::open_context_menu))
+            .on_action(cx.listener(Self::copy_command_line))
+            .on_action(cx.listener(Self::save_command_line))
+            .on_action(cx.listener(Self::toggle_sudo))
+            .on_action(cx.listener(Self::edit_command_line))
+            .on_action(cx.listener(Self::clear_command_line))
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(GMouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(GMouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_mouse_down(GMouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_up(GMouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(GMouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(GMouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(GMouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_hover(cx.listener(Self::on_hover))

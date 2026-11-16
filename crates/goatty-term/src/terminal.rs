@@ -2,7 +2,7 @@
 //! a cheap, thread-safe handle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rio_vt::ansi::CursorShape;
@@ -55,6 +55,9 @@ pub(crate) struct Inner {
     /// Commands started (OSC 133;C) since this terminal was created: tells
     /// commands apart where indices shift (the scrollback drops old ones).
     pub(crate) started: AtomicU64,
+    /// The shell said at its prompt that goatty's command-line widgets are
+    /// bound (`OSC 7337;zle=1`); cleared when a command starts.
+    pub(crate) zle: AtomicBool,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -105,6 +108,7 @@ impl Terminal {
             ui: utx,
             shell: AtomicU8::new(0),
             started: AtomicU64::new(0),
+            zle: AtomicBool::new(false),
         };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
@@ -146,7 +150,7 @@ impl Terminal {
         let mut term = self.inner.term.lock();
         // Up to each mark, then the mark at the cursor it was printed at.
         let mut at = 0;
-        for &(end, mark) in &parser.found {
+        for (end, mark) in parser.found.drain(..) {
             parser.vt.advance(&mut *term, &bytes[at..end]);
             at = end;
             self.apply_mark(&mut term, mark);
@@ -191,6 +195,7 @@ impl Terminal {
                     }
                 }
                 self.set_shell(ShellState::Running);
+                self.inner.zle.store(false, Ordering::Relaxed);
                 self.inner.started.fetch_add(1, Ordering::Relaxed);
             }
             Mark::Restore(state, started) => {
@@ -206,7 +211,23 @@ impl Terminal {
                 self.set_shell(ShellState::Finished);
                 let _ = self.inner.ui.send(UiEvent::CommandFinished { exit });
             }
+            Mark::Zle(on) => self.inner.zle.store(on, Ordering::Relaxed),
+            Mark::Line(line) => {
+                let _ = self.inner.ui.send(UiEvent::CommandLine(line));
+            }
         }
+    }
+
+    /// Whether the shell waits at a prompt with goatty's command-line
+    /// widgets bound (the managed zsh with shell integration, #186): then
+    /// [`crate::input::LineEdit`] keys work.
+    pub fn line_editing(&self) -> bool {
+        self.inner.zle.load(Ordering::Relaxed) && self.shell_state() != ShellState::Running
+    }
+
+    /// What the snapshots carry about the shell.
+    pub(crate) fn shell_info(&self) -> crate::snapshot::ShellInfo {
+        (self.shell_state(), self.commands_started(), self.inner.zle.load(Ordering::Relaxed))
     }
 
     /// Whether the shell reported a command that hasn't finished yet (needs

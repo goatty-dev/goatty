@@ -1,8 +1,8 @@
-//! The Terminal page (links, selection, pasting) and the Workspace page
+//! The Terminal page (links, selection, mouse, pasting) and the Workspace page
 //! (startup, tabs, panes).
 
 use goatty_config::{
-    CopyOnSelect, LinkClick, MiddleClick, OnLaunch, PaneSettings, PasteConfirm, TabActivity, TabBarShow, TabSettings, TabStyle,
+    CopyOnSelect, LinkClick, MiddleClick, OnLaunch, PaneSettings, PasteConfirm, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -58,6 +58,20 @@ impl SettingsWindow {
             }),
         ));
 
+        let mouse = section(ui, "Mouse").child(row(ui, "Right click").desc("Shift+right-click does the other thing").control(self.select(
+            "right-click",
+            "Right click",
+            opts(&[
+                (RightClick::Menu, "Shows goatty's menu", "Programs that use the mouse (vim, tmux) get the click"),
+                (RightClick::Always, "Always shows goatty's menu", "In vim and tmux too; Shift+right-click reaches them"),
+                (RightClick::Paste, "Copies or pastes", "Copies the selection, else pastes (like Windows Terminal)"),
+                (RightClick::Off, "Does nothing", "Programs that use the mouse still get the click"),
+            ]),
+            &s.mouse.right_click,
+            cx,
+            |v, _, cx| AppSettings::update(cx, |s| s.mouse.right_click = v),
+        )));
+
         let middle_opts = if PRIMARY_SELECTION {
             opts(&[
                 (MiddleClick::Primary, "Primary selection", "What you last selected anywhere"),
@@ -89,7 +103,7 @@ impl SettingsWindow {
                 cx,
                 |v, _, cx| AppSettings::update(cx, |s| s.paste.confirm = v),
             )));
-        div().flex().flex_col().gap(px(28.)).child(links).child(selection).child(pasting).into_any_element()
+        div().flex().flex_col().gap(px(28.)).child(links).child(selection).child(mouse).child(pasting).into_any_element()
     }
 
     fn tab_style_cards(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {

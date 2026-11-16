@@ -29,6 +29,19 @@
 //! default = "sh"
 //! choices = [{ value = "sh" }, { value = "bash" }]
 //! ```
+//!
+//! A command can also be in the terminal's right-click menu (#186), under
+//! the plugin's name, with one of goatty's icons ([`MENU_ICONS`]). With
+//! `when = "selection"` it shows only while text is selected, and `fill`
+//! names the input the selected text goes into (still asked, so the user
+//! sees and can change it):
+//!
+//! ```toml
+//! [command.menu]
+//! icon = "search"
+//! when = "selection"     # always (default) | selection | prompt
+//! fill = "container"
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,7 +69,63 @@ pub struct PaletteCommand {
     /// Asked in this order.
     #[serde(default, rename = "input")]
     pub inputs: Vec<CommandInput>,
+    /// Also in the terminal's right-click menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu: Option<CommandMenu>,
 }
+
+/// A command's entry in the terminal's right-click menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CommandMenu {
+    /// One of [`MENU_ICONS`]; none: the plugin icon.
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub when: MenuWhen,
+    /// `when = "selection"`: the input the selected text fills in.
+    #[serde(default)]
+    pub fill: Option<String>,
+}
+
+/// When a command shows in the right-click menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MenuWhen {
+    #[default]
+    Always,
+    /// While text is selected in the pane.
+    Selection,
+    /// While a shell waits at a prompt in the pane (nothing else runs there).
+    Prompt,
+}
+
+/// The icons a command's menu entry may use (goatty's own, by name).
+pub const MENU_ICONS: &[&str] = &[
+    "activity",
+    "book-open",
+    "bug",
+    "code",
+    "copy",
+    "download",
+    "external-link",
+    "file-text",
+    "folder-open",
+    "git-commit",
+    "globe",
+    "history",
+    "link",
+    "package",
+    "puzzle",
+    "refresh",
+    "search",
+    "server",
+    "shield-check",
+    "terminal",
+    "trash",
+    "upload",
+    "zap",
+];
 
 /// One value a command asks for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,6 +440,24 @@ pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
                 err(p.path, p.message);
             }
         }
+        if let Some(menu) = &c.menu {
+            if let Some(icon) = &menu.icon
+                && !MENU_ICONS.contains(&icon.as_str())
+            {
+                err(format!("{at}.menu.icon"), format!("{icon:?} isn't one of goatty's icons ({})", MENU_ICONS.join(", ")));
+            }
+            match (&menu.fill, menu.when) {
+                (Some(_), w) if w != MenuWhen::Selection => err(format!("{at}.menu.fill"), "needs when = \"selection\"".into()),
+                (Some(f), _) => match c.inputs.iter().find(|i| &i.id == f) {
+                    None => err(format!("{at}.menu.fill"), format!("no input {f:?}")),
+                    Some(i) if matches!(i.kind, InputKind::Choice | InputKind::Integer | InputKind::Number) => {
+                        err(format!("{at}.menu.fill"), format!("{f:?}: selected text can only fill text, path and folder inputs"))
+                    }
+                    Some(_) => {}
+                },
+                _ => {}
+            }
+        }
         match c.run.first() {
             None => err(format!("{at}.run"), "empty".into()),
             Some(p) if !programs.contains(p.as_str()) => {
@@ -530,6 +617,35 @@ type = "choice"
     }
 
     #[test]
+    fn menu_entries() {
+        let menu = r#"
+[command.menu]
+icon = "search"
+when = "selection"
+fill = "filter"
+"#;
+        let m = with_commands(&format!("{COMMANDS}{menu}")).unwrap();
+        let got = m.commands[0].menu.clone().unwrap();
+        assert_eq!(got, CommandMenu { icon: Some("search".into()), when: MenuWhen::Selection, fill: Some("filter".into()) });
+        // Only serialized when there is one (older goatty refuses unknown fields).
+        let plain = with_commands(COMMANDS).unwrap();
+        assert!(!serde_json::to_string(&plain.commands[0]).unwrap().contains("menu"));
+
+        let bad = |menu: &str| -> Vec<String> {
+            with_commands(&format!("{COMMANDS}\n[command.menu]\n{menu}\n"))
+                .unwrap_err()
+                .0
+                .iter()
+                .map(|p| format!("{}: {}", p.path, p.message))
+                .collect()
+        };
+        assert!(bad("icon = \"rocket\"")[0].starts_with("command[0].menu.icon: \"rocket\" isn't one of"));
+        assert_eq!(bad("fill = \"dir\""), ["command[0].menu.fill: needs when = \"selection\""]);
+        assert_eq!(bad("when = \"selection\"\nfill = \"nope\""), ["command[0].menu.fill: no input \"nope\""]);
+        assert!(bad("when = \"selection\"\nfill = \"depth\"")[0].contains("can only fill text"));
+    }
+
+    #[test]
     fn commands_are_a_permission() {
         use crate::permissions::{Permission, derived, describe};
         let m = with_commands(COMMANDS).unwrap();
@@ -551,6 +667,7 @@ type = "choice"
             keywords: Vec::new(),
             run: vec!["printf".into(), "%s\\n".into(), "{a}".into(), "pre-{b}".into()],
             inputs: Vec::new(),
+            menu: None,
         };
         let nasty = ["it's \"$HOME\" `id` $(echo hi); ls *", "\\ ' \" ! ~ # &"];
         let mut v = BTreeMap::new();

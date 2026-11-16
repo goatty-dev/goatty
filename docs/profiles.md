@@ -100,7 +100,7 @@ Settings travel as JSON documents rather than typed structs, so a schema change 
 | Page | Edits | Applies |
 |---|---|---|
 | Appearance | live preview; theme gallery (one theme, or light + dark following the desktop), import, color editor (folded); font and interface font (searchable pickers, monospace/proportional or all), size, line height, ligatures, bold-is-bright; cursor shape (visual) and blink; padding (all sides or each side), background opacity (+ blur) | live, saved immediately |
-| Terminal | how links open, file opener command, copy on select (primary selection / clipboard / off), what a middle click pastes, when to ask before pasting | live |
+| Terminal | how links open, file opener command, copy on select (primary selection / clipboard / off), what a right click does (`mouse.right_click`: goatty's menu / always the menu / copy or paste / nothing; Shift+right-click does the other thing), what a middle click pastes, when to ask before pasting | live |
 | Workspace | what a new window shows, tab style (visual), tab bar, program icons, fading inactive panes, asking before closing a running program | live / next launch |
 | Shortcuts | a table of every action: grouped or sorted by name or keys, search by name or keys (typed, or pressed with the keyboard button), filters for changed and unbound; per action: keycaps (× removes), + records a keystroke, reset; warnings when a recorded key took over another action's key, when a key you added is one the shell uses, and when a keystroke doesn't parse | live |
 | Hosts | open hosts in a new window or tab (`ssh.open_in`), add hosts (`user@host` or an ssh alias, optional name), plain SSH per host, list the hosts in `~/.ssh/config`, connect | saved immediately |
