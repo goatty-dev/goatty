@@ -604,11 +604,42 @@ pub struct SshSettings {
     /// tools) to a host goatty connects to, for hosts without their own
     /// choice (`hosts[].sync`).
     pub sync: SyncMode,
+    /// Show typed characters before the host echoes them (#16).
+    pub local_echo: LocalEcho,
 }
 
 impl Default for SshSettings {
     fn default() -> Self {
-        Self { discover: true, hosts: Vec::new(), open_in: OpenIn::Window, sync: SyncMode::Ask }
+        Self { discover: true, hosts: Vec::new(), open_in: OpenIn::Window, sync: SyncMode::Ask, local_echo: LocalEcho::Auto }
+    }
+}
+
+/// Local echo prediction: draw what is typed (underlined) right away and
+/// check it against the host's echo, mosh-style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalEcho {
+    /// When the host is slow enough to notice: its round trip or the
+    /// time it takes to echo a key is above [`LocalEcho::AUTO_RTT`].
+    #[default]
+    Auto,
+    /// However fast the host answers.
+    Always,
+    Never,
+}
+
+impl LocalEcho {
+    /// Round trips above this are slow enough to feel when typing.
+    pub const AUTO_RTT: std::time::Duration = std::time::Duration::from_millis(30);
+
+    /// Whether to show predictions for a host that answers in this time
+    /// (`None`: not measured yet).
+    pub fn wanted(self, rtt: Option<std::time::Duration>) -> bool {
+        match self {
+            LocalEcho::Auto => rtt.is_some_and(|r| r > Self::AUTO_RTT),
+            LocalEcho::Always => true,
+            LocalEcho::Never => false,
+        }
     }
 }
 
@@ -931,6 +962,19 @@ const GENERIC_FONTS: &[&str] = &["monospace", "sans-serif", "serif", "system-ui"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_echo_auto_waits_for_a_slow_measured_link() {
+        use std::time::Duration;
+        let ms = |n| Some(Duration::from_millis(n));
+        assert!(!LocalEcho::Auto.wanted(None));
+        assert!(!LocalEcho::Auto.wanted(ms(5)));
+        assert!(LocalEcho::Auto.wanted(ms(80)));
+        assert!(LocalEcho::Always.wanted(None));
+        assert!(!LocalEcho::Never.wanted(ms(500)));
+        let s: SshSettings = serde_json::from_str(r#"{"local_echo": "always"}"#).unwrap();
+        assert_eq!(s.local_echo, LocalEcho::Always);
+    }
 
     #[test]
     fn theme_colors_take_css_and_are_written_as_hex() {

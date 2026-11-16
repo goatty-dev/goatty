@@ -321,6 +321,7 @@ impl TerminalView {
         self.padding = edges(s.terminal.padding);
         self.opacity = s.terminal.opacity;
         self.glyph_mode = s.terminal.renderer == Renderer::Glyphs;
+        self.session.set_local_echo(s.ssh.local_echo);
         self.cursor_blink = s.terminal.cursor_blink;
         if !self.cursor_blink {
             self.cursor_visible = true;
@@ -417,9 +418,22 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn send(&mut self, bytes: &[u8]) {
+    fn send(&mut self, bytes: &[u8], cx: &mut Context<'_, Self>) {
         self.session.terminal.scroll_to_bottom();
         self.session.write(bytes);
+        // Predicted echo (#16) the host doesn't confirm in time disappears.
+        if let Some(at) = self.session.prediction_deadline() {
+            let wait = at.saturating_duration_since(Instant::now());
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |view, cx| {
+                    if view.session.expire_predictions() {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// Show the cursor solid and restart the blink timer.
@@ -474,7 +488,7 @@ impl TerminalView {
             self.session.terminal.selection_clear();
         } else if let Some(bytes) = encode_key(&Key::Text("c"), Mods { ctrl: true, ..Mods::default() }, self.session.terminal.mode()) {
             self.poke_cursor();
-            self.send(&bytes);
+            self.send(&bytes, cx);
         }
         cx.notify();
     }
@@ -516,7 +530,7 @@ impl TerminalView {
         let bytes = encode_paste(text, self.session.terminal.mode());
         self.session.terminal.selection_clear();
         self.poke_cursor();
-        self.send(&bytes);
+        self.send(&bytes, cx);
         cx.notify();
     }
 
@@ -534,9 +548,9 @@ impl TerminalView {
     /// goes to the kill ring, Ctrl+Y brings it back), so it can't join the
     /// command. The line is sent as a paste, so nothing in it acts as a key.
     pub fn run_line(&mut self, line: &str, cx: &mut Context<'_, Self>) {
-        self.send(b"\x05\x15");
+        self.send(b"\x05\x15", cx);
         self.paste_text(line, cx);
-        self.send(b"\r");
+        self.send(b"\r", cx);
     }
 
     // ---- the command line (#186) ----------------------------------------------
@@ -553,7 +567,7 @@ impl TerminalView {
             return false;
         }
         self.poke_cursor();
-        self.send(edit.keys());
+        self.send(edit.keys(), cx);
         cx.notify();
         true
     }
@@ -969,7 +983,7 @@ impl TerminalView {
         let Some((key, mods)) = terminal_key(&ev.keystroke) else { return };
         if let Some(bytes) = encode_key(&key, mods, self.session.terminal.mode()) {
             self.session.terminal.selection_clear();
-            self.send(&bytes);
+            self.send(&bytes, cx);
         }
     }
 

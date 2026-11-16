@@ -3,7 +3,7 @@
 //! `~/.ssh/config` are client settings (`ssh` in `settings.json`), saved
 //! right away.
 
-use goatty_config::{OpenIn, SshHost, SyncMode, ssh_host_problem};
+use goatty_config::{LocalEcho, OpenIn, SshHost, SyncMode, ssh_host_problem};
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, div, prelude::*, px,
 };
@@ -201,7 +201,7 @@ impl SettingsWindow {
 
     pub(super) fn hosts_page(&self, ui: Ui, cx: &Context<'_, Self>) -> AnyElement {
         let settings = &cx.global::<AppSettings>().file.value.ssh;
-        let (discover, open_in, sync) = (settings.discover, settings.open_in, settings.sync);
+        let (discover, open_in, sync, local_echo) = (settings.discover, settings.open_in, settings.sync, settings.local_echo);
         let entries = hosts::current(cx);
         let (added, found): (Vec<&HostEntry>, Vec<&HostEntry>) = entries.iter().partition(|e| !e.discovered);
 
@@ -213,6 +213,17 @@ impl SettingsWindow {
                 ui,
                 |v, _, cx| AppSettings::update(cx, |s| s.ssh.open_in = v),
             )))
+            .child(
+                row(ui, "Show typing before the host echoes it")
+                    .desc("Underlined until the host confirms it; Auto: above 30 ms round trip")
+                    .control(segmented(
+                        "ssh-local-echo",
+                        &[(LocalEcho::Auto, "Auto"), (LocalEcho::Always, "Always"), (LocalEcho::Never, "Never")],
+                        &local_echo,
+                        ui,
+                        |v, _, cx| AppSettings::update(cx, |s| s.ssh.local_echo = v),
+                    )),
+            )
             .footer(
                 "Ctrl+Shift+H lists your hosts and their sessions. goatty runs its session daemon on a host so shells survive \
                  disconnects; it asks before copying it there (to ~/.local/share/goatty, no sudo).",
