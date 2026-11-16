@@ -87,6 +87,8 @@ pub const INDEX: &[Entry] = &[
     e(Page::Workspace, "Panes", "Fade inactive panes", "dim split focus").keys(&["panes.dim_inactive"]),
     e(Page::Workspace, "Panes", "Ask before closing a running program", "confirm close quit").keys(&["panes.confirm_close"]),
     e(Page::Hosts, "Connecting", "Open hosts in", "ssh window tab remote").keys(&["ssh.open_in"]),
+    e(Page::Hosts, "Connecting", "Show typing before the host echoes it", "local echo prediction latency lag slow mosh remote")
+        .keys(&["ssh.local_echo"]),
     e(Page::Hosts, "Shell setup", "Bring your shell setup", "sync copy mirror plugins aliases prompt remote same everywhere")
         .keys(&["ssh.sync"]),
     e(Page::Hosts, "Shell setup", "Sync the active tab's host now", "sync copy mirror plugins aliases prompt remote"),
