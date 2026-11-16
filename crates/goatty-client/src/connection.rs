@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
-    ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, PROTOCOL_VERSION, RUN_SINCE, ReqId,
-    SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
+    ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE, PROTOCOL_VERSION, RUN_SINCE,
+    ReqId, SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -470,6 +470,24 @@ impl Connection {
         }
     }
 
+    /// A tailnet operation on this host (`goatty_net::api::Request` as
+    /// JSON); returns the reply JSON. Changing availability runs
+    /// `tailscale`. Needs a daemon with protocol v12. Blocks: call off the
+    /// UI thread.
+    pub fn net(&self, request: String) -> Result<String> {
+        let version = self.protocol_version();
+        if version < NET_SINCE {
+            bail!(
+                "goattyd via {} is too old for the tailnet (protocol v{version}); restart it to use the new version",
+                self.endpoint().label()
+            );
+        }
+        match self.request_within(REQUEST_TIMEOUT * 4, Pending::Reply, |req| ClientMsg::Net { req, request })? {
+            ServerMsg::Net { reply, .. } => Ok(reply),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
     /// Remember the window's layout (tabs and splits; `json` is the
     /// client's format) on the host, so a later window can restore it. No
     /// `sessions`: forget it. Never blocks; saved again after a reconnect.
@@ -634,10 +652,18 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
 }
 
 /// Did ssh fail where only the user can help (no key/agent worked, or the
-/// host key is unknown or changed)?
+/// host key is unknown or changed)? Or a tailnet host that refused this
+/// device (revoked) or shows another key: retrying won't change that.
 fn needs_user_input(e: &anyhow::Error) -> bool {
+    use goatty_net::gateway::{GatewayError, Refusal};
     let text = format!("{e:#}");
-    text.contains("Permission denied") || text.contains("Host key verification failed")
+    let gateway = e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<GatewayError>(),
+            Some(GatewayError::HostKeyChanged { .. } | GatewayError::Refused { code: Refusal::NotPaired, .. })
+        )
+    });
+    gateway || text.contains("Permission denied") || text.contains("Host key verification failed")
 }
 
 fn read_loop(s: &Shared, reader: &mut Reader) -> anyhow::Error {
@@ -751,7 +777,8 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::ShellsReloaded { req, .. }
         | ServerMsg::Plugin { req, .. }
         | ServerMsg::Layout { req, .. }
-        | ServerMsg::Shell { req, .. } => {
+        | ServerMsg::Shell { req, .. }
+        | ServerMsg::Net { req, .. } => {
             if let Some(Pending::Reply(tx) | Pending::Attach { tx, .. }) = s.pending.lock().remove(&req) {
                 let _ = tx.send(msg);
             }
@@ -792,5 +819,11 @@ mod tests {
         assert!(needs_user_input(&denied));
         assert!(needs_user_input(&anyhow::anyhow!("Host key verification failed.")));
         assert!(!needs_user_input(&anyhow::anyhow!("ssh: connect to host box port 22: Network is unreachable")));
+        use goatty_net::gateway::{GatewayError, Refusal};
+        let revoked = anyhow::Error::new(GatewayError::Refused { code: Refusal::NotPaired, reason: "not paired".into() });
+        assert!(needs_user_input(&revoked));
+        assert!(needs_user_input(&anyhow::Error::new(GatewayError::HostKeyChanged { name: "box".into() }).context("connecting")));
+        let busy = anyhow::Error::new(GatewayError::Refused { code: Refusal::TooMany, reason: "later".into() });
+        assert!(!needs_user_input(&busy));
     }
 }

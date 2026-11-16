@@ -37,6 +37,21 @@ pub enum Endpoint {
     /// `program args…` speaks the protocol on its stdio (normally it ends in
     /// `goattyd proxy`).
     Command { label: String, program: String, args: Vec<String> },
+    /// goattyd on a paired host of the user's tailnet, through its gateway
+    /// (`goatty_net`).
+    Tailnet(TailnetTarget),
+}
+
+/// A host on the user's tailnet that this computer paired with.
+#[derive(Debug, Clone)]
+pub struct TailnetTarget {
+    /// Its MagicDNS name: how the pinned hosts are keyed.
+    pub dns: String,
+    /// Its Tailscale host name, as shown.
+    pub name: String,
+    /// goatty's tailnet files on this computer (device key, pinned hosts).
+    pub paths: goatty_net::Paths,
+    pub tailscale: goatty_net::tailscale::Tailscale,
 }
 
 /// A host reached with the system's OpenSSH client.
@@ -112,6 +127,7 @@ impl Endpoint {
             Endpoint::Local => "local",
             Endpoint::Ssh(t) => &t.host,
             Endpoint::Command { label, .. } => label,
+            Endpoint::Tailnet(t) => &t.name,
         }
     }
 
@@ -143,6 +159,7 @@ impl Endpoint {
                 c.args(args);
                 spawn_stdio(c, label)
             }
+            Endpoint::Tailnet(t) => crate::tailnet::connect(t),
         }
     }
 }
@@ -225,14 +242,15 @@ impl StderrTail {
     }
 }
 
-enum CloseHandle {
+pub(crate) enum CloseHandle {
     Socket(UnixStream),
     Child(Child),
+    Net(goatty_net::link::Closer),
 }
 
 /// Tears a transport down from any thread, unblocking its reader.
 #[derive(Clone)]
-pub struct Closer(Arc<Mutex<Option<CloseHandle>>>);
+pub struct Closer(pub(crate) Arc<Mutex<Option<CloseHandle>>>);
 
 impl Closer {
     pub fn close(&self) {
@@ -244,6 +262,7 @@ impl Closer {
                 let _ = c.kill();
                 let _ = c.wait();
             }
+            Some(CloseHandle::Net(c)) => c.close(),
             None => {}
         }
     }

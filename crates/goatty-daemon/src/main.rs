@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use goatty_client::Control;
 use goatty_proto::SessionId;
 
+mod net_cmd;
+
 #[derive(Parser)]
 #[command(name = "goattyd", version, about = "goatty session daemon: owns shells so they outlive the window")]
 struct Cli {
@@ -62,6 +64,9 @@ enum Cmd {
     /// Snippets (commands with blanks) and expansions on this host: yours and the plugins'.
     #[command(subcommand)]
     Snippet(SnippetCmd),
+    /// This computer on your tailnet: make it available to your other devices, pair them.
+    #[command(subcommand)]
+    Net(net_cmd::NetCmd),
     /// Print the completion script for SHELL (goatty's managed zsh has it already).
     Completions {
         #[arg(value_enum)]
@@ -331,7 +336,14 @@ fn main() -> Result<()> {
     // Silence rio_vt's [unhandled osc_dispatch] warnings (e.g. systemd OSC 3008) by default (#20).
     let default_level = if matches!(
         cmd,
-        Cmd::Proxy | Cmd::RestoreVersion | Cmd::Shell(_) | Cmd::Settings(_) | Cmd::Plugin(_) | Cmd::Alias(_) | Cmd::Snippet(_)
+        Cmd::Proxy
+            | Cmd::RestoreVersion
+            | Cmd::Shell(_)
+            | Cmd::Settings(_)
+            | Cmd::Plugin(_)
+            | Cmd::Alias(_)
+            | Cmd::Snippet(_)
+            | Cmd::Net(_)
     ) {
         "warn,rio_vt=error"
     } else {
@@ -392,6 +404,7 @@ fn main() -> Result<()> {
             Control::connect_local(CLIENT)?.send_input(id, data)
         }
         Cmd::Stop { force } => stop(force),
+        Cmd::Net(cmd) => net_cmd::run(cmd, CLIENT),
         Cmd::Service(cmd) => match cmd {
             ServiceCmd::Install => service_install(),
             ServiceCmd::Uninstall => service_uninstall(),

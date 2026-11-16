@@ -91,6 +91,14 @@ pub const INDEX: &[Entry] = &[
         .keys(&["ssh.sync"]),
     e(Page::Hosts, "Shell setup", "Sync the active tab's host now", "sync copy mirror plugins aliases prompt remote"),
     e(Page::Hosts, "From ~/.ssh/config", "List these hosts too", "ssh config discover").keys(&["ssh.discover"]),
+    e(Page::Network, "Availability", "Make this computer available", "tailscale tailnet serve remote reach without ssh"),
+    e(Page::Network, "Availability", "Port", "tailscale tailnet serve port"),
+    e(Page::Network, "Pairing", "Allow a new device", "pair pairing code tailscale tailnet trust"),
+    e(Page::Network, "Paired devices", "Paired devices", "revoke forget trust tailscale tailnet"),
+    e(Page::Network, "Your other computers", "List computers on your tailnet", "tailscale tailnet discover peers switcher")
+        .keys(&["tailnet.discover"]),
+    e(Page::Network, "Your other computers", "Include everyone's devices", "tailscale tailnet tagged shared other users")
+        .keys(&["tailnet.all_devices"]),
     e(Page::Shell, "", "goatty's managed zsh", "zsh managed dotfiles").keys(&["shell.managed"]),
     e(Page::Snippets, "Expansions", "Expand plain words while typing", "expansion abbreviation space first lines head rewrite")
         .keys(&["shell.expansions", "expansions"]),

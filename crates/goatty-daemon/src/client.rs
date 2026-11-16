@@ -192,6 +192,19 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the shell operation: {e}") });
                     }
                 }
+                ClientMsg::Net { req, request } => {
+                    // Runs `tailscale`: off the reader thread.
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-net")).spawn(move || {
+                        let msg = crate::net::request(&daemon, req, &request);
+                        if let Ok(f) = encode(&msg) {
+                            let _ = tx.send(f);
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the tailnet operation: {e}") });
+                    }
+                }
                 ClientMsg::SaveLayout { id, sessions, json } => {
                     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                     daemon.layouts.lock().save(conn, id, sessions, json, now);

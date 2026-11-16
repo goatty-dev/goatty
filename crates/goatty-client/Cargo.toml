@@ -9,6 +9,7 @@ description = "Transport-independent goattyd client: local socket, SSH, any stdi
 
 [dependencies]
 goatty-proto.workspace = true
+goatty-net.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 log.workspace = true

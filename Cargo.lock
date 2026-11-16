@@ -2020,6 +2020,7 @@ dependencies = [
  "fontdb",
  "goatty-client",
  "goatty-config",
+ "goatty-net",
  "goatty-plugin",
  "goatty-proto",
  "goatty-shell",
@@ -2043,6 +2044,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flume",
+ "goatty-net",
  "goatty-proto",
  "libc",
  "log",
@@ -2071,6 +2073,7 @@ dependencies = [
  "flume",
  "goatty-client",
  "goatty-config",
+ "goatty-net",
  "goatty-plugin",
  "goatty-proto",
  "goatty-shell",
@@ -2080,6 +2083,21 @@ dependencies = [
  "parking_lot 0.13.0",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "goatty-net"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "libc",
+ "log",
+ "parking_lot 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "tempfile",
 ]
 

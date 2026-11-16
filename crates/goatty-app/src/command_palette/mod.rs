@@ -399,6 +399,7 @@ impl CommandPalette {
         });
         // `~/.ssh/config` is re-read in the background; list what it has now.
         let hosts_changed = cx.observe_global::<HostList>(|this, cx| this.reload_commands(cx));
+        let tailnet_changed = cx.observe_global::<crate::tailnet::TailnetList>(|this, cx| this.reload_commands(cx));
         // Plugin commands arrive after the host's catalog is fetched.
         let commands_changed = cx.observe_global::<CommandRegistry>(|this, cx| this.reload_commands(cx));
         hosts::refresh(cx);
@@ -422,7 +423,7 @@ impl CommandPalette {
             _load: None,
             ending: None,
             asking: None,
-            _subscriptions: vec![sub, hosts_changed, commands_changed],
+            _subscriptions: vec![sub, hosts_changed, tailnet_changed, commands_changed],
         };
         // A host's sessions are fetched; the other scopes list what's here.
         match this.scope.clone() {
@@ -490,7 +491,8 @@ impl CommandPalette {
             return;
         }
         let registry = cx.try_global::<CommandRegistry>().map(|r| r.commands().to_vec()).unwrap_or_default();
-        let hosts = hosts::current(cx).into_iter().map(|e| Rc::new(hosts::command(&e)));
+        let tailnet: Vec<_> = crate::tailnet::current(cx).iter().map(|e| Rc::new(crate::tailnet::command(e))).collect();
+        let hosts = hosts::current(cx).into_iter().map(|e| Rc::new(hosts::command(&e))).chain(tailnet);
         self.commands = match self.scope {
             Scope::All => registry.into_iter().chain(hosts).collect(),
             Scope::Hosts => std::iter::once(Rc::new(hosts::local_command()))

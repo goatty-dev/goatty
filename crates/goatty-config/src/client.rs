@@ -26,7 +26,26 @@ pub struct ClientSettings {
     pub selection: SelectionSettings,
     pub mouse: MouseSettings,
     pub ssh: SshSettings,
+    pub tailnet: TailnetSettings,
     pub debug: DebugSettings,
+}
+
+/// Other computers on the user's tailnet that run goatty (#15).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TailnetSettings {
+    /// List the tailnet's computers that run goatty (and the paired ones)
+    /// in the host switcher. Reads `tailscale status` and probes goatty's
+    /// port on online peers when the switcher opens.
+    pub discover: bool,
+    /// Also other people's and tagged devices, not only the user's own.
+    pub all_devices: bool,
+}
+
+impl Default for TailnetSettings {
+    fn default() -> Self {
+        Self { discover: true, all_devices: false }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

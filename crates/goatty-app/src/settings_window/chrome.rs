@@ -632,6 +632,7 @@ impl Render for SettingsWindow {
                 Page::Workspace => self.workspace(ui, cx),
                 Page::Shortcuts => self.shortcuts_page(ui, window, cx),
                 Page::Hosts => self.hosts_page(ui, cx),
+                Page::Network => self.network_page(ui, cx),
                 Page::Shell => self.shell(ui, cx),
                 Page::Dotfiles => self.dotfiles_page(ui, window, cx),
                 Page::Path => self.path_page(ui, window, cx),

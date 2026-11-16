@@ -21,6 +21,8 @@
 //! * [`service`] knows about goattyd's systemd user units (starting the
 //!   socket instead of a detached daemon when they're installed).
 //! * [`ssh_config`] lists the hosts in `~/.ssh/config` for the GUI's host list.
+//! * [`tailnet`] connects to paired hosts on the user's tailnet, discovers
+//!   and pairs new ones (`goatty_net` does the Tailscale and gateway parts).
 
 pub mod askpass;
 mod connection;
@@ -30,6 +32,7 @@ pub mod local;
 pub mod remote;
 pub mod service;
 pub mod ssh_config;
+pub mod tailnet;
 pub mod transport;
 
 pub use connection::{Connection, HostSettingsApplied, HostSettingsReply};
@@ -38,7 +41,7 @@ pub use goatty_proto::TopLineCause;
 pub use handshake::VersionMismatch;
 pub use local::LocalProblem;
 pub use remote::RemoteProblem;
-pub use transport::{Endpoint, SshTarget, connect_or_spawn_daemon};
+pub use transport::{Endpoint, SshTarget, TailnetTarget, connect_or_spawn_daemon};
 
 /// Receives one session's terminal stream. Called on the connection's
 /// reader thread; keep it fast (feed a VT, wake the UI).

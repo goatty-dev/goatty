@@ -22,6 +22,7 @@ log.workspace = true
 env_logger.workspace = true
 flume.workspace = true
 goatty-client.workspace = true
+goatty-net.workspace = true
 goatty-config.workspace = true
 goatty-shell.workspace = true
 goatty-plugin.workspace = true
