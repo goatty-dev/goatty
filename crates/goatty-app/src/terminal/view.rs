@@ -155,6 +155,9 @@ pub struct TerminalView {
     drag_pos: Option<Point<Pixels>>,
     /// Scrolls while a selecting drag is past the top or bottom edge (#26).
     autoscroll: Option<Task<()>>,
+    /// Drops predicted echo (#16) the host didn't confirm in time; runs
+    /// while there are predictions.
+    expiring: bool,
     scroll_accum: f32,
     cursor_visible: bool,
     last_activity: Instant,
@@ -282,6 +285,7 @@ impl TerminalView {
             selecting: false,
             drag_pos: None,
             autoscroll: None,
+            expiring: false,
             scroll_accum: 0.0,
             cursor_visible: true,
             last_activity: Instant::now(),
@@ -421,19 +425,33 @@ impl TerminalView {
     fn send(&mut self, bytes: &[u8], cx: &mut Context<'_, Self>) {
         self.session.terminal.scroll_to_bottom();
         self.session.write(bytes);
-        // Predicted echo (#16) the host doesn't confirm in time disappears.
-        if let Some(at) = self.session.prediction_deadline() {
-            let wait = at.saturating_duration_since(Instant::now());
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(wait).await;
-                let _ = this.update(cx, |view, cx| {
+        self.arm_expiry(cx);
+    }
+
+    /// Predicted echo (#16) the host doesn't confirm in time disappears:
+    /// one task follows the earliest deadline until no prediction is left
+    /// (confirming the earliest guess moves the deadline later).
+    fn arm_expiry(&mut self, cx: &mut Context<'_, Self>) {
+        if self.expiring || self.session.prediction_deadline().is_none() {
+            return;
+        }
+        self.expiring = true;
+        cx.spawn(async move |this, cx| {
+            while let Ok(Some(at)) = this.update(cx, |view, _| view.session.prediction_deadline()) {
+                cx.background_executor().timer(at.saturating_duration_since(Instant::now())).await;
+                let alive = this.update(cx, |view, cx| {
                     if view.session.expire_predictions() {
                         cx.notify();
                     }
                 });
-            })
-            .detach();
-        }
+                if alive.is_err() {
+                    return;
+                }
+            }
+            // No await since the last check: nothing was predicted meanwhile.
+            let _ = this.update(cx, |view, _| view.expiring = false);
+        })
+        .detach();
     }
 
     /// Show the cursor solid and restart the blink timer.

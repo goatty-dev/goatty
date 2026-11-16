@@ -13,9 +13,15 @@
 //! *tentative*: its guesses stay hidden until the host echoes one of them.
 //! So at a password prompt (echo off) nothing typed is ever shown. An epoch
 //! is trusted right away only when the shell says it's at a prompt with its
-//! line editor running (goatty's managed zsh, `OSC 7337;zle=1`), nothing we
-//! sent earlier still waits for a reaction, and no shown guess was wrong
-//! since the host last confirmed one.
+//! line editor running (goatty's managed zsh, `OSC 7337;zle=1`), that prompt
+//! is newer than the last unpredictable input (a key bound to a widget may
+//! read a secret without echo while zle stays on), nothing we sent earlier
+//! still waits for a reaction, and no shown guess was wrong since the host
+//! last confirmed one.
+//!
+//! Guesses typed after unpredictable input can't be confirmed before the
+//! host reacted to it: until then the cursor they were placed at is stale,
+//! and an echo meant for an earlier guess could seem to confirm them.
 //!
 //! The caller decides when to predict at all (a slow link, not in the alt
 //! screen) and feeds every input chunk and every output chunk through here.
@@ -52,6 +58,12 @@ enum Fence {
     Output,
 }
 
+impl Fence {
+    fn clear(self) -> bool {
+        self == Fence::Clear
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Predictor {
     guesses: Vec<Guess>,
@@ -64,6 +76,12 @@ pub struct Predictor {
     /// The next guess goes at the real cursor, not after the last guess.
     from_cursor: bool,
     fence: Fence,
+    /// The last guess made before the last unpredictable input: later
+    /// ones wait for the fence.
+    barrier: u64,
+    /// The prompt (`Terminal::prompt_generation`) that last got
+    /// unpredictable input: it isn't trusted any more.
+    spoiled_prompt: Option<u64>,
     /// A shown guess was wrong: trust nothing until the host confirms one.
     glitch: bool,
     seq: u64,
@@ -119,6 +137,8 @@ impl Predictor {
             decided: false,
             from_cursor: true,
             fence: Fence::Clear,
+            barrier: 0,
+            spoiled_prompt: None,
             glitch: false,
             seq: 0,
             visible: true,
@@ -130,10 +150,11 @@ impl Predictor {
 
     /// Forget every guess (prediction got turned off, the screen was
     /// resized, the link dropped). The next input starts a tentative epoch.
+    /// Input still waiting for the host's reaction keeps waiting: only
+    /// output resolves the fence.
     pub fn reset(&mut self) {
         self.guesses.clear();
         self.new_epoch();
-        self.fence = Fence::Clear;
     }
 
     fn new_epoch(&mut self) {
@@ -187,7 +208,7 @@ impl Predictor {
             Typed::Chars => {
                 if !self.decided {
                     self.decided = true;
-                    if !self.glitch && self.fence == Fence::Clear && term.line_editing() {
+                    if !self.glitch && self.fence.clear() && term.line_editing() && self.spoiled_prompt != Some(term.prompt_generation()) {
                         self.shown_epoch = self.epoch;
                     }
                 }
@@ -200,7 +221,7 @@ impl Predictor {
                     // Wrapping depends on the application: stop at the
                     // last column and wait for the host.
                     if col + 1 >= cols {
-                        self.unpredictable();
+                        self.unpredictable(term);
                         return;
                     }
                     self.seq += 1;
@@ -214,16 +235,18 @@ impl Predictor {
                 Some(g) if !self.from_cursor && g.epoch == self.epoch => {
                     self.guesses.pop();
                 }
-                _ => self.unpredictable(),
+                _ => self.unpredictable(term),
             },
-            Typed::Other => self.unpredictable(),
+            Typed::Other => self.unpredictable(term),
         }
     }
 
     /// Input whose effect we can't guess: wait for the host's reaction.
-    fn unpredictable(&mut self) {
+    fn unpredictable(&mut self, term: &Terminal) {
         self.new_epoch();
-        self.fence = if self.guesses.is_empty() { Fence::Output } else { Fence::Guesses(self.seq) };
+        self.barrier = self.seq;
+        self.fence = if self.guesses.iter().any(|g| g.seq <= self.barrier) { Fence::Guesses(self.seq) } else { Fence::Output };
+        self.spoiled_prompt = Some(term.prompt_generation());
     }
 
     /// The host's output was fed into `term`: check the guesses against it.
@@ -235,6 +258,9 @@ impl Predictor {
         }
         if !self.guesses.is_empty() {
             let shown = self.shown_epoch;
+            // Before the host reacted to unpredictable input, guesses typed
+            // after it can't be checked.
+            let (fenced, barrier) = (!self.fence.clear(), self.barrier);
             let mut failed = None;
             let mut confirmed_epoch = None;
             let mut echoed = None;
@@ -252,7 +278,7 @@ impl Predictor {
                         failed = Some(false);
                         return true;
                     }
-                    if ccol <= g.col {
+                    if ccol <= g.col || (fenced && g.seq > barrier) {
                         return true;
                     }
                     let ch = t.grid[Line(g.row as i32)][Column(g.col)].c();
@@ -481,7 +507,8 @@ mod tests {
         feed(&mut p, &t, b"\x08");
         feed(&mut p, &t, b"ba\x08");
         assert_eq!(p.wrong, 0);
-        // Trusted again, at the real cursor.
+        // `b` waited for the reaction to Left, then its echo confirmed it:
+        // the rest of its epoch shows, at the real cursor.
         p.input(&t, b"c", now, T);
         assert_eq!(shown(&p, &t), "c");
         assert_eq!(cursor(&p, &t), (0, 4));
@@ -564,5 +591,68 @@ mod tests {
         p.set_visible(true);
         p.input(&t, b"c", now, T);
         assert_eq!(shown(&p, &t), "c");
+    }
+
+    fn type_each(p: &mut Predictor, t: &Terminal, keys: &[u8], now: Instant) {
+        for k in keys {
+            p.input(t, std::slice::from_ref(k), now, T);
+        }
+    }
+
+    #[test]
+    fn password_typeahead_is_not_confirmed_by_the_commands_echo() {
+        let t = term();
+        zle_prompt(&t);
+        let mut p = Predictor::new();
+        let now = Instant::now();
+        // All typed before the host echoes anything.
+        type_each(&mut p, &t, b"sudo\rsecret", now);
+        assert_eq!(shown(&p, &t), "sudo");
+        // The echo of the command's `s` lands where the password's `s` was
+        // guessed too; it must not confirm it.
+        feed(&mut p, &t, b"s");
+        assert_eq!(shown(&p, &t), "udo");
+        feed(&mut p, &t, b"udo");
+        feed(&mut p, &t, b"\r\n\x1b]133;C\x07[sudo] password: ");
+        assert_eq!(shown(&p, &t), "");
+        p.expire(now + T);
+        assert_eq!(shown(&p, &t), "");
+    }
+
+    #[test]
+    fn a_widget_reading_without_echo_at_the_prompt_is_not_trusted() {
+        let t = term();
+        zle_prompt(&t);
+        let mut p = Predictor::new();
+        let now = Instant::now();
+        // A key bound to a widget that asks for a passphrase (`read -s`):
+        // zle stays on, no new prompt.
+        p.input(&t, b"\x1bp", now, T);
+        feed(&mut p, &t, b"Passphrase: ");
+        type_each(&mut p, &t, b"hunter2", now);
+        assert_eq!(shown(&p, &t), "");
+        // The next prompt is trusted again.
+        p.input(&t, b"\r", now, T);
+        feed(&mut p, &t, b"\r\n");
+        t.feed(b"\x1b[H\x1b[2J");
+        zle_prompt(&t);
+        p.output(&t, now);
+        p.input(&t, b"l", now, T);
+        assert_eq!(shown(&p, &t), "l");
+    }
+
+    #[test]
+    fn turning_drawing_on_keeps_waiting_for_the_hosts_reaction() {
+        let t = term();
+        zle_prompt(&t);
+        let mut p = Predictor::new();
+        p.set_visible(false);
+        let now = Instant::now();
+        type_each(&mut p, &t, b"sudo\r", now);
+        // The echo delay crossed the threshold: drawing turns on before
+        // the host reacted to Enter (zle is still on).
+        p.set_visible(true);
+        p.input(&t, b"x", now, T);
+        assert_eq!(shown(&p, &t), "");
     }
 }

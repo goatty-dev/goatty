@@ -59,6 +59,9 @@ pub(crate) struct Inner {
     /// The shell said at its prompt that goatty's command-line widgets are
     /// bound (`OSC 7337;zle=1`); cleared when a command starts.
     pub(crate) zle: AtomicBool,
+    /// How many times the shell said `zle=1`: once per prompt (local echo
+    /// prediction tells a fresh prompt from the one input went to).
+    pub(crate) prompts: AtomicU64,
     /// Which host line each row shows (clients; see `history`).
     pub(crate) lines: Mutex<crate::history::LineMap>,
 }
@@ -112,6 +115,7 @@ impl Terminal {
             shell: AtomicU8::new(0),
             started: AtomicU64::new(0),
             zle: AtomicBool::new(false),
+            prompts: AtomicU64::new(0),
             lines: Mutex::new(Default::default()),
         };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
@@ -215,7 +219,12 @@ impl Terminal {
                 self.set_shell(ShellState::Finished);
                 let _ = self.inner.ui.send(UiEvent::CommandFinished { exit });
             }
-            Mark::Zle(on) => self.inner.zle.store(on, Ordering::Relaxed),
+            Mark::Zle(on) => {
+                self.inner.zle.store(on, Ordering::Relaxed);
+                if on {
+                    self.inner.prompts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             Mark::Line(line) => {
                 let _ = self.inner.ui.send(UiEvent::CommandLine(line));
             }
@@ -227,6 +236,11 @@ impl Terminal {
     /// [`crate::input::LineEdit`] keys work.
     pub fn line_editing(&self) -> bool {
         self.inner.zle.load(Ordering::Relaxed) && self.shell_state() != ShellState::Running
+    }
+
+    /// Counts the prompts with line editing (`zle=1`) so far.
+    pub(crate) fn prompt_generation(&self) -> u64 {
+        self.inner.prompts.load(Ordering::Relaxed)
     }
 
     /// What the snapshots carry about the shell.
