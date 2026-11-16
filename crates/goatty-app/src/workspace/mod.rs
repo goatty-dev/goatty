@@ -229,7 +229,7 @@ pub struct Workspace {
     sidebar_drag: Option<(Sidebar, Sidebar)>,
     save_sidebar: Option<Task<()>>,
     /// The open right-click menu (a tab's or a pane's).
-    menu: Option<(Entity<crate::ui::context_menu::ContextMenu>, Subscription)>,
+    menu: Option<menu::OpenMenu>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -496,8 +496,8 @@ impl Workspace {
     /// Focus the active tab's pane (or connect screen); an open palette or
     /// list of recent notifications keeps the keyboard until it closes.
     fn focus_active(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some((menu, _)) = &self.menu {
-            menu.focus_handle(cx).focus(window, cx);
+        if let Some(menu) = self.menu_focus(cx) {
+            menu.focus(window, cx);
         } else if let Some((view, _)) = &self.recent {
             view.focus_handle(cx).focus(window, cx);
         } else if let Some((picker, _)) = &self.snippets {
@@ -769,6 +769,10 @@ impl Workspace {
     /// with its last pane, the window with its last tab.
     fn remove_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some((index, _)) = self.find_pane(id) else { return };
+        // Its menu's items would act on whatever pane has focus next.
+        if self.menu.as_ref().is_some_and(|m| m.owner == menu::MenuOwner::Pane(id)) {
+            self.close_menu(window, cx);
+        }
         let tab = &mut self.tabs[index];
         if tab.tree == Node::Leaf(id) {
             self.remove_tab(index, window, cx);
@@ -798,6 +802,9 @@ impl Workspace {
     }
 
     fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(id) = self.tabs.get(index).map(|t| t.id) {
+            self.close_menu_of_tab(id, window, cx);
+        }
         let tab = self.tabs.remove(index);
         if self.rename.as_ref().is_some_and(|r| r.tab == tab.id) {
             self.rename = None;

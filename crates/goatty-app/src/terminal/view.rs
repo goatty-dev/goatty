@@ -544,7 +544,7 @@ impl TerminalView {
     /// Send `edit`'s keys to the shell, if it's at a prompt with goatty's
     /// widgets; otherwise say why not and return false.
     fn line_edit(&mut self, edit: LineEdit, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
-        if !self.session.terminal.line_editing() {
+        if !self.can_edit_line() {
             let body = match self.process.as_deref() {
                 Some(p) if !crate::workspace::icons::is_shell(p) => format!("{p} is running in this pane. Use it at a shell prompt."),
                 _ => "This works at a prompt of goatty's shell (with shell integration on).".to_string(),
@@ -558,9 +558,20 @@ impl TerminalView {
         true
     }
 
+    /// Whether goatty's widgets take keys here: the shell says so, and no
+    /// other program is in the foreground (an editor started from the line,
+    /// a job the shell integration doesn't know about).
+    fn can_edit_line(&self) -> bool {
+        self.session.terminal.line_editing() && self.process.as_deref().is_none_or(crate::workspace::icons::is_shell)
+    }
+
     /// Ask the shell for the command line; [`Self::command_line_arrived`]
-    /// does the rest.
+    /// does the rest. One question at a time: a second one while the first
+    /// waits would take over its answer.
     fn request_line(&mut self, what: LineUse, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.line_request.is_some() {
+            return;
+        }
         if !self.line_edit(LineEdit::Report, window, cx) {
             return;
         }
@@ -616,7 +627,7 @@ impl TerminalView {
     /// The typed command into a new snippet; without one (or outside
     /// goatty's shell), the last command run.
     fn save_command_line(&mut self, _: &SaveCommandLine, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.session.terminal.line_editing() {
+        if self.can_edit_line() {
             self.request_line(LineUse::Snippet, window, cx);
         } else {
             crate::snippets::save_last(window, cx);
@@ -704,12 +715,13 @@ impl TerminalView {
         );
 
         out.push(Entry::Separator);
-        if self.session.terminal.line_editing() {
+        if self.can_edit_line() {
             out.push(Entry::Header("Command line".into()));
             out.push(Item::action("Copy the command", "copy_command_line", cx).icon(Icon::Copy).into());
             out.push(Item::action("Save as a snippet…", "save_command_line", cx).icon(Icon::BookmarkPlus).into());
             out.push(Item::action("Add or remove sudo", "toggle_sudo", cx).icon(Icon::Shield).into());
             out.push(Item::action("Edit in your editor", "edit_command_line", cx).icon(Icon::Pencil).into());
+            out.push(Item::action("Clear the command", "clear_command_line", cx).icon(Icon::Eraser).into());
             out.push(Item::action("Find a snippet…", "snippets", cx).icon(Icon::BookOpen).into());
         } else if !self.session.terminal.command_running() && self.process.as_deref().is_none_or(crate::workspace::icons::is_shell) {
             // A shell without goatty's widgets (plain SSH, bash): what works anyway.

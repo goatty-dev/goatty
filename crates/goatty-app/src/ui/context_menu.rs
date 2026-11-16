@@ -209,8 +209,12 @@ impl ContextMenu {
         }
     }
 
+    /// Open the submenu of item `parent` (if it is one and enabled).
     fn open_sub(&mut self, parent: usize, keys: bool) {
-        let Some(Entry::Item(Item { kind: Kind::Submenu(entries), .. })) = self.entries.get(parent) else { return };
+        let Some(Entry::Item(item @ Item { kind: Kind::Submenu(entries), .. })) = self.entries.get(parent) else { return };
+        if !item.enabled() {
+            return;
+        }
         let selected = if keys { next_enabled(entries, None, 1) } else { None };
         self.closing = None;
         self.selected = Some(parent);
@@ -299,6 +303,11 @@ impl ContextMenu {
 
     /// The pointer is over item `ix` of the main menu.
     fn hover_main(&mut self, ix: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // The keys follow the pointer back to the main menu; an open submenu
+        // only stays visible for the grace period.
+        if std::mem::take(&mut self.in_sub) {
+            cx.notify();
+        }
         if self.selected == Some(ix) && (self.sub.is_none() || self.sub.as_ref().is_some_and(|s| s.parent == ix)) {
             self.closing = None;
             return;
@@ -376,7 +385,8 @@ impl ContextMenu {
                     .px(px(10.))
                     .pt(px(6.))
                     .pb(px(2.))
-                    .text_size(px(text::CAPTION))
+                    // Not smaller than the items under it.
+                    .text_size(px(text::LABEL))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(ui.muted)
                     .child(t.clone())

@@ -61,24 +61,35 @@ _goatty_line_report() {
 _goatty_line_sudo() {
   [[ -z $BUFFER ]] && zle .up-history
   if [[ $BUFFER == sudo\ * ]]; then
+    # Shortening BUFFER clamps CURSOR: take it first.
+    local cursor=$CURSOR
     BUFFER=${BUFFER#sudo }
-    (( CURSOR = CURSOR > 5 ? CURSOR - 5 : 0 ))
+    (( CURSOR = cursor > 5 ? cursor - 5 : 0 ))
   else
     BUFFER="sudo $BUFFER"
     (( CURSOR += 5 ))
   fi
 }
 
+# Edit the line in $VISUAL/$EDITOR. The editor owns the terminal meanwhile:
+# goatty mustn't send it the keys above.
+_goatty_line_editor() {
+  builtin print -rn -- $'\e]7337;zle=0\a'
+  zle edit-command-line
+  builtin print -rn -- $'\e]7337;zle=1\a'
+}
+
 builtin autoload -Uz edit-command-line
 zle -N edit-command-line
 zle -N _goatty_line_report
 zle -N _goatty_line_sudo
+zle -N _goatty_line_editor
 () {
   local km
   for km in emacs viins vicmd; do
     bindkey -M $km '^[[7337;1~' _goatty_line_report
     bindkey -M $km '^[[7337;2~' _goatty_line_sudo
-    bindkey -M $km '^[[7337;3~' edit-command-line
+    bindkey -M $km '^[[7337;3~' _goatty_line_editor
     bindkey -M $km '^[[7337;4~' kill-buffer
   done
 }

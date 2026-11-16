@@ -23,23 +23,46 @@ use crate::terminal::TerminalView;
 use crate::ui::context_menu::{ContextMenu, Entry, Item, MenuEvent};
 use crate::ui::icons::Icon;
 
+/// What the open menu is about: it closes when that goes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MenuOwner {
+    Tab(u64),
+    Pane(PaneId),
+}
+
+/// The open menu.
+pub(super) struct OpenMenu {
+    menu: Entity<ContextMenu>,
+    pub owner: MenuOwner,
+    _subscription: gpui::Subscription,
+}
+
 /// More plugin entries than this go into a submenu.
 const INLINE_PLUGIN_ITEMS: usize = 3;
 
 impl Workspace {
-    /// Open `entries` as the window's menu at `at`.
-    fn open_menu(&mut self, entries: Vec<Entry>, at: Point<Pixels>, keyboard: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Open `entries` as the window's menu for `owner` at `at`.
+    fn open_menu(
+        &mut self,
+        owner: MenuOwner,
+        entries: Vec<Entry>,
+        at: Point<Pixels>,
+        keyboard: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         self.finish_rename(true, window, cx);
         let menu = cx.new(|cx| ContextMenu::new(entries, at, keyboard, window, cx));
         let sub = cx.subscribe_in(&menu, window, |this, _, ev: &MenuEvent, window, cx| match ev {
             MenuEvent::Run(handler) => {
                 let handler = handler.clone();
                 this.close_menu(window, cx);
-                handler(window, cx);
+                // After this update: handlers may update the workspace.
+                window.defer(cx, move |window, cx| handler(window, cx));
             }
             MenuEvent::Dismissed => this.close_menu(window, cx),
         });
-        self.menu = Some((menu, sub));
+        self.menu = Some(OpenMenu { menu, owner, _subscription: sub });
         cx.notify();
     }
 
@@ -52,7 +75,24 @@ impl Workspace {
     }
 
     pub(super) fn render_menu(&self) -> Option<Entity<ContextMenu>> {
-        self.menu.as_ref().map(|(m, _)| m.clone())
+        self.menu.as_ref().map(|m| m.menu.clone())
+    }
+
+    pub(super) fn menu_focus(&self, cx: &gpui::App) -> Option<gpui::FocusHandle> {
+        use gpui::Focusable;
+        self.menu.as_ref().map(|m| m.menu.focus_handle(cx))
+    }
+
+    /// Close the menu if it's about tab `tab` or one of its panes (going away).
+    pub(super) fn close_menu_of_tab(&mut self, tab: u64, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(owner) = self.menu.as_ref().map(|m| m.owner) else { return };
+        let mine = match owner {
+            MenuOwner::Tab(t) => t == tab,
+            MenuOwner::Pane(p) => self.tab_index(tab).is_some_and(|i| self.tabs[i].pane(p).is_some()),
+        };
+        if mine {
+            self.close_menu(window, cx);
+        }
     }
 
     // ---- a tab's menu -----------------------------------------------------------
@@ -91,7 +131,7 @@ impl Workspace {
             .disabled(last.then_some(if vertical { "No tabs below this one" } else { "No tabs to the right" }))
             .into(),
         ];
-        self.open_menu(entries, at, false, window, cx);
+        self.open_menu(MenuOwner::Tab(tab), entries, at, false, window, cx);
     }
 
     // ---- a pane's menu ----------------------------------------------------------
@@ -164,7 +204,7 @@ impl Workspace {
             entries.push(Entry::Separator);
             entries.push(Entry::Note(Icon::MousePointerClick, note.into()));
         }
-        self.open_menu(entries, at, keyboard, window, cx);
+        self.open_menu(MenuOwner::Pane(pane), entries, at, keyboard, window, cx);
     }
 
     // ---- moving panes ---------------------------------------------------------
