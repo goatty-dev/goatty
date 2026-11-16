@@ -19,6 +19,16 @@ pub struct HostSettings {
     /// The user's own aliases, by name (#88). Rendered after the plugins'
     /// aliases, so one of these with the same name wins.
     pub aliases: BTreeMap<String, UserAlias>,
+    /// The user's own snippets (#89), by id: command lines with blanks for
+    /// the snippet picker, in the format of a plugin's `[[snippet]]`
+    /// (`goatty_plugin::snippets::Snippet`, without its `id`). Checked
+    /// on the host, where the format is known; a broken one is left out
+    /// and reported.
+    pub snippets: BTreeMap<String, Value>,
+    /// The user's own expansions (#89), by id: words that turn into a
+    /// command while typing (`goatty_plugin::snippets::Expansion`, plus
+    /// `"enabled": false` to keep one but switch it off).
+    pub expansions: BTreeMap<String, Value>,
     /// Plugins' configuration, by plugin id (Stage 5): the built-in ones
     /// (`fzf`, `fzf-tab`, `autosuggestions`, `starship`,
     /// `syntax-highlighting`) and installed ones. Which plugins are installed is host state,
@@ -132,12 +142,30 @@ pub struct ShellSettings {
     /// Bring what the user's own shell sets up (PATH folders and variables
     /// from `.zshrc` or `.bashrc`) into goatty's managed zsh.
     pub import: ImportSettings,
+    /// Expansions (#89): plain words turn into a command while you type
+    /// (`| first 20 lines` + Space → `| head -n 20`), in goatty's managed zsh.
+    pub expansions: bool,
 }
 
 impl Default for ShellSettings {
     fn default() -> Self {
-        Self { program: None, managed: true, zsh: ZshSettings::default(), path: Vec::new(), import: ImportSettings::default() }
+        Self {
+            program: None,
+            managed: true,
+            zsh: ZshSettings::default(),
+            path: Vec::new(),
+            import: ImportSettings::default(),
+            expansions: true,
+        }
     }
+}
+
+/// Ids of the user's snippets and expansions: lowercase letters, digits
+/// and `-`, starting with a letter, at most 40 characters.
+pub fn is_snippet_id(s: &str) -> bool {
+    (1..=40).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.as_bytes()[0].is_ascii_lowercase()
 }
 
 /// Importing the user's own shell setup (`shell.import`): goatty runs their
@@ -247,7 +275,7 @@ impl Default for HistorySettings {
 impl Document for HostSettings {
     const NAME: &'static str = "host";
     const VERSION: u32 = 4;
-    const OPEN_MAPS: &'static [&'static str] = &["aliases", "plugins", "prompt.modules"];
+    const OPEN_MAPS: &'static [&'static str] = &["aliases", "snippets", "expansions", "plugins", "prompt.modules"];
 
     fn migrations() -> &'static [Migration] {
         &[(1, builtin_tools_became_plugins), (2, atuin_left_the_builtins), (3, minimal_prompt_became_lean)]
@@ -289,6 +317,14 @@ impl Document for HostSettings {
         for a in self.aliases.values_mut() {
             if a.group.trim() != a.group {
                 a.group = a.group.trim().to_owned();
+            }
+        }
+        for (what, map) in [("snippets", &mut self.snippets), ("expansions", &mut self.expansions)] {
+            let bad: Vec<String> = map.iter().filter(|(id, v)| !is_snippet_id(id) || !v.is_object()).map(|(id, _)| id.clone()).collect();
+            for id in bad {
+                let why = if is_snippet_id(&id) { "not an object" } else { "not an id (lowercase letters, digits and -)" };
+                issues.push(Issue::new(format!("{what}.{id}"), format!("{why}; ignored")));
+                map.remove(&id);
             }
         }
         let bad: Vec<String> = self.plugins.keys().filter(|id| !is_plugin_id(id)).cloned().collect();
@@ -548,6 +584,23 @@ mod tests {
         let json = crate::store::to_json(&loaded.value, &loaded.unknown);
         assert!(json.contains("\"icons\": \"always\"") && json.contains("\"zoxide\""), "{json}");
         assert!(crate::store::is_known_key::<HostSettings>("plugins.eza.settings.icons"));
+    }
+
+    #[test]
+    fn user_snippets_and_expansions() {
+        let loaded = crate::store::parse::<HostSettings>(
+            r#"{"snippets": {"find-big": {"title": "Find big files", "line": "du -sh *"}, "Bad Id": {}, "list": "ls"},
+                "expansions": {"first": {"say": "| first {n} lines", "to": "| head -n {n}"}},
+                "shell": {"expansions": false}}"#,
+        );
+        assert_eq!(loaded.value.snippets.keys().collect::<Vec<_>>(), ["find-big"]);
+        assert_eq!(loaded.value.expansions["first"]["to"], "| head -n {n}");
+        assert!(!loaded.value.shell.expansions);
+        let paths: Vec<&str> = loaded.issues.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"snippets.Bad Id") && paths.contains(&"snippets.list"), "{paths:?}");
+        assert!(!loaded.issues.iter().any(|i| i.message.contains("unknown")), "{:?}", loaded.issues);
+        assert!(HostSettings::default().shell.expansions, "on by default");
+        assert!(crate::store::is_known_key::<HostSettings>("snippets.mine.line"));
     }
 
     #[test]

@@ -538,6 +538,8 @@ pub fn modal(ui: Ui, id: &str, title: impl Into<SharedString>, body: impl IntoEl
             .id(SharedString::from(format!("{id}-card")))
             .w(px(520.))
             .max_w(relative(0.9))
+            // A tall dialog (the snippet editor) scrolls its body in a short window.
+            .max_h(relative(0.94))
             .flex()
             .flex_col()
             .rounded(px(22.))
@@ -557,7 +559,16 @@ pub fn modal(ui: Ui, id: &str, title: impl Into<SharedString>, body: impl IntoEl
                     .text_color(ui.text)
                     .child(title.into()),
             )
-            .child(div().px(px(24.)).py(px(12.)).child(body))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-body")))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(24.))
+                    .py(px(12.))
+                    .child(body),
+            )
             .child(div().flex().justify_end().gap(px(8.)).px(px(20.)).pt(px(8.)).pb(px(20.)).child(footer)),
     )
 }

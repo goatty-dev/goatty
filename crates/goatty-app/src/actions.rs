@@ -44,6 +44,8 @@ actions!(
         ToggleCommandPalette,
         /// The command palette with only the hosts to connect to.
         ConnectToHost,
+        /// The snippet picker: find a command by what it does and fill it in (#89).
+        OpenSnippets,
         /// The command palette with the active tab's host's sessions (open
         /// or end one without entering it).
         ListSessions,
@@ -124,6 +126,7 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "open_settings" => Box::new(OpenSettings),
         "command_palette" => Box::new(ToggleCommandPalette),
         "connect_to_host" => Box::new(ConnectToHost),
+        "snippets" => Box::new(OpenSnippets),
         "list_sessions" => Box::new(ListSessions),
         "reload_shells" => Box::new(ReloadShells),
         "dismiss_notifications" => Box::new(DismissNotifications),
@@ -203,6 +206,9 @@ pub fn apply_keybindings(overrides: &BTreeMap<String, Option<String>>, cx: &mut 
     let palette_keys = goatty_config::keys::keys_for("command_palette", overrides);
     let palette = crate::command_palette::bindings(&palette_keys, cx);
     cx.bind_keys(palette);
+    let snippet_keys = goatty_config::keys::keys_for("snippets", overrides);
+    let snippets = crate::snippets::picker::bindings(&snippet_keys, cx);
+    cx.bind_keys(snippets);
     let recent_keys = goatty_config::keys::keys_for("show_recent_notifications", overrides);
     let recent = crate::toast::recent::bindings(&recent_keys, cx);
     cx.bind_keys(recent);

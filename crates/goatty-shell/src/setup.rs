@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use goatty_config::{Effective, HostSettings};
 use serde::{Deserialize, Serialize};
 
-use crate::builtins::{self, BUILTINS, Builtin};
+use crate::builtins::{self, Builtin};
 use crate::dirs::Dirs;
 use crate::doctor::{self, State};
 use crate::generation;
@@ -356,7 +356,7 @@ pub fn status(svc: &HostService) -> Result<Status> {
             stderr: p.stderr.trim().to_owned(),
         });
     }
-    s.tools = svc.plugins(|plugins| Ok(BUILTINS.iter().map(|b| tool(b, plugins, &host, probe.as_ref())).collect()))?;
+    s.tools = svc.plugins(|plugins| Ok(builtins::tools().map(|b| tool(b, plugins, &host, probe.as_ref())).collect()))?;
     Ok(s)
 }
 

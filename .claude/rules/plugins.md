@@ -14,6 +14,7 @@ Format and trust model: `docs/plugins.md`.
   - Everything that gets sourced is re-checked against the lock.
 - Quote all generated shell code with `goatty_plugin::zsh::quote`. The only code a plugin runs is its reviewed `zsh.init`.
 - A new pin must be a release at least 2 weeks old, with its sha256 matched against upstream's digest.
+- Snippets (`[[snippet]]`, docs/snippets.md): every `{input}` becomes one quoted word (`snippets::render`); a placeholder inside quotes is a validation error. Sources run the host's own definition (a client sends only ids), argv-only for plugins (`sh` is for the user's own snippets), with a timeout and an output cap. Expansions reach zsh only as quoted data (`snippets::render_table`).
 - To add a manifest field: add it to `manifest.rs` (with validation, and permissions if it can run code), render it in `zsh.rs`, and document it in `docs/plugins.md` and in the template repo.
 - Related repos:
   - `../goatty-registry` (https://github.com/goatty-dev/goatty-registry) is the official registry. Its index is signed offline with the key in `~/.local/share/goatty-registry-keys/`. Never commit that key or put it in CI.

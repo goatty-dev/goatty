@@ -115,6 +115,23 @@ pub enum InputKind {
     Folder,
     /// One of `choices`.
     Choice,
+    /// Snippets only: a yes/no question whose "yes" inserts the input's
+    /// `on` text ("Include subfolders?" → `-r`).
+    Flag,
+}
+
+impl InputKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            InputKind::Text => "text",
+            InputKind::Integer => "integer",
+            InputKind::Number => "number",
+            InputKind::Path => "path",
+            InputKind::Folder => "folder",
+            InputKind::Choice => "choice",
+            InputKind::Flag => "flag",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,13 +151,13 @@ impl InputChoice {
     }
 }
 
-fn is_command_id(s: &str) -> bool {
+pub(crate) fn is_command_id(s: &str) -> bool {
     (1..=40).contains(&s.len())
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && s.as_bytes()[0].is_ascii_lowercase()
 }
 
-fn is_input_id(s: &str) -> bool {
+pub(crate) fn is_input_id(s: &str) -> bool {
     (1..=40).contains(&s.len())
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         && s.as_bytes()[0].is_ascii_lowercase()
@@ -183,6 +200,11 @@ pub fn check_value(input: &CommandInput, text: &str) -> Result<String, String> {
         InputKind::Choice => {
             input.choices.iter().find(|c| c.value == text).map(|c| c.value.clone()).ok_or_else(|| "Pick one from the list".to_string())
         }
+        InputKind::Flag => match text.trim() {
+            "yes" | "on" | "true" => Ok("yes".into()),
+            "no" | "off" | "false" => Ok("no".into()),
+            _ => Err("Answer yes or no".into()),
+        },
         InputKind::Path | InputKind::Folder => Ok(text.to_string()),
         InputKind::Text => {
             if let Some(p) = &input.pattern {
@@ -270,6 +292,56 @@ pub fn describe(c: &PaletteCommand) -> String {
     c.run.join(" ")
 }
 
+/// Problems with one input's definition (labels, limits, pattern,
+/// choices, default), shared by `[[command]]` and `[[snippet]]` inputs.
+pub(crate) fn check_input(input: &CommandInput, at: &str) -> Vec<Problem> {
+    let mut out = Vec::new();
+    let mut err = |path: String, message: String| out.push(Problem { path, message });
+    if input.label.trim().is_empty() {
+        err(format!("{at}.label"), "empty".into());
+    }
+    let numeric = matches!(input.kind, InputKind::Integer | InputKind::Number);
+    if !numeric && (input.min.is_some() || input.max.is_some()) {
+        err(format!("{at}.min"), "min and max are for integer and number inputs".into());
+    }
+    if let (Some(lo), Some(hi)) = (input.min, input.max)
+        && lo > hi
+    {
+        err(format!("{at}.max"), "smaller than min".into());
+    }
+    match (&input.pattern, input.kind) {
+        (Some(_), k) if k != InputKind::Text => err(format!("{at}.pattern"), "pattern is for text inputs".into()),
+        (Some(p), _) => {
+            if let Err(e) = regex::Regex::new(&anchored(p)) {
+                err(format!("{at}.pattern"), format!("not a regular expression: {e}"));
+            }
+        }
+        (None, _) if input.pattern_help.is_some() => err(format!("{at}.pattern_help"), "without a pattern".into()),
+        _ => {}
+    }
+    if (input.kind == InputKind::Choice) == input.choices.is_empty() {
+        err(
+            format!("{at}.choices"),
+            if input.choices.is_empty() { "a choice input needs choices" } else { "only choice inputs have choices" }.into(),
+        );
+    }
+    let mut values = BTreeSet::new();
+    for ch in &input.choices {
+        if ch.value.is_empty() || !values.insert(ch.value.as_str()) {
+            err(format!("{at}.choices"), format!("{:?}: empty or listed twice", ch.value));
+        }
+    }
+    if input.must_exist && !matches!(input.kind, InputKind::Path | InputKind::Folder) {
+        err(format!("{at}.must_exist"), "only for path and folder inputs".into());
+    }
+    if let Some(d) = &input.default
+        && let Err(e) = check_value(input, d)
+    {
+        err(format!("{at}.default"), format!("{d:?}: {e}"));
+    }
+    out
+}
+
 pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
     let mut out = Vec::new();
     let mut err = |path: String, message: String| out.push(Problem { path, message });
@@ -292,47 +364,11 @@ pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
             } else if !inputs.insert(input.id.as_str()) {
                 err(format!("{at}.id"), format!("{:?} is used twice", input.id));
             }
-            if input.label.trim().is_empty() {
-                err(format!("{at}.label"), "empty".into());
+            if input.kind == InputKind::Flag {
+                err(format!("{at}.type"), "flag inputs are for snippets".into());
             }
-            let numeric = matches!(input.kind, InputKind::Integer | InputKind::Number);
-            if !numeric && (input.min.is_some() || input.max.is_some()) {
-                err(format!("{at}.min"), "min and max are for integer and number inputs".into());
-            }
-            if let (Some(lo), Some(hi)) = (input.min, input.max)
-                && lo > hi
-            {
-                err(format!("{at}.max"), "smaller than min".into());
-            }
-            match (&input.pattern, input.kind) {
-                (Some(_), k) if k != InputKind::Text => err(format!("{at}.pattern"), "pattern is for text inputs".into()),
-                (Some(p), _) => {
-                    if let Err(e) = regex::Regex::new(&anchored(p)) {
-                        err(format!("{at}.pattern"), format!("not a regular expression: {e}"));
-                    }
-                }
-                (None, _) if input.pattern_help.is_some() => err(format!("{at}.pattern_help"), "without a pattern".into()),
-                _ => {}
-            }
-            if (input.kind == InputKind::Choice) == input.choices.is_empty() {
-                err(
-                    format!("{at}.choices"),
-                    if input.choices.is_empty() { "a choice input needs choices" } else { "only choice inputs have choices" }.into(),
-                );
-            }
-            let mut values = BTreeSet::new();
-            for ch in &input.choices {
-                if ch.value.is_empty() || !values.insert(ch.value.as_str()) {
-                    err(format!("{at}.choices"), format!("{:?}: empty or listed twice", ch.value));
-                }
-            }
-            if input.must_exist && !matches!(input.kind, InputKind::Path | InputKind::Folder) {
-                err(format!("{at}.must_exist"), "only for path and folder inputs".into());
-            }
-            if let Some(d) = &input.default
-                && let Err(e) = check_value(input, d)
-            {
-                err(format!("{at}.default"), format!("{d:?}: {e}"));
+            for p in check_input(input, &at) {
+                err(p.path, p.message);
             }
         }
         match c.run.first() {

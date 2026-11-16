@@ -27,8 +27,43 @@ pub type Answers = BTreeMap<String, String>;
 /// What runs with the answers, after the palette closed.
 pub type AnswerHandler = Rc<dyn Fn(&Answers, &mut Window, &mut App)>;
 
+/// Code that runs with the window later (going back to the snippet picker).
+pub type WindowAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// An extra check: `Some(message)` when the value can't be used.
 pub type Check = Rc<dyn Fn(&str) -> Option<String>>;
+
+/// Suggestions that take a while (a program on the host): given the
+/// answers so far, the work to do off the UI thread.
+pub type Loader = Rc<dyn Fn(&Answers) -> Job>;
+pub type Job = Box<dyn FnOnce() -> Loaded + Send>;
+
+/// What a [`Loader`]'s job found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Loaded {
+    pub items: Vec<Suggestion>,
+    /// Shown under the field (why there are none, "Showing the first ones").
+    pub note: Option<String>,
+}
+
+/// The finished line shown above the fields while they're asked, updated
+/// as you type: (answers so far, the field being asked, its text).
+pub type Preview = Rc<dyn Fn(&Answers, &str, &str) -> Vec<goatty_plugin::snippets::Seg>>;
+
+/// A small label next to the title (a snippet's "Deletes data").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Badge {
+    pub text: SharedString,
+    pub tone: Tone,
+    pub tooltip: SharedString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Good,
+    Warn,
+    Danger,
+}
 
 /// Most suggestions listed for a folder.
 const MAX_PATH_SUGGESTIONS: usize = 200;
@@ -47,6 +82,11 @@ pub struct Field {
     /// Leading and trailing spaces aren't part of the answer (hosts).
     /// Text and paths keep theirs; numbers are trimmed by their check.
     pub trim: bool,
+    /// Suggestions fetched when the field is asked (they replace `suggestions`).
+    pub loader: Option<Loader>,
+    /// Takes several values: Enter adds one, Enter on an empty field goes
+    /// on. The answer is the values separated by `\n`.
+    pub multiple: bool,
 }
 
 /// An entry under the field.
@@ -80,6 +120,8 @@ impl Field {
             suggestions: Vec::new(),
             custom: true,
             trim: false,
+            loader: None,
+            multiple: false,
         }
     }
 
@@ -144,6 +186,29 @@ impl Field {
         if spec.kind == InputKind::Choice {
             f.suggestions = choice_suggestions(&spec.choices);
             f.custom = false;
+        }
+        f
+    }
+
+    /// A field for a snippet's input: choices and flags pick from a list,
+    /// a source's suggestions come from `loader`.
+    pub fn from_snippet(input: &goatty_plugin::snippets::SnippetInput, loader: Option<Loader>) -> Self {
+        let mut f = Self::from_plugin(&input.spec());
+        if input.kind == InputKind::Flag {
+            let on = input.on.clone().unwrap_or_default();
+            f.suggestions = vec![
+                Suggestion { value: "yes".into(), label: "Yes".into(), detail: Some(format!("adds {on}")) },
+                Suggestion { value: "no".into(), label: "No".into(), detail: None },
+            ];
+            f.custom = false;
+            if f.spec.default.is_none() {
+                f.spec.default = Some("no".into());
+            }
+        }
+        f.multiple = input.multiple;
+        if input.source.is_some() {
+            f.loader = loader;
+            f.custom = !input.strict;
         }
         f
     }
@@ -219,11 +284,32 @@ pub struct Ask {
     /// Without one, relative paths aren't looked up.
     pub base: Option<PathBuf>,
     pub then: AnswerHandler,
+    /// The finished line, shown above the fields.
+    pub preview: Option<Preview>,
+    pub badge: Option<Badge>,
+    /// Esc on the first field calls this instead of just closing (back to
+    /// the snippet picker).
+    pub back: Option<WindowAction>,
+    /// What Enter on the last field does ("insert").
+    pub done_label: Option<SharedString>,
+    /// Answers to start with (going back into a filled-in snippet).
+    pub answers: Answers,
 }
 
 impl Ask {
     pub fn new(title: impl Into<SharedString>, fields: Vec<Field>, then: impl Fn(&Answers, &mut Window, &mut App) + 'static) -> Self {
-        Self { title: title.into(), fields, local: true, base: None, then: Rc::new(then) }
+        Self {
+            title: title.into(),
+            fields,
+            local: true,
+            base: None,
+            then: Rc::new(then),
+            preview: None,
+            badge: None,
+            back: None,
+            done_label: None,
+            answers: Answers::new(),
+        }
     }
 
     /// The answers are for another host: don't look at this computer's files.

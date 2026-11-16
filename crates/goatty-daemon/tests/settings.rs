@@ -339,3 +339,91 @@ fn shell_status_over_the_protocol() {
     assert_eq!(states, [("~/bin", &PathState::Used), ("~/missing", &PathState::Missing)], "{p:?}");
     assert!(p.entries.iter().any(|e| e.shown == "~/bin" && e.origin == Origin::Settings), "{p:?}");
 }
+
+#[test]
+fn snippets_and_suggestions_over_the_protocol() {
+    let d = start_daemon();
+    let reg = d.home.join("registry");
+    let key_file = d.home.join("signing.key");
+    let public = goatty_plugin::sign::keygen_file(&key_file).unwrap();
+    std::fs::create_dir_all(reg.join("plugins/picks/0.1.0")).unwrap();
+    std::fs::write(reg.join("registry.toml"), format!("name = \"local\"\nkeys = [\"{public}\"]\n")).unwrap();
+    std::fs::write(
+        reg.join("plugins/picks/0.1.0/plugin.toml"),
+        r#"schema = 1
+id = "picks"
+name = "Picks"
+version = "0.1.0"
+summary = "Snippets with suggestions"
+publisher = "tests"
+[requires]
+commands = ["printf"]
+[[snippet]]
+id = "echo-two"
+title = "Echo two words"
+line = "echo {first} {second}"
+[[snippet.input]]
+id = "first"
+label = "First"
+[[snippet.input]]
+id = "second"
+label = "Second"
+strict = true
+[snippet.input.source]
+run = ["printf", '%s\t%s\n', "alpha", "the first letter", "{first}", "what you typed"]
+split = "\t"
+[[expansion]]
+say = "| shout it"
+to = "| tr a-z A-Z"
+[permissions]
+snippet-sources = "lists alpha and what you typed first, to test suggestions"
+"#,
+    )
+    .unwrap();
+    let idx = goatty_plugin::index::build(&reg).unwrap();
+    std::fs::write(reg.join("index.json"), idx.to_bytes()).unwrap();
+    goatty_plugin::index::sign_dir(&reg, &goatty_plugin::sign::load_secret(&key_file).unwrap()).unwrap();
+    let config = d.home.join(".config/goatty");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("registries.json"),
+        format!(r#"{{"builtin": false, "registries": [{{"name": "local", "url": "{}", "keys": ["{public}"]}}]}}"#, reg.display()),
+    )
+    .unwrap();
+    let call = |r: goatty_plugin::api::Request| -> goatty_plugin::api::Reply {
+        let request = serde_json::to_string(&r).unwrap();
+        match request_msg(&d.sock, |req| ClientMsg::Plugin { req, request }) {
+            ServerMsg::Plugin { reply, .. } => serde_json::from_str(&reply).unwrap(),
+            other => panic!("{other:?}"),
+        }
+    };
+    use goatty_plugin::api::{Reply, Request};
+    let Reply::Catalog(_) = call(Request::Catalog { refresh: true }) else { panic!() };
+    let Reply::Plan(plan) = call(Request::Plan { id: "picks".into(), version: None }) else { panic!() };
+    assert!(plan.permissions.iter().any(|g| g.permission == goatty_plugin::Permission::SnippetSources));
+    let Reply::Changed(_) = call(Request::Install { id: "picks".into(), version: None, approved: plan.digest.clone() }) else { panic!() };
+
+    let Reply::Snippets(list) = call(Request::Snippets) else { panic!() };
+    let s = list.snippets.iter().find(|s| s.origin.owner == "picks").expect("the plugin's snippet");
+    assert_eq!(s.snippet.id, "echo-two");
+    assert!(s.missing.is_empty(), "echo is a builtin: {:?}", s.missing);
+    assert!(list.snippets.iter().any(|s| s.origin.owner == "basics"), "goatty's own pack");
+    assert!(list.expansions.iter().any(|e| e.expansion.say == "| shout it"));
+    let zdir = d.home.join(".local/share/goatty/current/zsh");
+    assert!(std::fs::read_to_string(zdir.join("expansions.zsh")).unwrap().contains("'| shout it'"), "the zsh table has it");
+
+    // The host runs its own definition with the earlier answer as one argument.
+    let values = [("first".to_string(), "x y; $(id)".to_string())].into();
+    let suggest = Request::Suggest { owner: "picks".into(), snippet: "echo-two".into(), input: "second".into(), values, cwd: None };
+    let Reply::Suggestions(sg) = call(suggest) else { panic!() };
+    let got: Vec<(&str, Option<&str>)> = sg.items.iter().map(|i| (i.value.as_str(), i.detail.as_deref())).collect();
+    assert_eq!(got, [("alpha", Some("the first letter")), ("x y; $(id)", Some("what you typed"))]);
+    // Only what the host knows: no such snippet, no such input.
+    for bad in [
+        Request::Suggest { owner: "picks".into(), snippet: "nope".into(), input: "second".into(), values: Default::default(), cwd: None },
+        Request::Suggest { owner: "picks".into(), snippet: "echo-two".into(), input: "nope".into(), values: Default::default(), cwd: None },
+    ] {
+        let request = serde_json::to_string(&bad).unwrap();
+        assert!(matches!(request_msg(&d.sock, |req| ClientMsg::Plugin { req, request }), ServerMsg::Error { .. }));
+    }
+}

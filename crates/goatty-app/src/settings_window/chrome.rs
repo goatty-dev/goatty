@@ -46,6 +46,7 @@ impl SettingsWindow {
                         .chain(h.plugins.keys())
                         .any(|id| d.plugins.get(id).map(|p| &p.disabled_aliases) != h.plugins.get(id).map(|p| &p.disabled_aliases))
             }
+            Page::Snippets => (&d.snippets, &d.expansions, d.shell.expansions) != (&h.snippets, &h.expansions, h.shell.expansions),
             Page::Plugins => d.plugins != h.plugins,
             _ => false,
         }
@@ -577,6 +578,8 @@ impl SettingsWindow {
                 window.focus(&self.nav_focus, cx);
             } else if self.aliases_modal_open() {
                 self.close_alias_form(true, cx);
+            } else if self.snippets_modal_open() {
+                self.close_snippet_form(true, cx);
             } else if self.prompt_modal_open() {
                 self.close_module_dialog(cx);
             } else if !self.search.read(cx).text().is_empty() {
@@ -609,8 +612,9 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
+        self.take_pending_snippet(window, cx);
         focus::begin(cx, window, &self.scroll, &self.menu_scroll);
-        if let Some(back) = self.aliases.restore.take().or_else(|| self.prompt.restore.take()) {
+        if let Some(back) = self.aliases.restore.take().or_else(|| self.snippets.restore.take()).or_else(|| self.prompt.restore.take()) {
             window.focus(&back, cx);
         }
         let focus_row = self.highlighted(cx);
@@ -634,6 +638,7 @@ impl Render for SettingsWindow {
                 Page::Prompt => self.prompt(ui, window, cx),
                 Page::History => self.history(ui, cx),
                 Page::Aliases => self.aliases_page(ui, window, cx),
+                Page::Snippets => self.snippets_page(ui, window, cx),
                 Page::Plugins => self.plugins_page(ui, window, cx),
                 Page::Diagnostics => self.diagnostics(ui, cx),
                 Page::Profile => self.profile(ui, cx),
@@ -642,7 +647,7 @@ impl Render for SettingsWindow {
         };
         let bar = self.bottom_bar(ui, cx);
         focus::bar(bar.is_some().then_some(&self.bar_scroll));
-        let modal = self.alias_modal(ui, window, cx).or_else(|| self.module_modal(ui, cx));
+        let modal = self.alias_modal(ui, window, cx).or_else(|| self.snippet_modal(ui, cx)).or_else(|| self.module_modal(ui, cx));
         let compact = f32::from(window.viewport_size().width) < RAIL_BELOW;
         let gutter = if compact { 24. } else { 40. };
         let nav = if compact {

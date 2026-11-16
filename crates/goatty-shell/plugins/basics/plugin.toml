@@ -1,0 +1,693 @@
+# Built into goatty (crates/goatty-shell/plugins/): always available, turned
+# off rather than uninstalled. Same format as registry plugins (docs/plugins.md,
+# docs/snippets.md).
+schema = 1
+id = "basics"
+name = "Basics"
+version = "1.0.0"
+summary = "Everyday commands as snippets, and plain-words expansions like | first 20 lines"
+description = """
+Snippets for the everyday things you'd otherwise look up: find big files, extract an archive, stop a program, see what uses a port. Pick one with Ctrl+Shift+S, fill in the blanks, and goatty puts the finished command on your prompt to read and run. The expansions turn plain words into commands while you type: `| first 20 lines` followed by Space becomes `| head -n 20`."""
+publisher = "goatty"
+license = "MIT"
+keywords = ["snippets", "beginner", "cheatsheet", "expansions", "help"]
+
+[requires]
+# The process list for "Stop a running program".
+commands = ["ps"]
+
+[permissions]
+snippet-sources = "\"Stop a running program\" lists the running programs (ps) so you can pick one by name."
+
+# --- Files and folders --------------------------------------------------------
+
+[[snippet]]
+id = "biggest-files"
+title = "Find the biggest files"
+description = "Lists the largest files and folders below a folder, biggest first."
+tags = ["files", "disk"]
+keywords = ["large", "space", "size", "du", "full disk"]
+safety = "safe"
+line = "du -ah {dir} 2>/dev/null | sort -rh | head -n {count}"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder to look in"
+type = "folder"
+default = "."
+
+[[snippet.input]]
+id = "count"
+label = "How many to show"
+type = "integer"
+min = 1
+max = 10000
+default = "20"
+
+[[snippet]]
+id = "folder-sizes"
+title = "Show how big each folder is"
+description = "Adds up the size of everything in a folder, one line per entry, smallest first."
+tags = ["files", "disk"]
+keywords = ["size", "space", "du", "usage"]
+safety = "safe"
+line = "du -sh {dir}/* 2>/dev/null | sort -h"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder"
+type = "folder"
+default = "."
+
+[[snippet]]
+id = "disk-space"
+title = "Show free disk space"
+description = "How full each drive is, in sizes you can read."
+tags = ["disk", "system"]
+keywords = ["df", "storage", "full", "free space"]
+safety = "safe"
+line = "df -h"
+
+[[snippet]]
+id = "find-by-name"
+title = "Find files by name"
+description = "Searches a folder and everything below it for names that match a pattern (* matches anything, case doesn't matter)."
+tags = ["files", "search"]
+keywords = ["locate", "find", "where is", "filename"]
+safety = "safe"
+line = "find {dir} -iname {pattern}"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder to search"
+type = "folder"
+default = "."
+
+[[snippet.input]]
+id = "pattern"
+label = "Name pattern"
+placeholder = "*.pdf"
+help = "* stands for anything: *.pdf, report*, *2024*"
+
+[[snippet]]
+id = "find-recent"
+title = "Find files changed recently"
+description = "Lists the files below a folder that changed in the last few days."
+tags = ["files", "search"]
+keywords = ["modified", "new", "today", "mtime"]
+safety = "safe"
+line = "find {dir} -type f -mtime -{days}"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder to search"
+type = "folder"
+default = "."
+
+[[snippet.input]]
+id = "days"
+label = "Changed in the last … days"
+type = "integer"
+min = 1
+default = "1"
+
+[[snippet]]
+id = "search-text"
+title = "Search for text inside files"
+description = "Shows every line containing the text, with the file name and line number, in a folder and everything below it."
+tags = ["search", "text"]
+keywords = ["grep", "contains", "find text", "occurrences"]
+safety = "safe"
+line = "grep -rn {ignore_case} -- {text} {dir}"
+
+[[snippet.input]]
+id = "text"
+label = "Text to look for"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder (or file)"
+type = "path"
+default = "."
+
+[[snippet.input]]
+id = "ignore_case"
+label = "Ignore upper and lower case?"
+type = "flag"
+on = "-i"
+default = "yes"
+
+[[snippet]]
+id = "make-folder"
+title = "Create a folder"
+description = "Creates the folder, and the folders above it that don't exist yet."
+tags = ["folders"]
+keywords = ["mkdir", "new folder", "directory"]
+safety = "changes"
+line = "mkdir -p {dir}"
+
+[[snippet.input]]
+id = "dir"
+label = "New folder"
+type = "folder"
+placeholder = "projects/new-thing"
+
+[[snippet]]
+id = "copy"
+title = "Copy a file or folder"
+description = "Copies it, with everything inside a folder. Asks before replacing a file that's already there."
+tags = ["files", "folders"]
+keywords = ["cp", "duplicate", "backup"]
+safety = "changes"
+line = "cp -ri {from} {to}"
+
+[[snippet.input]]
+id = "from"
+label = "What to copy"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "to"
+label = "Where to put the copy"
+type = "path"
+
+[[snippet]]
+id = "move"
+title = "Move or rename a file or folder"
+description = "Moves it to another place, or gives it a new name. Asks before replacing a file that's already there."
+tags = ["files", "folders"]
+keywords = ["mv", "rename"]
+safety = "changes"
+line = "mv -i {from} {to}"
+
+[[snippet.input]]
+id = "from"
+label = "What to move"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "to"
+label = "New place or name"
+type = "path"
+
+[[snippet]]
+id = "delete-folder"
+title = "Delete a folder and everything in it"
+description = "Removes the folder with all its files. They don't go to a trash can: there's no undo. Asks once before deleting."
+tags = ["folders", "files"]
+keywords = ["rm", "remove", "delete directory"]
+safety = "destructive"
+line = "rm -rI {dir}"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder to delete"
+type = "folder"
+must_exist = true
+
+[[snippet]]
+id = "make-executable"
+title = "Make a script runnable"
+description = "Lets you run the file as a program (./script.sh)."
+tags = ["files"]
+keywords = ["chmod", "permission denied", "executable", "+x"]
+safety = "changes"
+line = "chmod +x {file}"
+
+[[snippet.input]]
+id = "file"
+label = "Script"
+type = "path"
+must_exist = true
+
+[[snippet]]
+id = "file-details"
+title = "Show a file's size, owner and permissions"
+tags = ["files"]
+keywords = ["ls", "owner", "permissions", "details"]
+safety = "safe"
+line = "ls -lh {file}"
+
+[[snippet.input]]
+id = "file"
+label = "File or folder"
+type = "path"
+must_exist = true
+
+# --- Archives -------------------------------------------------------------------
+
+[[snippet]]
+id = "extract-tar"
+title = "Extract a .tar.gz, .tar.xz or .tgz archive"
+description = "Unpacks the archive into a folder (the current one unless you pick another)."
+tags = ["archives"]
+keywords = ["untar", "unpack", "decompress", "tar"]
+safety = "changes"
+line = "tar -xf {archive} -C {dir}"
+
+[[snippet.input]]
+id = "archive"
+label = "Archive"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "dir"
+label = "Extract into"
+type = "folder"
+default = "."
+must_exist = true
+
+[[snippet]]
+id = "create-tar"
+title = "Pack a folder into a .tar.gz archive"
+description = "Puts the folder and everything in it into one compressed file."
+tags = ["archives"]
+keywords = ["compress", "tar", "backup", "bundle"]
+safety = "changes"
+line = "tar -czf {archive} {dir}"
+
+[[snippet.input]]
+id = "dir"
+label = "Folder to pack"
+type = "folder"
+must_exist = true
+
+[[snippet.input]]
+id = "archive"
+label = "Archive to create"
+default = "archive.tar.gz"
+
+[[snippet]]
+id = "list-archive"
+title = "List what's inside an archive"
+description = "Shows the files in a .tar, .tar.gz or .tar.xz archive without unpacking it."
+tags = ["archives"]
+keywords = ["contents", "peek", "tar"]
+safety = "safe"
+line = "tar -tf {archive}"
+
+[[snippet.input]]
+id = "archive"
+label = "Archive"
+type = "path"
+must_exist = true
+
+[[snippet]]
+id = "extract-zip"
+title = "Extract a .zip file"
+tags = ["archives"]
+keywords = ["unzip", "unpack"]
+safety = "changes"
+line = "unzip {archive} -d {dir}"
+
+[[snippet.input]]
+id = "archive"
+label = "Zip file"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "dir"
+label = "Extract into"
+type = "folder"
+default = "."
+
+[[snippet]]
+id = "create-zip"
+title = "Pack files into a .zip"
+description = "Makes a zip file others can open on any computer."
+tags = ["archives"]
+keywords = ["zip", "compress"]
+safety = "changes"
+line = "zip -r {archive} {what}"
+
+[[snippet.input]]
+id = "what"
+label = "File or folder to pack"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "archive"
+label = "Zip file to create"
+default = "archive.zip"
+
+# --- Programs -------------------------------------------------------------------
+
+[[snippet]]
+id = "stop-program"
+title = "Stop a running program"
+description = "Asks the program to quit. If it hangs, say yes to forcing it: it stops at once, without saving."
+tags = ["processes"]
+keywords = ["kill", "quit", "frozen", "hanging", "end task", "pid"]
+safety = "changes"
+line = "kill {force} {pid}"
+
+[[snippet.input]]
+id = "pid"
+label = "Program"
+help = "Type part of its name: your running programs, with their process id"
+strict = true
+[snippet.input.source]
+# Your own programs (BSD-style `x`: with or without a terminal), id and name.
+run = ["ps", "x", "-o", "pid=,comm="]
+split = " "
+column = 1
+label = 2
+
+[[snippet.input]]
+id = "force"
+label = "Force it?"
+type = "flag"
+on = "-9"
+default = "no"
+
+[[snippet]]
+id = "top-memory"
+title = "Show what uses the most memory"
+tags = ["processes", "system"]
+keywords = ["ram", "slow", "memory hog", "ps"]
+safety = "safe"
+line = "ps -eo pid,pmem,rss,comm | sort -k2 -rn | head -n {count}"
+
+[[snippet.input]]
+id = "count"
+label = "How many"
+type = "integer"
+min = 1
+default = "10"
+
+[[snippet]]
+id = "top-cpu"
+title = "Show what uses the most CPU"
+tags = ["processes", "system"]
+keywords = ["cpu", "slow", "fan", "load", "ps"]
+safety = "safe"
+line = "ps -eo pid,pcpu,comm | sort -k2 -rn | head -n {count}"
+
+[[snippet.input]]
+id = "count"
+label = "How many"
+type = "integer"
+min = 1
+default = "10"
+
+[[snippet]]
+id = "repeat"
+title = "Run a command every few seconds"
+description = "Shows the command's output again and again, so you can watch it change. Ctrl+C stops it."
+tags = ["processes"]
+keywords = ["watch", "refresh", "loop", "monitor"]
+safety = "safe"
+line = "watch -n {seconds} {command}"
+
+[[snippet.input]]
+id = "command"
+label = "Command"
+placeholder = "df -h"
+
+[[snippet.input]]
+id = "seconds"
+label = "Every … seconds"
+type = "number"
+min = 0.1
+default = "2"
+
+[[snippet]]
+id = "where-is-program"
+title = "Find where a program is installed"
+tags = ["system"]
+keywords = ["which", "path", "location", "command not found"]
+safety = "safe"
+line = "type -a {program}"
+
+[[snippet.input]]
+id = "program"
+label = "Program name"
+placeholder = "python3"
+
+# --- Network --------------------------------------------------------------------
+
+[[snippet]]
+id = "port-user"
+title = "See which program uses a port"
+description = "Shows the programs listening on or connected to the port."
+tags = ["network", "processes"]
+keywords = ["lsof", "address already in use", "listen", "port"]
+safety = "safe"
+line = "lsof -i :{port}"
+
+[[snippet.input]]
+id = "port"
+label = "Port"
+type = "integer"
+min = 1
+max = 65535
+placeholder = "8080"
+
+[[snippet]]
+id = "ping"
+title = "Check if a computer is reachable"
+description = "Sends a few small messages and shows how long the answers take."
+tags = ["network"]
+keywords = ["ping", "online", "connection", "latency"]
+safety = "safe"
+line = "ping -c {count} {host}"
+
+[[snippet.input]]
+id = "host"
+label = "Computer or website"
+placeholder = "example.com"
+
+[[snippet.input]]
+id = "count"
+label = "How many times"
+type = "integer"
+min = 1
+max = 1000
+default = "4"
+
+[[snippet]]
+id = "download"
+title = "Download a file"
+description = "Saves the file from the web into the current folder, under its own name."
+tags = ["network", "files"]
+keywords = ["curl", "wget", "fetch", "url"]
+safety = "changes"
+line = "curl -fLO {url}"
+
+[[snippet.input]]
+id = "url"
+label = "Address (URL)"
+placeholder = "https://example.com/file.zip"
+pattern = "https?://\\S+"
+pattern_help = "an address starting with https://"
+
+[[snippet]]
+id = "check-website"
+title = "Check if a website answers"
+description = "Shows the web server's answer (its status and headers) without downloading the page."
+tags = ["network"]
+keywords = ["curl", "status", "headers", "down", "http"]
+safety = "safe"
+line = "curl -sSI {url}"
+
+[[snippet.input]]
+id = "url"
+label = "Address (URL)"
+placeholder = "https://example.com"
+pattern = "https?://\\S+"
+pattern_help = "an address starting with https://"
+
+[[snippet]]
+id = "ip-address"
+title = "Show this computer's IP addresses"
+tags = ["network"]
+keywords = ["ip", "address", "interface", "ifconfig"]
+safety = "safe"
+line = "ip -brief address"
+
+[[snippet]]
+id = "copy-to-host"
+title = "Copy a file to another computer"
+description = "Copies over SSH. The destination looks like user@host:folder/ (a folder there, or a new name)."
+tags = ["network", "files"]
+keywords = ["scp", "ssh", "upload", "transfer"]
+safety = "changes"
+line = "scp -r {file} {dest}"
+
+[[snippet.input]]
+id = "file"
+label = "File or folder to send"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "dest"
+label = "Destination"
+placeholder = "user@host:folder/"
+
+[[snippet]]
+id = "ssh-key"
+title = "Create an SSH key"
+description = "Makes a new key pair in ~/.ssh for logging in to servers and GitHub without a password. Asks where to save it and for a passphrase."
+tags = ["network", "system"]
+keywords = ["ssh-keygen", "github", "key pair", "ed25519"]
+safety = "changes"
+line = "ssh-keygen -t ed25519 -C {comment}"
+
+[[snippet.input]]
+id = "comment"
+label = "Label for the key"
+placeholder = "you@laptop"
+help = "Usually your email address or the computer's name"
+
+# --- Text -----------------------------------------------------------------------
+
+[[snippet]]
+id = "follow-log"
+title = "Watch a log file as it grows"
+description = "Shows the last lines, then new ones as they're written. Ctrl+C stops it."
+tags = ["text", "files"]
+keywords = ["tail", "follow", "log", "live"]
+safety = "safe"
+line = "tail -n {count} -f {file}"
+
+[[snippet.input]]
+id = "file"
+label = "Log file"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "count"
+label = "Start with the last … lines"
+type = "integer"
+min = 0
+default = "50"
+
+[[snippet]]
+id = "count-lines"
+title = "Count the lines of a file"
+tags = ["text", "files"]
+keywords = ["wc", "length", "how many lines"]
+safety = "safe"
+line = "wc -l {file}"
+
+[[snippet.input]]
+id = "file"
+label = "File"
+type = "path"
+must_exist = true
+
+[[snippet]]
+id = "most-common-lines"
+title = "Count how often each line appears"
+description = "Groups equal lines and shows the most common ones first: handy for logs."
+tags = ["text"]
+keywords = ["uniq", "frequency", "duplicates", "histogram"]
+safety = "safe"
+line = "sort {file} | uniq -c | sort -rn | head -n {count}"
+
+[[snippet.input]]
+id = "file"
+label = "File"
+type = "path"
+must_exist = true
+
+[[snippet.input]]
+id = "count"
+label = "How many"
+type = "integer"
+min = 1
+default = "20"
+
+[[snippet]]
+id = "show-variable"
+title = "Show an environment variable"
+tags = ["system"]
+keywords = ["env", "printenv", "$PATH", "variable"]
+safety = "safe"
+line = "printenv {name}"
+
+[[snippet.input]]
+id = "name"
+label = "Variable"
+placeholder = "PATH"
+pattern = "[A-Za-z_][A-Za-z0-9_]*"
+pattern_help = "letters, digits and _"
+
+[[snippet]]
+id = "os-version"
+title = "Show which system and version you're running"
+tags = ["system"]
+keywords = ["uname", "os-release", "distribution", "kernel", "version"]
+safety = "safe"
+line = "uname -a"
+
+# --- Expansions: plain words that become commands as you type --------------------
+
+[[expansion]]
+say = "| first {n} lines"
+to = "| head -n {n}"
+description = "Keep only the first lines of the output"
+input.n.type = "integer"
+
+[[expansion]]
+say = "| last {n} lines"
+to = "| tail -n {n}"
+description = "Keep only the last lines of the output"
+input.n.type = "integer"
+
+[[expansion]]
+say = "| count lines"
+to = "| wc -l"
+description = "Count the lines of the output"
+
+[[expansion]]
+say = "| only lines with {text}"
+to = "| grep -- {text}"
+description = "Keep the lines that contain a word"
+
+[[expansion]]
+say = "| without lines with {text}"
+to = "| grep -v -- {text}"
+description = "Drop the lines that contain a word"
+
+[[expansion]]
+say = "| sorted"
+to = "| sort"
+description = "Sort the lines alphabetically"
+
+[[expansion]]
+say = "| biggest first"
+to = "| sort -rh"
+description = "Sort sizes and numbers, largest first (works with du -h's 4K, 2M, 1G)"
+
+[[expansion]]
+say = "| without duplicates"
+to = "| sort -u"
+description = "Sort and drop repeated lines"
+
+[[expansion]]
+say = "| count each line"
+to = "| sort | uniq -c | sort -rn"
+description = "How often each line appears, most common first"
+
+[[expansion]]
+say = "| page by page"
+to = "| less"
+description = "Read long output one screen at a time (q quits)"
+
+[[expansion]]
+say = "| as json"
+to = "| jq ."
+description = "Show JSON readable and colored (needs jq)"
+
+[[expansion]]
+say = "| save to {file}"
+to = "| tee {file}"
+description = "Show the output and also write it to a file"

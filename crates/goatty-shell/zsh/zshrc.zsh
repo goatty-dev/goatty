@@ -145,6 +145,17 @@ zstyle ':completion:*:descriptions' format '%F{yellow}-- %d --%f'
 zstyle ':completion:*' use-cache on
 zstyle ':completion:*' cache-path "$_goatty_cache/zcompcache"
 
+# --- Expansions (shell.expansions) -------------------------------------------
+# Plain words that turn into a command on Space (`| first 20 lines` →
+# `| head -n 20`; expand.zsh). Bound here, before the line editor plugins,
+# so autosuggestions and syntax highlighting wrap these widgets, and your
+# own .zshrc or additions can still bind Space, Enter or Backspace.
+if _goatty_on expansions && builtin source -- "$_goatty_dir/expand.zsh"; then
+  _goatty_ok expansions "${#_goatty_exp_re} rules"
+else
+  _goatty_state[expansions]=off
+fi
+
 # --- The user's .zshrc (opt-in: GOATTY_ZSH_USER_RC=1) ----------------------
 # Guarded: what it sources goes through rc-guard.zsh, which skips prompt and
 # plugin frameworks (oh-my-zsh, Powerlevel10k, zinit, …) and second copies

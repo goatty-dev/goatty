@@ -29,6 +29,7 @@ mod prompt;
 mod search;
 mod shell;
 mod shortcuts;
+pub mod snippets;
 mod terminal;
 
 use std::cell::Cell;
@@ -172,6 +173,7 @@ pub enum Page {
     Prompt,
     History,
     Aliases,
+    Snippets,
     Plugins,
     Diagnostics,
     Profile,
@@ -181,7 +183,7 @@ pub enum Page {
 impl Page {
     /// Sidebar order: this computer's pages, the host's shell pages, then
     /// the files and About.
-    pub const ALL: [Page; 15] = [
+    pub const ALL: [Page; 16] = [
         Page::Appearance,
         Page::Terminal,
         Page::Workspace,
@@ -193,6 +195,7 @@ impl Page {
         Page::Prompt,
         Page::History,
         Page::Aliases,
+        Page::Snippets,
         Page::Plugins,
         Page::Diagnostics,
         Page::Profile,
@@ -212,6 +215,7 @@ impl Page {
             Page::Prompt => "Prompt",
             Page::History => "History",
             Page::Aliases => "Aliases",
+            Page::Snippets => "Snippets",
             Page::Plugins => "Plugins",
             Page::Diagnostics => "Diagnostics",
             Page::Profile => "Profile",
@@ -233,6 +237,7 @@ impl Page {
             Page::Prompt => "What the prompt shows",
             Page::History => "What the shell remembers",
             Page::Aliases => "Short names for longer commands",
+            Page::Snippets => "Commands with blanks to fill in, and words that expand",
             Page::Plugins => "Tools and extensions for the shell",
             Page::Diagnostics => "What the shell loads, and how fast it starts",
             Page::Profile => "Settings files, sharing and generations",
@@ -253,6 +258,7 @@ impl Page {
             Page::Prompt => Icon::TextCursorInput,
             Page::History => Icon::History,
             Page::Aliases => Icon::Link2,
+            Page::Snippets => Icon::Code,
             Page::Plugins => Icon::Puzzle,
             Page::Diagnostics => Icon::Activity,
             Page::Profile => Icon::UserRound,
@@ -271,6 +277,7 @@ impl Page {
             "import" | "zshrc" | "bashrc" | "rc" => Some(Page::Dotfiles),
             "profiles" | "files" => Some(Page::Profile),
             "doctor" | "status" | "setup" => Some(Page::Diagnostics),
+            "snippet" | "expansions" | "cheatsheet" => Some(Page::Snippets),
             _ => None,
         };
         alias.or_else(|| Self::ALL.into_iter().find(|p| p.title().eq_ignore_ascii_case(&name)))
@@ -280,7 +287,15 @@ impl Page {
     pub fn is_host(self) -> bool {
         matches!(
             self,
-            Page::Shell | Page::Dotfiles | Page::Path | Page::Prompt | Page::History | Page::Aliases | Page::Plugins | Page::Diagnostics
+            Page::Shell
+                | Page::Dotfiles
+                | Page::Path
+                | Page::Prompt
+                | Page::History
+                | Page::Aliases
+                | Page::Snippets
+                | Page::Plugins
+                | Page::Diagnostics
         )
     }
 }
@@ -388,6 +403,7 @@ pub struct SettingsWindow {
     path: path::PathPage,
     dotfiles: dotfiles::DotfilesPage,
     aliases: aliases::AliasesPage,
+    snippets: snippets::SnippetsPage,
     prompt: prompt::PromptPage,
     hosts: hosts::HostsPage,
     shortcuts: shortcuts::ShortcutsPage,
@@ -537,6 +553,7 @@ impl SettingsWindow {
             path: path::PathPage::new(cx),
             dotfiles: dotfiles::DotfilesPage::new(cx),
             aliases: aliases::AliasesPage::new(cx),
+            snippets: snippets::SnippetsPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
             hosts: hosts::HostsPage::new(cx),
             shortcuts: shortcuts::ShortcutsPage::new(cx),
@@ -616,6 +633,11 @@ impl SettingsWindow {
                 }
             }
             Page::Hosts => crate::hosts::refresh(cx),
+            Page::Snippets => {
+                if let Some(link) = &self.link {
+                    crate::snippets::ensure(link, cx);
+                }
+            }
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
@@ -906,6 +928,8 @@ impl SettingsWindow {
     fn move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
         let trap = if self.aliases_modal_open() {
             Some(self.aliases.modal_focus.clone())
+        } else if self.snippets_modal_open() {
+            Some(self.snippets.modal_focus.clone())
         } else if self.prompt_modal_open() {
             Some(self.prompt.modal_focus.clone())
         } else if self.menu.is_some() {
@@ -942,7 +966,7 @@ impl SettingsWindow {
     /// Ctrl+PageDown / Ctrl+PageUp: the next or previous page.
     fn step_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
         // The page behind a dialog isn't reachable.
-        if self.aliases_modal_open() || self.prompt_modal_open() {
+        if self.aliases_modal_open() || self.snippets_modal_open() || self.prompt_modal_open() {
             return;
         }
         let at = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);
@@ -1069,6 +1093,7 @@ impl SettingsWindow {
                             view.load_host(cx);
                             // A plugin switched on or off brings or takes its commands.
                             crate::plugin_commands::refresh(cx);
+                            crate::snippets::refresh(cx);
                         }
                     }
                     Err(e) => view.outcome = Some(Outcome { ok: false, lines: vec![format!("{e:#}")], diff: Vec::new(), reload: false }),
@@ -1130,6 +1155,7 @@ impl SettingsWindow {
                 view.load_host(cx);
                 // A rollback can switch plugins on or off: their commands too.
                 crate::plugin_commands::refresh(cx);
+                crate::snippets::refresh(cx);
             });
         })
         .detach();

@@ -12,13 +12,11 @@ use std::rc::Rc;
 
 use goatty_plugin::api::{Installed, Reply, Request};
 use goatty_plugin::commands::{PaletteCommand, command_line};
-use gpui::{App, AsyncApp, ClipboardItem, Global, Window};
+use gpui::{App, AsyncApp, Global, Window};
 
 use crate::command_palette::registry::Source;
 use crate::command_palette::{Answers, Ask, Command, CommandRegistry, Field, ask};
 use crate::settings_window::{HostLink, HostLinkGlobal};
-use crate::toast::{self, Toast};
-use crate::workspace::Workspace;
 
 /// Which host the registered plugin commands are from, and the newest fetch.
 #[derive(Default)]
@@ -137,42 +135,9 @@ fn run(c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Wi
     let origin = origin.clone();
     // Deferred: the palette runs commands from inside the workspace.
     window.defer(cx, move |window, cx| {
-        let ws = window.root::<Workspace>().flatten();
-        let target = ws.as_ref().map(|ws| (ws.read(cx).focused_terminal(), ws.read(cx).active_host_link()));
-        let copy = line.clone();
-        let refuse = |title: String, body: String, window: &mut Window, cx: &mut App| {
-            let t = Toast::warning(title)
-                .body(body)
-                .action("Copy the command", move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone())))
-                .key("plugin.command");
-            toast::show_in(window, cx, t);
-        };
-        let Some((Some(view), host)) = target else {
-            refuse("No terminal to run it in".into(), line.clone(), window, cx);
-            return;
-        };
-        // A command listed for another host (the tab changed meanwhile).
-        if !host.is_some_and(|h| h.same(&origin)) {
-            refuse(
-                format!("This command is from {}'s plugins", origin.label()),
-                format!("The active tab is on another host. Run it in a tab on {}: {line}", origin.label()),
-                window,
-                cx,
-            );
-            return;
+        if let Some(view) = crate::typing::target(&origin, &line, crate::typing::What::Command, window, cx) {
+            view.update(cx, |v, cx| v.run_line(&line, cx));
         }
-        let v = view.read(cx);
-        let busy = match v.process() {
-            Some(p) if !crate::workspace::icons::is_shell(p) => Some(p.to_string()),
-            // Shell integration knows a command runs even when the program isn't known.
-            _ if v.session().terminal.command_running() => Some("A command".to_string()),
-            _ => None,
-        };
-        if let Some(program) = busy {
-            refuse(format!("{program} is running in this pane"), format!("Run it at a prompt: {line}"), window, cx);
-            return;
-        }
-        view.update(cx, |v, cx| v.run_line(&line, cx));
     });
 }
 

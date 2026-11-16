@@ -71,6 +71,12 @@ pub struct Manifest {
     /// Entries in goatty's command palette (see [`crate::commands`]).
     #[serde(default, rename = "command", skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<crate::commands::PaletteCommand>,
+    /// Command lines with blanks for the snippet picker (see [`crate::snippets`]).
+    #[serde(default, rename = "snippet", skip_serializing_if = "Vec::is_empty")]
+    pub snippets: Vec<crate::snippets::Snippet>,
+    /// Words that turn into commands while you type (see [`crate::snippets`]).
+    #[serde(default, rename = "expansion", skip_serializing_if = "Vec::is_empty")]
+    pub expansions: Vec<crate::snippets::Expansion>,
     /// Why the plugin needs each permission it uses: `binaries = "..."`.
     /// See [`crate::permissions`].
     #[serde(default)]
@@ -868,6 +874,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
     }
 
     out.extend(crate::commands::check(m, &commands));
+    out.extend(crate::snippets::check(m, &commands));
     for p in crate::permissions::check(m) {
         out.push(p);
     }

@@ -55,6 +55,8 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
   zsh/.zshenv .zprofile .zshrc  static, from crates/goatty-shell/zsh/
   zsh/integration.zsh           OSC 133 + OSC 7
   zsh/rc-guard.zsh              what a guarded .zshrc sources goes through it
+  zsh/expand.zsh                the expansion widget (Space, Enter, Backspace), static
+  zsh/expansions.zsh            the expansion rules as data: yours, then the plugins' (empty with shell.expansions off)
   zsh/starship.toml             generated from the prompt settings; used unless you prefer your own starship.toml
   host.json, info.json          the settings it was built from; when, by which goatty, on which generation, what changed, its name
 ~/.local/share/goatty/current → generations/<n>   the active one
@@ -243,6 +245,10 @@ fzf and fzf-tab by default (#165), measured 2026-11-13 on the same machine: sand
 So fzf costs about 6 ms (one process spawn for `fzf --zsh`) and fzf-tab about 5 ms. Caching `fzf --zsh` belongs to #41.
 
 goatty's part is about 30 ms, half of it `starship init` (two process spawns). Caching the init scripts is #41. The first start after a zsh upgrade or on a fresh machine builds the completion dump (178 ms once in the real home dir; 47 ms after that, measured with `goattyd shell status`).
+
+## Expansions
+
+`shell.expansions` (on by default) sources `expand.zsh` right after `compinit` and before the line-editor plugins, so autosuggestions and syntax highlighting wrap its widgets and the user's `.zshrc` or additions can still rebind Space, Enter and Backspace. `| first 20 lines` + Space becomes `| head -n 20`; Enter on a line ending in a rule expands it and stops; Backspace right after undoes it; nothing changes inside quotes or after a paste. `goatty-status` shows `expansions ok <n> rules`. Design, rules and the cost per keypress (≈40 µs on a plain word, under 0.5 ms with 300 rules; 0.56 ms at startup with Basics): [`snippets.md`](snippets.md).
 
 ## Plugins
 

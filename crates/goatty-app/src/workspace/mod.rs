@@ -54,6 +54,8 @@ use gpui::{
     ScrollHandle, Styled, Subscription, Task, Window, div, prelude::*, px, relative,
 };
 
+use std::rc::Rc;
+
 use crate::actions::*;
 use crate::app::Initial;
 use crate::close_confirm::{CloseConfirm, CloseConfirmEvent, Closing};
@@ -200,6 +202,8 @@ pub struct Workspace {
     next_id: u64,
     rename: Option<Rename>,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
+    /// The snippet picker (Ctrl+Shift+S).
+    snippets: Option<(Entity<crate::snippets::picker::SnippetPicker>, Subscription)>,
     /// "Notifications: Show recent".
     recent: Option<(Entity<RecentNotifications>, Subscription)>,
     paste: Option<(Entity<PasteConfirm>, PaneId, Subscription)>,
@@ -268,6 +272,7 @@ impl Workspace {
             next_id: 1,
             rename: None,
             palette: None,
+            snippets: None,
             recent: None,
             paste: None,
             close: None,
@@ -494,6 +499,8 @@ impl Workspace {
     fn focus_active(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if let Some((view, _)) = &self.recent {
             view.focus_handle(cx).focus(window, cx);
+        } else if let Some((picker, _)) = &self.snippets {
+            picker.focus_handle(cx).focus(window, cx);
         } else if let Some((palette, _)) = &self.palette {
             palette.focus_handle(cx).focus(window, cx);
         } else if let Some((view, _)) = self.active_tab().and_then(|t| t.connecting.as_ref()) {
@@ -1298,8 +1305,78 @@ impl Workspace {
         toast::show(cx, Toast::info("No sessions to list here").body(body).key("list-sessions"));
     }
 
+    fn toggle_snippets(&mut self, _: &OpenSnippets, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.snippets.is_some() {
+            self.close_snippets(window, cx);
+            return;
+        }
+        self.open_snippets(crate::snippets::picker::Memory::default(), window, cx);
+    }
+
+    /// The snippet picker for the active tab's host, where `memory` left it.
+    pub fn open_snippets(&mut self, memory: crate::snippets::picker::Memory, window: &mut Window, cx: &mut Context<'_, Self>) {
+        use crate::snippets::picker::{PickerEvent, SnippetPicker};
+        let Some(link) = self.active_host_link() else {
+            toast::show(cx, Toast::info("No snippets yet").body("This tab is still connecting.").key("snippets.open"));
+            return;
+        };
+        self.close_recent(window, cx);
+        self.palette = None;
+        let picker = cx.new(|cx| SnippetPicker::new(link.clone(), memory, window, cx));
+        let sub = cx.subscribe_in(&picker, window, move |this, _, ev: &PickerEvent, window, cx| match ev {
+            PickerEvent::Dismissed => this.close_snippets(window, cx),
+            PickerEvent::Manage => {
+                this.close_snippets(window, cx);
+                crate::settings_window::open_at(cx, Some(crate::settings_window::Page::Snippets));
+            }
+            PickerEvent::Fill(s, memory) => {
+                let (s, memory) = ((**s).clone(), memory.clone());
+                this.close_snippets(window, cx);
+                this.fill_snippet(&s, &link, memory, window, cx);
+            }
+        });
+        self.snippets = Some((picker, sub));
+        cx.notify();
+    }
+
+    fn close_snippets(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.snippets.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Ask for `s`'s blanks (Esc on the first goes back to the picker), then
+    /// put the line on the prompt. Without blanks it goes there right away.
+    fn fill_snippet(
+        &mut self,
+        s: &goatty_plugin::api::HostSnippet,
+        link: &crate::settings_window::HostLink,
+        memory: crate::snippets::picker::Memory,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if s.snippet.inputs.is_empty() {
+            crate::snippets::insert(&s.snippet.render(&Default::default()), link, window, cx);
+            return;
+        }
+        // Sources run in the pane's directory (on the host it reports).
+        let cwd = self.focused_view().and_then(|v| v.read(cx).cwd());
+        let back: crate::command_palette::input::WindowAction = Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+            let memory = memory.clone();
+            window.defer(cx, move |window, cx| {
+                if let Some(Some(ws)) = window.root::<Workspace>() {
+                    ws.update(cx, |ws, cx| ws.open_snippets(memory, window, cx));
+                }
+            });
+        });
+        let ask = crate::snippets::ask_for(s, link, cwd, Some(back));
+        self.open_ask(ask, window, cx);
+    }
+
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_recent(window, cx);
+        self.snippets = None;
         let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
         self.show_palette(palette, window, cx);
     }
@@ -1313,6 +1390,7 @@ impl Workspace {
         }
         self.close_recent(window, cx);
         self.palette = None;
+        self.snippets = None;
         let palette = cx.new(|cx| CommandPalette::asking(ask, window, cx));
         self.show_palette(palette, window, cx);
     }
@@ -1335,6 +1413,11 @@ impl Workspace {
                 then(&answers, window, cx);
             }
             PaletteEvent::Dismissed => this.close_palette(window, cx),
+            PaletteEvent::Back(back) => {
+                let back = back.clone();
+                this.close_palette(window, cx);
+                back(window, cx);
+            }
             PaletteEvent::Run(command) => {
                 let command = command.clone();
                 // Focus the terminal first: actions go to the focused element.
@@ -1514,6 +1597,7 @@ impl Render for Workspace {
                 toast::press_primary(window, cx);
             })
             .on_action(cx.listener(Self::connect_to_host))
+            .on_action(cx.listener(Self::toggle_snippets))
             .on_action(cx.listener(Self::list_sessions))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_pane))
@@ -1552,6 +1636,9 @@ impl Render for Workspace {
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {
                 d.child(div().absolute().top(px(48.)).left(px(panes_left)).right_0().px_4().flex().justify_center().child(palette.clone()))
+            })
+            .when_some(self.snippets.as_ref(), |d, (picker, _)| {
+                d.child(div().absolute().top(px(48.)).left(px(panes_left)).right_0().px_4().flex().justify_center().child(picker.clone()))
             })
             .when_some(self.recent.as_ref(), |d, (view, _)| {
                 d.child(div().absolute().top(px(48.)).left(px(panes_left)).right_0().px_4().flex().justify_center().child(view.clone()))

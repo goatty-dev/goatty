@@ -91,6 +91,9 @@ pub const INDEX: &[Entry] = &[
     e(Page::Hosts, "Shell setup", "Sync the active tab's host now", "sync copy mirror plugins aliases prompt remote"),
     e(Page::Hosts, "From ~/.ssh/config", "List these hosts too", "ssh config discover").keys(&["ssh.discover"]),
     e(Page::Shell, "", "goatty's managed zsh", "zsh managed dotfiles").keys(&["shell.managed"]),
+    e(Page::Snippets, "Expansions", "Expand plain words while typing", "expansion abbreviation space first lines head rewrite")
+        .keys(&["shell.expansions", "expansions"]),
+    e(Page::Snippets, "My snippets", "My snippets", "snippet cheatsheet template blanks fill in").keys(&["snippets"]),
     e(Page::Shell, "Program", "Shell", "program bash fish login shell").keys(&["shell.program"]),
     e(Page::Shell, "Your dotfiles", "Dotfiles", "zshrc bashrc dotfiles import oh-my-zsh existing config"),
     e(
