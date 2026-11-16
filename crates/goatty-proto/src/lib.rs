@@ -27,6 +27,6 @@ mod codec;
 mod msg;
 mod paths;
 
-pub use codec::{Frame, MAX_FRAME, encode, read_msg, write_msg};
+pub use codec::{Frame, MAX_FRAME, ZSTD_LEVEL, encode, encode_server, read_msg, write_msg};
 pub use msg::*;
 pub use paths::{runtime_dir, socket_path};

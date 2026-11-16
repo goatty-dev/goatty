@@ -221,6 +221,10 @@ impl Element for TerminalElement {
         let snap_start = Instant::now();
         self.session.terminal.snapshot_into(&mut frame);
         self.stats.borrow_mut().snapshot_us += snap_start.elapsed().as_micros() as u64;
+        if frame.display_offset > 0 {
+            // Scrolled up: get what the daemon has above (or in between).
+            self.session.fill_history();
+        }
         self.geom.set(Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows });
 
         let default_bg = frame.background;

@@ -7,6 +7,8 @@ paths:
 # Wire protocol, client, daemon
 
 - The wire carries raw VT bytes and VT-byte snapshots, never rio-vt types. `Attached` snapshots start with RIS. `Resync` snapshots must not reset, because the client keeps its scrollback.
+- Line numbers (v11): rows of a session's primary screen are numbered from the session's start (`Terminal::top_line`). Send `TopLine` after anything that resets or reflows the client's rows (attach, resync, resize), under the subscriber lock so it lands at the right point in the stream. History goes out as `History` replies, never as stream data.
+- Compression is per connection (`Compress`, remote clients only) and only for `Attached`, `Resync` and `History` (`encode_server`). Live `Output` stays uncompressed. Flow control counts uncompressed stream bytes.
 - Flow control is part of the protocol. Clients `Ack` the bytes they consumed. Once a client is past `window`, the daemon skips output and later sends `Resync`. The local window is 8 MiB (lossless) and the remote window 256 KiB.
 - Compatibility rules:
   - `Hello` stays variant 0, with `version` as its first field in both enums.

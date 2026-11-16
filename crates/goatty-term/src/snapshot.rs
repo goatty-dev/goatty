@@ -9,13 +9,15 @@
 //!   * the window title,
 //!   * the OSC 133 prompt marks on rows and soft wraps in the scrollback,
 //!     so the client's [transcript](crate::transcript) finds the same
-//!     commands and unwrapped lines.
+//!     commands and unwrapped lines,
+//!   * OSC 8 hyperlinks.
 
 use std::fmt::Write as _;
 
 use rio_vt::crosswords::formatter::write_sgr;
 use rio_vt::crosswords::grid::row::SemanticPrompt;
 use rio_vt::crosswords::pos::{Column, Line};
+use rio_vt::crosswords::square::Hyperlink;
 use rio_vt::crosswords::style::Style;
 
 use crate::marks::ShellState;
@@ -159,7 +161,7 @@ fn write_cursor(t: &Term, out: &mut String) {
 /// whatever width it has); a marked row always starts a line of its own.
 /// `newline_after_last`: end with a newline (the scrollback) or not (the
 /// screen, which would scroll).
-fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, out: &mut String) {
+pub(crate) fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, out: &mut String) {
     let cols = t.columns();
     let mut current = Style::default();
     let mut wrapping = false;
@@ -252,12 +254,13 @@ fn last_content_col(t: &Term, line: Line, cols: usize) -> Option<usize> {
     })
 }
 
-/// Write a row's text with its styles; `full` keeps trailing blanks.
-/// Returns how many cells it wrote.
+/// Write a row's text with its styles and hyperlinks; `full` keeps
+/// trailing blanks. Returns how many cells it wrote.
 fn write_row(t: &Term, line: Line, cols: usize, full: bool, current: &mut Style, out: &mut String) -> usize {
     let row = &t.grid[line];
     let last = if full { Some(cols - 1) } else { last_content_col(t, line, cols) };
     let Some(last) = last else { return 0 };
+    let mut link: Option<Hyperlink> = None;
     let mut c = 0;
     while c <= last {
         let sq = row[Column(c)];
@@ -270,13 +273,33 @@ fn write_row(t: &Term, line: Line, cols: usize, full: bool, current: &mut Style,
             write_sgr(out, &style);
             *current = style;
         }
+        let cell_link = if sq.has_hyperlink() { t.cell_hyperlink(line, Column(c)) } else { None };
+        if cell_link != link {
+            write_hyperlink(cell_link.as_ref(), out);
+            link = cell_link;
+        }
         let pos = rio_vt::crosswords::pos::Pos::new(line, Column(c));
         for (i, ch) in t.grid.cell_text(pos).enumerate() {
             out.push(if i == 0 && ch == '\0' { ' ' } else { ch });
         }
         c += if sq.is_wide() { 2 } else { 1 };
     }
+    if link.is_some() {
+        write_hyperlink(None, out);
+    }
     last + 1
+}
+
+/// Open `link` (OSC 8 with its id, so the cells stay one link), or close
+/// the open one.
+fn write_hyperlink(link: Option<&Hyperlink>, out: &mut String) {
+    let clean = |s: &str| s.replace(['\x07', '\x1b', ';', ':'], "");
+    match link {
+        Some(l) => {
+            let _ = write!(out, "\x1b]8;id={};{}\x1b\\", clean(l.id()), l.uri().replace(['\x07', '\x1b'], ""));
+        }
+        None => out.push_str("\x1b]8;;\x1b\\"),
+    }
 }
 
 #[cfg(test)]

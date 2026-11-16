@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
-use goatty_proto::{ClientMsg, Frame, PROTOCOL_VERSION, ServerMsg, SessionId, encode, read_msg};
+use goatty_proto::{ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, ServerMsg, SessionId, encode, encode_server, read_msg};
 use goatty_term::Palette;
 
 use crate::server::Daemon;
-use crate::session::{Session, Subscriber};
+use crate::session::{Session, SubFeatures, Subscriber};
 
 /// Serve one client connection until it closes. Its subscriptions end with
 /// it; the sessions keep running.
@@ -54,6 +54,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let mut subs: HashMap<SessionId, (Arc<Session>, Arc<Subscriber>)> = HashMap::new();
     // The protocol version agreed in the handshake.
     let mut agreed_version = 0;
+    let mut features = SubFeatures::default();
     let mut rstream = BufReader::with_capacity(64 << 10, stream);
     let result = (|| -> Result<()> {
         loop {
@@ -74,19 +75,20 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     };
                     log::debug!("connection {conn}: {client} (protocol v{agreed})");
                     agreed_version = agreed;
+                    features.lines = agreed >= HISTORY_SINCE;
                     reply(ServerMsg::Hello { version: agreed, daemon_pid, host });
                 }
                 ClientMsg::ListSessions { req } => reply(ServerMsg::Sessions { req, list: daemon.list() }),
                 ClientMsg::Create { req, size, cwd, opts } => match daemon.create(size, cwd, agreed_version >= goatty_proto::SHELL_SINCE) {
                     Ok(s) => {
-                        let sub = s.subscribe(conn, req, opts, &tx);
+                        let sub = s.subscribe(conn, req, opts, features, &tx);
                         subs.insert(s.id, (s, sub));
                     }
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                 },
                 ClientMsg::Run { req, size, cwd, argv, opts } => match daemon.run(size, cwd, argv) {
                     Ok(s) => {
-                        let sub = s.subscribe(conn, req, opts, &tx);
+                        let sub = s.subscribe(conn, req, opts, features, &tx);
                         subs.insert(s.id, (s, sub));
                     }
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
@@ -95,8 +97,8 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     Some(s) => {
                         // Resize first so the snapshot already has the
                         // client's geometry (reflowed by the VT core).
-                        s.resize(size);
-                        let sub = s.subscribe(conn, req, opts, &tx);
+                        s.resize(size, None);
+                        let sub = s.subscribe(conn, req, opts, features, &tx);
                         subs.insert(s.id, (s, sub));
                     }
                     None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
@@ -115,7 +117,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientMsg::Resize { session, size } => {
                     if let Some((s, _)) = subs.get(&session) {
-                        s.resize(size);
+                        s.resize(size, Some(conn));
                     }
                 }
                 ClientMsg::Ack { session, consumed } => {
@@ -195,6 +197,22 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     daemon.layouts.lock().save(conn, id, sessions, json, now);
                 }
                 ClientMsg::ClaimLayout { req } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout(conn) }),
+                ClientMsg::FetchHistory { req, session, before, count } => match daemon.get(session) {
+                    Some(s) => {
+                        let rows = s.term.history_rows(before, count as usize);
+                        let msg = ServerMsg::History { req, session, before, first: rows.first, oldest: rows.oldest, data: rows.data };
+                        if let Ok(f) = encode_server(&msg, features.zstd) {
+                            let _ = tx.send(f);
+                        }
+                    }
+                    None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
+                },
+                ClientMsg::Compress { zstd } => {
+                    features.zstd = zstd;
+                    for (_, sub) in subs.values() {
+                        sub.zstd.store(zstd, Ordering::Relaxed);
+                    }
+                }
                 ClientMsg::SetPalette { session, colors } => {
                     // Any client of the session may set it (last one wins);
                     // it only affects answers to color queries.

@@ -34,6 +34,7 @@ pub mod transport;
 
 pub use connection::{Connection, HostSettingsApplied, HostSettingsReply};
 pub use control::Control;
+pub use goatty_proto::TopLineCause;
 pub use handshake::VersionMismatch;
 pub use local::LocalProblem;
 pub use remote::RemoteProblem;
@@ -46,6 +47,24 @@ pub trait PaneSink: Send + Sync + 'static {
     /// snapshots alike. Feeding them into a terminal reproduces the session.
     fn feed(&self, bytes: &[u8]);
     fn event(&self, ev: PaneEvent);
+    /// In stream order: the session's top screen row is host line `line`
+    /// (protocol v11; `goatty_term::Terminal::set_top_line`).
+    fn top_line(&self, _line: u64, _cause: TopLineCause) {}
+    /// The answer to [`Connection::fetch_history`], or `None` if it failed
+    /// (the link dropped, or the daemon refused). Called on the reader
+    /// thread, in order with `feed`.
+    fn history(&self, _history: Option<History>) {}
+}
+
+/// Scrollback from the daemon ([`Connection::fetch_history`]): the rows
+/// from host line `first` up to `before`, as VT text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct History {
+    pub before: u64,
+    pub first: u64,
+    /// The oldest line the daemon still has.
+    pub oldest: u64,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
