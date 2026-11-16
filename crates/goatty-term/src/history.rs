@@ -126,7 +126,7 @@ impl Terminal {
     /// The host line of the primary screen's top row, or `None` while the
     /// alternate screen is active (its rows have no history).
     pub fn top_line(&self) -> Option<u64> {
-        self.with_term(|t| (!t.mode().contains(TermMode::ALT_SCREEN)).then(|| own_rows(t).1))
+        self.with_term(|t| (!TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN)).then(|| own_rows(t).1))
     }
 
     /// Up to `count` (at most [`MAX_FETCH`]) rows just before host line
@@ -136,7 +136,7 @@ impl Terminal {
     pub fn history_rows(&self, before: u64, count: usize) -> HistoryRows {
         self.with_term(|t| {
             let (oldest, top) = own_rows(t);
-            if t.mode().contains(TermMode::ALT_SCREEN) {
+            if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
                 return HistoryRows { first: before, oldest, data: Vec::new() };
             }
             let end = before.min(top + t.screen_lines() as u64);
@@ -157,7 +157,7 @@ impl Terminal {
     /// the bytes fed so far (see the module docs).
     pub fn set_top_line(&self, line: u64, cause: TopLineCause) {
         let t = self.inner.term.lock();
-        if t.mode().contains(TermMode::ALT_SCREEN) {
+        if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
             // The primary screen's rows aren't where this applies.
             return;
         }
@@ -189,7 +189,7 @@ impl Terminal {
     /// the daemon never said where its rows are.
     pub fn wanted_history(&self, margin: usize) -> Option<HistoryWanted> {
         let t = self.inner.term.lock();
-        if t.mode().contains(TermMode::ALT_SCREEN) {
+        if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
             return None;
         }
         let mut map = self.inner.lines.lock();
@@ -233,7 +233,7 @@ impl Terminal {
             let t = self.inner.term.lock();
             let mut map = self.inner.lines.lock();
             map.oldest = map.oldest.max(rows.oldest);
-            if t.mode().contains(TermMode::ALT_SCREEN) || map.resized.is_some() {
+            if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) || map.resized.is_some() {
                 return false;
             }
             let (evicted, top) = own_rows(&t);

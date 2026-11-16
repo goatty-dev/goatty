@@ -17,6 +17,7 @@ pub mod input;
 mod links;
 mod listener;
 mod marks;
+mod mode;
 pub mod paste;
 pub mod process;
 pub mod pty;
@@ -29,7 +30,6 @@ pub use frame::{Cell, CellFlags, Cursor, CursorKind, Frame};
 pub use history::{HistoryRows, HistoryWanted, TopLineCause};
 pub use links::{Found, Link, LinkKind, LinkSpan, find_links};
 pub use listener::UiEvent;
-/// Terminal mode bits (DECCKM, mouse reporting, alt screen, ...).
-pub use rio_vt::crosswords::Mode as TermMode;
+pub use mode::TermMode;
 pub use terminal::{DEFAULT_SCROLLBACK, SelectKind, TermSize, Terminal, TerminalChannels};
 pub use transcript::{CommandBlock, Span, Transcript, TranscriptLine};

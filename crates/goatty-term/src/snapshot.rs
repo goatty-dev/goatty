@@ -51,7 +51,7 @@ impl Terminal {
     pub fn restore_snapshot(&self) -> Vec<u8> {
         self.with_term(|t| {
             let shell = self.shell_info();
-            if !t.mode().contains(TermMode::ALT_SCREEN) {
+            if !TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
                 return serialize(t, MAX_REPLAY_HISTORY, shell);
             }
             // rio-vt keeps the primary grid private while the alternate one
@@ -63,7 +63,7 @@ impl Terminal {
             write_primary(t, MAX_REPLAY_HISTORY, &mut out);
             t.swap_alt();
             t.grid = alt;
-            let mode = t.mode();
+            let mode = TermMode::from_rio(t.mode());
             out.push_str("\x1b[?1049h");
             write_screen(t, false, &mut out);
             write_shell_state(shell, &mut out);
@@ -84,7 +84,7 @@ impl Terminal {
 }
 
 fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
-    let mode = t.mode();
+    let mode = TermMode::from_rio(t.mode());
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
     // region, origin mode, and the alt-screen switch in whichever direction.
@@ -101,7 +101,7 @@ fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
 }
 
 fn serialize(t: &Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
-    let mode = t.mode();
+    let mode = TermMode::from_rio(t.mode());
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
     out.push_str("\x1bc");
@@ -153,7 +153,7 @@ fn write_cursor(t: &Term, out: &mut String) {
     out.push_str("\x1b[0m");
     let pos = t.grid.cursor.pos;
     let _ = write!(out, "\x1b[{};{}H", pos.row.0.max(0) + 1, pos.col.0 + 1);
-    out.push_str(if t.mode().contains(TermMode::SHOW_CURSOR) { "\x1b[?25h" } else { "\x1b[?25l" });
+    out.push_str(if TermMode::from_rio(t.mode()).contains(TermMode::SHOW_CURSOR) { "\x1b[?25h" } else { "\x1b[?25l" });
 }
 
 /// Write `lines` with their styles and prompt marks. A soft-wrapped row is
