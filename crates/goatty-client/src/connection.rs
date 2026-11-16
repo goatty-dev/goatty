@@ -345,11 +345,17 @@ impl Connection {
     /// blocks: the answer goes to the pane's [`PaneSink::history`]. False
     /// when it wasn't sent (no link, or a daemon older than protocol v11).
     pub fn fetch_history(&self, session: SessionId, before: u64, count: u32) -> bool {
-        if !self.is_connected() || self.protocol_version() < HISTORY_SINCE {
-            return false;
-        }
         let req = self.shared.req_id();
-        self.shared.pending.lock().insert(req, Pending::History(session));
+        {
+            // Checked under the lock the disconnect drain takes: a request
+            // registered here is either drained (and answered with `None`) or
+            // goes out on a live link.
+            let mut pending = self.shared.pending.lock();
+            if !self.is_connected() || self.protocol_version() < HISTORY_SINCE {
+                return false;
+            }
+            pending.insert(req, Pending::History(session));
+        }
         self.shared.send(&ClientMsg::FetchHistory { req, session, before, count });
         true
     }

@@ -231,20 +231,31 @@ impl Session {
 
     /// Resize for connection `from` (`None`: before it subscribes). Rows
     /// reflow, so subscribers that number lines hear the new top line: all
-    /// of them when the size changed, else just `from`.
+    /// of them when the size changed, else just `from`. Lagging ones don't:
+    /// they lack output the line counts, and their `Resync` brings the line.
     pub(crate) fn resize(&self, ws: WinSize, from: Option<u64>) {
         let size = to_size(ws);
-        let changed = self.term.size() != (size.cols, size.rows);
-        if changed {
-            self.term.resize(size);
+        {
+            // The reflow and its top line are one point in the stream, like a
+            // snapshot and its top line in `subscribe`/`resync`.
+            let subs = self.subs.lock();
+            let changed = self.term.size() != (size.cols, size.rows);
+            if changed {
+                self.term.resize(size);
+            }
+            self.push_resized(&subs, changed, from);
         }
         if let Err(e) = self.pty.lock().resize(size) {
             log::warn!("session {}: resize failed: {e}", self.id);
         }
-        let subs = self.subs.lock(); // a point in the stream
+    }
+
+    /// Caller holds `subs`.
+    fn push_resized(&self, subs: &[Arc<Subscriber>], changed: bool, from: Option<u64>) {
         if let Some(line) = self.term.top_line() {
             let frame = encode(&ServerMsg::TopLine { session: self.id, line, cause: TopLineCause::Resize }).ok();
-            for sub in subs.iter().filter(|s| s.lines && (changed || Some(s.conn) == from)) {
+            let wants = |s: &Subscriber| s.lines && !s.lagging.load(Ordering::Acquire) && (changed || Some(s.conn) == from);
+            for sub in subs.iter().filter(|s| wants(s)) {
                 if let Some(f) = &frame {
                     sub.push(f.clone(), 0);
                 }

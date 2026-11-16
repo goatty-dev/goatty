@@ -206,7 +206,8 @@ impl Terminal {
         // A skipped stretch between two runs (newest first).
         for w in map.anchors.windows(2).rev() {
             let ((c0, h0), (c1, h1)) = (w[0], w[1]);
-            let expected = h0 + (c1 - c0);
+            // Not what the daemon dropped meanwhile.
+            let expected = (h0 + (c1 - c0)).max(map.oldest);
             if h1 > expected && near(c1) {
                 return Some(HistoryWanted { before: h1, count: chunk(h1 - expected) });
             }
@@ -264,6 +265,11 @@ impl Terminal {
 
         let mut t = self.inner.term.lock();
         let mut map = self.inner.lines.lock();
+        // `resize` doesn't wait for the parser lock: a grid of the old size
+        // must not replace the resized one.
+        if (t.columns() as u16, t.screen_lines() as u16) != (size.cols, size.rows) || map.resized.is_some() {
+            return false;
+        }
         let (_, old_top) = own_rows(&t);
         let old_rows = t.history_size() as u64 + t.screen_lines() as u64;
         // Keep the cursor, its pen and the saved cursor. Style and extras
@@ -397,6 +403,29 @@ mod tests {
         b.scroll(10);
         fill(&a, &b);
         assert_eq!(lines(&b), lines(&a));
+    }
+
+    #[test]
+    fn a_gap_the_daemon_dropped_is_not_asked_for_again() {
+        let size = TermSize::new(30, 5);
+        let a = term(size, true);
+        let b = term(size, false);
+        b.feed(&a.reattach_snapshot());
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Attach);
+        let start = numbered(0..50);
+        a.feed(&start);
+        b.feed(&start);
+        a.feed(&numbered(50..400));
+        b.feed(&a.resync_snapshot());
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Resync);
+        // The daemon's history is cleared before the client asks.
+        a.feed(b"\x1b[3J");
+        b.scroll(10);
+        let w = b.wanted_history(100).expect("the gap");
+        let rows = a.history_rows(w.before, w.count as usize);
+        assert!(rows.data.is_empty() && rows.oldest >= w.before);
+        assert!(b.insert_history(w.before, &rows));
+        assert_eq!(b.wanted_history(100), None);
     }
 
     #[test]

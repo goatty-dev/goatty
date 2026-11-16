@@ -303,8 +303,9 @@ fn foreground_program_changes_are_reported() {
 struct TestSink {
     term: Mutex<Option<Terminal>>,
     events: Mutex<Vec<String>>,
-    /// History answers received.
+    /// History answers and top lines received.
     histories: Mutex<u32>,
+    tops: Mutex<u32>,
 }
 
 impl PaneSink for TestSink {
@@ -321,6 +322,7 @@ impl PaneSink for TestSink {
             TopLineCause::Resize => goatty_term::TopLineCause::Resize,
         };
         self.term.lock().get_or_insert_with(term).set_top_line(line, cause);
+        *self.tops.lock() += 1;
     }
     fn history(&self, history: Option<History>) {
         let h = history.expect("history answer");
@@ -403,9 +405,12 @@ fn scrollback_is_fetched_from_the_daemon_on_demand() {
     let rows = |sink: &TestSink| -> Vec<String> {
         let t = sink.term.lock();
         let t = t.as_ref().unwrap();
-        t.transcript().lines.into_iter().map(|l| l.text).filter(|l| l.starts_with("row ")).collect()
+        // dash prints its prompt after the echoed command: `$ row 1`.
+        let row =
+            |l: &str| l.rfind("row ").map(|i| l[i..].to_string()).filter(|r| r[4..].bytes().all(|b| b.is_ascii_digit()) && r.len() > 4);
+        t.transcript().lines.iter().filter_map(|l| row(&l.text)).collect()
     };
-    eventually("the attach snapshot", || rows(&sink).len() > 1000);
+    eventually("the attach snapshot and its top line", || rows(&sink).len() > 1000 && *sink.tops.lock() > 0);
     assert!(!rows(&sink).contains(&"row 1".to_string()));
     let mut fetches = 0;
     loop {
