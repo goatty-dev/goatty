@@ -22,35 +22,6 @@ fn c(color: goatty_config::Color) -> Hsla {
     rgb(color.0).into()
 }
 
-/// Monospace-looking family names, for the default font list.
-pub(super) fn looks_monospace(name: &str) -> bool {
-    let n = name.to_lowercase();
-    [
-        "mono",
-        "code",
-        "consol",
-        "courier",
-        "term",
-        "iosevka",
-        "hack",
-        "menlo",
-        "fixed",
-        "jetbrains",
-        "cascadia",
-        "inconsolata",
-        "victor",
-        "commit",
-        "monaspace",
-        "berkeley",
-        "input",
-        "fira",
-        "source han code",
-        "sarasa",
-    ]
-    .iter()
-    .any(|k| n.contains(k))
-}
-
 /// Opacity in 5 % steps, between the minimum and opaque.
 pub(super) fn snap_opacity(v: f32) -> f32 {
     ((v * 20.0).round() / 20.0).clamp(TerminalSettings::MIN_OPACITY, 1.0)
@@ -537,7 +508,7 @@ impl SettingsWindow {
             &self.font_filter,
             self.show_all_fonts,
             "Monospace",
-            looks_monospace,
+            true,
             |v, all| v.show_all_fonts = all,
             |s, val| s.font.family = val,
             window,
@@ -558,7 +529,7 @@ impl SettingsWindow {
             &self.ui_font_filter,
             self.show_all_ui_fonts,
             "Proportional",
-            |f| !looks_monospace(f),
+            false,
             |v, all| v.show_all_ui_fonts = all,
             |s, val| s.font.ui_family = val,
             window,
@@ -577,7 +548,7 @@ impl SettingsWindow {
         filter_input: &Entity<TextInput>,
         show_all: bool,
         kind_label: &'static str,
-        kind_filter: fn(&str) -> bool,
+        kind_mono: bool,
         set_show_all: fn(&mut Self, bool),
         set_font: fn(&mut ClientSettings, Option<String>),
         window: &Window,
@@ -607,10 +578,12 @@ impl SettingsWindow {
             div().flex().flex_col().w(px(320.)).p(px(5.)).rounded(px(14.)).bg(ui.menu).border_1().border_color(ui.border).shadow_lg();
         if open {
             let query = filter_input.read(cx).text().to_lowercase();
+            // Until the monospace scan is done, the kind filter lets everything through.
+            let of_kind = |f: &String| app.mono_fonts.as_ref().is_none_or(|m| m.contains(f) == kind_mono);
             let fonts: Vec<String> = app
                 .fonts
                 .iter()
-                .filter(|f| show_all || kind_filter(f) || current.as_deref() == Some(f.as_str()))
+                .filter(|f| show_all || of_kind(f) || current.as_deref() == Some(f.as_str()))
                 .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
                 .take(300)
                 .cloned()
@@ -911,13 +884,6 @@ pub(super) fn opts<T: Clone>(items: &[(T, &'static str, &'static str)]) -> Vec<O
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn monospace_guess() {
-        assert!(looks_monospace("JetBrains Mono"));
-        assert!(looks_monospace("Fira Code"));
-        assert!(!looks_monospace("Noto Sans"));
-    }
 
     #[test]
     fn opacity_snaps_to_five_percent() {

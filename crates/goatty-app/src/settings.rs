@@ -2,13 +2,14 @@
 //! reloaded when the file changes, edited by the settings window, observed
 //! by every view that renders with them.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use goatty_config::{ClientSettings, Document, FileStamp, Issue, Loaded, ThemeColors, ThemeLibrary, store};
 use goatty_term::Palette;
-use gpui::{App, ClipboardItem, Global, WindowAppearance};
+use gpui::{App, BorrowAppContext, ClipboardItem, Global, WindowAppearance};
 
 use crate::toast::{self, Toast};
 
@@ -29,6 +30,9 @@ pub struct AppSettings {
     pub fonts: Arc<Vec<String>>,
     /// Font families installed on the system, without the bundled one.
     system_fonts: Arc<Vec<String>>,
+    /// The monospace families (measured, see `fonts::monospace_families`);
+    /// `None` while the background scan runs.
+    pub mono_fonts: Option<Arc<HashSet<String>>>,
     /// Proportional font for goatty's own windows (GPUI's default UI font
     /// name doesn't resolve on every Linux system).
     pub ui_font: gpui::SharedString,
@@ -98,6 +102,7 @@ impl AppSettings {
             stamp,
             fonts: Arc::new(fonts),
             system_fonts: Arc::new(system_fonts),
+            mono_fonts: None,
             ui_font: "sans-serif".into(),
             key_errors: Vec::new(),
             save_error: None,
@@ -120,6 +125,13 @@ impl AppSettings {
         cx.set_global(s);
         // A file broken before goatty started: say so once a window is up.
         Self::announce(cx, &[], issues);
+
+        cx.spawn(async move |cx| {
+            let mono = cx.background_executor().spawn(async { crate::fonts::monospace_families() }).await;
+            log::debug!("{} monospace font families", mono.len());
+            cx.update(|cx| cx.update_global::<Self, _>(|s, _| s.mono_fonts = Some(Arc::new(mono))));
+        })
+        .detach();
 
         cx.spawn(async move |cx| {
             loop {
