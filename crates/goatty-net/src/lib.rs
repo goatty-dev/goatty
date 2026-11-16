@@ -112,18 +112,22 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let tmp = dir.join(format!(".{}.{}", path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp"), std::process::id()));
+    // Unique per write: two writes at once must not share a temporary file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
+    let tmp = dir.join(format!(".{name}.{}.{n}.{}", std::process::id(), hex(&random::<4>()?)));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(mode)
         .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    let written = f.write_all(data).and_then(|()| f.sync_all()).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("write {}", path.display()))
 }
 
 /// A JSON file, or the default when it doesn't exist.

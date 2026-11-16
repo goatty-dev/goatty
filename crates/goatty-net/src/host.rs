@@ -102,6 +102,9 @@ impl Host {
     /// route of ours. Talks to Tailscale, so call it off any hot path.
     pub fn start(self: &Arc<Self>, handler: Handler) {
         let _ = self.handler.set(handler);
+        // Held from reading the state to the end: an `Enable` meanwhile must
+        // not have its new route taken for a leftover and removed.
+        let _guard = self.changing.lock();
         let state = self.state();
         if state.available {
             if let Err(e) = self.listen() {
@@ -109,10 +112,8 @@ impl Host {
                 *self.route.lock() = RouteStatus::Failed { message: format!("{e:#}") };
                 return;
             }
-            let _guard = self.changing.lock();
             self.ensure_route(state.port);
         } else if self.ts.serve_config().is_ok_and(|c| !c.our_ports(&self.socket).is_empty()) {
-            let _guard = self.changing.lock();
             self.remove_routes(None);
         }
     }
@@ -158,7 +159,11 @@ impl Host {
                 .gateway
                 .revoke(&key)
                 .and_then(|gone| if gone.is_empty() { bail!("no paired device has a key starting with {key}") } else { Ok(()) }),
-            Request::Leave => self.disable().and_then(|()| self.gateway.forget_all()),
+            Request::Leave => {
+                // Forget the devices even if the route couldn't be removed.
+                let disabled = self.disable();
+                self.gateway.forget_all().and(disabled)
+            }
         };
         match done {
             Ok(()) => Reply::Status(Box::new(self.status())),
@@ -237,11 +242,12 @@ impl Host {
     fn disable(&self) -> Result<()> {
         let _guard = self.changing.lock();
         self.gateway.close_pairing();
-        let state = self.state();
-        self.save_state(HostState { available: false, ..state })?;
+        // Tear down first: a failed save must not leave the gateway serving.
         self.stop_listening();
         let problem = self.remove_routes(None);
         *self.route.lock() = RouteStatus::Off;
+        let state = self.state();
+        self.save_state(HostState { available: false, ..state })?;
         if let Some(e) = problem {
             bail!("availability is off, but goatty's Serve route is still there: {e}");
         }

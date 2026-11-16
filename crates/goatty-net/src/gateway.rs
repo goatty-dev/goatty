@@ -4,12 +4,19 @@
 //! Newline-delimited JSON, one message each way per step:
 //!
 //! ```text
-//! host   → { gateway: 1, goatty, name, key, nonce, protocol }   greeting
-//! client → { op: "probe" }                                       → { answer: "probe", pairing }, then closed
-//! client → { op: "auth", key, nonce, sig }                       → { answer: "welcome", sig } → goatty protocol
-//! client → { op: "pair", key, nonce, name, sig }                 → { answer: "confirm", sig } … { answer: "paired" }
-//!                                                                  (or { answer: "refused", reason, code })
+//! host   → { gateway: 1, goatty, name, key, nonce, commit, protocol }   greeting
+//! client → { op: "probe" }                         → { answer: "probe", pairing }, then closed
+//! client → { op: "auth", key, nonce, sig }         → { answer: "welcome", sig } → goatty protocol
+//! client → { op: "pair", key, nonce, name, sig }   → { answer: "confirm", reveal, sig } … { answer: "paired" }
+//!                                                    (or { answer: "refused", reason, code })
 //! ```
+//!
+//! The pairing code comes from both keys, the host's pairing nonce and the
+//! client's nonce. The host only *commits* to its pairing nonce in the
+//! greeting (`commit` = a hash of its key and the nonce) and reveals it
+//! after the client sent its own, so neither side can pick its nonce after
+//! seeing the other's. Without that, a device in the middle could try
+//! about a million nonces until both screens showed the same code.
 //!
 //! Every signature covers both public keys and both nonces (fresh per
 //! connection), so neither can be replayed: the client's proves it holds
@@ -59,9 +66,20 @@ pub struct Greeting {
     pub name: String,
     /// The host's public key (hex).
     pub key: String,
+    /// Fresh per connection: what the client signs to authenticate.
     pub nonce: String,
+    /// The host's commitment to its pairing nonce ([`commitment`]),
+    /// revealed in `Confirm` once the client sent its nonce.
+    pub commit: String,
     /// The goatty protocol versions the host's goattyd speaks.
     pub protocol: (u32, u32),
+}
+
+/// The commitment to a pairing nonce: SHA-256 over the host's key and the
+/// nonce (hex).
+pub fn commitment(host_key: &str, pair_nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex(&Sha256::digest(transcript(PAIR_COMMIT, host_key, pair_nonce, "", "")))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,11 +93,22 @@ enum Hello {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 enum Answer {
-    Probe { pairing: bool },
-    Welcome { sig: String },
-    Confirm { sig: String },
+    Probe {
+        pairing: bool,
+    },
+    Welcome {
+        sig: String,
+    },
+    /// `reveal`: the pairing nonce the greeting committed to.
+    Confirm {
+        reveal: String,
+        sig: String,
+    },
     Paired,
-    Refused { reason: String, code: Refusal },
+    Refused {
+        reason: String,
+        code: Refusal,
+    },
 }
 
 /// Why a host refused.
@@ -150,6 +179,7 @@ const AUTH: &str = "goatty-gateway-auth-v1";
 const AUTH_HOST: &str = "goatty-gateway-auth-host-v1";
 const PAIR: &str = "goatty-gateway-pair-v1";
 const PAIR_HOST: &str = "goatty-gateway-pair-host-v1";
+const PAIR_COMMIT: &str = "goatty-gateway-pair-commit-v1";
 
 fn send<T: Serialize>(w: &mut impl Write, msg: &T) -> Result<()> {
     let mut line = serde_json::to_vec(msg)?;
@@ -241,6 +271,10 @@ pub struct Gateway {
     pairing: Mutex<PairingState>,
     changed: Condvar,
     failures: Mutex<VecDeque<Instant>>,
+    /// Held across every read-modify-write of `devices.json`. The number
+    /// counts `forget_all`s: an approved pairing that started before one
+    /// isn't saved.
+    devices: Mutex<u64>,
 }
 
 /// The outcome of a handshake that went through.
@@ -255,7 +289,15 @@ pub enum Accepted {
 impl Gateway {
     pub fn new(paths: Paths, info: HostInfo) -> Result<Self> {
         let identity = Identity::load_or_create(&paths.key())?;
-        Ok(Self { identity, paths, info, pairing: Mutex::default(), changed: Condvar::new(), failures: Mutex::default() })
+        Ok(Self {
+            identity,
+            paths,
+            info,
+            pairing: Mutex::default(),
+            changed: Condvar::new(),
+            failures: Mutex::default(),
+            devices: Mutex::new(0),
+        })
     }
 
     pub fn public_key(&self) -> String {
@@ -307,6 +349,7 @@ impl Gateway {
 
     /// Forget the devices whose key starts with `prefix` (8+ hex digits).
     pub fn revoke(&self, prefix: &str) -> Result<Vec<Device>> {
+        let _lock = self.devices.lock();
         let mut d = Devices::load(&self.paths.devices())?;
         let gone = d.revoke(prefix);
         if !gone.is_empty() {
@@ -317,6 +360,10 @@ impl Gateway {
 
     /// Forget every paired device.
     pub fn forget_all(&self) -> Result<()> {
+        let mut epoch = self.devices.lock();
+        *epoch += 1;
+        // Waiting requests are rejected too.
+        self.close_pairing();
         match std::fs::remove_file(self.paths.devices()) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
@@ -340,6 +387,7 @@ impl Gateway {
     /// positioned at the goatty protocol.
     pub fn accept(&self, stream: &mut (impl Read + Write)) -> Result<Accepted> {
         let nonce = hex(&crate::random::<32>()?);
+        let pair_nonce = hex(&crate::random::<32>()?);
         let host_key = self.identity.public();
         send(
             stream,
@@ -349,6 +397,7 @@ impl Gateway {
                 name: self.info.name.clone(),
                 key: host_key.clone(),
                 nonce: nonce.clone(),
+                commit: commitment(&host_key, &pair_nonce),
                 protocol: self.info.protocol,
             },
         )?;
@@ -365,13 +414,20 @@ impl Gateway {
                 Ok(Accepted::Done)
             }
             Hello::Auth { key, nonce: client_nonce, sig } => {
-                if self.too_many_failures() {
-                    refuse(stream, Refusal::TooMany, "too many failed attempts; try again in a minute")?;
-                    bail!("refused an authentication: too many failures");
-                }
+                // A valid signature from a paired key always gets in: failed
+                // attempts by others must not lock paired devices out.
                 let msg = transcript(AUTH, &host_key, &nonce, &key, &client_nonce);
-                let device = Devices::load(&self.paths.devices())?.get(&key).cloned();
-                let Some(device) = device.filter(|_| identity::verify(&key, &msg, &sig).is_ok()) else {
+                let device = identity::verify(&key, &msg, &sig).ok().and_then(|()| {
+                    let _lock = self.devices.lock();
+                    Devices::load(&self.paths.devices()).ok()?.get(&key).cloned()
+                });
+                let Some(device) = device else {
+                    if self.too_many_failures() {
+                        // Slow down whoever is trying (one thread per connection).
+                        std::thread::sleep(Duration::from_secs(1));
+                        refuse(stream, Refusal::TooMany, "too many failed attempts; try again in a minute")?;
+                        bail!("refused an authentication: too many failures");
+                    }
                     self.failed();
                     refuse(stream, Refusal::NotPaired, &format!("this device isn't paired with {}", self.info.name))?;
                     bail!("refused key {}: not paired or bad signature", identity::short(&key));
@@ -381,29 +437,21 @@ impl Gateway {
                 Ok(Accepted::Device(device))
             }
             Hello::Pair { key, nonce: client_nonce, name, sig } => {
-                self.pair(stream, &host_key, &nonce, &key, &client_nonce, &name, &sig)?;
+                let nonces = Nonces { auth: &nonce, pair: &pair_nonce, client: &client_nonce };
+                self.pair(stream, &host_key, nonces, &key, &name, &sig)?;
                 Ok(Accepted::Done)
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn pair(
-        &self,
-        stream: &mut (impl Read + Write),
-        host_key: &str,
-        nonce: &str,
-        key: &str,
-        client_nonce: &str,
-        name: &str,
-        sig: &str,
-    ) -> Result<()> {
-        if identity::verify(key, &transcript(PAIR, host_key, nonce, key, client_nonce), sig).is_err() {
+    fn pair(&self, stream: &mut (impl Read + Write), host_key: &str, n: Nonces<'_>, key: &str, name: &str, sig: &str) -> Result<()> {
+        if identity::verify(key, &transcript(PAIR, host_key, n.auth, key, n.client), sig).is_err() {
             refuse(stream, Refusal::BadRequest, "bad signature")?;
             bail!("pairing request with a bad signature");
         }
         let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
-        let code = pairing::code(host_key, nonce, key, client_nonce);
+        let code = pairing::code(host_key, n.pair, key, n.client);
+        let epoch = *self.devices.lock();
         let id = {
             let mut p = self.pairing.lock();
             if !p.is_open() {
@@ -412,9 +460,10 @@ impl Gateway {
                 refuse(stream, Refusal::PairingClosed, &reason)?;
                 return Ok(());
             }
-            p.pending.retain(|(_, d)| d.is_none());
+            // Decided requests stay until their own connection takes the decision.
             p.attempts += 1;
-            if p.attempts > MAX_PAIR_ATTEMPTS || p.pending.len() >= MAX_PENDING {
+            let waiting = p.pending.iter().filter(|(_, d)| d.is_none()).count();
+            if p.attempts > MAX_PAIR_ATTEMPTS || waiting >= MAX_PENDING {
                 drop(p);
                 refuse(stream, Refusal::TooMany, "too many pairing requests; open the pairing window again")?;
                 return Ok(());
@@ -426,17 +475,27 @@ impl Gateway {
             id
         };
         log::info!("pairing request from {name} ({}), code {code}", identity::short(key));
-        let sig = self.identity.sign(&transcript(PAIR_HOST, host_key, nonce, key, client_nonce));
-        let wait = send(stream, &Answer::Confirm { sig }).map(|()| self.wait_for_decision(id));
+        let sig = self.identity.sign(&transcript(PAIR_HOST, host_key, n.pair, key, n.client));
+        let wait = send(stream, &Answer::Confirm { reveal: n.pair.into(), sig }).map(|()| self.wait_for_decision(id));
         let mut p = self.pairing.lock();
         let decision = p.pending.iter().find(|(r, _)| r.id == id).and_then(|(_, d)| *d);
         p.pending.retain(|(r, _)| r.id != id);
         drop(p);
         wait?;
-        if decision == Some(true) {
-            let mut d = Devices::load(&self.paths.devices())?;
-            d.add(Device { key: key.into(), name: name.clone(), paired_unix: crate::now_unix() });
-            d.save(&self.paths.devices())?;
+        let saved = (decision == Some(true))
+            .then(|| {
+                let current = self.devices.lock();
+                // Everything was forgotten meanwhile (`Leave`): this approval goes too.
+                if *current != epoch {
+                    return Ok(false);
+                }
+                let mut d = Devices::load(&self.paths.devices())?;
+                d.add(Device { key: key.into(), name: name.clone(), paired_unix: crate::now_unix() });
+                d.save(&self.paths.devices())?;
+                anyhow::Ok(true)
+            })
+            .transpose()?;
+        if saved == Some(true) {
             log::info!("paired with {name} ({})", identity::short(key));
             send(stream, &Answer::Paired)?;
         } else {
@@ -457,6 +516,17 @@ impl Gateway {
             let _ = self.changed.wait_until(&mut p, until);
         }
     }
+}
+
+/// The nonces of one gateway connection.
+#[derive(Clone, Copy)]
+struct Nonces<'a> {
+    /// The greeting's (the client signs it).
+    auth: &'a str,
+    /// The pairing nonce the greeting committed to.
+    pair: &'a str,
+    /// The client's.
+    client: &'a str,
 }
 
 fn refuse(w: &mut impl Write, code: Refusal, reason: &str) -> Result<()> {
@@ -535,10 +605,14 @@ pub fn start_pairing(r: &mut impl BufRead, w: &mut impl Write, identity: &Identi
     let sig = identity.sign(&transcript(PAIR, &g.key, &g.nonce, &key, &nonce));
     send(w, &Hello::Pair { key: key.clone(), nonce: nonce.clone(), name: name.into(), sig })?;
     match read_answer(r)? {
-        Answer::Confirm { sig } => {
-            identity::verify(&g.key, &transcript(PAIR_HOST, &g.key, &g.nonce, &key, &nonce), &sig)
+        Answer::Confirm { reveal, sig } => {
+            // The nonce must be the one the host committed to before it saw ours.
+            if commitment(&g.key, &reveal) != g.commit {
+                bail!("the host's pairing nonce doesn't match its commitment: refusing to pair");
+            }
+            identity::verify(&g.key, &transcript(PAIR_HOST, &g.key, &reveal, &key, &nonce), &sig)
                 .context("the host's answer isn't signed with its key")?;
-            let code = pairing::code(&g.key, &g.nonce, &key, &nonce);
+            let code = pairing::code(&g.key, &reveal, &key, &nonce);
             Ok(Pairing { greeting: g, code })
         }
         Answer::Refused { reason, code } => bail!(GatewayError::Refused { code, reason }),
@@ -712,6 +786,82 @@ mod tests {
         // Probes still work.
         let (mut r, mut w, _) = connect(&g);
         probe(&mut r, &mut w).unwrap();
+        // And a paired device isn't locked out by someone else's failures.
+        let paired = Identity::generate().unwrap();
+        g.open_pairing(PAIRING_WINDOW);
+        pair(&g, &paired, true).unwrap();
+        let (mut r, mut w, host) = connect(&g);
+        authenticate(&mut r, &mut w, &paired, &g.public_key()).unwrap();
+        w.write_all(b"hello").unwrap();
+        assert!(matches!(host.join().unwrap().unwrap(), Accepted::Device(_)));
+    }
+
+    #[test]
+    fn a_reveal_that_doesnt_match_the_commitment_is_refused() {
+        // A "host" that picks its pairing nonce after seeing the client's.
+        let (client, mut host) = UnixStream::pair().unwrap();
+        let fake = Identity::generate().unwrap();
+        let fake_key = fake.public();
+        std::thread::spawn(move || {
+            let committed = "11".repeat(32);
+            let greeting = Greeting {
+                gateway: VERSION,
+                goatty: "0.1.0".into(),
+                name: "desk".into(),
+                key: fake_key.clone(),
+                nonce: "22".repeat(32),
+                commit: commitment(&fake_key, &committed),
+                protocol: (7, 12),
+            };
+            send(&mut host, &greeting).unwrap();
+            let Ok(Hello::Pair { key, nonce, .. }) = serde_json::from_str(&read_line_unbuffered(&mut host).unwrap()) else { panic!() };
+            let chosen = "33".repeat(32);
+            let sig = fake.sign(&transcript(PAIR_HOST, &fake_key, &chosen, &key, &nonce));
+            send(&mut host, &Answer::Confirm { reveal: chosen, sig }).unwrap();
+        });
+        let mut w = client.try_clone().unwrap();
+        let mut r = BufReader::new(client);
+        let me = Identity::generate().unwrap();
+        let err = start_pairing(&mut r, &mut w, &me, "laptop").err().unwrap();
+        assert!(err.to_string().contains("commitment"), "{err:#}");
+    }
+
+    #[test]
+    fn a_decision_waits_for_its_own_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = gateway(dir.path());
+        g.open_pairing(PAIRING_WINDOW);
+        let (a, b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+        let (mut ra, mut wa, _) = connect(&g);
+        let pa = start_pairing(&mut ra, &mut wa, &a, "a").unwrap();
+        let id = g.pairing().unwrap().pending[0].id;
+        // Approve a, and have b's request arrive before a's connection reads the decision.
+        let mut p = g.pairing.lock();
+        p.pending.iter_mut().find(|(r, _)| r.id == id).unwrap().1 = Some(true);
+        drop(p);
+        let (mut rb, mut wb, _) = connect(&g);
+        let _pb = start_pairing(&mut rb, &mut wb, &b, "b").unwrap();
+        g.changed.notify_all();
+        pa.wait(&mut ra).unwrap();
+        assert!(g.devices().unwrap().iter().any(|d| d.key == a.public()));
+    }
+
+    #[test]
+    fn forgetting_everyone_voids_approvals_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = gateway(dir.path());
+        g.open_pairing(PAIRING_WINDOW);
+        let me = Identity::generate().unwrap();
+        let (mut r, mut w, host) = connect(&g);
+        let p = start_pairing(&mut r, &mut w, &me, "laptop").unwrap();
+        // `Leave` lands between the request and its commit.
+        *g.devices.lock() += 1;
+        let id = g.pairing().unwrap().pending[0].id;
+        g.decide(id, true).unwrap();
+        let err = p.wait(&mut r).unwrap_err();
+        assert_eq!(GatewayError::refusal(&err), Some(Refusal::Rejected));
+        host.join().unwrap().unwrap();
+        assert!(g.devices().unwrap().is_empty());
     }
 
     #[test]

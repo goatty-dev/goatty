@@ -43,14 +43,15 @@ fn route(ts: &Tailscale, dns: &str, fallback: Option<&KnownHost>, name: &str) ->
 /// computer's device key; the host must show the key pinned when pairing),
 /// then the goatty protocol.
 pub(crate) fn connect(t: &TailnetTarget) -> Result<Transport> {
-    let hosts = KnownHosts::load(&t.paths.hosts())?;
+    let paths = t.paths.as_ref().context("no $HOME: goatty keeps this computer's tailnet key there")?;
+    let hosts = KnownHosts::load(&paths.hosts())?;
     let Some(host) = hosts.get(&t.dns).cloned() else {
         bail!(GatewayError::Refused {
             code: Refusal::NotPaired,
             reason: format!("this computer isn't paired with {}: pair it first", t.name),
         });
     };
-    let identity = Identity::load_or_create(&t.paths.key())?;
+    let identity = Identity::load_or_create(&paths.key())?;
     let (mode, addr) = route(&t.tailscale, &t.dns, Some(&host), &t.name)?;
     let l = link::open(&t.tailscale, mode, &addr, host.port, CONNECT_TIMEOUT)?;
     let stderr = l.stderr.clone();
@@ -162,7 +163,15 @@ impl Pairing {
         let mut writer = l.writer;
         let inner = {
             let _deadline = Deadline::start(&l.closer, CONNECT_TIMEOUT);
-            gateway::start_pairing(&mut reader, &mut writer, &identity, my_name)?
+            gateway::start_pairing(&mut reader, &mut writer, &identity, my_name)
+        };
+        let inner = match inner {
+            Ok(p) => p,
+            Err(e) => {
+                // No `Pairing` to drop: end `tailscale nc` here.
+                l.closer.close();
+                return Err(e);
+            }
         };
         Ok(Self {
             code: inner.code.clone(),

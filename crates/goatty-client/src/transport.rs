@@ -49,8 +49,9 @@ pub struct TailnetTarget {
     pub dns: String,
     /// Its Tailscale host name, as shown.
     pub name: String,
-    /// goatty's tailnet files on this computer (device key, pinned hosts).
-    pub paths: goatty_net::Paths,
+    /// goatty's tailnet files on this computer (device key, pinned hosts);
+    /// `None` without `$HOME` (never a shared temporary directory).
+    pub paths: Option<goatty_net::Paths>,
     pub tailscale: goatty_net::tailscale::Tailscale,
 }
 

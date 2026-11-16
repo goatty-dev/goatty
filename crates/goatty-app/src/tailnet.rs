@@ -29,9 +29,15 @@ use crate::settings::AppSettings;
 use crate::toast::{self, Toast};
 
 /// goatty's tailnet files on this computer (device key, pinned hosts).
-pub fn paths() -> Paths {
-    let dir = goatty_shell::Dirs::from_env().map(|d| d.tailnet_dir()).unwrap_or_else(|| std::env::temp_dir().join("goatty-tailnet"));
-    Paths::new(dir)
+/// `None` without `$HOME`: never a shared temporary directory, where
+/// another user could plant a key.
+pub fn paths() -> Option<Paths> {
+    goatty_shell::Dirs::from_env().map(|d| Paths::new(d.tailnet_dir()))
+}
+
+/// The hosts this computer paired with.
+fn known() -> Vec<KnownHost> {
+    paths().map(|p| tailnet::known_hosts(&p)).unwrap_or_default()
 }
 
 /// What the switcher knows about the tailnet: the paired hosts and the
@@ -42,6 +48,9 @@ pub struct TailnetList {
     /// `None` until discovery ran (or with discovery off).
     pub discovery: Option<Arc<Discovery>>,
     reading: bool,
+    /// A refresh was asked for while one ran: run another when it ends
+    /// (its results may predate a pairing or a forget).
+    again: bool,
     /// When the last discovery finished: the palette opens often, and each
     /// discovery probes every online peer.
     finished: Option<std::time::Instant>,
@@ -64,7 +73,11 @@ pub fn refresh_now(cx: &mut App) {
 /// [`TailnetList`] hear about changes.
 pub fn refresh(cx: &mut App) {
     let list = cx.default_global::<TailnetList>();
-    if list.reading || list.finished.is_some_and(|t| t.elapsed() < REDISCOVER_AFTER) {
+    if list.reading {
+        list.again |= list.finished.is_none();
+        return;
+    }
+    if list.finished.is_some_and(|t| t.elapsed() < REDISCOVER_AFTER) {
         return;
     }
     list.reading = true;
@@ -73,7 +86,7 @@ pub fn refresh(cx: &mut App) {
         let (known, discovery) = cx
             .background_executor()
             .spawn(async move {
-                let paths = paths();
+                let Some(paths) = paths() else { return (Vec::new(), None) };
                 let known = tailnet::known_hosts(&paths);
                 let discovery = settings
                     .discover
@@ -85,12 +98,18 @@ pub fn refresh(cx: &mut App) {
             let l = cx.global::<TailnetList>();
             let same = *l.known == known && l.discovery.as_deref() == discovery.as_ref();
             let finished = Some(std::time::Instant::now());
+            let again = cx.global::<TailnetList>().again;
             if same {
                 let l = cx.global_mut::<TailnetList>();
                 l.reading = false;
+                l.again = false;
                 l.finished = finished;
             } else {
-                cx.set_global(TailnetList { known: Arc::new(known), discovery: discovery.map(Arc::new), reading: false, finished });
+                let (known, discovery) = (Arc::new(known), discovery.map(Arc::new));
+                cx.set_global(TailnetList { known, discovery, reading: false, again: false, finished });
+            }
+            if again {
+                refresh_now(cx);
             }
         });
     })
@@ -154,16 +173,13 @@ fn path(node: &goatty_net::tailscale::Node) -> String {
 pub fn current(cx: &App) -> Vec<Entry> {
     match cx.try_global::<TailnetList>() {
         Some(l) => entries(&l.known, l.discovery.as_deref()),
-        None => entries(&tailnet::known_hosts(&paths()), None),
+        None => entries(&known(), None),
     }
 }
 
 /// The name a paired host is shown with (its Tailscale host name).
 pub fn name_of(dns: &str) -> String {
-    tailnet::known_hosts(&paths())
-        .into_iter()
-        .find(|h| h.dns == dns)
-        .map_or_else(|| dns.split('.').next().unwrap_or(dns).to_string(), |h| h.name)
+    known().into_iter().find(|h| h.dns == dns).map_or_else(|| dns.split('.').next().unwrap_or(dns).to_string(), |h| h.name)
 }
 
 /// The palette's command for `e`: connect to a paired host (its id makes
@@ -203,6 +219,9 @@ pub fn command(e: &Entry) -> Command {
 /// What the user has done so far in a pairing.
 #[derive(Default)]
 struct PairState {
+    /// The pairing's toast, kept through every stage so it stays in the
+    /// window it started in.
+    toast: Option<toast::ToastId>,
     confirmed_here: bool,
     cancelled: bool,
     /// The host's answer: `Ok` when its user confirmed.
@@ -215,17 +234,19 @@ struct PairState {
 pub fn pair(cx: &mut App, found: Found) {
     let name = found.node.name.clone();
     let key = format!("tailnet.pair.{}", found.node.dns);
-    toast::show(cx, Toast::loading(format!("Pairing with {name}…")).body("Asking it for a code").key(key.clone()).sticky());
+    let state = Arc::new(Mutex::new(PairState::default()));
+    stage(cx, None, &state, Toast::loading(format!("Pairing with {name}…")).body("Asking it for a code").key(key.clone()).sticky());
     cx.spawn(async move |cx| {
         let node = found.node.clone();
         let started = cx
             .background_executor()
             .spawn(async move {
+                let paths = paths().ok_or_else(|| anyhow::anyhow!("no $HOME: goatty keeps this computer's tailnet key there"))?;
                 let ts = Tailscale::system();
                 let status = ts.detect();
                 let status = status.running().ok_or_else(|| anyhow::anyhow!("{}", status.describe()))?;
-                let port = tailnet::port_of(&paths(), &node.dns);
-                Pairing::start(&ts, &paths(), status, &node, port, &tailnet::my_name())
+                let port = tailnet::port_of(&paths, &node.dns);
+                Pairing::start(&ts, &paths, status, &node, port, &tailnet::my_name())
             })
             .await;
         let pairing = match started {
@@ -239,14 +260,13 @@ pub fn pair(cx: &mut App, found: Found) {
                 };
                 cx.update(|cx| {
                     let t = t.key(key.clone()).action("Try again", move |_, cx| pair(cx, found.clone()));
-                    toast::show(cx, t);
+                    stage(cx, None, &state, t);
                 });
                 return;
             }
         };
         let code = spaced(&pairing.code);
         let cancel = pairing.canceller();
-        let state = Arc::new(Mutex::new(PairState::default()));
         let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(cancel);
         cx.update(|cx| ask_code(cx, &name, &code, &key, &state, &cancel, &found));
         // The host's answer, in the background.
@@ -263,9 +283,25 @@ pub fn pair(cx: &mut App, found: Found) {
             s.host = Some(answer);
             s.pairing = Some(pairing);
         }
-        cx.update(|cx| finish(cx, &name, &key, &state, &found));
+        cx.update(|cx| finish(cx, None, &name, &key, &state, &found));
     })
     .detach();
+}
+
+/// Show the pairing's next stage: in place of its toast in the window it
+/// is in. From a toast's button (`window`), as a new toast there with the
+/// same key (the button dismisses the old one); otherwise as an update.
+fn stage(cx: &mut App, window: Option<&gpui::Window>, state: &Arc<Mutex<PairState>>, t: Toast) {
+    let id = state.lock().toast;
+    let id = match (window, id) {
+        (Some(w), _) => toast::show_in(w, cx, t),
+        (None, Some(id)) => {
+            toast::update(cx, id, t);
+            id
+        }
+        (None, None) => toast::show(cx, t),
+    };
+    state.lock().toast = Some(id);
 }
 
 /// The toast with the code: "Codes match" or "Cancel".
@@ -284,20 +320,20 @@ fn ask_code(
         .body(format!("Confirm the code on {name} too. Only confirm here if both screens show the same code."))
         .key(key.to_string())
         .sticky()
-        .action("Codes match", move |_, cx| {
+        .action("Codes match", move |window, cx| {
             s1.lock().confirmed_here = true;
-            finish(cx, &n, &k, &s1, &f);
+            finish(cx, Some(window), &n, &k, &s1, &f);
         })
         .action("Cancel", move |_, _| {
             s2.lock().cancelled = true;
             c2();
         });
-    toast::show(cx, t);
+    stage(cx, None, state, t);
 }
 
 /// Called when this side confirmed and when the host answered: pin once
 /// both happened, report what went wrong otherwise.
-fn finish(cx: &mut App, name: &str, key: &str, state: &Arc<Mutex<PairState>>, found: &Found) {
+fn finish(cx: &mut App, window: Option<&gpui::Window>, name: &str, key: &str, state: &Arc<Mutex<PairState>>, found: &Found) {
     let mut s = state.lock();
     if s.cancelled {
         return;
@@ -314,14 +350,13 @@ fn finish(cx: &mut App, name: &str, key: &str, state: &Arc<Mutex<PairState>>, fo
             let f = found.clone();
             s.cancelled = true;
             drop(s);
-            toast::show(cx, t.key(key.to_string()).action("Try again", move |_, cx| pair(cx, f.clone())));
+            stage(cx, window, state, t.key(key.to_string()).action("Try again", move |_, cx| pair(cx, f.clone())));
         }
         (None, true) => {
             drop(s);
-            toast::show(
-                cx,
-                Toast::loading(format!("Waiting for {name}…")).body(format!("Confirm the code on {name}.")).key(key.to_string()).sticky(),
-            );
+            let t =
+                Toast::loading(format!("Waiting for {name}…")).body(format!("Confirm the code on {name}.")).key(key.to_string()).sticky();
+            stage(cx, window, state, t);
         }
         (Some(Ok(())), true) => {
             let pinned = s.pairing.as_ref().map(|p| p.pin());
@@ -337,14 +372,12 @@ fn finish(cx: &mut App, name: &str, key: &str, state: &Arc<Mutex<PairState>>, fo
                             let place = cx.global::<AppSettings>().client.ssh.open_in;
                             hosts::open(cx, OpenRequest { host: host.clone(), attach: hosts::default_attach(cx), conn: None, place });
                         });
-                    toast::show(cx, t);
+                    stage(cx, window, state, t);
                     refresh_now(cx);
                 }
                 Some(Err(e)) => {
-                    toast::show(
-                        cx,
-                        Toast::error(format!("Couldn't save the pairing with {name}")).body(format!("{e:#}")).key(key.to_string()),
-                    );
+                    let t = Toast::error(format!("Couldn't save the pairing with {name}")).body(format!("{e:#}")).key(key.to_string());
+                    stage(cx, window, state, t);
                 }
                 None => {}
             }
@@ -357,7 +390,8 @@ fn finish(cx: &mut App, name: &str, key: &str, state: &Arc<Mutex<PairState>>, fo
 /// Forget a paired host on this computer.
 pub fn forget(cx: &mut App, dns: &str) {
     let name = name_of(dns);
-    match tailnet::forget(&paths(), dns) {
+    let forgot = paths().ok_or_else(|| anyhow::anyhow!("no $HOME")).and_then(|p| tailnet::forget(&p, dns));
+    match forgot {
         Ok(_) => {
             toast::show(
                 cx,
@@ -396,8 +430,15 @@ mod tests {
     }
 
     fn found(n: Node, key: &str, paired: bool) -> Found {
-        let greeting =
-            Greeting { gateway: 1, goatty: "0.1.0".into(), name: n.name.clone(), key: key.into(), nonce: String::new(), protocol: (7, 12) };
+        let greeting = Greeting {
+            gateway: 1,
+            goatty: "0.1.0".into(),
+            name: n.name.clone(),
+            key: key.into(),
+            nonce: String::new(),
+            commit: String::new(),
+            protocol: (7, 12),
+        };
         Found { node: n, probe: Probe { greeting, pairing: false }, paired, key_changed: false }
     }
 

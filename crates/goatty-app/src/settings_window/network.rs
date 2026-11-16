@@ -36,6 +36,14 @@ pub struct NetPage {
     pub port: Entity<TextInput>,
     /// Refreshes the status while the pairing window is open.
     poll: Option<Task<()>>,
+    /// Bumped when the window follows another host: replies to requests
+    /// sent to the previous one are dropped.
+    host_gen: u64,
+    /// Numbers the requests, so a status read before a change isn't shown
+    /// after it.
+    seq: u64,
+    /// The number of the latest change (enable, pairing, revoke, …).
+    changed: u64,
 }
 
 impl NetPage {
@@ -46,7 +54,7 @@ impl NetPage {
                 view.net_change_port(cx);
             }
         });
-        (Self { status: None, error: None, loading: false, busy: false, port, poll: None }, sub)
+        (Self { status: None, error: None, loading: false, busy: false, port, poll: None, host_gen: 0, seq: 0, changed: 0 }, sub)
     }
 
     /// Forget what was shown (another host).
@@ -54,6 +62,15 @@ impl NetPage {
         self.status = None;
         self.error = None;
         self.poll = None;
+        self.loading = false;
+        self.busy = false;
+        self.host_gen += 1;
+    }
+
+    /// A number for the next request.
+    fn next(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
     }
 }
 
@@ -72,11 +89,19 @@ impl SettingsWindow {
             return;
         }
         self.net.loading = true;
+        let (host_gen, seq) = (self.net.host_gen, self.net.next());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { link.net(&Request::Status) }).await;
             let _ = this.update(cx, |view, cx| {
+                if view.net.host_gen != host_gen {
+                    return; // asked of the host the window showed before
+                }
                 view.net.loading = false;
+                if seq < view.net.changed {
+                    // Read before a change that answered (or will answer) with a newer status.
+                    return;
+                }
                 view.net_show(result, cx);
             });
         })
@@ -106,10 +131,15 @@ impl SettingsWindow {
             return;
         }
         self.net.busy = true;
+        let (host_gen, seq) = (self.net.host_gen, self.net.next());
+        self.net.changed = seq;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { link.net(&req) }).await;
             let _ = this.update(cx, |view, cx| {
+                if view.net.host_gen != host_gen {
+                    return;
+                }
                 view.net.busy = false;
                 match result {
                     Ok(s) => view.net_show(Ok(s), cx),

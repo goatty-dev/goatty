@@ -68,12 +68,14 @@ fn start_daemon() -> Daemon {
         .env_remove("XDG_DATA_HOME")
         .spawn()
         .unwrap();
+    // The guard first: a panic while waiting still kills the daemon.
+    let d = Daemon { child, sock, dir };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while UnixStream::connect(&sock).is_err() {
+    while UnixStream::connect(&d.sock).is_err() {
         assert!(Instant::now() < deadline, "daemon did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Daemon { child, sock, dir }
+    d
 }
 
 fn net(c: &mut Control, req: &Request) -> anyhow::Result<NetStatus> {
@@ -135,7 +137,7 @@ fn pair_and_run_a_session_over_the_tailnet() {
     let ts = Tailscale::with_program(fake(&client.path().join("bin"), CLIENT_STATUS));
     std::fs::write(client.path().join("bin/nc-socket"), gateway.to_str().unwrap()).unwrap();
     let paths = Paths::new(client.path().join("tailnet"));
-    let target = TailnetTarget { dns: "desk.tail1.ts.net".into(), name: "desk".into(), paths: paths.clone(), tailscale: ts.clone() };
+    let target = TailnetTarget { dns: "desk.tail1.ts.net".into(), name: "desk".into(), paths: Some(paths.clone()), tailscale: ts.clone() };
 
     // Not paired yet: refused before anything is sent to the host.
     let err = Connection::open(Endpoint::Tailnet(target.clone()), "test").err().unwrap();

@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
             Endpoint::Tailnet(goatty_client::TailnetTarget {
                 name: dns.split('.').next().unwrap_or(&dns).to_string(),
                 dns,
-                paths: goatty_net::Paths::new(dirs.tailnet_dir()),
+                paths: Some(goatty_net::Paths::new(dirs.tailnet_dir())),
                 tailscale: goatty_net::tailscale::Tailscale::system(),
             })
         }

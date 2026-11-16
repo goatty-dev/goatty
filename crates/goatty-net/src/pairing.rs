@@ -1,9 +1,13 @@
 //! Pairing: the code both screens show, the devices a host accepts and the
 //! hosts a client pinned.
 //!
-//! Each side derives the code from both public keys and both nonces, so a
-//! device in the middle (which would have to swap in its own key) makes
-//! the two screens show different codes.
+//! Each side derives the code from both public keys, the host's pairing
+//! nonce and the client's nonce. The host commits to its nonce before it
+//! sees the client's and reveals it afterwards (`gateway`), so neither side
+//! can choose its nonce to steer the code: a device in the middle, which
+//! has to swap in its own keys, ends up with different codes on the two
+//! screens (except with a chance of one in a million per attempt, and the
+//! host allows ten attempts per pairing window).
 
 use std::path::Path;
 

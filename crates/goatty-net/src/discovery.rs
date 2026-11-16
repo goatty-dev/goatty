@@ -53,28 +53,34 @@ pub fn probe(ts: &Tailscale, mode: Mode, addr: &str, port: u16) -> Result<Probe>
     p
 }
 
-/// Probe every candidate on `port` at once; the ones that answered, in the
-/// status's order.
+/// Probes running at once: a tagged node (or `all_users`) on a big
+/// tailnet can have hundreds of candidates, each a thread (and with
+/// `tailscale nc` a process).
+const MAX_PROBES: usize = 16;
+
+/// Probe the candidates on `port`, up to [`MAX_PROBES`] at a time; the
+/// ones that answered, in the status's order.
 pub fn discover(ts: &Tailscale, status: &Status, port: u16, all_users: bool) -> Vec<Peer> {
     let mode = Mode::for_tun(status.tun);
-    let handles: Vec<_> = candidates(status, all_users)
-        .into_iter()
-        .cloned()
-        .map(|node| {
-            let ts = ts.clone();
-            std::thread::spawn(move || {
-                let addr = node.addr()?.to_string();
-                match probe(&ts, mode, &addr, port) {
-                    Ok(probe) => Some(Peer { node, probe }),
-                    Err(e) => {
-                        log::debug!("tailnet: {} doesn't answer on {port}: {e:#}", node.name);
-                        None
+    let nodes: Vec<Node> = candidates(status, all_users).into_iter().cloned().collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<parking_lot::Mutex<Option<Peer>>> = nodes.iter().map(|_| parking_lot::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..MAX_PROBES.min(nodes.len()) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(node) = nodes.get(i) else { break };
+                    let Some(addr) = node.addr() else { continue };
+                    match probe(ts, mode, addr, port) {
+                        Ok(probe) => *results[i].lock() = Some(Peer { node: node.clone(), probe }),
+                        Err(e) => log::debug!("tailnet: {} doesn't answer on {port}: {e:#}", node.name),
                     }
                 }
-            })
-        })
-        .collect();
-    handles.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+            });
+        }
+    });
+    results.into_iter().filter_map(parking_lot::Mutex::into_inner).collect()
 }
 
 #[cfg(test)]

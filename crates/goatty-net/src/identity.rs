@@ -25,6 +25,7 @@ impl Identity {
     pub fn load_or_create(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
+                check_private(path)?;
                 let line = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).context("empty key file")?;
                 let seed = unhex::<32>(line).with_context(|| format!("read {}", path.display()))?;
                 Ok(Self { key: SigningKey::from_bytes(&seed) })
@@ -54,6 +55,26 @@ impl Identity {
     pub fn sign(&self, msg: &[u8]) -> String {
         hex(&self.key.sign(msg).to_bytes())
     }
+}
+
+/// Refuse a key file someone else could have planted or can read: it must
+/// belong to this user and be readable by nobody else.
+fn check_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).with_context(|| format!("read {}", path.display()))?;
+    // SAFETY: getuid has no preconditions.
+    let me = unsafe { libc::getuid() };
+    if m.uid() != me {
+        bail!("{} belongs to another user (uid {}): refusing to use it as this computer's goatty key", path.display(), m.uid());
+    }
+    if m.mode() & 0o077 != 0 {
+        bail!(
+            "{} is readable by other users (mode {:o}): refusing to use it as this computer's goatty key; `chmod 600` it if it is yours",
+            path.display(),
+            m.mode() & 0o777
+        );
+    }
+    Ok(())
 }
 
 /// Whether `sig` (hex) is `public`'s (hex) signature over `msg`.
@@ -92,6 +113,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         assert!(is_public_key(&a.public()));
+        // A key others can read isn't used.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = Identity::load_or_create(&path).unwrap_err();
+        assert!(err.to_string().contains("readable by other users"), "{err:#}");
     }
 
     #[test]
