@@ -32,10 +32,11 @@ clap_complete.workspace = true
 image.workspace = true
 regex.workspace = true
 unicode-width.workspace = true
+ttf-parser.workspace = true
+fontdb.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-ttf-parser.workspace = true
 
 [lints]
 workspace = true

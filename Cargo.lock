@@ -2017,6 +2017,7 @@ dependencies = [
  "clap_complete",
  "env_logger",
  "flume",
+ "fontdb",
  "goatty-client",
  "goatty-config",
  "goatty-plugin",
