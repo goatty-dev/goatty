@@ -36,7 +36,7 @@ impl From<Frame> for Outbound {
     }
 }
 
-struct WorkerGuard(Arc<AtomicUsize>);
+pub(crate) struct WorkerGuard(Arc<AtomicUsize>);
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
@@ -55,7 +55,7 @@ impl Drop for FileByteGuard {
     }
 }
 
-fn try_acquire_worker(counter: &Arc<AtomicUsize>, limit: usize) -> Option<WorkerGuard> {
+pub(crate) fn try_acquire_worker(counter: &Arc<AtomicUsize>, limit: usize) -> Option<WorkerGuard> {
     let mut cur = counter.load(Ordering::Acquire);
     while cur < limit {
         match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {

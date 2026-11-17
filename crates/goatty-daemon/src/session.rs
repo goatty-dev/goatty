@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,12 @@ use goatty_term::pty::Pty;
 use goatty_term::{TermSize, Terminal, UiEvent};
 use parking_lot::{Condvar, Mutex};
 
-use crate::client::Outbound;
+use crate::client::{Outbound, try_acquire_worker};
 use crate::systemd::StoredPty;
+
+/// Max concurrent OSC 7 `canonicalize` worker threads per session (bounds
+/// thread leaks if a slow or unavailable mount stalls filesystem resolution).
+const MAX_OSC_CWD_WORKERS: usize = 4;
 
 /// One connection's subscription to one session.
 ///
@@ -76,6 +80,11 @@ pub(crate) struct CwdState {
     /// canonical target of an OSC 7 path), so a subsequent foreground probe
     /// doesn't clobber a symlinked OSC 7 path when `/proc` didn't change.
     pub(crate) last_proc: Option<PathBuf>,
+    /// Monotonic sequence assigned to each OSC 7 event on the output pump.
+    pub(crate) osc_seq: u64,
+    /// Monotonic counter incremented when `last_proc` changes via a `/proc`
+    /// probe, so a slow OSC 7 worker cannot overwrite a newer non-OSC `cd`.
+    pub(crate) proc_seq: u64,
 }
 
 impl CwdState {
@@ -86,6 +95,7 @@ impl CwdState {
             return None;
         }
         self.last_proc = Some(proc_cwd.clone());
+        self.proc_seq = self.proc_seq.wrapping_add(1);
         let next = proc_cwd.to_string_lossy().into_owned();
         if self.current.as_deref() == Some(next.as_str()) {
             return None;
@@ -94,11 +104,30 @@ impl CwdState {
         Some(Some(next))
     }
 
-    /// Record an OSC 7 report together with its canonical physical path.
+    /// Assign a sequence number to an incoming OSC 7 event on the output pump.
+    fn begin_osc(&mut self) -> (u64, u64) {
+        self.osc_seq = self.osc_seq.wrapping_add(1);
+        (self.osc_seq, self.proc_seq)
+    }
+
+    /// Record an OSC 7 report together with its canonical physical path if the
+    /// `(seq, expected_proc_seq)` snapshot is still current.
     /// Never marks an unrelated `/proc/<pid>/cwd` observed later as already
     /// reflected by this OSC report. Returns `Some(new_cwd)` when `current`
     /// changed and subscribers should be notified.
-    fn apply_osc(&mut self, osc_cwd: String, canonical_target: Option<PathBuf>) -> Option<Option<String>> {
+    fn apply_osc(
+        &mut self,
+        seq: u64,
+        expected_proc_seq: u64,
+        osc_cwd: String,
+        canonical_target: Option<PathBuf>,
+    ) -> Option<Option<String>> {
+        if seq != self.osc_seq {
+            return None;
+        }
+        if self.proc_seq != expected_proc_seq && (canonical_target.is_none() || self.last_proc.as_ref() != canonical_target.as_ref()) {
+            return None;
+        }
         self.last_proc = canonical_target;
         if self.current.as_deref() == Some(osc_cwd.as_str()) {
             return None;
@@ -108,19 +137,106 @@ impl CwdState {
     }
 }
 
+/// Coordinates serialized CWD state (`OSC 7` + `/proc/<pid>/cwd`), subscriber
+/// notifications, and off-pump OSC 7 canonicalization workers.
+pub(crate) struct CwdCoordinator {
+    session_id: SessionId,
+    subs: Arc<Mutex<Vec<Arc<Subscriber>>>>,
+    state: Mutex<CwdState>,
+    workers: Arc<AtomicUsize>,
+}
+
+impl CwdCoordinator {
+    pub(crate) fn new(
+        session_id: SessionId,
+        subs: Arc<Mutex<Vec<Arc<Subscriber>>>>,
+        current: Option<String>,
+        last_proc: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            session_id,
+            subs,
+            state: Mutex::new(CwdState { current, last_proc, osc_seq: 0, proc_seq: 0 }),
+            workers: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub(crate) fn current(&self) -> Option<String> {
+        self.state.lock().current.clone()
+    }
+
+    fn notify_update(&self, update: impl FnOnce(&mut CwdState) -> Option<Option<String>>) {
+        // Lock order matches `subscribe`: `subs` before `state`, so updates
+        // and subscriber notifications cannot interleave out of order.
+        let subs = self.subs.lock();
+        let next = {
+            let mut state = self.state.lock();
+            update(&mut state)
+        };
+        let Some(cwd) = next else { return };
+        let Ok(frame) = encode(&ServerMsg::Cwd { session: self.session_id, cwd }) else { return };
+        for sub in subs.iter() {
+            if sub.cwd {
+                sub.push(frame.clone(), 0);
+            }
+        }
+    }
+
+    pub(crate) fn apply_proc(&self, proc_cwd: Option<PathBuf>) {
+        let Some(path) = proc_cwd else { return };
+        self.notify_update(|state| state.apply_proc(path));
+    }
+
+    pub(crate) fn apply_osc_async(self: &Arc<Self>, cwd: String) {
+        self.apply_osc_with(cwd, |path| std::fs::canonicalize(path).ok());
+    }
+
+    pub(crate) fn apply_osc_with(self: &Arc<Self>, cwd: String, canonicalize: impl FnOnce(&str) -> Option<PathBuf> + Send + 'static) {
+        let (seq, proc_seq) = {
+            let mut state = self.state.lock();
+            if self.workers.load(Ordering::Acquire) == 0 && state.last_proc.is_some() && state.current.as_deref() == Some(cwd.as_str()) {
+                return;
+            }
+            state.begin_osc()
+        };
+        let Some(guard) = try_acquire_worker(&self.workers, MAX_OSC_CWD_WORKERS) else {
+            self.notify_update(|state| state.apply_osc(seq, proc_seq, cwd, None));
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let worker_cwd = cwd.clone();
+        if let Err(e) = std::thread::Builder::new().name(format!("s{}-cwd", self.session_id)).spawn(move || {
+            let _guard = guard;
+            let Some(coord) = weak.upgrade() else { return };
+            if coord.state.lock().osc_seq != seq {
+                return;
+            }
+            // Release strong ref before blocking filesystem I/O so an exit on
+            // a hung mount does not keep session/coordinator state alive.
+            drop(coord);
+            let canonical = canonicalize(&worker_cwd);
+            let Some(coord) = weak.upgrade() else { return };
+            coord.notify_update(|state| state.apply_osc(seq, proc_seq, worker_cwd, canonical));
+        }) {
+            log::warn!("session {}: couldn't spawn cwd worker: {e}", self.session_id);
+            self.notify_update(|state| state.apply_osc(seq, proc_seq, cwd, None));
+        }
+    }
+}
+
 pub(crate) struct Session {
     pub(crate) id: SessionId,
     pub(crate) term: Terminal,
     pub(crate) pty: Mutex<Pty>,
     /// Held while feeding + broadcasting, so taking a snapshot and
     /// (un)subscribing are atomic with respect to the output stream: no gap,
-    /// no overlap. Also acquired before `cwd` when notifying CWD changes.
-    pub(crate) subs: Mutex<Vec<Arc<Subscriber>>>,
+    /// no overlap. Also acquired before `cwd.state` when notifying CWD changes.
+    pub(crate) subs: Arc<Mutex<Vec<Arc<Subscriber>>>>,
     pub(crate) created_unix: u64,
     /// The foreground program, kept current by `fg` (see [`Session::watch_foreground`]).
     pub(crate) process: Mutex<Option<String>>,
     /// Serialized working directory state (`OSC 7` + `/proc/<pid>/cwd`).
-    pub(crate) cwd: Mutex<CwdState>,
+    pub(crate) cwd: Arc<CwdCoordinator>,
     pub(crate) fg: OnceLock<ForegroundWatch>,
     /// goatty's managed zsh (it handles reload requests).
     pub(crate) managed: bool,
@@ -275,41 +391,20 @@ impl Session {
     }
 
     pub(crate) fn current_cwd(&self) -> Option<String> {
-        self.cwd.lock().current.clone().or_else(|| self.proc_cwd().map(|p| p.to_string_lossy().into_owned()))
-    }
-
-    fn update_cwd_and_notify(&self, update: impl FnOnce(&mut CwdState) -> Option<Option<String>>) {
-        // Lock order matches `subscribe`: `subs` before `cwd`, so updates and
-        // subscriber notifications cannot interleave out of order.
-        let subs = self.subs.lock();
-        let next = {
-            let mut state = self.cwd.lock();
-            update(&mut state)
-        };
-        let Some(cwd) = next else { return };
-        let Ok(frame) = encode(&ServerMsg::Cwd { session: self.id, cwd }) else { return };
-        for sub in subs.iter() {
-            if sub.cwd {
-                sub.push(frame.clone(), 0);
-            }
-        }
+        self.cwd.current().or_else(|| self.proc_cwd().map(|p| p.to_string_lossy().into_owned()))
     }
 
     fn maybe_update_proc_cwd(&self, proc_cwd: Option<PathBuf>) {
-        let Some(path) = proc_cwd else { return };
-        self.update_cwd_and_notify(|state| state.apply_proc(path));
+        self.cwd.apply_proc(proc_cwd);
     }
 
     pub(crate) fn set_osc_cwd(&self, cwd: String) {
-        // Resolve the physical target outside the locks; only that target (not a
-        // later `/proc/<pid>/cwd` read) may match a future proc-cwd probe.
-        let canonical = std::fs::canonicalize(&cwd).ok();
-        self.update_cwd_and_notify(|state| state.apply_osc(cwd, canonical));
+        self.cwd.apply_osc_async(cwd);
     }
 
     pub(crate) fn info(&self) -> SessionInfo {
         let (cols, rows) = self.term.size();
-        let tracked_cwd = self.cwd.lock().current.clone();
+        let tracked_cwd = self.cwd.current();
         let proc_cwd = self.proc_cwd();
         SessionInfo {
             id: self.id,
@@ -403,7 +498,7 @@ impl Session {
             sub.push(f, 0);
         }
         if sub.cwd {
-            let cwd = self.cwd.lock().current.clone();
+            let cwd = self.cwd.current();
             if cwd.is_some()
                 && let Ok(f) = encode(&ServerMsg::Cwd { session: self.id, cwd })
             {
@@ -509,12 +604,14 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
                         sub.push(f, n)
                     });
                 }
+                let mut cwd_changed = false;
                 for ev in s.ui_events.try_iter() {
-                    if matches!(ev, UiEvent::CwdChanged)
-                        && let Some(dir) = s.term.current_directory()
-                    {
-                        s.set_osc_cwd(dir.to_string_lossy().into_owned());
+                    if matches!(ev, UiEvent::CwdChanged) {
+                        cwd_changed = true;
                     }
+                }
+                if cwd_changed && let Some(dir) = s.term.current_directory() {
+                    s.set_osc_cwd(dir.to_string_lossy().into_owned());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -527,6 +624,45 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+
+    fn test_coord() -> (Arc<CwdCoordinator>, flume::Receiver<Outbound>) {
+        let (tx, rx) = flume::unbounded();
+        let sub = Arc::new(Subscriber {
+            conn: 1,
+            tx,
+            window: 64 << 10,
+            sent: AtomicU64::new(0),
+            acked: AtomicU64::new(0),
+            lagging: AtomicBool::new(false),
+            skipped: AtomicU64::new(0),
+            lines: false,
+            cwd: true,
+            zstd: AtomicBool::new(false),
+        });
+        let subs = Arc::new(Mutex::new(vec![sub]));
+        let coord = Arc::new(CwdCoordinator::new(1, subs, None, None));
+        (coord, rx)
+    }
+
+    fn drain_cwds(rx: &flume::Receiver<Outbound>) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            let msg: ServerMsg = goatty_proto::read_msg(&mut std::io::Cursor::new(&item.frame)).unwrap();
+            if let ServerMsg::Cwd { cwd, .. } = msg {
+                out.push(cwd);
+            }
+        }
+        out
+    }
+
+    fn wait_workers_idle(coord: &CwdCoordinator) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coord.workers.load(Ordering::Acquire) > 0 {
+            assert!(Instant::now() < deadline, "cwd workers did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn cwd_state_preserves_symlinks_without_masking_later_proc_changes() {
@@ -534,20 +670,119 @@ mod tests {
 
         // Symlinked OSC 7 directory records its canonical target so a matching
         // `/proc/<pid>/cwd` probe does not clobber the logical symlink path.
-        let update = state.apply_osc("/home/u/sym".into(), Some(PathBuf::from("/srv/real")));
+        let (seq, proc_seq) = state.begin_osc();
+        let update = state.apply_osc(seq, proc_seq, "/home/u/sym".into(), Some(PathBuf::from("/srv/real")));
         assert_eq!(update, Some(Some("/home/u/sym".into())));
         assert_eq!(state.apply_proc(PathBuf::from("/srv/real")), None);
         assert_eq!(state.current.as_deref(), Some("/home/u/sym"));
 
         // If the shell later changes to `/srv/other` before/after an earlier OSC 7
         // for `/srv/a` is processed, `/srv/other` is not masked as already reflected.
-        let update = state.apply_osc("/srv/a".into(), Some(PathBuf::from("/srv/a")));
+        let (seq, proc_seq) = state.begin_osc();
+        let update = state.apply_osc(seq, proc_seq, "/srv/a".into(), Some(PathBuf::from("/srv/a")));
         assert_eq!(update, Some(Some("/srv/a".into())));
         assert_eq!(state.apply_proc(PathBuf::from("/srv/other")), Some(Some("/srv/other".into())));
         assert_eq!(state.current.as_deref(), Some("/srv/other"));
 
         // When canonicalization fails (`None`), subsequent `/proc` probes still apply.
-        state.apply_osc("/missing/dir".into(), None);
+        let (seq, proc_seq) = state.begin_osc();
+        state.apply_osc(seq, proc_seq, "/missing/dir".into(), None);
         assert_eq!(state.apply_proc(PathBuf::from("/srv/other")), Some(Some("/srv/other".into())));
+    }
+
+    #[test]
+    fn osc_cwd_worker_does_not_block_pump_and_rejects_stale_completions() {
+        let (coord, rx) = test_coord();
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        // 1. Slow mount canonicalize blocks on `release`, but `apply_osc_with` returns immediately.
+        let (s1, r1) = (started.clone(), release.clone());
+        coord.apply_osc_with("/mnt/slow/sym".into(), move |_| {
+            s1.wait();
+            r1.wait();
+            Some(PathBuf::from("/mnt/slow/real"))
+        });
+        started.wait();
+        assert_eq!(coord.current(), None);
+
+        // 2. Newer fast OSC 7 event arrives and completes immediately.
+        coord.apply_osc_with("/tmp/fast".into(), |_| Some(PathBuf::from("/tmp/fast")));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while coord.current().as_deref() != Some("/tmp/fast") {
+            assert!(Instant::now() < deadline, "fast cwd update did not apply");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // 3. Release the slow worker: its stale completion must be discarded.
+        release.wait();
+        wait_workers_idle(&coord);
+        assert_eq!(coord.current().as_deref(), Some("/tmp/fast"));
+        assert_eq!(drain_cwds(&rx), vec![Some("/tmp/fast".into())]);
+    }
+
+    #[test]
+    fn osc_cwd_worker_interaction_with_proc_probes() {
+        let (coord, _rx) = test_coord();
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        // A blocked OSC 7 worker must not overwrite a subsequent non-OSC `/proc` change.
+        let (s1, r1) = (started.clone(), release.clone());
+        coord.apply_osc_with("/mnt/slow/sym".into(), move |_| {
+            s1.wait();
+            r1.wait();
+            Some(PathBuf::from("/mnt/slow/real"))
+        });
+        started.wait();
+        coord.apply_proc(Some(PathBuf::from("/srv/other")));
+        assert_eq!(coord.current().as_deref(), Some("/srv/other"));
+        release.wait();
+        wait_workers_idle(&coord);
+        assert_eq!(coord.current().as_deref(), Some("/srv/other"));
+
+        // If `/proc` moved to the *canonical target* of the symlink while canonicalize
+        // was in flight, the completing OSC 7 worker preserves the symlink path.
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (s2, r2) = (started.clone(), release.clone());
+        coord.apply_osc_with("/home/u/sym".into(), move |_| {
+            s2.wait();
+            r2.wait();
+            Some(PathBuf::from("/srv/real"))
+        });
+        started.wait();
+        coord.apply_proc(Some(PathBuf::from("/srv/real")));
+        assert_eq!(coord.current().as_deref(), Some("/srv/real"));
+        release.wait();
+        wait_workers_idle(&coord);
+        assert_eq!(coord.current().as_deref(), Some("/home/u/sym"));
+    }
+
+    #[test]
+    fn osc_cwd_worker_limit_falls_back_without_blocking() {
+        let (coord, _rx) = test_coord();
+        let release = Arc::new(Barrier::new(MAX_OSC_CWD_WORKERS + 1));
+
+        for i in 0..MAX_OSC_CWD_WORKERS {
+            let started = Arc::new(Barrier::new(2));
+            let (s, r) = (started.clone(), release.clone());
+            coord.apply_osc_with(format!("/mnt/hung/{i}"), move |_| {
+                s.wait();
+                r.wait();
+                Some(PathBuf::from(format!("/mnt/hung/real-{i}")))
+            });
+            started.wait();
+        }
+        assert_eq!(coord.workers.load(Ordering::Acquire), MAX_OSC_CWD_WORKERS);
+
+        // Next OSC 7 event must fall back immediately without blocking or spawning a 5th worker,
+        // and once hung workers unblock they must all be rejected as stale.
+        coord.apply_osc_with("/tmp/fallback".into(), |_| unreachable!("must not spawn above limit"));
+        assert_eq!(coord.current().as_deref(), Some("/tmp/fallback"));
+
+        release.wait();
+        wait_workers_idle(&coord);
+        assert_eq!(coord.current().as_deref(), Some("/tmp/fallback"));
     }
 }

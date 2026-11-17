@@ -180,6 +180,81 @@ impl CachedStat {
     }
 }
 
+#[derive(Default)]
+struct RemoteStatCache {
+    entries: HashMap<RemoteStatKey, CachedStat>,
+    inflight: HashSet<(RemoteStatKey, u64)>,
+    generation: u64,
+}
+
+impl RemoteStatCache {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn get_fresh(&self, key: &RemoteStatKey, now: Instant) -> Option<&CachedStat> {
+        self.entries.get(key).filter(|c| c.is_fresh(now))
+    }
+
+    fn invalidate(&mut self) {
+        self.entries.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn begin_lookup(&mut self, key: &RemoteStatKey) -> Option<u64> {
+        let generation = self.generation;
+        self.inflight.insert((key.clone(), generation)).then_some(generation)
+    }
+
+    fn abort_lookup(&mut self, key: &RemoteStatKey, generation: u64) {
+        self.inflight.remove(&(key.clone(), generation));
+    }
+
+    fn finish_lookup(
+        &mut self,
+        key: RemoteStatKey,
+        generation: u64,
+        current_cwd_present: bool,
+        result: std::result::Result<Option<RemotePathInfo>, ()>,
+        now: Instant,
+    ) -> bool {
+        self.inflight.remove(&(key.clone(), generation));
+        if generation != self.generation {
+            return false;
+        }
+        // If `Cwd` arrived while a `cwd == None` query was in flight, the daemon
+        // may have resolved against the new directory; do not cache under `None`.
+        let cwd_mismatch = key.0.is_none() && current_cwd_present;
+        if !cwd_mismatch {
+            self.evict_if_full(now);
+            let entry = match result {
+                Ok(Some(info)) => CachedStat::Found { info, at: now },
+                Ok(None) => CachedStat::Missing(now),
+                Err(()) => CachedStat::Error(now),
+            };
+            self.entries.insert(key, entry);
+        }
+        true
+    }
+
+    fn insert_found(&mut self, key: RemoteStatKey, generation: u64, current_cwd_present: bool, info: RemotePathInfo, now: Instant) {
+        if generation != self.generation || (key.0.is_none() && current_cwd_present) {
+            return;
+        }
+        self.evict_if_full(now);
+        self.entries.insert(key, CachedStat::Found { info, at: now });
+    }
+
+    fn evict_if_full(&mut self, now: Instant) {
+        if self.entries.len() >= 256 {
+            self.entries.retain(|_, v| v.is_fresh(now));
+            if self.entries.len() >= 256 {
+                self.entries.clear();
+            }
+        }
+    }
+}
+
 pub struct TerminalView {
     session: Arc<Session>,
     focus: FocusHandle,
@@ -238,10 +313,8 @@ pub struct TerminalView {
     /// Explicit click waiting for an in-flight `StatPath` response.
     pending_open: Option<PendingOpen>,
     hostname: Option<String>,
-    /// Cached remote `StatPath` results keyed by `(remote_cwd, raw_target)`.
-    remote_stats: HashMap<(Option<String>, String), CachedStat>,
-    /// In-flight remote `StatPath` queries to deduplicate hover lookups.
-    remote_stat_inflight: HashSet<(Option<String>, String)>,
+    /// Cached and in-flight remote `StatPath` results keyed by `(remote_cwd, raw_target)`.
+    remote_stats: RemoteStatCache,
     /// The output viewer, while it covers the grid.
     viewer: Option<(Entity<OutputView>, Subscription)>,
     /// Asked the shell for the command line (and gives up when this ends).
@@ -372,8 +445,7 @@ impl TerminalView {
             pressed_pending_link: None,
             pending_open: None,
             hostname: links::hostname(),
-            remote_stats: HashMap::new(),
-            remote_stat_inflight: HashSet::new(),
+            remote_stats: RemoteStatCache::default(),
             viewer: None,
             line_request: None,
             menu_cell: None,
@@ -487,7 +559,7 @@ impl TerminalView {
         let process = self.session.process.lock().clone();
         let process_changed = process != self.process;
         if clear_stats || process_changed {
-            self.remote_stats.clear();
+            self.remote_stats.invalidate();
             self.hover = None;
             self.pending_open = None;
         }
@@ -996,7 +1068,7 @@ impl TerminalView {
             return false;
         }
         if let Some(key) = &h.remote_stat_key {
-            return key.0 == self.session.remote_cwd_str() && self.remote_stats.get(key).is_some_and(|c| c.is_fresh(Instant::now()));
+            return key.0 == self.session.remote_cwd_str() && self.remote_stats.get_fresh(key, Instant::now()).is_some();
         }
         true
     }
@@ -1036,7 +1108,7 @@ impl TerminalView {
 
     fn cached_remote_stat(&self, target: &str) -> Option<RemotePathInfo> {
         let key = (self.session.remote_cwd_str(), target.to_string());
-        match self.remote_stats.get(&key).filter(|c| c.is_fresh(Instant::now()))? {
+        match self.remote_stats.get_fresh(&key, Instant::now())? {
             CachedStat::Found { info, .. } => Some(info.clone()),
             CachedStat::Missing(_) | CachedStat::Error(_) => None,
         }
@@ -1078,7 +1150,7 @@ impl TerminalView {
         let remote_stat_fn = |text: &str| -> RemoteLookup {
             let key = (cwd_key.clone(), text.to_string());
             *consulted_stat_key.borrow_mut() = Some(key.clone());
-            if let Some(cached) = self.remote_stats.get(&key).filter(|c| c.is_fresh(now)) {
+            if let Some(cached) = self.remote_stats.get_fresh(&key, now) {
                 match cached {
                     CachedStat::Found { info, .. } => RemoteLookup::Found(info.clone()),
                     CachedStat::Missing(_) | CachedStat::Error(_) => RemoteLookup::Missing,
@@ -1122,7 +1194,7 @@ impl TerminalView {
             return None;
         }
         let key = (self.session.remote_cwd_str(), link.target.clone());
-        if self.remote_stats.get(&key).is_some_and(|c| c.is_fresh(Instant::now())) {
+        if self.remote_stats.get_fresh(&key, Instant::now()).is_some() {
             return None;
         }
         Some(Target::Remote {
@@ -1138,9 +1210,12 @@ impl TerminalView {
     }
 
     fn request_remote_stat(&mut self, conn: Arc<goatty_client::Connection>, key: RemoteStatKey, cx: &mut Context<'_, Self>) {
-        if *self.session.status.lock() != LinkStatus::Connected || !conn.is_connected() || !self.remote_stat_inflight.insert(key.clone()) {
+        if *self.session.status.lock() != LinkStatus::Connected || !conn.is_connected() {
             return;
         }
+        let Some(generation) = self.remote_stats.begin_lookup(&key) else {
+            return;
+        };
         let stat_cwd = key.0.clone();
         let candidates = links::remote_candidates(&key.1);
         let session_id = self.session.daemon_id();
@@ -1148,7 +1223,7 @@ impl TerminalView {
         if let Err(e) = std::thread::Builder::new().name("remote-stat".into()).spawn(move || {
             let _ = tx.send(conn.stat_path(session_id, stat_cwd, candidates));
         }) {
-            self.remote_stat_inflight.remove(&key);
+            self.remote_stats.abort_lookup(&key, generation);
             log::debug!("couldn't spawn remote-stat thread for {}: {e}", key.1);
             return;
         }
@@ -1156,35 +1231,17 @@ impl TerminalView {
             let res = rx.recv_async().await;
             let mut pending_to_open: Option<(AnyWindowHandle, Target)> = None;
             let _ = this.update(cx, |view, cx| {
-                view.remote_stat_inflight.remove(&key);
                 let now = Instant::now();
-                // If `Cwd` arrived while a `cwd == None` query was in flight,
-                // the daemon may have resolved against the new directory; do not
-                // cache that reply under the `None` key.
-                let cwd_mismatch = key.0.is_none() && view.session.remote_cwd_str().is_some();
-                if !cwd_mismatch {
-                    if view.remote_stats.len() >= 256 {
-                        view.remote_stats.retain(|_, v| v.is_fresh(now));
-                        if view.remote_stats.len() >= 256 {
-                            view.remote_stats.clear();
-                        }
+                let result = match res {
+                    Ok(Ok(info)) => Ok(info),
+                    Ok(Err(e)) => {
+                        log::debug!("remote stat_path failed for {}: {e:#}", key.1);
+                        Err(())
                     }
-                    match res {
-                        Ok(Ok(info)) => {
-                            let entry = match info {
-                                Some(info) => CachedStat::Found { info, at: now },
-                                None => CachedStat::Missing(now),
-                            };
-                            view.remote_stats.insert(key.clone(), entry);
-                        }
-                        Ok(Err(e)) => {
-                            log::debug!("remote stat_path failed for {}: {e:#}", key.1);
-                            view.remote_stats.insert(key.clone(), CachedStat::Error(now));
-                        }
-                        Err(_) => {
-                            view.remote_stats.insert(key.clone(), CachedStat::Error(now));
-                        }
-                    }
+                    Err(_) => Err(()),
+                };
+                if !view.remote_stats.finish_lookup(key.clone(), generation, view.session.remote_cwd_str().is_some(), result, now) {
+                    return;
                 }
                 if let Some(pending) = view.pending_open.as_ref().filter(|p| p.stat_key == key).cloned() {
                     view.pending_open = None;
@@ -1360,6 +1417,7 @@ impl TerminalView {
             return;
         };
         let stat_cwd = self.session.remote_cwd_str();
+        let generation = self.remote_stats.generation();
         let session_id = self.session.daemon_id();
         let filename = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string();
         let toast_id =
@@ -1403,9 +1461,13 @@ impl TerminalView {
                         let _ = window_handle.update(cx, |_, window, cx| {
                             if let Some(entity) = this.upgrade() {
                                 entity.update(cx, |view, cx| {
-                                    if !(stat_cwd.is_none() && view.session.remote_cwd_str().is_some()) {
-                                        view.remote_stats.insert((stat_cwd, path), CachedStat::Found { info, at: Instant::now() });
-                                    }
+                                    view.remote_stats.insert_found(
+                                        (stat_cwd, path),
+                                        generation,
+                                        view.session.remote_cwd_str().is_some(),
+                                        info,
+                                        Instant::now(),
+                                    );
                                     view.open_link(target, window, cx);
                                 });
                             }
@@ -2478,5 +2540,40 @@ mod tests {
 
         assert!(err.is_fresh(t0 + Duration::from_secs(4)));
         assert!(!err.is_fresh(t0 + STAT_ERROR_BACKOFF));
+    }
+
+    #[test]
+    fn remote_stat_cache_rejects_pre_invalidation_replies_and_allows_replacement() {
+        let mut cache = RemoteStatCache::default();
+        let key: RemoteStatKey = (Some("/repo".into()), "generated.rs".into());
+        let t0 = Instant::now();
+
+        // Start lookup in generation 0; duplicate in same generation is deduped.
+        let gen0 = cache.begin_lookup(&key).expect("gen0 lookup starts");
+        assert_eq!(cache.begin_lookup(&key), None);
+
+        // Invalidate cache before gen0 completes: replacement lookup in gen1 must start immediately.
+        cache.invalidate();
+        let gen1 = cache.begin_lookup(&key).expect("replacement lookup starts after invalidation");
+        assert_ne!(gen0, gen1);
+
+        // Stale gen0 missing reply arrives first: rejected, not cached, and gen1 remains in flight.
+        assert!(!cache.finish_lookup(key.clone(), gen0, true, Ok(None), t0));
+        assert!(cache.get_fresh(&key, t0).is_none());
+        assert_eq!(cache.begin_lookup(&key), None);
+
+        // Fresh gen1 found reply arrives: accepted and cached.
+        let info = RemotePathInfo { path: "/repo/generated.rs".into(), is_dir: false, size: 42 };
+        assert!(cache.finish_lookup(key.clone(), gen1, true, Ok(Some(info.clone())), t0));
+        assert!(matches!(cache.get_fresh(&key, t0), Some(CachedStat::Found { info: got, .. }) if got == &info));
+
+        // Even if an earlier-gen reply arrives AFTER gen1 already populated the cache, it is discarded.
+        let stale_gen = cache.generation() - 1;
+        assert!(!cache.finish_lookup(key.clone(), stale_gen, true, Ok(None), t0));
+        assert!(matches!(cache.get_fresh(&key, t0), Some(CachedStat::Found { info: got, .. }) if got == &info));
+
+        // Direct insert_found from an earlier generation is also ignored.
+        cache.insert_found(key.clone(), stale_gen, true, RemotePathInfo { path: "/wrong".into(), is_dir: false, size: 0 }, t0);
+        assert!(matches!(cache.get_fresh(&key, t0), Some(CachedStat::Found { info: got, .. }) if got == &info));
     }
 }

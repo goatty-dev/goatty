@@ -19,7 +19,7 @@ use goatty_term::{Palette, Terminal, TerminalChannels};
 use parking_lot::{Mutex, RwLock};
 
 use crate::layouts::Layouts;
-use crate::session::{CwdState, Pause, Session, pump_output, to_size};
+use crate::session::{CwdCoordinator, Pause, Session, pump_output, to_size};
 
 /// The session registry shared by every connection.
 pub(crate) struct Daemon {
@@ -152,14 +152,16 @@ impl Daemon {
             .map(|p| p.to_string_lossy().into_owned())
             .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
         for _ in chans.ui.try_iter() {}
+        let subs = Arc::new(Mutex::new(Vec::new()));
+        let cwd = Arc::new(CwdCoordinator::new(id, subs.clone(), init_cwd, proc_cwd));
         let session = Arc::new(Session {
             id,
             term,
             pty: Mutex::new(pty),
-            subs: Mutex::new(Vec::new()),
+            subs,
             created_unix,
             process: Mutex::new(None),
-            cwd: Mutex::new(CwdState { current: init_cwd, last_proc: proc_cwd }),
+            cwd,
             fg: OnceLock::new(),
             managed,
             pause: Pause::new()?,
