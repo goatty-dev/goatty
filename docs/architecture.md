@@ -161,7 +161,7 @@ terminal/
   view.rs      TerminalView: input → terminal, actions, emits TerminalEvent
   element.rs   custom grid Element (prepaint/paint)
   glyphs.rs    per-cell glyph cache
-  keys.rs      GPUI keystroke → terminal Key (pure, unit-tested)
+  keys.rs      GPUI keystroke → terminal KeyEvent (pure, unit-tested)
   links.rs     what a detected link means here (URL, other scheme → ask, local file if it exists, remote path → copy), file openers
   stats.rs     GOATTY_STATS frame statistics
 ```
@@ -195,7 +195,7 @@ Input: GPUI dispatches a bound action before the view's raw `on_key_down`. Short
 | Tab/pane features (layout restore, titlebar tabs, …) | `workspace/` (`mod.rs` for behaviour, `layout.rs` for tree operations, `tab_bar.rs` for looks); a new program icon: `workspace/icons.rs` |
 | IME / compose (#21)                    | `terminal/view.rs`: implement `EntityInputHandler`, register it in the element's paint |
 | Box drawing (#24)                      | `terminal/element.rs` (+ a new `terminal/boxdraw.rs`)                 |
-| Kitty keyboard (#22)                   | `goatty-term/src/input.rs`, fed from `terminal/keys.rs`               |
+| Keyboard encoding, kitty protocol (#22) | `goatty-term/src/input.rs` (`encode_key_event`: legacy xterm, or kitty once the program pushes flags; the flags are `TermMode::kitty_flags`, read from rio-vt's per-screen stack, which also answers `CSI ? u`; snapshots carry them), fed from `terminal/keys.rs` (GPUI keystroke → `KeyEvent`); `TerminalView::on_key`/`on_key_up` send repeats and the releases of keys whose press the program got. Not reported: lone modifier keys, Caps/Num Lock, keypad keys as their own keys |
 | Shell integration, terminal side (#28) | `goatty-term` listener (OSC 7 → `UiEvent`), `goatty-term/src/marks.rs` (OSC 133, which rio-vt doesn't act on → row marks, `UiEvent::CommandFinished`, `Terminal::command_running`), `goatty-term/src/transcript.rs` (commands and their output) + daemon `SessionInfo`; the zsh side is in `goatty-shell/zsh/integration.zsh` |
 | Output viewer features (export, more sources) | `output_view/mod.rs`; what counts as a command's output: `goatty-term/src/transcript.rs` |
 | Managed zsh features, tool versions    | `goatty-shell/zsh/zshrc.zsh` (load order matters, see `managed-zsh.md`); the tools are built-in plugins: `goatty-shell/plugins/<id>/plugin.toml` (+ `builtins.rs` to list a new one) |
@@ -214,7 +214,7 @@ Input: GPUI dispatches a bound action before the view's raw `on_key_down`. Short
 | Snippets and expansions (#89)          | format, rendering, sources' parsing, expansion → ERE: `goatty-plugin/src/snippets.rs`; on a host: `goatty-shell/src/snippets.rs`, the widget `goatty-shell/zsh/expand.zsh`, the Basics pack `goatty-shell/plugins/basics/`; GUI: `snippets/`, the palette's input mode (`command_palette/input.rs`: loaders, several values, preview), `settings_window/snippets.rs`. See [`snippets.md`](snippets.md) |
 | A plugin feature (new manifest field)  | `goatty-plugin/src/manifest.rs` (+ validation, permissions if it can run code), rendering in `goatty-plugin/src/zsh.rs`, document it in `docs/plugins.md` and the template |
 | A plugin operation (GUI/CLI)           | `goatty_plugin::api::Request`/`Reply` (no protocol bump), `HostService::plugin_request`, `settings_window/plugins.rs`, `plugins/cmd.rs` |
-| Local echo prediction (#16) | guessing, checking and drawing: `goatty-term/src/predict.rs` (`Predictor`, unit-tested); when to predict and draw (`ssh.local_echo`, RTT or measured echo delay, alt screen) and feeding it input/output: `Session::predict`/`ingest` (`goatty-app/src/session.rs`); overlay per frame in `terminal/element.rs`; see `remote-architecture.md` R3 |
+| Local echo prediction (#16) | guessing, checking and drawing: `goatty-term/src/predict.rs` (`Predictor`, unit-tested); when to predict and draw (`ssh.local_echo`, RTT or measured echo delay, not in the alt screen or with kitty keyboard flags) and feeding it input/output: `Session::predict`/`ingest` (`goatty-app/src/session.rs`); overlay per frame in `terminal/element.rs`; see `remote-architecture.md` R3 |
 | Scrollback on demand, snapshot contents | line numbers, the client's line map and inserting fetched rows: `goatty-term/src/history.rs`; what a snapshot carries: `goatty-term/src/snapshot.rs`; when to fetch: `Session::fill_history` (`goatty-app/src/session.rs`); see `remote-architecture.md` §4a |
 | The tailnet (#15)                      | Tailscale CLI, handshake, pairing, availability: `goatty-net` (tested against `tests/fake-tailscale.sh`); a new host-side operation: `goatty_net::api::Request` (no protocol bump) + `Host::request`; client side: `goatty-client/src/tailnet.rs`; GUI: `tailnet.rs`, `settings_window/network.rs`; see [`tailnet.md`](tailnet.md) |
 | New wire messages                      | `goatty-proto/src/msg.rs`: a new variant at the *end* (append-only), bump `PROTOCOL_VERSION`, mark it `vN:`; handle in `goatty-daemon/src/client.rs` and `goatty-client/src/connection.rs`, which must not send it to a daemon that agreed on an older version (`Connection::protocol_version`) |

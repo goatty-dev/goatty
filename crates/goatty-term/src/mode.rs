@@ -26,9 +26,27 @@ impl TermMode {
     pub const LINE_WRAP: Self = Self(1 << 11);
     pub const ALT_SCREEN: Self = Self(1 << 12);
     pub const ALTERNATE_SCROLL: Self = Self(1 << 13);
+    /// Kitty keyboard protocol flags (`CSI > flags u`, #22): the active
+    /// screen's top of the flag stack, one bit per progressive enhancement.
+    /// Read them with [`TermMode::kitty_flags`].
+    pub const KITTY_DISAMBIGUATE: Self = Self(1 << 14);
+    pub const KITTY_EVENT_TYPES: Self = Self(1 << 15);
+    pub const KITTY_ALTERNATE_KEYS: Self = Self(1 << 16);
+    pub const KITTY_ALL_KEYS: Self = Self(1 << 17);
+    pub const KITTY_ASSOCIATED_TEXT: Self = Self(1 << 18);
 
     /// Any mouse reporting protocol enabled.
     pub const MOUSE_MODE: Self = Self(Self::MOUSE_REPORT_CLICK.0 | Self::MOUSE_REPORT_X10.0 | Self::MOUSE_DRAG.0 | Self::MOUSE_MOTION.0);
+
+    /// Any kitty keyboard enhancement enabled.
+    pub const KITTY_KEYBOARD: Self = Self(
+        Self::KITTY_DISAMBIGUATE.0
+            | Self::KITTY_EVENT_TYPES.0
+            | Self::KITTY_ALTERNATE_KEYS.0
+            | Self::KITTY_ALL_KEYS.0
+            | Self::KITTY_ASSOCIATED_TEXT.0,
+    );
+    const KITTY_SHIFT: u32 = 14;
 
     pub const fn empty() -> Self {
         Self(0)
@@ -48,6 +66,21 @@ impl TermMode {
 
     pub const fn intersects(self, other: Self) -> bool {
         (self.0 & other.0) != 0
+    }
+
+    /// The kitty keyboard flags as the protocol numbers them (the byte
+    /// `CSI ? u` reports: 1 disambiguate, 2 event types, 4 alternate keys,
+    /// 8 all keys as escapes, 16 associated text).
+    pub const fn kitty_flags(self) -> u8 {
+        ((self.0 & Self::KITTY_KEYBOARD.0) >> Self::KITTY_SHIFT) as u8
+    }
+
+    /// The modes of `t`. rio-vt's kitty bits in `Mode` go stale (switching
+    /// screens and RIS don't update them), so the flags come from the
+    /// keyboard mode stack.
+    pub(crate) fn of(t: &crate::terminal::Term) -> Self {
+        let kitty = (t.keyboard_mode().bits() as u32) << Self::KITTY_SHIFT;
+        Self::from_rio(t.mode()) | Self(kitty & Self::KITTY_KEYBOARD.0)
     }
 
     pub(crate) fn from_rio(mode: Mode) -> Self {

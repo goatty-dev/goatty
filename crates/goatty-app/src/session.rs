@@ -425,9 +425,12 @@ impl Session {
             _ => LocalEcho::Auto,
         };
         let mut p = self.predictor.lock();
+        // Programs in the alternate screen or speaking the kitty keyboard
+        // protocol (key releases, CSI u keys) aren't a prompt to echo at.
+        let mode = self.terminal.mode();
         let on = setting != LocalEcho::Never
             && *self.status.lock() == LinkStatus::Connected
-            && !self.terminal.mode().contains(TermMode::ALT_SCREEN);
+            && !mode.intersects(TermMode::ALT_SCREEN | TermMode::KITTY_KEYBOARD);
         if !on {
             if p.deadline().is_some() {
                 p.reset();

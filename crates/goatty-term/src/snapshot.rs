@@ -5,7 +5,8 @@
 //! what it leaves out and what reconnecting actually needs:
 //!   * scrollback (replayed as lines so they scroll into the client history),
 //!   * the alternate screen switch (so `vim` exiting restores correctly),
-//!   * input-affecting modes (DECCKM, keypad, bracketed paste, mouse, focus),
+//!   * input-affecting modes (DECCKM, keypad, bracketed paste, mouse, focus,
+//!     kitty keyboard flags),
 //!   * the window title,
 //!   * the OSC 133 prompt marks on rows and soft wraps in the scrollback,
 //!     so the client's [transcript](crate::transcript) finds the same
@@ -61,9 +62,12 @@ impl Terminal {
             t.swap_alt();
             let mut out = String::from("\x1bc");
             write_primary(t, MAX_REPLAY_HISTORY, &mut out);
+            // Each screen has its own kitty keyboard flags: the primary's
+            // here, the alternate's in `write_modes`.
+            write_kitty_flags(TermMode::of(t), &mut out);
             t.swap_alt();
             t.grid = alt;
-            let mode = TermMode::from_rio(t.mode());
+            let mode = TermMode::of(t);
             out.push_str("\x1b[?1049h");
             write_screen(t, false, &mut out);
             write_shell_state(shell, &mut out);
@@ -84,7 +88,7 @@ impl Terminal {
 }
 
 fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
-    let mode = TermMode::from_rio(t.mode());
+    let mode = TermMode::of(t);
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
     // region, origin mode, and the alt-screen switch in whichever direction.
@@ -101,7 +105,7 @@ fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
 }
 
 fn serialize(t: &Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
-    let mode = TermMode::from_rio(t.mode());
+    let mode = TermMode::of(t);
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
     out.push_str("\x1bc");
@@ -238,8 +242,21 @@ fn write_modes(t: &Term, mode: TermMode, out: &mut String) {
         set(out, true, 1006);
     }
     out.push_str(if mode.contains(TermMode::APP_KEYPAD) { "\x1b=" } else { "\x1b>" });
+    write_kitty_flags(mode, out);
     if !t.title.is_empty() {
         let _ = write!(out, "\x1b]2;{}\x07", t.title.replace(['\x07', '\x1b'], ""));
+    }
+}
+
+/// The active screen's kitty keyboard flags (#22): empty the client's stack
+/// (popping more than it holds clears it), then push the flags. The levels
+/// below the top aren't readable from rio-vt, so an application that pops
+/// later lands on no flags here; it pushed over the shell's, which are
+/// normally none.
+fn write_kitty_flags(mode: TermMode, out: &mut String) {
+    out.push_str("\x1b[<99u");
+    if mode.kitty_flags() != 0 {
+        let _ = write!(out, "\x1b[>{}u", mode.kitty_flags());
     }
 }
 
@@ -522,6 +539,35 @@ mod tests {
         assert!(!a.line_editing());
         b.feed(&a.resync_snapshot());
         assert!(!b.line_editing());
+    }
+
+    #[test]
+    fn snapshots_carry_kitty_keyboard_flags() {
+        let fresh = || Terminal::new(TermSize::new(20, 5), false, Arc::new(Palette::default())).0;
+        let a = fresh();
+        a.feed(b"\x1b[>1u\x1b[?1049h\x1b[>11u");
+        let b = fresh();
+        b.feed(&a.reattach_snapshot());
+        assert_eq!(b.mode().kitty_flags(), 11);
+
+        // Resync replaces what the client had.
+        let c = fresh();
+        c.feed(b"\x1b[>31u\x1b[>31u");
+        c.feed(&a.resync_snapshot());
+        assert_eq!(c.mode().kitty_flags(), 11);
+
+        // A restore keeps each screen's flags.
+        let d = fresh();
+        d.feed(&a.restore_snapshot());
+        assert_eq!(d.mode().kitty_flags(), 11);
+        d.feed(b"\x1b[?1049l");
+        assert_eq!(d.mode().kitty_flags(), 1);
+        assert_eq!(a.mode().kitty_flags(), 11, "restoring left the source as it was");
+
+        // Flags off: the client's go too.
+        a.feed(b"\x1b[<99u");
+        c.feed(&a.resync_snapshot());
+        assert_eq!(c.mode().kitty_flags(), 0);
     }
 
     #[test]

@@ -286,7 +286,7 @@ impl Terminal {
     }
 
     pub fn mode(&self) -> TermMode {
-        TermMode::from_rio(self.inner.term.lock().mode())
+        TermMode::of(&self.inner.term.lock())
     }
 
     /// Scrollback lines currently held (primary screen).
