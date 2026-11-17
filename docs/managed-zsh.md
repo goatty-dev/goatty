@@ -178,20 +178,20 @@ The right-click menu (#186) reads and changes the line typed at the prompt throu
 
 1. Downloads the pinned release archive with `curl` (fallback `wget`). The sha256 pin is what makes an archive trusted, so goattyd needs no TLS stack of its own.
 2. Checks the archive against the sha256 in the plugin's manifest before unpacking anything.
-3. Unpacks into `tools/<id>/.<version>.partial-<pid>` (the `tar` crate refuses paths outside it), checks the expected binaries or `source` script, then renames it to `tools/<id>/<version>`.
+3. Unpacks into `tools/<id>/.<version>.partial-<pid>` (`goatty_plugin::archive` handles every package format, tar.gz/xz/zst, zip or a raw executable, and refuses paths outside it), checks the expected binaries or `source` script, then renames it to `tools/<id>/<version>`.
 4. Switches `bin/<exe>` or `plugins/<id>` by renaming a temp symlink over the old one, then removes older versions.
 
 No sudo, nothing outside goatty's data directory. `goattyd shell uninstall NAME…|--all` removes goatty's downloads (the plugins stay on and use system copies if there are any). For a remote goattyd this all happens on the remote host, which is also where `goatty-setup` runs.
 
 | Built-in plugin     | Package (id)                               | Version | Builds                    | Load slot   | Installed by goatty-setup |
 |---------------------|--------------------------------------------|---------|---------------------------|-------------|---------------------------|
-| fzf                 | fzf (`fzf`)                                | 0.74.5  | x86_64/aarch64 Linux      | line-editor | yes |
+| fzf                 | fzf (`fzf`)                                | 0.74.5  | x86_64/aarch64 Linux, macOS | line-editor | yes |
 | fzf-tab             | fzf-tab (`fzf-tab`)                        | 1.3.0   | source tarball            | line-editor (after fzf) | yes |
 | autosuggestions     | zsh-autosuggestions (`autosuggestions`)    | 0.7.1   | source tarball            | line-editor (after fzf, fzf-tab) | yes |
 | syntax-highlighting | zsh-syntax-highlighting (`syntax-highlighting`) | 0.8.0 | source tarball          | last        | yes |
-| starship            | Starship (`starship`)                      | 1.27.0  | x86_64/aarch64 Linux musl | prompt      | yes |
+| starship            | Starship (`starship`)                      | 1.27.0  | x86_64/aarch64 Linux musl, macOS | prompt      | yes |
 
-Pinned 2026-11-07 to releases at least two weeks old (fzf-tab 2026-11-13: v1.3.0 is from 2026-03-16). Checksums were computed from the downloads and matched upstream's published `.sha256`/checksums files where they exist (Starship, fzf); GitHub's source tarballs (fzf-tab, the zsh plugins) have none, so their checksum was taken from two separate downloads. fzf-tab's system copies: Arch's AUR `fzf-tab-git`, NixOS/Nix `zsh-fzf-tab`. The package ids are the tool ids from before #98, so managed installs made then (`tools/<id>/`, `bin/` and `plugins/` links) are used as they are. zsh itself isn't installed: if it's missing, goatty starts `$SHELL` and `goattyd shell status` says so.
+Pinned 2026-11-07 to releases at least two weeks old (fzf-tab 2026-11-13: v1.3.0 is from 2026-03-16; the macOS builds of the same fzf and Starship releases 2026-11-17). Checksums were computed from the downloads and matched upstream's published `.sha256`/checksums files where they exist (Starship, fzf); GitHub's source tarballs (fzf-tab, the zsh plugins) have none, so their checksum was taken from two separate downloads. fzf-tab's system copies: Arch's AUR `fzf-tab-git`, NixOS/Nix `zsh-fzf-tab`. The package ids are the tool ids from before #98, so managed installs made then (`tools/<id>/`, `bin/` and `plugins/` links) are used as they are. zsh itself isn't installed: if it's missing, goatty starts `$SHELL` and `goattyd shell status` says so.
 
 ### Bumping a tool pin (#45)
 
@@ -258,4 +258,4 @@ Installed plugins (Stage 5, [`plugins.md`](plugins.md)) render into `plugins-ear
 
 ## Not done yet
 
-Caching tool init scripts (#41, including `fzf --zsh`), installs for macOS and other architectures (#42), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).
+Caching tool init scripts (#41, including `fzf --zsh`), installs for other architectures and a distro-specific hint when zsh is missing (#42), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).

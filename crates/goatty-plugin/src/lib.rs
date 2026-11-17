@@ -14,6 +14,7 @@
 //! * [`bundle`]: a plugin directory as checksummed files,
 //! * [`index`] + [`sign`]: registries, their signed index, verification,
 //! * [`fetch`]: HTTPS downloads through curl/wget,
+//! * [`archive`]: unpacking package downloads (tar.gz/xz/zst, zip),
 //! * [`api`]: plugin operations as JSON (protocol, GUI).
 //!
 //! The `goatty-plugin` binary wraps these for plugin authors (`new`,
@@ -22,6 +23,7 @@
 
 pub mod alias;
 pub mod api;
+pub mod archive;
 pub mod bundle;
 pub mod commands;
 pub mod fetch;

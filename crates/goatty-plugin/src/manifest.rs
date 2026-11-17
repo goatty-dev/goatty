@@ -194,14 +194,59 @@ pub struct Asset {
     pub root: String,
 }
 
+/// What a download is: an archive to unpack (`crate::archive`), or the
+/// executable itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AssetFormat {
     #[default]
     #[serde(rename = "tar.gz")]
     TarGz,
+    #[serde(rename = "tar.xz")]
+    TarXz,
+    #[serde(rename = "tar.zst")]
+    TarZst,
+    #[serde(rename = "tar")]
+    Tar,
+    #[serde(rename = "zip")]
+    Zip,
     /// The download is the executable itself (one `bin` entry).
     #[serde(rename = "binary")]
     Binary,
+}
+
+impl AssetFormat {
+    /// Every format, as written in `plugin.toml`.
+    pub const ALL: [AssetFormat; 6] = [Self::TarGz, Self::TarXz, Self::TarZst, Self::Tar, Self::Zip, Self::Binary];
+
+    /// The name in `plugin.toml` (`"tar.gz"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::TarGz => "tar.gz",
+            Self::TarXz => "tar.xz",
+            Self::TarZst => "tar.zst",
+            Self::Tar => "tar",
+            Self::Zip => "zip",
+            Self::Binary => "binary",
+        }
+    }
+
+    /// The archive format a URL's file name ends in (`.zip`, `.tgz`, …),
+    /// ignoring a query or fragment; `None` for anything else.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+        [
+            (".tar.gz", Self::TarGz),
+            (".tgz", Self::TarGz),
+            (".tar.xz", Self::TarXz),
+            (".txz", Self::TarXz),
+            (".tar.zst", Self::TarZst),
+            (".tzst", Self::TarZst),
+            (".tar", Self::Tar),
+            (".zip", Self::Zip),
+        ]
+        .into_iter()
+        .find_map(|(ext, f)| path.ends_with(ext).then_some(f))
+    }
 }
 
 /// A setting shown in goatty's settings window, with an explanation.
@@ -731,6 +776,11 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
             if !a.root.is_empty() && !is_bundle_path(&a.root) {
                 err(format!("{at}.root"), format!("{:?}: a relative directory inside the archive", a.root));
             }
+            if let Some(f) = AssetFormat::from_url(&a.url)
+                && f != a.format
+            {
+                err(format!("{at}.format"), format!("the URL is a .{} archive: set format = \"{}\"", f.name(), f.name()));
+            }
             if a.format == AssetFormat::Binary && p.bin.len() != 1 {
                 err(format!("{at}.format"), "a \"binary\" download is one executable: list exactly one bin".into());
             }
@@ -1025,6 +1075,27 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
 
     fn problems(text: &str) -> Vec<String> {
         parse(text, None).unwrap_err().0.into_iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn asset_formats_match_their_urls() {
+        assert_eq!(AssetFormat::from_url("https://x/fzf-darwin_arm64.zip"), Some(AssetFormat::Zip));
+        assert_eq!(AssetFormat::from_url("https://x/a.TGZ?raw=1#top"), Some(AssetFormat::TarGz));
+        assert_eq!(AssetFormat::from_url("https://x/a.tar.xz"), Some(AssetFormat::TarXz));
+        assert_eq!(AssetFormat::from_url("https://x/a.tar.zst"), Some(AssetFormat::TarZst));
+        assert_eq!(AssetFormat::from_url("https://x/a.tar"), Some(AssetFormat::Tar));
+        assert_eq!(AssetFormat::from_url("https://x/download/latest"), None);
+        for f in AssetFormat::ALL {
+            assert_eq!(toml::Value::try_from(f).unwrap().as_str(), Some(f.name()));
+        }
+
+        let zip = EXAMPLE.replace("eza.tar.gz", "eza.zip");
+        assert!(problems(&zip).iter().any(|p| p.contains("format = \"zip\"")), "{:?}", problems(&zip));
+        let m = parse(&zip.replace("size = 100", "size = 100\nformat = \"zip\""), None).unwrap();
+        assert_eq!(m.packages[0].assets[0].format, AssetFormat::Zip);
+        // No extension: any format goes.
+        let raw = EXAMPLE.replace("eza.tar.gz", "eza").replace("size = 100", "size = 100\nformat = \"binary\"");
+        assert!(parse(&raw, None).is_ok());
     }
 
     #[test]
