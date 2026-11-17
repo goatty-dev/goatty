@@ -186,6 +186,43 @@ fn reattach_restores_alt_screen_app() {
 }
 
 #[test]
+fn reattach_in_alt_screen_restores_primary_screen_on_exit() {
+    let d = start_daemon();
+    let mut a = connect(&d.sock);
+    let (id, mut consumed) = create(&mut a, StreamOpts::LOCAL);
+    let ta = term();
+    send(
+        &mut a,
+        &ClientMsg::Input {
+            session: id,
+            data: b"echo START; i=1; while [ $i -le 20 ]; do echo \"hist-$i\"; i=$((i+1)); done; echo BEFORE-$((40+2)); printf '\\033[?1049h\\033[2J\\033[2;2H%s-%s' ALT MODE; read _; printf '\\033[?1049l'; echo AFTER-$((1+1))\r".to_vec(),
+        },
+    );
+    pump_until(&mut a, id, &ta, &mut consumed, "ALT-MODE");
+    drop(a);
+
+    let mut b = connect(&d.sock);
+    send(&mut b, &ClientMsg::Attach { req: 2, session: id, size: SIZE, opts: StreamOpts::LOCAL });
+    let tb = term();
+    let mut consumed = 0;
+    pump_until(&mut b, id, &tb, &mut consumed, "ALT-MODE");
+    assert!(tb.mode().contains(goatty_term::TermMode::ALT_SCREEN));
+
+    // Exit the alt-screen app: the pre-alt primary screen and scrollback must reappear.
+    send(&mut b, &ClientMsg::Input { session: id, data: b"\r".to_vec() });
+    pump_until(&mut b, id, &tb, &mut consumed, "AFTER-2");
+    assert!(!tb.mode().contains(goatty_term::TermMode::ALT_SCREEN));
+    assert!(screen_text(&tb).contains("BEFORE-42"), "primary screen lost:\n{}", screen_text(&tb));
+    assert!(tb.history_size() > 0, "primary scrollback should be restored");
+    let transcript = tb.transcript();
+    assert!(
+        transcript.lines.iter().any(|l| l.text.trim() == "hist-1"),
+        "oldest scrollback missing:\n{}",
+        transcript.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n"),
+    );
+}
+
+#[test]
 fn sessions_multiplex_over_one_connection() {
     let d = start_daemon();
     let mut c = connect(&d.sock);

@@ -22,7 +22,7 @@ use rio_vt::crosswords::square::Hyperlink;
 use rio_vt::crosswords::style::Style;
 
 use crate::marks::ShellState;
-use crate::terminal::Term;
+use crate::terminal::{Term, with_primary};
 use crate::{TermMode, Terminal};
 
 /// The shell's state, how many commands started, and whether goatty's
@@ -34,46 +34,24 @@ pub const MAX_REPLAY_HISTORY: usize = 5_000;
 
 impl Terminal {
     /// Full snapshot for a *fresh* client terminal: RIS, up to
-    /// `max_history` scrollback lines, screen, modes.
+    /// `max_history` scrollback lines, primary screen (even while the alternate
+    /// screen is active), alternate screen when active, and modes.
     pub fn reattach_snapshot(&self) -> Vec<u8> {
         self.reattach_snapshot_with_history(MAX_REPLAY_HISTORY)
     }
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info(), self.primary_kitty()))
+        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info()))
     }
 
     /// Everything another process needs to rebuild this terminal (goattyd
-    /// handing its sessions to its next version): like
-    /// [`Self::reattach_snapshot`], plus the primary screen and its
-    /// scrollback while the alternate screen is active, which the attach
-    /// snapshot leaves out. Leaves the terminal as it was.
+    /// handing its sessions to its next version): identical to
+    /// [`Self::reattach_snapshot`] (full [`MAX_REPLAY_HISTORY`] scrollback and
+    /// both screens when the alternate screen is active). Leaves the terminal
+    /// as it was.
     pub fn restore_snapshot(&self) -> Vec<u8> {
-        self.with_term(|t| {
-            let shell = self.shell_info();
-            if !TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
-                return serialize(t, MAX_REPLAY_HISTORY, shell, 0);
-            }
-            // rio-vt keeps the primary grid private while the alternate one
-            // is active. Switch to it, and back: switching to the alternate
-            // screen clears it, so put its grid back afterwards.
-            let alt = t.grid.clone();
-            t.swap_alt();
-            let mut out = String::from("\x1bc");
-            write_primary(t, MAX_REPLAY_HISTORY, &mut out);
-            // Each screen has its own kitty keyboard flags: the primary's
-            // here, the alternate's in `write_modes`.
-            write_kitty_flags(TermMode::of(t).kitty_flags(), &mut out);
-            t.swap_alt();
-            t.grid = alt;
-            let mode = TermMode::of(t);
-            out.push_str("\x1b[?1049h");
-            write_screen(t, false, &mut out);
-            write_shell_state(shell, &mut out);
-            write_modes(t, mode, &mut out);
-            out.into_bytes()
-        })
+        self.reattach_snapshot()
     }
 
     /// Catch-up snapshot for a client terminal that already mirrors this
@@ -118,21 +96,23 @@ fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// `primary`: as for [`resync`].
-fn serialize(t: &Term, max_history: usize, shell: ShellInfo, primary: u8) -> Vec<u8> {
+fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
     let mode = TermMode::of(t);
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
     out.push_str("\x1bc");
 
-    let alt = mode.contains(TermMode::ALT_SCREEN);
-    // Scrollback only exists for the primary grid. When the alt screen is
-    // active, `t.grid` *is* the alt grid (rio swaps them), so history replay
-    // is only possible on the primary screen.
-    if !alt {
+    if !mode.contains(TermMode::ALT_SCREEN) {
         write_primary(t, max_history, &mut out);
     } else {
-        write_kitty_flags(primary, &mut out);
+        // Replay the primary screen + its scrollback and kitty flags before
+        // switching to the alternate screen, so leaving the full-screen app
+        // restores the original screen.
+        let primary_kitty = with_primary(t, |t| {
+            write_primary(t, max_history, &mut out);
+            TermMode::of(t).kitty_flags()
+        });
+        write_kitty_flags(primary_kitty, &mut out);
         out.push_str("\x1b[?1049h");
         write_screen(t, false, &mut out);
     }
@@ -651,5 +631,45 @@ mod tests {
         assert_eq!(text_of(&a), text_of(&b));
         assert_eq!((a.mode() & relevant).bits(), (b.mode() & relevant).bits());
         assert!(b.history_size() >= hb_before, "client history kept");
+    }
+
+    #[test]
+    fn reattach_in_alt_screen_restores_primary_screen_and_history() {
+        let size = TermSize::new(20, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        for i in 0..12 {
+            a.feed(format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd {i}\r\n\x1b]133;C\x07out {i}\r\n\x1b]133;D;0\x07").as_bytes());
+        }
+        a.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07vim\r\n\x1b]133;C\x07");
+        let (primary, history) = (text_of(&a), a.history_size());
+        let primary_cursor = a.with_term(|t| t.grid.cursor.pos);
+
+        a.feed(b"\x1b[?1049h\x1b[2;3HALT SCREEN");
+        let alt = text_of(&a);
+
+        // Full reattach snapshot restores alt screen, and leaving it restores
+        // the primary screen, scrollback, prompt marks, and cursor.
+        let (b, _cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&a.reattach_snapshot());
+        assert_eq!(text_of(&b), alt);
+        assert_eq!(text_of(&a), alt, "snapshot left source unchanged");
+
+        // Trimmed history reattach also preserves the primary screen and the
+        // requested tail of scrollback.
+        let (c, _cc) = Terminal::new(size, false, Arc::new(Palette::default()));
+        c.feed(&a.reattach_snapshot_with_history(4));
+        assert_eq!(text_of(&c), alt);
+
+        for t in [&a, &b] {
+            t.feed(b"\x1b[?1049l");
+            assert_eq!(text_of(t), primary);
+            assert_eq!(t.history_size(), history);
+            assert_eq!(t.with_term(|t| t.grid.cursor.pos), primary_cursor);
+        }
+        assert_eq!(a.transcript().commands, b.transcript().commands);
+
+        c.feed(b"\x1b[?1049l");
+        assert_eq!(text_of(&c), primary);
+        assert_eq!(c.history_size(), 4);
     }
 }
