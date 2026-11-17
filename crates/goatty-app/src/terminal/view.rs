@@ -35,10 +35,10 @@ use goatty_term::input::{
 use goatty_term::paste::{self, PasteRisk};
 use goatty_term::{CursorKind, Frame, Link, SelectKind, TermMode, UiEvent};
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, Font, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
+    AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, Font, Global, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
     MouseButton as GMouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection, Window, canvas, div, point,
+    ScrollEvent, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection, WeakEntity, Window, canvas, div, point,
     prelude::FluentBuilder, px,
 };
 
@@ -1019,8 +1019,12 @@ impl TerminalView {
         let mode = self.session.terminal.mode();
         if let Some(bytes) = encode_key_event(&key, mode) {
             cx.stop_propagation();
-            // A dead key's composition ends with the composed key itself.
-            self.preedit.clear();
+            // A dead key's composition ends with the composed key itself,
+            // which goes where the keyboard focus is.
+            if let Some(pane) = self.composing_elsewhere(window, cx) {
+                pane.update(cx, |v, cx| v.end_composition(cx));
+            }
+            self.end_composition(cx);
             self.session.terminal.selection_clear();
             self.send(&bytes, cx);
             window.invalidate_character_coordinates();
@@ -1289,25 +1293,26 @@ impl EntityInputHandler for TerminalView {
         Some(UTF16Selection { range: 0..0, reversed: false })
     }
 
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<'_, Self>) -> Option<Range<usize>> {
-        (!self.preedit.is_empty()).then(|| 0..self.preedit.encode_utf16().count())
+    fn marked_text_range(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> Option<Range<usize>> {
+        let preedit = |v: &Self| (!v.preedit.is_empty()).then(|| 0..v.preedit.encode_utf16().count());
+        match self.composing_elsewhere(window, cx) {
+            Some(pane) => preedit(pane.read(cx)),
+            None => preedit(self),
+        }
     }
 
-    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) {
-        self.preedit.clear();
-        cx.notify();
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        match self.composing_elsewhere(window, cx) {
+            Some(pane) => pane.update(cx, |v, cx| v.end_composition(cx)),
+            None => self.end_composition(cx),
+        }
     }
 
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.preedit.clear();
-        self.poke_cursor();
-        cx.notify();
-        if text.is_empty() || self.exited {
-            return;
+        match self.composing_elsewhere(window, cx) {
+            Some(pane) => pane.update(cx, |v, cx| v.commit(text, window, cx)),
+            None => self.commit(text, window, cx),
         }
-        self.session.terminal.selection_clear();
-        self.send(text.as_bytes(), cx);
-        window.invalidate_character_coordinates();
     }
 
     fn replace_and_mark_text_in_range(
@@ -1318,10 +1323,10 @@ impl EntityInputHandler for TerminalView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        text.clone_into(&mut self.preedit);
-        self.poke_cursor();
-        cx.notify();
-        window.invalidate_character_coordinates();
+        match self.composing_elsewhere(window, cx) {
+            Some(pane) => pane.update(cx, |v, cx| v.compose(text, window, cx)),
+            None => self.compose(text, window, cx),
+        }
     }
 
     /// The input method's popup goes under the composition (or the cursor).
@@ -1329,9 +1334,73 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         range: Range<usize>,
         _: Bounds<Pixels>,
-        _: &mut Window,
-        _: &mut Context<'_, Self>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
     ) -> Option<Bounds<Pixels>> {
+        match self.composing_elsewhere(window, cx) {
+            Some(pane) => pane.read(cx).ime_bounds(range),
+            None => self.ime_bounds(range),
+        }
+    }
+
+    fn character_index_for_point(&mut self, _: Point<Pixels>, _: &mut Window, _: &mut Context<'_, Self>) -> Option<usize> {
+        None
+    }
+}
+
+/// The pane an input-method composition is going on in. gpui doesn't reset
+/// the input method when focus moves to another pane (both take text), so
+/// the rest of a composition, and its commit, would land in the newly
+/// focused pane: it finishes in the pane it started in instead.
+#[derive(Default)]
+struct Composing(Option<(AnyWindowHandle, WeakEntity<TerminalView>)>);
+
+impl Global for Composing {}
+
+impl TerminalView {
+    /// Another pane in this window that has a composition going on.
+    fn composing_elsewhere(&self, window: &Window, cx: &Context<'_, Self>) -> Option<Entity<Self>> {
+        let (handle, pane) = cx.try_global::<Composing>()?.0.as_ref()?;
+        let pane = pane.upgrade().filter(|p| *handle == window.window_handle() && p.entity_id() != cx.entity_id())?;
+        (!pane.read(cx).preedit.is_empty()).then_some(pane)
+    }
+
+    /// Show `text` as the composition; empty ends it.
+    fn compose(&mut self, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if text.is_empty() {
+            self.end_composition(cx);
+        } else {
+            text.clone_into(&mut self.preedit);
+            let me = cx.entity().downgrade();
+            cx.set_global(Composing(Some((window.window_handle(), me))));
+        }
+        self.poke_cursor();
+        cx.notify();
+        window.invalidate_character_coordinates();
+    }
+
+    /// The input method's text, sent as typed (no key encoding).
+    fn commit(&mut self, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.end_composition(cx);
+        self.poke_cursor();
+        if text.is_empty() || self.exited {
+            return;
+        }
+        self.session.terminal.selection_clear();
+        self.send(text.as_bytes(), cx);
+        window.invalidate_character_coordinates();
+    }
+
+    fn end_composition(&mut self, cx: &mut Context<'_, Self>) {
+        self.preedit.clear();
+        let mine = cx.try_global::<Composing>().and_then(|c| c.0.as_ref()).is_some_and(|(_, p)| p.entity_id() == cx.entity_id());
+        if mine {
+            cx.set_global(Composing(None));
+        }
+        cx.notify();
+    }
+
+    fn ime_bounds(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
         let geom = self.geom.get();
         if geom.cols == 0 {
             return None;
@@ -1341,10 +1410,6 @@ impl EntityInputHandler for TerminalView {
         let origin = geom.preedit_origin(cells(&self.preedit));
         let x = origin.x + geom.cell.width * cells(&self.preedit[..start]) as f32;
         Some(Bounds::new(point(x, origin.y), geom.cell))
-    }
-
-    fn character_index_for_point(&mut self, _: Point<Pixels>, _: &mut Window, _: &mut Context<'_, Self>) -> Option<usize> {
-        None
     }
 }
 

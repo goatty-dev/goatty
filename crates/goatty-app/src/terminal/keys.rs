@@ -34,9 +34,11 @@ pub fn terminal_key(ks: &Keystroke, kind: KeyKind) -> Option<KeyEvent<'_>> {
         k if k.len() >= 2 && k.starts_with('f') && k[1..].parse::<u8>().is_ok() => Key::F(k[1..].parse().ok()?),
         k => match &ks.key_char {
             // Typed text from the layout (already shifted). With ctrl the
-            // layout often gives nothing; fall back to the key name.
+            // layout often gives nothing; fall back to the key name. A
+            // plain key without text is part of a dead-key or compose
+            // sequence: the composed character comes as its own key.
             Some(t) if !m.control => Key::Text(t.as_str()),
-            _ if k.chars().count() == 1 => Key::Text(k),
+            _ if (m.control || m.alt) && k.chars().count() == 1 => Key::Text(k),
             _ => return None,
         },
     };
@@ -89,6 +91,14 @@ mod tests {
         // Ctrl combos often have no key_char: fall back to the key name.
         let (key, m) = map("ctrl-r", None).unwrap();
         assert_eq!((key.as_str(), m.ctrl), (r#"Text("r")"#, true));
+    }
+
+    #[test]
+    fn unfinished_compose_keys_send_nothing() {
+        // Compose, ', e: the ' comes without text while composing.
+        assert!(map("'", None).is_none());
+        assert!(map("shift-'", None).is_none());
+        assert_eq!(map("alt-x", None).unwrap().0, r#"Text("x")"#);
     }
 
     #[test]

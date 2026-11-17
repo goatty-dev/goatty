@@ -18,8 +18,8 @@ use std::time::Instant;
 
 use goatty_term::{CellFlags, CursorKind, Frame, LinkSpan, Rgb, TermSize};
 use gpui::{
-    App, Bounds, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun,
+    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun,
     UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use unicode_width::UnicodeWidthStr;
@@ -249,7 +249,7 @@ impl Element for TerminalElement {
             // Scrolled up: get what the daemon has above (or in between).
             self.session.fill_history();
         }
-        let caret = frame.cursor.map_or(self.geom.get().caret, |c| (c.col, c.row));
+        let caret = frame.caret.unwrap_or(self.geom.get().caret);
         let caret = (caret.0.min(frame.cols.saturating_sub(1)), caret.1.min(frame.rows.saturating_sub(1)));
         let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret };
         self.geom.set(geom);
@@ -471,8 +471,10 @@ impl Element for TerminalElement {
                 TextRun { len: self.preedit.len(), font: self.font.clone(), color, background_color: None, underline, strikethrough: None };
             let line = ts.shape_line(self.preedit.clone(), self.font_size, &[run], None);
             let cells = self.preedit.width().max(1);
-            let bg = Bounds::new(geom.preedit_origin(cells), size(line.width.max(cell_w * cells as f32), line_height));
-            (bg, hsla(frame.background), line)
+            let at = geom.preedit_origin(cells);
+            // A composition longer than the line is cut off at the grid's edge.
+            let width = line.width.max(cell_w * cells as f32).min(origin.x + cell_w * frame.cols as f32 - at.x);
+            (Bounds::new(at, size(width, line_height)), hsla(frame.background), line)
         });
 
         self.stats.borrow_mut().shaped_segments += if self.glyph_mode { glyph_draws.len() } else { lines.len() } as u64;
@@ -544,8 +546,10 @@ impl Element for TerminalElement {
             }
         }
         if let Some((bg, bg_color, line)) = layout.preedit.take() {
-            window.paint_quad(fill(bg, bg_color));
-            let _ = line.paint(bg.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
+            window.with_content_mask(Some(ContentMask { bounds: bg }), |window| {
+                window.paint_quad(fill(bg, bg_color));
+                let _ = line.paint(bg.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
+            });
         }
         let mut st = self.stats.borrow_mut();
         let pre = paint_start.duration_since(layout.started).as_micros() as u64;

@@ -90,11 +90,13 @@ impl Terminal {
         }
 
         let cur = t.cursor();
+        let row = cur.pos.row.0 + offset;
+        let in_view = row >= 0 && (row as usize) < rows;
+        frame.caret = in_view.then_some((cur.pos.col.0, row as usize));
         frame.cursor = if matches!(cur.content, CursorShape::Hidden) {
             None
         } else {
-            let row = cur.pos.row.0 + offset;
-            (row >= 0 && (row as usize) < rows).then(|| Cursor {
+            in_view.then(|| Cursor {
                 col: cur.pos.col.0,
                 row: row as usize,
                 shape: match cur.content {
@@ -169,6 +171,9 @@ pub struct Frame {
     pub cells: Vec<Cell>,
     pub extra_text: Vec<char>,
     pub cursor: Option<Cursor>,
+    /// The cursor cell (col, row) while it's in view, shown or hidden:
+    /// where input-method composition goes.
+    pub caret: Option<(usize, usize)>,
     pub cursor_color: Rgb,
     pub background: Rgb,
     pub mode: TermMode,
@@ -198,6 +203,7 @@ impl Default for Frame {
             cells: Vec::new(),
             extra_text: Vec::new(),
             cursor: None,
+            caret: None,
             cursor_color: Rgb::default(),
             background: Rgb::default(),
             mode: TermMode::empty(),
