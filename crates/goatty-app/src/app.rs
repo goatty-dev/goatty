@@ -28,6 +28,7 @@ pub fn run(initial: Initial, open_settings: Option<String>) {
         cx.on_action(|_: &ReloadShells, cx| reload_shells(cx));
         command_palette::register_builtins(cx);
         crate::plugin_commands::init(cx);
+        crate::plugin_updates::init(cx);
         crate::snippets::init(cx);
         // `~/.ssh/config`'s hosts, ready for the palette.
         crate::hosts::refresh(cx);

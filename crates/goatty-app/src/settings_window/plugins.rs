@@ -13,15 +13,19 @@ use std::collections::HashMap;
 use goatty_config::{HostSettings, PluginConfig};
 use goatty_plugin::api::{self, Catalog, Installed, PackageState, Plan};
 use goatty_plugin::manifest::{Category, Setting, SettingKind};
-use goatty_plugin::{Permission, permissions, schema};
+use goatty_plugin::{Permission, fetch, permissions, schema};
 use gpui::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*, px,
 };
 use serde_json::Value;
 
 use super::kit::{self, card, opt, row, search_field, section};
-use super::{Outcome, Page, SettingsWindow};
-use crate::ui::controls::{ButtonKind, Tone, badge, banner, button, button_with, icon_button, segmented, stepper, toggle, tooltip};
+use super::{HostLink, Outcome, Page, SettingsWindow};
+use crate::settings::AppSettings;
+use crate::toast::{self, Toast};
+use crate::ui::controls::{
+    ButtonKind, Tone, badge, banner, button, button_with, icon_button, progress_bar, segmented, stepper, toggle, tooltip,
+};
 use crate::ui::focus::{self, Ring, Scroller};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
@@ -47,6 +51,11 @@ pub struct PluginsPage {
     pub tab: Tab,
     /// Plugin whose Uninstall was clicked once (the second click removes it).
     pub confirm_uninstall: Option<String>,
+    /// The install this window follows (#102): started here, or found
+    /// running on the host when the page loaded.
+    pub follow: Option<Follow>,
+    /// The loop asking the host for install progress runs.
+    polling: bool,
     /// Text fields for string/path/list settings: `"<plugin>.<setting>"`.
     inputs: HashMap<String, Entity<TextInput>>,
     filter: Option<Entity<TextInput>>,
@@ -104,6 +113,87 @@ impl PluginsPage {
         self.plan_return = None;
         self.plan_review = None;
         self.active_review = None;
+    }
+}
+
+/// An install the page shows progress for.
+#[derive(Debug, Clone)]
+pub struct Follow {
+    pub id: String,
+    /// "Installing" or "Updating".
+    pub verb: &'static str,
+    /// The host's latest report (`None` until the first one, or from a
+    /// goattyd that can't report progress).
+    pub progress: Option<api::InstallProgress>,
+    /// This window's `Install` request is still open: its reply reports
+    /// the outcome. Otherwise (the request was lost with the connection,
+    /// or another window started it) the progress reports carry it.
+    pub awaiting_reply: bool,
+    /// Where to go once it's done (the review's origin page).
+    pub return_id: Option<u64>,
+    /// When the host last answered a progress request.
+    last_heard: std::time::Instant,
+}
+
+impl Follow {
+    fn new(id: String, verb: &'static str, awaiting_reply: bool, return_id: Option<u64>) -> Follow {
+        Follow { id, verb, progress: None, awaiting_reply, return_id, last_heard: std::time::Instant::now() }
+    }
+
+    fn name(&self) -> String {
+        self.progress.as_ref().map_or_else(|| self.id.clone(), |p| format!("{} {}", p.name, p.version))
+    }
+
+    fn cancelling(&self) -> bool {
+        self.progress.as_ref().is_some_and(|p| p.cancelling)
+    }
+}
+
+/// How often the page asks for install progress.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(400);
+/// Give up following an install the host hasn't reported on for this long.
+const LOSE_TRACK_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The request failed because the connection did (it may come back), not
+/// because the host refused.
+fn connection_lost(link: &HostLink, e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    !link.is_connected() || m.contains("did not answer") || m.contains("not connected to goattyd")
+}
+
+/// What an install is doing, for the progress row.
+fn step_text(f: &Follow, connected: bool) -> String {
+    if !connected {
+        return "Connection lost: waiting for it to come back…".into();
+    }
+    if f.cancelling() {
+        return "Cancelling…".into();
+    }
+    match f.progress.as_ref().map(|p| &p.step) {
+        None => "Starting…".into(),
+        Some(api::Step::Waiting) => "Waiting for another plugin change on the host".into(),
+        Some(api::Step::Downloading { package, index, count, bytes, total }) => {
+            let of = if *count > 1 { format!(" ({index} of {count})") } else { String::new() };
+            let amount = if *total > 0 { format!("{} of {}", size(*bytes), size(*total)) } else { size(*bytes) };
+            format!("Downloading {package}{of} · {amount}")
+        }
+        Some(api::Step::Activating) => "Setting it up (can't be cancelled any more)".into(),
+        Some(api::Step::Done(_)) => "Done".into(),
+        Some(api::Step::Failed { .. }) => "Failed".into(),
+        Some(api::Step::Cancelled) => "Cancelled".into(),
+    }
+}
+
+/// How far along it is: the downloads' share, or `None` when unknown.
+fn step_fraction(f: &Follow) -> Option<f32> {
+    match f.progress.as_ref().map(|p| &p.step)? {
+        api::Step::Downloading { index, count, bytes, total, .. } if *total > 0 && *count > 0 => {
+            let done = (*index as f32 - 1.0 + (*bytes as f32 / *total as f32).min(1.0)) / *count as f32;
+            Some(done * 0.9)
+        }
+        api::Step::Activating => Some(0.95),
+        s if s.finished() => Some(1.0),
+        _ => None,
     }
 }
 
@@ -174,6 +264,137 @@ impl SettingsWindow {
             }),
             cx,
         );
+        self.find_running_install(cx);
+    }
+
+    /// Pick up an install running on the host that this window doesn't
+    /// follow yet (started before a reconnect, or from another window).
+    /// A goattyd from before #102 can't tell: nothing to show then.
+    fn find_running_install(&mut self, cx: &mut Context<'_, Self>) {
+        if self.plugins.follow.is_some() {
+            return;
+        }
+        let Some(link) = self.link.clone() else { return };
+        cx.spawn(async move |this, cx| {
+            let reply = cx.background_executor().spawn(async move { link.plugin(api::Request::Installs) }).await;
+            let Ok(api::Reply::Installs { installs: list }) = reply else { return };
+            let Some(running) = list.into_iter().find(|p| !p.step.finished()) else { return };
+            let _ = this.update(cx, |view, cx| {
+                if view.plugins.follow.is_none() {
+                    let mut f = Follow::new(running.id.clone(), "Installing", false, None);
+                    f.progress = Some(running);
+                    view.plugins.follow = Some(f);
+                    view.poll_installs(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ask the host for install progress until the followed install is
+    /// over. Survives a dropped connection: once it's back, the host's
+    /// report says how the install ended.
+    fn poll_installs(&mut self, cx: &mut Context<'_, Self>) {
+        if self.plugins.polling {
+            return;
+        }
+        self.plugins.polling = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL_EVERY).await;
+                let Ok(Some(link)) = this.update(cx, |v, _| v.link.clone().filter(|_| v.plugins.follow.is_some())) else { break };
+                let probe = link.clone();
+                let reply = cx.background_executor().spawn(async move { probe.plugin(api::Request::Installs) }).await;
+                let Ok(keep) = this.update(cx, |v, cx| v.on_installs(&link, reply, cx)) else { break };
+                if !keep {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |v, _| v.plugins.polling = false);
+        })
+        .detach();
+    }
+
+    /// A progress report arrived. Returns whether to keep asking.
+    fn on_installs(&mut self, link: &HostLink, reply: anyhow::Result<api::Reply>, cx: &mut Context<'_, Self>) -> bool {
+        let Some(f) = self.plugins.follow.as_mut() else { return false };
+        cx.notify();
+        let list = match reply {
+            Ok(api::Reply::Installs { installs: list }) => list,
+            Err(e) if connection_lost(link, &e) => {
+                if f.last_heard.elapsed() < LOSE_TRACK_AFTER {
+                    return true;
+                }
+                let name = f.name();
+                self.plugins.follow = None;
+                toast::show(cx, Toast::warning(format!("Lost track of {name}")).body("The host didn't come back; see the Plugins page."));
+                return false;
+            }
+            // A goattyd from before #102 can't report progress: only the
+            // install's reply will tell. Lost that too: show what's there now.
+            _ => {
+                if !f.awaiting_reply {
+                    self.plugins.follow = None;
+                    self.load_host(cx);
+                    self.load_plugins(false, cx);
+                }
+                return false;
+            }
+        };
+        f.last_heard = std::time::Instant::now();
+        let mine = list.into_iter().find(|p| p.id == f.id);
+        if f.awaiting_reply {
+            if mine.is_some() {
+                f.progress = mine;
+            }
+            return true;
+        }
+        // The reply was lost: the report carries the outcome.
+        let Some(p) = mine else {
+            // The host forgot it (goattyd restarted): show what's there now.
+            self.plugins.follow = None;
+            self.load_host(cx);
+            self.load_plugins(false, cx);
+            return false;
+        };
+        if !p.step.finished() {
+            f.progress = Some(p);
+            return true;
+        }
+        let f = self.plugins.follow.take().expect("followed");
+        let result = match p.step {
+            api::Step::Done(c) => Ok(c),
+            api::Step::Failed { error } => Err(anyhow::anyhow!(error)),
+            _ => Err(fetch::Cancelled.into()),
+        };
+        self.after_change(result, Some(f.id), true, f.return_id, cx);
+        false
+    }
+
+    /// Stop the followed install (refused by the host once it's activating).
+    pub fn cancel_install(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(id) = self.plugins.follow.as_ref().map(|f| f.id.clone()) else { return };
+        self.plugin_call(
+            api::Request::CancelInstall { id },
+            |r| match r {
+                api::Reply::Installs { installs } => Some(installs),
+                _ => None,
+            },
+            Box::new(|view, result: anyhow::Result<Vec<api::InstallProgress>>, cx| match result {
+                Ok(list) => {
+                    if let Some(f) = view.plugins.follow.as_mut()
+                        && let Some(p) = list.into_iter().find(|p| p.id == f.id)
+                    {
+                        f.progress = Some(p);
+                    }
+                }
+                Err(e) => {
+                    toast::show(cx, Toast::error("Couldn't cancel").body(format!("{e:#}")).key("plugins.cancel"));
+                }
+            }),
+            cx,
+        );
     }
 
     /// Open the install review for `id` and return to `from` once closed.
@@ -217,12 +438,57 @@ impl SettingsWindow {
     }
 
     /// Install the reviewed plan (the host refuses if it changed since).
+    /// Its progress shows on the page, with a Cancel button until it's
+    /// activated.
     pub fn install_reviewed(&mut self, cx: &mut Context<'_, Self>) {
+        if self.plugins.follow.is_some() {
+            toast::show(cx, Toast::info("Another plugin is being installed").body("Wait for it to finish first.").key("plugins.busy"));
+            return;
+        }
         let Some(plan) = self.plugins.plan.take() else { return };
         let return_id = self.plugins.plan_review.take();
         let id = plan.id.clone();
+        let verb = if plan.replaces.is_some() { "Updating" } else { "Installing" };
+        let mut follow = Follow::new(id.clone(), verb, true, return_id);
+        follow.progress = Some(api::InstallProgress {
+            id: id.clone(),
+            name: plan.name.clone(),
+            version: plan.version.clone(),
+            step: api::Step::Waiting,
+            cancelling: false,
+        });
+        self.plugins.follow = Some(follow);
+        let link = self.link.clone();
         let req = api::Request::Install { id: plan.id.clone(), version: Some(plan.version.clone()), approved: plan.digest.clone() };
-        self.plugin_call(req, changed, Box::new(move |view, result, cx| view.after_change(result, Some(id), true, return_id, cx)), cx);
+        self.plugin_call(
+            req,
+            changed,
+            Box::new(move |view, result, cx| {
+                let Some(f) = view.plugins.follow.as_mut().filter(|f| f.id == id) else {
+                    // Not followed any more (another host): just report it.
+                    view.after_change(result, Some(id), true, return_id, cx);
+                    return;
+                };
+                if let (Err(e), Some(link)) = (&result, &link)
+                    && connection_lost(link, e)
+                {
+                    // The install goes on on the host: its progress reports
+                    // will say how it ended, once the connection is back.
+                    f.awaiting_reply = false;
+                    view.poll_installs(cx);
+                    return;
+                }
+                let cancelled = f.cancelling();
+                view.plugins.follow = None;
+                let result = match result {
+                    Err(_) if cancelled => Err(fetch::Cancelled.into()),
+                    r => r,
+                };
+                view.after_change(result, Some(id), true, return_id, cx);
+            }),
+            cx,
+        );
+        self.poll_installs(cx);
     }
 
     pub fn uninstall_plugin(&mut self, id: String, cx: &mut Context<'_, Self>) {
@@ -257,6 +523,10 @@ impl SettingsWindow {
                     }
                 }
                 self.outcome = Some(Outcome { ok: true, lines: c.lines, diff: Vec::new(), reload: c.reload });
+            }
+            Err(e) if fetch::Cancelled::is(&e) => {
+                let what = id.as_deref().unwrap_or("the plugin");
+                toast::show(cx, Toast::info(format!("Cancelled installing {what}")).body("Nothing on the host changed."));
             }
             Err(e) => self.outcome = Some(Outcome { ok: false, lines: vec![format!("{e:#}")], diff: Vec::new(), reload: false }),
         }
@@ -361,6 +631,9 @@ impl SettingsWindow {
         if let Some(e) = &self.plugins.error {
             page = page.child(banner(ui, Tone::Danger, "Couldn't talk to the host", vec![e.clone()]));
         }
+        if let Some(f) = &self.plugins.follow {
+            page = page.child(self.install_progress(ui, f, cx));
+        }
         let Some(cat) = &self.plugins.catalog else {
             return page
                 .child(card(ui).child(kit::empty(
@@ -458,6 +731,18 @@ impl SettingsWindow {
                             .children(builtin.into_iter().map(|i| self.plugin_row(ui, i, cx))),
                     );
                 }
+                if query.is_empty() {
+                    let on = cx.global::<AppSettings>().file.value.plugins.notify_updates;
+                    page = page.child(
+                        section(ui, "Updates").child(
+                            row(ui, "Tell me about plugin updates")
+                                .desc("Checks the active tab's host every few hours; you still review each update")
+                                .control(toggle("plugins-notify-updates", on, ui, |_, cx| {
+                                    AppSettings::update(cx, |s| s.plugins.notify_updates = !s.plugins.notify_updates);
+                                })),
+                        ),
+                    );
+                }
             }
             Tab::Browse => {
                 let list: Vec<&&api::Available> = available.iter().filter(|a| matches(&a.id, &a.name, &a.summary, &a.keywords)).collect();
@@ -486,6 +771,20 @@ impl SettingsWindow {
             .collect();
         page.child(kit::hint(ui, format!("Registries: {}. Add one with goattyd plugin registry add.", regs.join(", "))).px(px(4.)))
             .into_any_element()
+    }
+
+    /// The followed install: what it's doing, how far, and Cancel.
+    fn install_progress(&self, ui: Ui, f: &Follow, cx: &Context<'_, Self>) -> AnyElement {
+        let connected = self.link.as_ref().is_some_and(HostLink::is_connected);
+        let cancellable = f.progress.as_ref().is_none_or(|p| p.step.cancellable()) && !f.cancelling();
+        let title = format!("{} {}", f.verb, f.name());
+        let cancel = button("plugin-install-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.cancel_install(cx)));
+        let r = row(ui, title.clone())
+            .icon(Icon::Download)
+            .desc(step_text(f, connected))
+            .below(progress_bar("plugin-install-progress", step_fraction(f), title, ui).mt(px(4.)));
+        let r = if cancellable && connected { r.control(cancel) } else { r };
+        kit::group(ui).child(r).into_any_element()
     }
 
     /// The round icon standing for a plugin.
@@ -1116,7 +1415,7 @@ impl SettingsWindow {
                 .items_center()
                 .justify_end()
                 .gap(px(8.))
-                .when(self.plugins.is_loading(), |d| d.child(kit::hint(ui, "Installing…")))
+                .when(self.plugins.follow.is_some(), |d| d.child(kit::hint(ui, "Another plugin is being installed")))
                 .child(button("plan-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.back(cx))))
                 .child(button_with(
                     "plan-install",

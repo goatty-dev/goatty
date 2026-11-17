@@ -53,6 +53,14 @@ impl HostLink {
         }
     }
 
+    /// The link is up (`--local` always is).
+    pub fn is_connected(&self) -> bool {
+        match self {
+            HostLink::Daemon(c) => c.is_connected(),
+            HostLink::Local(_) => true,
+        }
+    }
+
     /// The host is this computer (its files are ours to show).
     pub fn is_local(&self) -> bool {
         match self {

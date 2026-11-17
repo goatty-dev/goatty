@@ -121,6 +121,21 @@ pub fn open_issue(cx: &mut App, is_host: bool, path: &str) {
     }
 }
 
+/// Open the Plugins page's list of installed plugins, fresh from the host
+/// (the "Review" on a plugin update toast).
+pub fn open_plugin_updates(cx: &mut App) {
+    open_at(cx, Some(Page::Plugins));
+    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        let _ = handle.update(cx, |view, _, cx| {
+            if view.plugins.plan.is_none() {
+                view.plugins.detail = None;
+                view.plugins.tab = plugins::Tab::Installed;
+            }
+            view.load_plugins(false, cx);
+        });
+    }
+}
+
 /// Open the settings window at `page` (or where it was).
 pub fn open_at(cx: &mut App, page: Option<Page>) {
     if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
@@ -618,7 +633,8 @@ impl SettingsWindow {
             (Some(a), Some(b)) => a.same(b),
             (a, b) => a.is_none() && b.is_none(),
         };
-        if same || self.draft.is_some() || self.busy {
+        // An install in progress keeps its host until it's over.
+        if same || self.draft.is_some() || self.busy || self.plugins.follow.is_some() {
             return;
         }
         self.link = link;

@@ -192,6 +192,30 @@ fn local_plugins_are_flagged_and_conflicts_refused() {
     assert!(p.plan(&demo, &settings).unwrap_err().to_string().contains("already provided by the mine plugin"));
 }
 
+/// Downloads that cancel their install once they started.
+#[derive(Debug)]
+struct CancelOnFetch {
+    inner: Fixed,
+    jobs: jobs::Jobs,
+}
+
+impl goatty_plugin::fetch::Fetch for CancelOnFetch {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+        self.inner.fetch(url)
+    }
+
+    fn fetch_progress(&self, url: &str, progress: &mut dyn FnMut(u64) -> bool) -> Result<Vec<u8>> {
+        assert!(progress(0), "not cancelled yet");
+        let running = self.jobs.list();
+        assert!(matches!(running[0].step, goatty_plugin::api::Step::Downloading { index: 1, count: 1, .. }), "{running:?}");
+        self.jobs.cancel("demo").unwrap();
+        if !progress(1) {
+            return Err(goatty_plugin::fetch::Cancelled.into());
+        }
+        self.inner.fetch(url)
+    }
+}
+
 #[test]
 fn update_replaces_version_and_packages() {
     let w = world();
@@ -221,9 +245,31 @@ fn update_replaces_version_and_packages() {
 
     let cat = p.catalog(true, &settings);
     assert_eq!(installed(&cat)[0].update.as_deref(), Some("1.1.0"));
+    let updates = p.updates(false);
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!((updates[0].installed.as_str(), updates[0].version.as_str()), ("1.0.0", "1.1.0"));
+    assert!(updates[0].new_permissions.is_empty(), "same permissions: {updates:?}");
     let c2 = p.find("demo", None).unwrap();
     let plan2 = p.plan(&c2, &settings).unwrap();
     assert_eq!(plan2.replaces.as_deref(), Some("1.0.0"));
+
+    // Cancelled while downloading: the host stays at 1.0.0.
+    let jobs = jobs::Jobs::default();
+    let cancelling = CancelOnFetch { inner: fetch.clone(), jobs: jobs.clone() };
+    let pc = Plugins { dirs: &w.dirs, fetch: &cancelling, builtin: &w.sources };
+    let r = jobs.run("demo", "Demo", "1.1.0", |job| pc.install_with(&c2, &plan2.digest, &settings, job).map(|_| Default::default()));
+    assert!(goatty_plugin::fetch::Cancelled::is(&r.unwrap_err()));
+    assert_eq!(jobs.list()[0].step, goatty_plugin::api::Step::Cancelled);
+    assert!(w.dirs.tools_dir().join("demo/2.0").is_dir());
+    assert!(!w.dirs.tools_dir().join("demo/2.1").exists());
+    assert_eq!(Lock::load(&w.dirs).unwrap().plugins["demo"].version, "1.0.0");
+    let leftovers: Vec<_> = std::fs::read_dir(w.dirs.installed_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("partial"))
+        .collect();
+    assert!(leftovers.is_empty(), "no staging left behind: {leftovers:?}");
+
     p.install(&c2, &plan2.digest, &settings).unwrap();
     assert!(w.dirs.tools_dir().join("demo/2.1").is_dir());
     assert!(!w.dirs.tools_dir().join("demo/2.0").exists());
