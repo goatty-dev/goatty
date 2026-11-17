@@ -1,9 +1,9 @@
 //! The Terminal page (links, selection, mouse, pasting) and the Workspace page
-//! (startup, tabs, panes).
+//! (startup, tabs, panes, notifications).
 
 use goatty_config::{
-    CopyOnSelect, LinkClick, LinkSettings, MiddleClick, OnLaunch, PaneSettings, PasteConfirm, RemoteFileOpen, RightClick, TabActivity,
-    TabBarShow, TabSettings, TabStyle,
+    CopyOnSelect, LinkClick, LinkSettings, MiddleClick, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm, RemoteFileOpen, RightClick,
+    TabActivity, TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -325,7 +325,7 @@ impl SettingsWindow {
                     client(|s| s.tabs.scroll_to_switch = !s.tabs.scroll_to_switch),
                 ),
             ))
-            .child(row(ui, "Program icons").desc("nvim, git, docker, python… in each tab").control(toggle(
+            .child(row(ui, "Program icons").desc("nvim, git, docker… and coding agents' logos in each tab").control(toggle(
                 "tabs-icons",
                 s.tabs.icons,
                 ui,
@@ -391,6 +391,70 @@ impl SettingsWindow {
                     .icon(Icon::Keyboard)
                     .on_click("panes-shortcuts", self.listener_go(cx, Page::Shortcuts)),
             );
-        div().flex().flex_col().gap(px(28.)).child(startup).child(tabs).child(panes).into_any_element()
+        let notifications = self.notifications_section(ui, cx);
+        div().flex().flex_col().gap(px(28.)).child(startup).child(tabs).child(panes).child(notifications).into_any_element()
+    }
+
+    /// When goatty tells about what happens in panes (#205): coding agents
+    /// waiting or done, programs' own notifications; in the window and on
+    /// the desktop, set apart.
+    fn notifications_section(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {
+        let n = &cx.global::<AppSettings>().file.value.notifications;
+        let when = || {
+            opts(&[
+                (NotifyWhen::Background, "When you're not looking", "The pane is in another tab, or goatty isn't focused"),
+                (NotifyWhen::Unfocused, "When goatty isn't focused", "Only while you're in another app"),
+                (NotifyWhen::Always, "Always", "Also for the pane you're looking at"),
+                (NotifyWhen::Never, "Never", "Tabs still show it"),
+            ])
+        };
+        let off = n.in_app == NotifyWhen::Never && n.system == NotifyWhen::Never;
+        section(ui, "Notifications")
+            .desc("When a coding agent needs you or finishes, or a program asks to notify you")
+            .child(row(ui, "Notifications in goatty").desc("A message in the window's corner, with a button to go there").control(
+                self.select("notify-in-app", "Notifications in goatty", when(), &n.in_app, cx, |v, _, cx| {
+                    AppSettings::update(cx, |s| s.notifications.in_app = v)
+                }),
+            ))
+            .child(row(ui, "Desktop notifications").desc("Your system's notifications; clicking one shows the pane").control(self.select(
+                "notify-system",
+                "Desktop notifications",
+                when(),
+                &n.system,
+                cx,
+                |v, _, cx| AppSettings::update(cx, |s| s.notifications.system = v),
+            )))
+            .child(
+                row(ui, "A coding agent waits for you")
+                    .desc(if off { "Notifications are off" } else { "It asks for permission, an answer or a sign-in" })
+                    .disabled(off)
+                    .control(toggle(
+                        "notify-agent-waiting",
+                        n.agent_waiting,
+                        ui,
+                        client(|s| s.notifications.agent_waiting = !s.notifications.agent_waiting),
+                    )),
+            )
+            .child(
+                row(ui, "A coding agent finishes")
+                    .desc(if off { "Notifications are off" } else { "Its task is done, or it failed" })
+                    .disabled(off)
+                    .control(toggle(
+                        "notify-agent-done",
+                        n.agent_done,
+                        ui,
+                        client(|s| s.notifications.agent_done = !s.notifications.agent_done),
+                    )),
+            )
+            .child(
+                row(ui, "A program asks to notify you")
+                    .desc(if off { "Notifications are off" } else { "Programs that send notifications (OSC 9, OSC 777)" })
+                    .disabled(off)
+                    .control(toggle("notify-programs", n.programs, ui, client(|s| s.notifications.programs = !s.notifications.programs))),
+            )
+            .footer(
+                "Agents that report their state show it on their tab: a spinner while they work, a badge while they wait for you. \
+                 Claude Code, Codex, OpenCode and Antigravity do it on their own.",
+            )
     }
 }

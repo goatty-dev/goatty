@@ -23,6 +23,7 @@ pub mod predict;
 pub mod process;
 pub mod pty;
 pub mod snapshot;
+pub mod status;
 mod terminal;
 pub mod transcript;
 
@@ -32,5 +33,6 @@ pub use history::{HistoryRows, HistoryWanted, TopLineCause};
 pub use links::{Found, Link, LinkKind, LinkSpan, find_links};
 pub use listener::UiEvent;
 pub use mode::TermMode;
+pub use status::{BlockedKind, ProgramStatus, Progress, ProgressState, Record as StatusRecord, State as StatusState};
 pub use terminal::{DEFAULT_SCROLLBACK, SelectKind, TermSize, Terminal, TerminalChannels};
 pub use transcript::{CommandBlock, PromptJump, PromptJumped, Span, Transcript, TranscriptLine};

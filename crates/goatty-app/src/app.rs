@@ -24,6 +24,7 @@ pub enum Initial {
 pub fn run(initial: Initial, open_settings: Option<String>) {
     gpui_platform::application().with_assets(crate::ui::icons::Assets).run(move |cx: &mut App| {
         AppSettings::init(cx);
+        crate::agent::notify::init(cx);
         cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
         cx.on_action(|_: &ReloadShells, cx| reload_shells(cx));
         command_palette::register_builtins(cx);

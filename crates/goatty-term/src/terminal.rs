@@ -16,6 +16,7 @@ use rio_vt::selection::{Selection, SelectionType};
 
 use crate::listener::Listener;
 use crate::marks::{Mark, MarkScanner, ShellState};
+use crate::status::{self, ProgramStatus, Report};
 use crate::{Palette, TermMode, UiEvent};
 
 /// Grid size in cells plus the pixel size (for TIOCSWINSZ / XTWINOPS).
@@ -50,6 +51,14 @@ pub(crate) struct Inner {
     size: Arc<AtomicU32>,
     /// For the marks rio-vt doesn't report (see `marks`).
     ui: flume::Sender<UiEvent>,
+    /// The answer to the OSC 7501 probe goes here, in stream order with
+    /// rio-vt's replies (only when this terminal answers queries).
+    replies: flume::Sender<Vec<u8>>,
+    answer_queries: bool,
+    /// What programs said about themselves (OSC 7501, OSC 9;4); shared
+    /// with the listener, which gets the progress reports. Lock order:
+    /// after `term`.
+    pub(crate) status: Arc<Mutex<status::Store>>,
     /// What the shell last said ([`ShellState`] as a byte). Changed with
     /// the terminal locked (in `feed`), so it matches the grid under the lock.
     pub(crate) shell: AtomicU8,
@@ -109,13 +118,24 @@ impl Terminal {
         let (utx, urx) = flume::unbounded();
         let packed = Arc::new(AtomicU32::new(pack(size)));
         let palette: SharedPalette = Arc::new(parking_lot::RwLock::new(palette));
-        let listener = Listener { replies: rtx, ui: utx.clone(), answer_queries, palette: palette.clone(), size: packed.clone() };
+        let status = Arc::new(Mutex::new(status::Store::default()));
+        let listener = Listener {
+            replies: rtx.clone(),
+            ui: utx.clone(),
+            answer_queries,
+            palette: palette.clone(),
+            size: packed.clone(),
+            status: status.clone(),
+        };
         let term = Crosswords::new(size.to_crosswords(), CursorShape::Block, listener, WindowId::from(0), 0, DEFAULT_SCROLLBACK);
         let inner = Inner {
             term: Mutex::new(term),
             parser: Mutex::new(Parser::default()),
             size: packed,
             ui: utx,
+            replies: rtx,
+            answer_queries,
+            status,
             shell: AtomicU8::new(0),
             started: AtomicU64::new(0),
             zle: AtomicBool::new(false),
@@ -186,6 +206,10 @@ impl Terminal {
             Mark::PromptStart => {
                 t.grid[row].semantic_prompt = SemanticPrompt::Prompt;
                 self.set_shell(ShellState::Prompt);
+                // The program that reported is gone.
+                if self.inner.status.lock().prompt() {
+                    let _ = self.inner.ui.send(UiEvent::Status { notify: false });
+                }
             }
             Mark::PromptContinuation => {
                 if t.grid[row].semantic_prompt == SemanticPrompt::None {
@@ -239,7 +263,30 @@ impl Terminal {
                     self.inner.primary_kitty.store(mode.kitty_flags(), Ordering::Relaxed);
                 }
             }
+            Mark::Status(Report::Probe) => {
+                if self.inner.answer_queries {
+                    let _ = self.inner.replies.send(status::PROBE_REPLY.to_vec());
+                }
+            }
+            Mark::Status(report) => {
+                let notify = !matches!(report, Report::Set { restore: true, .. } | Report::Clear { .. });
+                if self.inner.status.lock().apply(report) {
+                    let _ = self.inner.ui.send(UiEvent::Status { notify });
+                }
+            }
+            Mark::Reset => {
+                if self.inner.status.lock().reset() {
+                    let _ = self.inner.ui.send(UiEvent::Status { notify: false });
+                }
+            }
         }
+    }
+
+    /// What the programs running here said about themselves: OSC 7501
+    /// records (coding agents working, waiting for the user, done) and the
+    /// last OSC 9;4 progress report. [`UiEvent::Status`] says when it changed.
+    pub fn program_status(&self) -> ProgramStatus {
+        self.inner.status.lock().status()
     }
 
     /// Whether the shell waits at a prompt with goatty's command-line

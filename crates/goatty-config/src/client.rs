@@ -28,7 +28,45 @@ pub struct ClientSettings {
     pub ssh: SshSettings,
     pub tailnet: TailnetSettings,
     pub plugins: PluginNotifySettings,
+    pub notifications: NotificationSettings,
     pub debug: DebugSettings,
+}
+
+/// When goatty tells about something that happened in a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyWhen {
+    Never,
+    /// Only while goatty's window isn't the focused one.
+    Unfocused,
+    /// While the pane isn't on screen: its tab is in the background, or the
+    /// window isn't focused.
+    Background,
+    Always,
+}
+
+/// Notifications about panes (#205): coding agents that wait for the user
+/// or finished (OSC 7501), and programs asking for one (OSC 9, OSC 777).
+/// In-app notifications and the desktop's are set separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationSettings {
+    /// goatty's own notifications, in the window.
+    pub in_app: NotifyWhen,
+    /// The desktop's notifications (the system's notification center).
+    pub system: NotifyWhen,
+    /// When a coding agent waits for you: a permission, an answer, a login.
+    pub agent_waiting: bool,
+    /// When a coding agent finishes its task or fails.
+    pub agent_done: bool,
+    /// When a program asks for a notification (OSC 9 / OSC 777).
+    pub programs: bool,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self { in_app: NotifyWhen::Background, system: NotifyWhen::Unfocused, agent_waiting: true, agent_done: true, programs: true }
+    }
 }
 
 /// What the app tells about plugins (#95).

@@ -17,6 +17,9 @@
 //!     final byte: the primary screen's kitty keyboard flags are noted there,
 //!     since rio-vt keeps the inactive screen's flags private and snapshots
 //!     need them.
+//!   * OSC 7501 program status reports (see [`crate::status`]), kept whole
+//!     up to the protocol's limit, and full resets (`ESC c`), which drop
+//!     them.
 //!
 //! The scanner keeps its state between chunks, so a mark split across two
 //! reads is still found. Outside escape sequences it only runs `memchr` for
@@ -25,6 +28,8 @@
 //! about as much as plain text.
 
 use memchr::{memchr, memchr2};
+
+use crate::status::{self, Report};
 
 /// A shell-integration mark found in the output.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +57,10 @@ pub(crate) enum Mark {
     /// `CSI ? 1049` (or `1047`, `47`) before its `h` or `l`: the screen is
     /// about to switch (or stay).
     ScreenSwitch,
+    /// `OSC 7501 ; …`: a program's status report, or the probe.
+    Status(Report),
+    /// `ESC c` (RIS): a full reset.
+    Reset,
 }
 
 /// What the shell last said about its command.
@@ -84,11 +93,36 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 /// The longest OSC prefix we look at: `133;C;goatty=prompt;n=<u64::MAX>`.
 const KEEP: usize = 48;
-/// goatty's command-line report; the only OSC kept whole.
+/// goatty's command-line report, kept whole.
 const LINE: &[u8] = b"7337;line=";
 /// The longest command line report kept (percent-encoded); a longer one
 /// is dropped.
 pub(crate) const MAX_LINE: usize = 256 * 1024;
+/// Program status reports, kept whole up to [`status::MAX_PAYLOAD`].
+const STATUS: &[u8] = b"7501;";
+
+/// The OSCs kept past [`KEEP`] bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Long {
+    Line,
+    Status,
+}
+
+impl Long {
+    fn prefix(self) -> &'static [u8] {
+        match self {
+            Long::Line => LINE,
+            Long::Status => STATUS,
+        }
+    }
+
+    fn max(self) -> usize {
+        match self {
+            Long::Line => MAX_LINE,
+            Long::Status => status::MAX_PAYLOAD,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -111,15 +145,15 @@ pub(crate) struct MarkScanner {
     /// The OSC payload's first [`KEEP`] bytes.
     buf: [u8; KEEP],
     len: usize,
-    /// A [`LINE`] report's payload after the prefix, while one is read
-    /// (`None` for every other OSC); `overflow` once it passed [`MAX_LINE`].
-    line: Option<Vec<u8>>,
+    /// A [`Long`] OSC's payload after its prefix, while one is read
+    /// (`None` for every other OSC); `overflow` once it passed its limit.
+    long: Option<(Long, Vec<u8>)>,
     overflow: bool,
 }
 
 impl Default for MarkScanner {
     fn default() -> Self {
-        Self { state: State::Ground, buf: [0; KEEP], len: 0, line: None, overflow: false }
+        Self { state: State::Ground, buf: [0; KEEP], len: 0, long: None, overflow: false }
     }
 }
 
@@ -141,11 +175,15 @@ impl MarkScanner {
                     self.state = match bytes[i] {
                         b']' => {
                             self.len = 0;
-                            self.line = None;
+                            self.long = None;
                             self.overflow = false;
                             State::Osc
                         }
                         b'[' => State::Csi,
+                        b'c' => {
+                            on(i + 1, Mark::Reset);
+                            State::Ground
+                        }
                         ESC => State::Esc,
                         _ => State::Ground,
                     };
@@ -180,7 +218,7 @@ impl MarkScanner {
                     let take = end.min(KEEP - self.len);
                     self.buf[self.len..self.len + take].copy_from_slice(&rest[..take]);
                     self.len += take;
-                    self.collect_line(&rest[..end], take);
+                    self.collect_long(&rest[..end], take);
                     i += end;
                     if let Some(&b) = bytes.get(i) {
                         i += 1;
@@ -204,32 +242,47 @@ impl MarkScanner {
         }
     }
 
-    /// Keep a [`LINE`] report's payload past [`KEEP`]: `seg` is this
-    /// chunk's part of the OSC, of which the first `took` bytes also went
-    /// into `buf`.
-    fn collect_line(&mut self, seg: &[u8], took: usize) {
-        if self.line.is_none() {
-            if self.len < LINE.len() || !self.buf.starts_with(LINE) {
-                return;
-            }
-            // Everything so far: `buf` after the prefix, then what didn't fit.
-            let mut v = self.buf[LINE.len()..self.len].to_vec();
-            v.extend_from_slice(&seg[took..]);
-            self.line = Some(v);
-        } else if let Some(v) = self.line.as_mut() {
-            v.extend_from_slice(seg);
+    /// Keep a [`Long`] OSC's payload past [`KEEP`]: `seg` is this chunk's
+    /// part of the OSC, of which the first `took` bytes also went into
+    /// `buf`.
+    fn collect_long(&mut self, seg: &[u8], took: usize) {
+        if self.overflow {
+            return;
         }
-        if self.line.as_ref().is_some_and(|v| v.len() > MAX_LINE) {
-            self.line = Some(Vec::new());
+        if let Some((_, v)) = self.long.as_mut() {
+            v.extend_from_slice(seg);
+        } else {
+            let Some(kind) =
+                [Long::Line, Long::Status].into_iter().find(|k| self.len >= k.prefix().len() && self.buf.starts_with(k.prefix()))
+            else {
+                return;
+            };
+            // Everything so far: `buf` after the prefix, then what didn't fit.
+            let mut v = self.buf[kind.prefix().len()..self.len].to_vec();
+            v.extend_from_slice(&seg[took..]);
+            self.long = Some((kind, v));
+        }
+        if let Some((kind, v)) = self.long.as_mut()
+            && v.len() > kind.max()
+        {
+            *v = Vec::new();
             self.overflow = true;
         }
     }
 
     fn finish(&mut self, end: usize, on: &mut impl FnMut(usize, Mark)) {
         self.state = State::Ground;
-        if let Some(line) = self.line.take() {
-            if !self.overflow {
-                on(end, Mark::Line(percent_decode(&line)));
+        if let Some((kind, payload)) = self.long.take() {
+            if self.overflow {
+                return;
+            }
+            match kind {
+                Long::Line => on(end, Mark::Line(percent_decode(&payload))),
+                Long::Status => {
+                    if let Some(report) = status::parse(&payload) {
+                        on(end, Mark::Status(report));
+                    }
+                }
             }
             return;
         }

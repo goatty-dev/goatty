@@ -37,7 +37,7 @@ use goatty_term::input::{
     Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
 };
 use goatty_term::paste::{self, PasteRisk};
-use goatty_term::{CursorKind, Frame, Link, LinkKind, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
+use goatty_term::{CursorKind, Frame, Link, LinkKind, ProgramStatus, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, Global, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
@@ -56,6 +56,8 @@ use crate::actions::{
     OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo,
     ViewLastOutput,
 };
+use crate::agent::notify::Notice;
+use crate::agent::{self, AgentStatus, Identity, StatusKey};
 use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::{LinkStatus, Session};
 use crate::settings::{AppSettings, palette};
@@ -97,6 +99,13 @@ pub enum TerminalEvent {
     /// [`TerminalView::menu_entries`] plus the workspace's own. `keyboard`:
     /// opened with a key (the first item starts out picked).
     ContextMenu { at: Point<Pixels>, keyboard: bool },
+    /// What the pane's programs say about themselves changed (a coding
+    /// agent working, waiting, done; a progress bar): tabs redraw.
+    StatusChanged,
+    /// Something to tell the user about (#205): the agent waits for them,
+    /// finished or failed, or the program asked for a notification. The
+    /// workspace decides whether and how (`notifications.*`).
+    Notice(Notice),
 }
 
 /// What the command line the shell reports is for.
@@ -298,6 +307,10 @@ pub struct TerminalView {
     title: String,
     /// Last foreground program reported the same way.
     process: Option<String>,
+    /// What the pane's programs said about themselves (OSC 7501, 9;4).
+    status: ProgramStatus,
+    /// The agent status last judged for notifications (`agent::is_news`).
+    told: Option<StatusKey>,
     exited: bool,
     // Links.
     link_click: LinkClick,
@@ -348,6 +361,7 @@ impl TerminalView {
     pub fn new(session: Arc<Session>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let app = cx.global::<AppSettings>().clone();
         let settings = app.client.clone();
+        let initial_status = session.terminal.program_status();
         let focus = cx.focus_handle();
         cx.observe_global::<AppSettings>(|view, cx| {
             let app = cx.global::<AppSettings>().clone();
@@ -436,6 +450,9 @@ impl TerminalView {
             app_title: DEFAULT_TITLE.into(),
             title: String::new(),
             process: None,
+            // What's there before the pane is (a reattach) isn't news.
+            told: agent::notable(&initial_status, None).map(|s| s.key()),
+            status: initial_status,
             exited: false,
             link_click: settings.links.open_on,
             mouse_cell: None,
@@ -514,6 +531,22 @@ impl TerminalView {
         self.process.as_deref()
     }
 
+    /// What the pane's programs said about themselves.
+    pub fn program_status(&self) -> &ProgramStatus {
+        &self.status
+    }
+
+    /// The coding agent (or other program reporting its status) running here.
+    pub fn agent(&self) -> Option<Identity> {
+        Identity::of(&self.status, self.process())
+    }
+
+    /// What the pane's agent is doing; `done` and `error` reported at or
+    /// before `seen` are hidden (the user saw them).
+    pub fn agent_status(&self, seen: u64) -> Option<AgentStatus> {
+        AgentStatus::of(&self.status, self.process(), seen)
+    }
+
     /// The shell's directory on the session's host (OSC 7 or daemon `/proc` fallback).
     pub fn cwd(&self) -> Option<PathBuf> {
         self.session.cwd()
@@ -540,6 +573,7 @@ impl TerminalView {
         // Tabs fall back to the directory when there's no title.
         let mut cwd_changed = self.session.take_cwd_dirty();
         let mut clear_stats = false;
+        let (mut status_changed, mut news) = (false, false);
         while let Ok(ev) = self.session.ui_events.try_recv() {
             match ev {
                 UiEvent::Title(t) => self.app_title = t,
@@ -553,8 +587,20 @@ impl TerminalView {
                     cx.emit(TerminalEvent::Activity(if failed { Activity::Failed } else { Activity::Finished }));
                 }
                 UiEvent::CommandLine(line) => self.command_line_arrived(line, cx),
+                UiEvent::Status { notify } => {
+                    status_changed = true;
+                    news |= notify;
+                }
+                UiEvent::Notification { title, body } => {
+                    if let Some(notice) = Notice::program(&title, &body) {
+                        cx.emit(TerminalEvent::Notice(notice));
+                    }
+                }
                 UiEvent::Exit => {}
             }
+        }
+        if status_changed {
+            self.status_changed(news, cx);
         }
         let bytes = self.session.bytes_in.load(Ordering::Relaxed);
         if bytes != self.seen_bytes {
@@ -601,6 +647,21 @@ impl TerminalView {
             self.jump_to_prompt(PromptJump::Previous, None, cx);
         }
         cx.notify();
+    }
+
+    /// Read the program status again; tell the workspace, and whether
+    /// there's news (`news`: a program reported, not a cleanup or replay).
+    fn status_changed(&mut self, news: bool, cx: &mut Context<'_, Self>) {
+        self.status = self.session.terminal.program_status();
+        let now = agent::notable(&self.status, self.process());
+        if news
+            && let Some(now) = &now
+            && agent::is_news(self.told.as_ref(), now)
+        {
+            cx.emit(TerminalEvent::Notice(Notice::Agent(now.clone())));
+        }
+        self.told = now.map(|s| s.key());
+        cx.emit(TerminalEvent::StatusChanged);
     }
 
     fn send(&mut self, bytes: &[u8], cx: &mut Context<'_, Self>) {

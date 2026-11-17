@@ -18,6 +18,14 @@
 //! was last shown (#122, `tabs.mark_bell` / `tabs.mark_activity`): a bell,
 //! or a dot for a finished command (red when it failed) or for new output.
 //!
+//! Coding agents (#205, `crate::agent`) show their logo as the tab's icon
+//! and their state in place of the activity mark: a spinner while working
+//! (and a progress line along the tab's bottom when they say how far
+//! along; OSC 9;4 progress bars show there too), a pulsing badge in the
+//! warning color while they wait for the user (the tab is tinted too, when
+//! in the background), a check or a cross when done or failed, until the
+//! tab is looked at. Hovering the mark tells what the agent said.
+//!
 //! With tabs on several hosts (`groups`), each host's tabs follow a label
 //! in the host's color (click: fold, right-click: the host's menu), and
 //! each tab carries a line in that color.
@@ -31,11 +39,14 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
+use goatty_term::{ProgressState, StatusState};
+
 use super::gestures::{Wheel, reorder_target};
 use super::groups::{Group, StripItem};
 use super::icons::{IconColor, icon_for};
 use super::{DraggedTab, Tab, Workspace, marks};
 use crate::actions::NewTab;
+use crate::agent::{self, AgentStatus, Identity};
 use crate::settings::AppSettings;
 use crate::terminal::Activity;
 use crate::ui::controls::tooltip;
@@ -93,14 +104,15 @@ impl Colors {
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let c = Colors::get(cx);
-        let icon = match self.icon {
-            Some((glyph, color)) => div()
+        let icon = match (&self.agent, self.icon) {
+            (Some(agent), _) => agent.logo().element(14., c.ui.text),
+            (None, Some((glyph, color))) => div()
                 .font(crate::fonts::icons())
                 .text_size(px(14.))
                 .text_color(color)
                 .child(SharedString::from(glyph.to_string()))
                 .into_any_element(),
-            None => Icon::Terminal.svg().size(px(14.)).text_color(c.ui.muted).into_any_element(),
+            (None, None) => Icon::Terminal.svg().size(px(14.)).text_color(c.ui.muted).into_any_element(),
         };
         div()
             .flex()
@@ -132,6 +144,13 @@ pub(super) struct TabView {
     pub panes: usize,
     /// What happened in it while in the background.
     pub activity: Option<Activity>,
+    /// The coding agent in its focused pane (its logo is the tab's icon).
+    pub agent: Option<Identity>,
+    /// The most important agent status among its panes (not idle).
+    pub status: Option<AgentStatus>,
+    /// How far along the focused pane's work is (an agent's progress, else
+    /// an OSC 9;4 progress bar).
+    pub progress: Option<Bar>,
     /// The sidebar's second line: the directory, and the host when remote.
     pub detail: Option<SharedString>,
     /// Still connecting (no session yet).
@@ -140,6 +159,21 @@ pub(super) struct TabView {
     pub dragged: bool,
     /// Its host group's color, when tabs are grouped by host.
     pub group: Option<Hsla>,
+}
+
+/// A progress line: how full, or moving when it can't tell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Bar {
+    /// `0.0..=1.0`, `None` while indeterminate.
+    pub fill: Option<f32>,
+    pub look: BarLook,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BarLook {
+    Normal,
+    Error,
+    Paused,
 }
 
 /// Which way tabs are laid out (for dragging).
@@ -243,6 +277,23 @@ impl Workspace {
     fn tab_view(&self, index: usize, tab: &Tab, cx: &App) -> TabView {
         let view = tab.focused_view().map(|v| v.read(cx));
         let process = view.and_then(|v| v.process().map(str::to_string));
+        let statuses: Vec<AgentStatus> = tab.panes.iter().filter_map(|p| p.view.read(cx).agent_status(p.seen)).collect();
+        let status = agent::most_important(statuses.iter()).cloned();
+        let agent = view.and_then(|v| v.agent());
+        let progress = view.and_then(|v| {
+            let own = v.agent_status(u64::MAX).filter(|s| s.state == StatusState::Working);
+            match own.and_then(|s| s.progress) {
+                Some(p) => Some(Bar { fill: Some(f32::from(p) / 100.0), look: BarLook::Normal }),
+                None => v.program_status().progress.map(|p| Bar {
+                    fill: p.percent.filter(|_| p.state != ProgressState::Indeterminate).map(|n| f32::from(n) / 100.0),
+                    look: match p.state {
+                        ProgressState::Error => BarLook::Error,
+                        ProgressState::Paused => BarLook::Paused,
+                        _ => BarLook::Normal,
+                    },
+                }),
+            }
+        });
         let active = index == self.active;
         // Turning a mark off in the settings hides the ones already there.
         let activity = tab.activity.filter(|&a| !active && marks(&cx.global::<AppSettings>().client.tabs, a));
@@ -271,6 +322,9 @@ impl Workspace {
             process,
             panes: tab.panes.len(),
             activity,
+            agent,
+            status,
+            progress,
             detail,
             connecting,
             dragged: self.dragging == Some(tab.id),
@@ -294,6 +348,16 @@ impl Workspace {
         let steps = self.wheel.feed(wheel, Instant::now());
         if steps != 0 {
             self.step_tab(steps, window, cx);
+        }
+    }
+
+    /// The tab's mark, `size` px across: its agent's state when it has one
+    /// to show, else what happened in the background. Hovering it says
+    /// what it means.
+    pub(super) fn tab_marker(&self, t: &TabView, size: f32, c: Colors) -> Option<AnyElement> {
+        match &t.status {
+            Some(status) => Some(status_marker(status, ("tab-status", t.id), size, c)),
+            None => self.activity_marker(t, size, c),
         }
     }
 
@@ -348,8 +412,8 @@ impl Workspace {
         Some((icon.glyph, c.icon(icon.color, cx)))
     }
 
-    /// The tab's icon: a spinner while it connects, the program's icon, or
-    /// `fallback`.
+    /// The tab's icon: a spinner while it connects, the agent's logo, the
+    /// program's icon, or `fallback`.
     pub(super) fn tab_icon(&self, t: &TabView, size: f32, c: Colors, cx: &App, fallback: impl FnOnce() -> AnyElement) -> AnyElement {
         if t.connecting {
             return Icon::Loader
@@ -361,7 +425,18 @@ impl Workspace {
                 })
                 .into_any_element();
         }
+        if let Some(logo) = self.agent_logo(t, size, c.ui.text, cx) {
+            return logo;
+        }
         self.process_icon(t.process.as_deref(), size, None, c, cx).unwrap_or_else(fallback)
+    }
+
+    /// The tab's agent's logo (unless icons are off), its marks tinted `tint`.
+    pub(super) fn agent_logo(&self, t: &TabView, size: f32, tint: Hsla, cx: &App) -> Option<AnyElement> {
+        if !cx.global::<AppSettings>().client.tabs.icons {
+            return None;
+        }
+        Some(t.agent.as_ref()?.logo().element(size, tint))
     }
 
     /// What every style's tab does: switch, close, rename, open its menu,
@@ -369,7 +444,13 @@ impl Workspace {
     pub(super) fn tab_shell(&self, t: &TabView, axis: Axis, cx: &mut Context<'_, Self>) -> gpui::Stateful<gpui::Div> {
         let (index, id) = (t.index, t.id);
         let c = Colors::get(cx);
-        let drag = DraggedTab { id, label: t.label.clone(), icon: self.process_glyph(t.process.as_deref(), c, cx) };
+        let icons = cx.global::<AppSettings>().client.tabs.icons;
+        let drag = DraggedTab {
+            id,
+            label: t.label.clone(),
+            icon: self.process_glyph(t.process.as_deref(), c, cx),
+            agent: t.agent.clone().filter(|_| icons),
+        };
         let renaming = self.rename.as_ref().is_some_and(|r| r.tab == id);
         div()
             .id(gpui::ElementId::NamedInteger("tab".into(), id))
@@ -465,7 +546,8 @@ impl Workspace {
         // or the menu still close them).
         let close = (t.active || width >= NARROW_TAB).then(|| self.close_button(&t, 18.0, c, cx));
         let title = self.tab_title(&t, cx);
-        let marker = self.activity_marker(&t, 13.0, c);
+        let marker = self.tab_marker(&t, 13.0, c);
+        let waiting = !t.active && is_waiting(&t);
         self.tab_shell(&t, Axis::Row, cx)
             .flex_none()
             .w(px(width))
@@ -477,6 +559,7 @@ impl Workspace {
             .text_sm()
             .when(t.active, |d| d.bg(c.terminal).text_color(c.ui.text))
             .when(!t.active, |d| d.text_color(c.ui.muted).hover(|s| s.bg(c.hover).text_color(c.ui.text)))
+            .when(waiting, |d| d.bg(c.ui.warning.opacity(0.12)).text_color(c.ui.text))
             .child(icon)
             .child(title)
             .children(marker)
@@ -485,15 +568,18 @@ impl Workspace {
             })
             .children(close)
             .when_some(t.group, |d, color| d.child(group_line(color, t.active, true)))
+            .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 8.0, c)))
             .into_any_element()
     }
 
     fn compact_tab(&self, t: TabView, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
         let mono = cx.global::<AppSettings>().client.font.family.clone().unwrap_or_else(|| "monospace".into());
         let fg = if t.active { c.ui.on_accent } else { c.ui.muted };
-        let icon = self.process_icon(t.process.as_deref(), 12.0, t.active.then_some(fg), c, cx);
+        let icon =
+            self.agent_logo(&t, 12.0, fg, cx).or_else(|| self.process_icon(t.process.as_deref(), 12.0, t.active.then_some(fg), c, cx));
         let title = self.tab_title(&t, cx);
-        let marker = self.activity_marker(&t, 11.0, c);
+        let marker = self.tab_marker(&t, 11.0, c);
+        let waiting = !t.active && is_waiting(&t);
         let number = SharedString::from(format!("{}", t.index + 1));
         self.tab_shell(&t, Axis::Row, cx)
             .flex_none()
@@ -504,12 +590,14 @@ impl Workspace {
             .text_color(fg)
             .when(t.active, |d| d.bg(c.ui.accent))
             .when(!t.active, |d| d.hover(|s| s.bg(c.hover).text_color(c.ui.text)))
+            .when(waiting, |d| d.bg(c.ui.warning.opacity(0.16)).text_color(c.ui.text))
             .child(div().flex_none().opacity(0.7).child(number))
             .children(icon)
             .child(title)
             .children(marker)
             .when(t.panes > 1, |d| d.child(div().flex_none().opacity(0.7).child(SharedString::from(format!("[{}]", t.panes)))))
             .when_some(t.group, |d, color| d.child(group_line(color, t.active, false)))
+            .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 4.0, c)))
             .into_any_element()
     }
 
@@ -531,7 +619,7 @@ impl Workspace {
                 .text_size(px(11.))
                 .child(SharedString::from(g.tabs.len().to_string()))
         });
-        let mark = g.activity.filter(|_| folded).map(|a| div().flex_none().size(px(7.)).rounded_full().bg(activity_look(a, c).1));
+        let mark = group_mark(&g, c).filter(|_| folded).map(|color| div().flex_none().size(px(7.)).rounded_full().bg(color));
         let label = div()
             .id(gpui::ElementId::NamedInteger("tab-group".into(), g.ids[0]))
             .flex_none()
@@ -581,6 +669,93 @@ pub(super) fn group_tooltip(g: &Group) -> String {
 fn group_line(color: Hsla, active: bool, modern: bool) -> impl IntoElement {
     let line = div().absolute().h(px(2.)).rounded_full().bg(color);
     if modern && active { line.top_0().left(px(8.)).right(px(8.)) } else { line.bottom_0().left(px(4.)).right(px(4.)).opacity(0.85) }
+}
+
+/// The dot a folded host group shows: its tabs' waiting agents first,
+/// then their activity.
+pub(super) fn group_mark(g: &Group, c: Colors) -> Option<Hsla> {
+    if g.waiting {
+        return Some(c.ui.warning);
+    }
+    g.activity.map(|a| activity_look(a, c).1)
+}
+
+/// Does the tab have an agent waiting for the user?
+pub(super) fn is_waiting(t: &TabView) -> bool {
+    t.status.as_ref().is_some_and(|s| s.state == StatusState::Blocked)
+}
+
+/// The color of an agent's state.
+pub(super) fn status_color(state: StatusState, c: Colors) -> Hsla {
+    match state {
+        StatusState::Blocked => c.ui.warning,
+        StatusState::Error => c.ui.danger,
+        StatusState::Done => c.ui.success,
+        StatusState::Working => c.ui.accent,
+        StatusState::Idle => c.ui.muted,
+    }
+}
+
+/// An agent's state, `size` px across: a spinner while it works, a
+/// pulsing badge while it waits for the user, a check or a cross when it's
+/// done or failed. Its tooltip says who and what (and the agent's words).
+pub(super) fn status_marker(status: &AgentStatus, id: (&'static str, u64), size: f32, c: Colors) -> AnyElement {
+    let color = status_color(status.state, c);
+    let icon = status.icon().unwrap_or(Icon::Bot);
+    let base = div()
+        .id(gpui::ElementId::NamedInteger(id.0.into(), id.1))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(tooltip(status.tooltip()));
+    match status.state {
+        StatusState::Working => base
+            .size(px(size))
+            .child(Icon::Loader.svg().size(px(size)).text_color(color).with_animation(
+                gpui::ElementId::NamedInteger("status-spin".into(), id.1),
+                Animation::new(Duration::from_millis(1100)).repeat(),
+                |s, t| s.with_transformation(Transformation::rotate(percentage(t))),
+            ))
+            .into_any_element(),
+        StatusState::Blocked => base
+            .size(px(size + 6.))
+            .rounded_full()
+            .bg(color.opacity(0.2))
+            .child(icon.svg().size(px(size - 1.)).text_color(color))
+            .with_animation(
+                gpui::ElementId::NamedInteger("status-pulse".into(), id.1),
+                Animation::new(Duration::from_millis(1600)).repeat().with_easing(gpui::pulsating_between(0.45, 1.0)),
+                |s, t| s.opacity(t),
+            )
+            .into_any_element(),
+        _ => base.size(px(size)).child(icon.svg().size(px(size)).text_color(color)).into_any_element(),
+    }
+}
+
+/// A thin progress line along the bottom of a tab, `inset` px from its
+/// sides: filled as far as the work is, or a moving segment while it
+/// can't tell.
+pub(super) fn progress_line(bar: Bar, id: (&'static str, u64), inset: f32, c: Colors) -> AnyElement {
+    let color = match bar.look {
+        BarLook::Normal => c.ui.accent,
+        BarLook::Error => c.ui.danger,
+        BarLook::Paused => c.ui.warning,
+    };
+    let track = div().absolute().bottom_0().left(px(inset)).right(px(inset)).h(px(2.)).rounded_full().bg(c.ui.text.opacity(0.08));
+    let fill = div().absolute().top_0().bottom_0().rounded_full().bg(color);
+    let fill = match bar.fill {
+        Some(f) => fill.left_0().w(gpui::relative(f.clamp(0.0, 1.0))).into_any_element(),
+        None => fill
+            .w(gpui::relative(0.3))
+            .with_animation(
+                gpui::ElementId::NamedInteger(id.0.into(), id.1),
+                Animation::new(Duration::from_millis(1400)).repeat().with_easing(gpui::ease_in_out),
+                |s, t| s.left(gpui::relative(t * 0.7)),
+            )
+            .into_any_element(),
+    };
+    track.child(fill).into_any_element()
 }
 
 /// What an activity marker says and its color.

@@ -84,12 +84,22 @@ pub const INDEX: &[Entry] = &[
     e(Page::Workspace, "Tabs", "Fold the sidebar to icons", "vertical tabs collapse rail compact hide").keys(&["tabs.sidebar_collapsed"]),
     e(Page::Workspace, "Tabs", "Switch tabs with the mouse wheel", "scroll wheel tab change next previous")
         .keys(&["tabs.scroll_to_switch"]),
-    e(Page::Workspace, "Tabs", "Program icons", "nerd font icon tab").keys(&["tabs.icons"]),
+    e(Page::Workspace, "Tabs", "Program icons", "nerd font icon tab logo coding agent claude codex").keys(&["tabs.icons"]),
     e(Page::Workspace, "Tabs", "Mark tabs that ring the bell", "bell alert notify background attention").keys(&["tabs.mark_bell"]),
     e(Page::Workspace, "Tabs", "Mark tabs with activity", "activity output command finished done notify background osc 133")
         .keys(&["tabs.mark_activity"]),
     e(Page::Workspace, "Panes", "Fade inactive panes", "dim split focus").keys(&["panes.dim_inactive"]),
     e(Page::Workspace, "Panes", "Ask before closing a running program", "confirm close quit").keys(&["panes.confirm_close"]),
+    e(Page::Workspace, "Notifications", "Notifications in goatty", "notify toast alert agent claude codex in-app message")
+        .keys(&["notifications.in_app"]),
+    e(Page::Workspace, "Notifications", "Desktop notifications", "notify system os notification center alert agent")
+        .keys(&["notifications.system"]),
+    e(Page::Workspace, "Notifications", "A coding agent waits for you", "agent claude codex opencode permission question blocked osc 7501")
+        .keys(&["notifications.agent_waiting"]),
+    e(Page::Workspace, "Notifications", "A coding agent finishes", "agent claude codex done finished failed error osc 7501")
+        .keys(&["notifications.agent_done"]),
+    e(Page::Workspace, "Notifications", "A program asks to notify you", "osc 9 osc 777 notify-send program notification")
+        .keys(&["notifications.programs"]),
     // Entries goatty dropped from `ssh.hosts` show in a banner over the list.
     e(Page::Hosts, "Your hosts", "Your hosts", "ssh add host list user server").keys(&["ssh.hosts"]),
     e(Page::Hosts, "Connecting", "Open hosts in", "ssh window tab remote").keys(&["ssh.open_in"]),

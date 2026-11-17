@@ -70,6 +70,9 @@ pub(super) struct Group {
     pub active: bool,
     /// The strongest activity mark among its tabs (shown when folded).
     pub activity: Option<Activity>,
+    /// A coding agent in one of its tabs waits for the user (shown when
+    /// folded, before the activity).
+    pub waiting: bool,
 }
 
 /// What the tab strip (or sidebar) lists, in order.
@@ -131,11 +134,16 @@ impl Workspace {
         for (i, tab) in self.tabs.iter().enumerate() {
             let key = self.host_key(tab);
             let activity = tab.activity.filter(|&a| i != self.active && marks(&settings.client.tabs, a));
+            let waiting = tab
+                .panes
+                .iter()
+                .any(|p| p.view.read(cx).agent_status(p.seen).is_some_and(|s| s.state == goatty_term::StatusState::Blocked));
             if let Some(g) = out.last_mut().filter(|g| g.key == key) {
                 g.tabs.push(i);
                 g.ids.push(tab.id);
                 g.active |= i == self.active;
                 g.activity = g.activity.max(activity);
+                g.waiting |= waiting;
                 continue;
             }
             let (label, detail, local) = Self::host_names(tab, cx);
@@ -156,6 +164,7 @@ impl Workspace {
                 ids: vec![tab.id],
                 active: i == self.active,
                 activity,
+                waiting,
             });
         }
         out
