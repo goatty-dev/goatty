@@ -61,6 +61,17 @@ pub enum Request {
         values: std::collections::BTreeMap<String, String>,
         cwd: Option<String>,
     },
+    /// The installs running on the host, and the ones that finished
+    /// recently (#102). Reply: [`Reply::Installs`].
+    Installs,
+    /// Stop the running install of `id` before it's activated (#102).
+    /// Reply: [`Reply::Installs`]; refused once it's being activated.
+    CancelInstall {
+        id: String,
+    },
+    /// Installed plugins with a newer version in their registry (#95).
+    /// Registries older than a day are fetched first. Reply: [`Reply::Updates`].
+    Updates,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +82,67 @@ pub enum Reply {
     Changed(Changed),
     Snippets(SnippetList),
     Suggestions(Suggestions),
+    Installs { installs: Vec<InstallProgress> },
+    Updates { updates: Vec<Update> },
+}
+
+/// One install on the host ([`Request::Installs`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallProgress {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub step: Step,
+    /// A cancel was asked for; the install stops at its next check.
+    #[serde(default)]
+    pub cancelling: bool,
+}
+
+/// Where an install is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum Step {
+    /// Waiting for another install or uninstall on the host to finish.
+    Waiting,
+    /// Downloading package `index` (from 1) of `count`: `bytes` of `total`
+    /// (`total` is 0 when unknown).
+    Downloading {
+        package: String,
+        index: usize,
+        count: usize,
+        bytes: u64,
+        total: u64,
+    },
+    /// Unpacking, swapping it in and building the shell configuration: too
+    /// late to cancel.
+    Activating,
+    Done(Changed),
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+impl Step {
+    pub fn finished(&self) -> bool {
+        matches!(self, Step::Done(_) | Step::Failed { .. } | Step::Cancelled)
+    }
+
+    /// Cancelling still leaves everything as it was.
+    pub fn cancellable(&self) -> bool {
+        matches!(self, Step::Waiting | Step::Downloading { .. })
+    }
+}
+
+/// A newer version of an installed plugin ([`Request::Updates`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Update {
+    pub id: String,
+    pub name: String,
+    pub installed: String,
+    pub version: String,
+    /// Permissions the new version has that the installed one doesn't.
+    pub new_permissions: Vec<Permission>,
 }
 
 /// A host's snippets and expansions ([`Request::Snippets`]).
@@ -361,5 +433,25 @@ mod tests {
         let c = Reply::Changed(Changed { lines: vec!["ok".into()], generation: Some(3), reload: true });
         let back: Reply = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn install_progress_round_trips() {
+        let steps = [
+            Step::Waiting,
+            Step::Downloading { package: "eza".into(), index: 1, count: 2, bytes: 10, total: 20 },
+            Step::Activating,
+            Step::Done(Changed::default()),
+            Step::Failed { error: "no".into() },
+            Step::Cancelled,
+        ];
+        let list: Vec<InstallProgress> = steps
+            .into_iter()
+            .map(|step| InstallProgress { id: "eza".into(), name: "eza".into(), version: "1".into(), step, cancelling: false })
+            .collect();
+        let r = Reply::Installs { installs: list };
+        let back: Reply = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(serde_json::to_string(&Request::CancelInstall { id: "eza".into() }).unwrap(), r#"{"op":"cancel_install","id":"eza"}"#);
     }
 }

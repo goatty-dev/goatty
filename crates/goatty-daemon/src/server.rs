@@ -344,6 +344,19 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
         let host = daemon.host.clone();
         std::thread::Builder::new().name("shell-import".into()).spawn(move || host.launcher.prepare_import(&host.settings().value))?;
     }
+    // Plugin updates are found without the Plugins page open (#95): fetch
+    // registries older than a day, but only when a plugin from one is
+    // installed. Clients ask with `Updates`; nothing is installed here.
+    {
+        let host = daemon.host.clone();
+        std::thread::Builder::new().name("plugin-registries".into()).spawn(move || {
+            std::thread::sleep(Duration::from_secs(120));
+            loop {
+                host.refresh_stale_registries();
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        })?;
+    }
     // Socket watchdog. On a server, systemd-logind deletes
     // /run/user/$UID when the user's last login session ends (unless
     // lingering is enabled). The daemon and its shells survive that, but the

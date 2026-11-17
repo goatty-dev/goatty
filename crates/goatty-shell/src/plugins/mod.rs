@@ -22,6 +22,7 @@
 //! as root.
 
 pub mod cmd;
+pub mod jobs;
 pub mod lock;
 pub mod registry;
 
@@ -30,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use goatty_config::HostSettings;
-use goatty_plugin::api::{Available, Catalog, Download, Installed, PackageState, PackageStatus, Plan, RegistryStatus};
+use goatty_plugin::api::{Available, Catalog, Download, Installed, PackageState, PackageStatus, Plan, RegistryStatus, Step, Update};
 use goatty_plugin::fetch::Fetch;
 use goatty_plugin::manifest::{self, Load, Manifest};
 use goatty_plugin::schema::{self, Values};
@@ -40,6 +41,7 @@ use crate::builtins::{self, Builtin};
 use crate::dirs::Dirs;
 use crate::install::{self, PackageInstall};
 use crate::packages::{self, Location};
+use jobs::Job;
 use lock::Lock;
 use registry::{Snapshot, Source};
 
@@ -115,6 +117,36 @@ fn op_lock(dirs: &Dirs) -> Result<std::fs::File> {
     let f = std::fs::File::create(dirs.installed_dir().join(".lock"))?;
     f.lock()?;
     Ok(f)
+}
+
+/// [`op_lock`] for an install: waits without blocking, so a cancel of a
+/// queued install takes effect while another one holds the lock.
+fn op_lock_for(dirs: &Dirs, job: &Job) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dirs.installed_dir())?;
+    let f = std::fs::File::create(dirs.installed_dir().join(".lock"))?;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                job.check()?;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
+/// Downloads waiting for activation, kept on disk (a plugin's packages
+/// can add up to more than goattyd should hold in memory). Removed when
+/// dropped, whatever happens to the install.
+struct Spool(Vec<PathBuf>);
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        for f in &self.0 {
+            let _ = std::fs::remove_file(f);
+        }
+    }
 }
 
 impl Plugins<'_> {
@@ -386,7 +418,17 @@ impl Plugins<'_> {
     /// Returns the plan that was carried out. The caller enables the plugin
     /// in the host settings and builds the shell configuration.
     pub fn install(&self, c: &Candidate, approved: &str, settings: &HostSettings) -> Result<Plan> {
-        let _guard = op_lock(self.dirs)?;
+        self.install_with(c, approved, settings, &Job::untracked())
+    }
+
+    /// [`install`](Self::install), reporting its progress to `job` and
+    /// stopping (with everything as it was) when `job` is cancelled while
+    /// it waits or downloads: nothing on the host changes before every
+    /// download is in. Leaves `job` at [`Step::Activating`].
+    pub fn install_with(&self, c: &Candidate, approved: &str, settings: &HostSettings, job: &Job) -> Result<Plan> {
+        job.step(Step::Waiting)?;
+        let _guard = op_lock_for(self.dirs, job)?;
+        job.check()?;
         let plan = self.plan(c, settings)?;
         if plan.digest != approved {
             bail!("{} changed since you reviewed it (files, downloads or permissions); review the new plan before installing", plan.name);
@@ -395,11 +437,43 @@ impl Plugins<'_> {
         let target = current_target();
         let mut lock = Lock::load(self.dirs)?;
         let previous = lock.plugins.get(&m.id).cloned();
+        let staging = self.dirs.installed_dir().join(format!(".{}.partial-{}", m.id, std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+
+        // Everything is downloaded before anything changes, so a cancel
+        // (or a failed download) leaves the host as it was.
+        let count = plan.downloads.iter().filter(|d| d.fetches()).count();
+        let mut spool = Spool(Vec::new());
+        let mut fetched: Vec<Option<PathBuf>> = Vec::new();
+        for (p, d) in m.packages.iter().zip(&plan.downloads) {
+            if !d.fetches() {
+                fetched.push(None);
+                continue;
+            }
+            let a = p.asset_for(&target).context("no build for this host")?;
+            let index = spool.0.len() + 1;
+            job.step(Step::Downloading { package: p.id.clone(), index, count, bytes: 0, total: a.size })?;
+            let bytes = self.fetch.fetch_progress(&a.url, &mut |n| job.downloaded(n)).with_context(|| format!("download {}", a.url))?;
+            let file = self.dirs.installed_dir().join(format!(".{}.download-{}-{index}", m.id, std::process::id()));
+            spool.0.push(file.clone());
+            std::fs::write(&file, &bytes).with_context(|| format!("keep the download of {} in {}", p.id, file.display()))?;
+            fetched.push(Some(file));
+        }
+        if c.builtin.is_none() {
+            // Stage the plugin's files too: the last step that can fail on its own.
+            goatty_plugin::bundle::copy_verified(&c.dir, &staging, &c.files).inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&staging);
+            })?;
+        }
+        if let Err(e) = job.activate() {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
 
         let mut packages = Vec::new();
         let mut fresh: Vec<(String, Vec<String>)> = Vec::new();
         let result = (|| -> Result<()> {
-            for (p, d) in m.packages.iter().zip(&plan.downloads) {
+            for ((p, d), bytes) in m.packages.iter().zip(&plan.downloads).zip(fetched) {
                 if let Some(sys) = &d.system {
                     packages.push(lock::Package {
                         id: p.id.clone(),
@@ -409,9 +483,9 @@ impl Plugins<'_> {
                     });
                     continue;
                 }
-                if !d.current {
+                if let Some(file) = bytes {
+                    let bytes = std::fs::read(&file).with_context(|| format!("read the download of {}", p.id))?;
                     let a = p.asset_for(&target).context("no build for this host")?;
-                    let bytes = self.fetch.fetch(&a.url).with_context(|| format!("download {}", a.url))?;
                     let pi = PackageInstall {
                         id: &p.id,
                         version: &p.version,
@@ -432,14 +506,8 @@ impl Plugins<'_> {
                 return Ok(());
             }
 
-            // The plugin's files: staged, checked, then swapped in.
+            // The plugin's files (staged and checked above) swapped in.
             let dest = lock::bundle_dir(self.dirs, &m.id);
-            let staging = self.dirs.installed_dir().join(format!(".{}.partial-{}", m.id, std::process::id()));
-            let _ = std::fs::remove_dir_all(&staging);
-            if let Err(e) = goatty_plugin::bundle::copy_verified(&c.dir, &staging, &c.files) {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(e);
-            }
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)?;
             }
@@ -447,6 +515,7 @@ impl Plugins<'_> {
             Ok(())
         })();
         if let Err(e) = result {
+            let _ = std::fs::remove_dir_all(&staging);
             // Undo packages this attempt added that the old version didn't have.
             let keep: Vec<&str> = previous.iter().flat_map(|p| p.packages.iter().map(|x| x.id.as_str())).collect();
             for (id, bins) in fresh.iter().filter(|(id, _)| !keep.contains(&id.as_str())) {
@@ -650,6 +719,33 @@ impl Plugins<'_> {
         available.sort_by_key(|a| a.name.to_lowercase());
         issues.extend(active(self.dirs, settings).1);
         Catalog { installed, available, registries, issues }
+    }
+}
+
+impl Plugins<'_> {
+    /// Installed plugins with a newer version in the registry they came
+    /// from. Registries older than a day are fetched first (`refresh_stale`).
+    pub fn updates(&self, refresh_stale: bool) -> Vec<Update> {
+        let lock = Lock::load(self.dirs).unwrap_or_default();
+        if !lock.plugins.values().any(|e| e.verified) {
+            // Nothing from a registry: nothing to ask the network about.
+            return Vec::new();
+        }
+        let (snaps, _, _) = self.snapshots(false, refresh_stale);
+        let mut out = Vec::new();
+        for (id, e) in lock.plugins.iter().filter(|(id, _)| builtins::get(id).is_none()) {
+            let Some(snap) = snaps.iter().find(|s| s.source.name == e.source) else { continue };
+            let Some((v, ver)) = snap.index.latest(id).filter(|(v, _)| newer(v, &e.version)) else { continue };
+            let name = snap.index.plugins.get(id).map_or_else(|| id.clone(), |p| p.name.clone());
+            out.push(Update {
+                id: id.clone(),
+                name,
+                installed: e.version.clone(),
+                version: v.to_owned(),
+                new_permissions: ver.permissions.iter().filter(|p| !e.permissions.contains(p)).copied().collect(),
+            });
+        }
+        out
     }
 }
 

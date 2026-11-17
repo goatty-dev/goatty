@@ -27,7 +27,23 @@ pub struct ClientSettings {
     pub mouse: MouseSettings,
     pub ssh: SshSettings,
     pub tailnet: TailnetSettings,
+    pub plugins: PluginNotifySettings,
     pub debug: DebugSettings,
+}
+
+/// What the app tells about plugins (#95).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginNotifySettings {
+    /// Show a notification when a host has newer versions of installed
+    /// plugins. Updates still need a review; nothing installs by itself.
+    pub notify_updates: bool,
+}
+
+impl Default for PluginNotifySettings {
+    fn default() -> Self {
+        Self { notify_updates: true }
+    }
 }
 
 /// Other computers on the user's tailnet that run goatty (#15).

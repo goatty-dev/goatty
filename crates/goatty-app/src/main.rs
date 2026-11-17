@@ -18,6 +18,7 @@ mod output_view;
 mod paste_confirm;
 mod pickers;
 mod plugin_commands;
+mod plugin_updates;
 mod session;
 mod settings;
 mod settings_window;

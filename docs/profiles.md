@@ -111,7 +111,7 @@ Settings travel as JSON documents rather than typed structs, so a schema change 
 | History | size, duplicates, leading space, sharing, fzf history search, fzf-tab completion and its previews | staged |
 | Aliases | yours first, then each plugin's (folded); filters All / Mine / From plugins; add/edit in a dialog (group completes existing groups) | staged |
 | Snippets | yours, then each plugin's (folded, "make my own copy"); filters; the editor (`{name}` in the line adds an input row; preview with blanks; safety); expansions with the `shell.expansions` switch, "Try it", add/edit/switch off ([`snippets.md`](snippets.md)) | staged |
-| Plugins | installed and built-in plugins, each with its own page (settings by the manifest's groups, advanced folded; tools; permissions; aliases); browse the registries; install review | staged / installs right away |
+| Plugins | installed and built-in plugins, each with its own page (settings by the manifest's groups, advanced folded; tools; permissions; aliases); browse the registries; install review with progress and Cancel; this computer: tell about plugin updates (`plugins.notify_updates`) | staged / installs right away; client switch: saved immediately |
 | Profile | problems (show, copy all), file locations (copy, open folder), env overrides, export/import, generations (name, one-line summary; click for every change, the file diff and naming) with rollback, reset | – |
 | About | version, what the window is connected to, links, a summary to copy into bug reports | – |
 

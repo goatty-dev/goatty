@@ -13,6 +13,7 @@ use goatty_plugin::fetch::Fetch;
 
 use crate::generation::{self, FileDiff, Generation};
 use crate::launch::Launcher;
+use crate::plugins::jobs::Jobs;
 use crate::plugins::registry::Source;
 use crate::plugins::{Candidate, Plugins};
 
@@ -48,6 +49,8 @@ pub struct HostService {
     fetch: Arc<dyn Fetch>,
     /// Built-in plugin registries (the official one).
     registries: Vec<Source>,
+    /// Plugin installs, running and recently finished. Shared between clones.
+    installs: Jobs,
 }
 
 impl HostService {
@@ -59,6 +62,7 @@ impl HostService {
             shells: Arc::default(),
             fetch: Arc::new(goatty_plugin::fetch::Curl { cache }),
             registries: vec![Source::official()],
+            installs: Jobs::default(),
         }
     }
 
@@ -166,14 +170,36 @@ impl HostService {
                 crate::snippets::suggest_command(p.dirs, &settings, &plugin, &command, &input, &values, cwd.as_deref())
                     .map(api::Reply::Suggestions)
             }),
+            api::Request::Installs => Ok(api::Reply::Installs { installs: self.installs.list() }),
+            api::Request::CancelInstall { id } => {
+                self.installs.cancel(&id)?;
+                Ok(api::Reply::Installs { installs: self.installs.list() })
+            }
+            api::Request::Updates => self.plugins(|p| Ok(api::Reply::Updates { updates: p.updates(true) })),
         }
+    }
+
+    /// Fetch the plugin registries that are older than a day, when a
+    /// plugin from one is installed (goattyd does this now and then, #95).
+    pub fn refresh_stale_registries(&self) {
+        let _ = self.plugins(|p| {
+            p.updates(true);
+            Ok(())
+        });
     }
 
     /// Install `c` as approved (`approved`: the plan's digest), enable it,
     /// and build the shell configuration.
+    /// The install runs as a job: [`api::Request::Installs`] shows its
+    /// progress and [`api::Request::CancelInstall`] stops it.
     pub fn install_plugin(&self, c: &Candidate, approved: &str) -> Result<Changed> {
+        let m = &c.manifest;
+        self.installs.run(&m.id, &m.name, &m.version, |job| self.install_plugin_with(c, approved, job))
+    }
+
+    fn install_plugin_with(&self, c: &Candidate, approved: &str, job: &crate::plugins::jobs::Job) -> Result<Changed> {
         let settings = self.settings().value;
-        let plan = self.plugins(|p| p.install(c, approved, &settings))?;
+        let plan = self.plugins(|p| p.install_with(c, approved, &settings, job))?;
         let id = plan.id.clone();
         let outcome = self.edit(|h| match c.builtin {
             // Built-in plugins are on by default: keep host.json sparse.
@@ -299,6 +325,13 @@ mod tests {
         let api::Reply::Changed(c) = svc.plugin_request(req).unwrap() else { panic!("expected a change") };
         assert!(c.lines[0].starts_with("Installed Demo 1.0.0"), "{:?}", c.lines);
         assert!(c.reload);
+        // The install's outcome stays listed for a client that lost its reply.
+        let api::Reply::Installs { installs } = svc.plugin_request(api::Request::Installs).unwrap() else { panic!() };
+        assert!(matches!(&installs[..], [p] if p.id == "demo" && p.step == api::Step::Done(c.clone())), "{installs:?}");
+        let e = svc.plugin_request(api::Request::CancelInstall { id: "demo".into() }).unwrap_err();
+        assert!(e.to_string().contains("isn't being installed any more"), "{e}");
+        let api::Reply::Updates { updates } = svc.plugin_request(api::Request::Updates).unwrap() else { panic!() };
+        assert!(updates.is_empty(), "{updates:?}");
         assert!(std::fs::read_to_string(&file).unwrap().contains("\"demo\""), "enabled in host.json");
         let plugins_zsh = std::fs::read_to_string(w.dirs.zsh_dir().join("plugins.zsh")).unwrap();
         assert!(plugins_zsh.contains("alias -- d='demo'"), "{plugins_zsh}");

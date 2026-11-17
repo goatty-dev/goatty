@@ -324,6 +324,22 @@ pub fn badge(label: impl Into<SharedString>, tone: Tone, ui: Ui) -> Div {
         .child(label.into())
 }
 
+/// A thin progress bar: `Some(fraction)` of 0..=1, or `None` while the
+/// total isn't known (a short bar then marks that something is going on).
+pub fn progress_bar(id: impl Into<ElementId>, value: Option<f32>, label: impl Into<SharedString>, ui: Ui) -> Stateful<Div> {
+    let el = div().id(id).role(Role::ProgressIndicator).aria_label(label.into()).w_full().h(px(6.)).rounded_full().bg(ui.field_hover);
+    match value {
+        Some(t) => {
+            let t = t.clamp(0.0, 1.0);
+            el.aria_numeric_value(f64::from(t))
+                .aria_min_numeric_value(0.0)
+                .aria_max_numeric_value(1.0)
+                .child(div().h_full().w(relative(t)).rounded_full().bg(ui.accent))
+        }
+        None => el.child(div().h_full().w(relative(0.25)).rounded_full().bg(ui.accent.opacity(0.6))),
+    }
+}
+
 /// A colored banner: an icon, a title and lines (warnings, errors, results).
 pub fn banner(ui: Ui, tone: Tone, title: impl Into<SharedString>, lines: Vec<String>) -> Div {
     let c = tone.color(ui);
