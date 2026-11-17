@@ -200,7 +200,7 @@ fn pair_and_run_a_session_over_the_tailnet() {
 fn availability_comes_back_after_the_daemon_restarts() {
     let d = start_daemon();
     let mut c = Control::connect(&d.sock, "test").unwrap();
-    net(&mut c, &Request::Enable { port: Some(7500) }).unwrap();
+    net(&mut c, &Request::Enable { port: Some(7500) }).unwrap_or_else(|e| panic!("enable: {e:#}"));
     let gateway = goatty_net::gateway_socket(&d.sock);
     drop(c);
     // `goattyd restart` re-executes the daemon (the gateway socket closes with the old image).
