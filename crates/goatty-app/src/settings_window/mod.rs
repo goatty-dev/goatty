@@ -21,6 +21,7 @@ mod dotfiles;
 mod host;
 mod hosts;
 pub(crate) mod kit;
+mod network;
 mod path;
 mod plugins;
 mod problems;
@@ -167,6 +168,7 @@ pub enum Page {
     Workspace,
     Shortcuts,
     Hosts,
+    Network,
     Shell,
     Dotfiles,
     Path,
@@ -183,12 +185,13 @@ pub enum Page {
 impl Page {
     /// Sidebar order: this computer's pages, the host's shell pages, then
     /// the files and About.
-    pub const ALL: [Page; 16] = [
+    pub const ALL: [Page; 17] = [
         Page::Appearance,
         Page::Terminal,
         Page::Workspace,
         Page::Shortcuts,
         Page::Hosts,
+        Page::Network,
         Page::Shell,
         Page::Dotfiles,
         Page::Path,
@@ -209,6 +212,7 @@ impl Page {
             Page::Workspace => "Workspace",
             Page::Shortcuts => "Shortcuts",
             Page::Hosts => "Hosts",
+            Page::Network => "Network",
             Page::Shell => "Shell",
             Page::Dotfiles => "Dotfiles",
             Page::Path => "PATH",
@@ -231,6 +235,7 @@ impl Page {
             Page::Workspace => "Startup, tabs and split panes",
             Page::Shortcuts => "Keys for terminal windows",
             Page::Hosts => "Machines to open sessions on over SSH",
+            Page::Network => "Your computers over Tailscale, without SSH",
             Page::Shell => "The shell goatty starts",
             Page::Dotfiles => "What goatty uses from your .zshrc or .bashrc",
             Page::Path => "Where the shell looks for programs",
@@ -252,6 +257,7 @@ impl Page {
             Page::Workspace => Icon::AppWindow,
             Page::Shortcuts => Icon::Keyboard,
             Page::Hosts => Icon::Server,
+            Page::Network => Icon::Globe,
             Page::Shell => Icon::Shell,
             Page::Dotfiles => Icon::FileText,
             Page::Path => Icon::FolderOpen,
@@ -273,6 +279,7 @@ impl Page {
             "theme" | "themes" | "colors" | "font" => Some(Page::Appearance),
             "tabs" | "panes" => Some(Page::Workspace),
             "ssh" => Some(Page::Hosts),
+            "tailscale" | "tailnet" | "pair" | "pairing" => Some(Page::Network),
             "path" | "env" | "environment" => Some(Page::Path),
             "import" | "zshrc" | "bashrc" | "rc" => Some(Page::Dotfiles),
             "profiles" | "files" => Some(Page::Profile),
@@ -406,6 +413,7 @@ pub struct SettingsWindow {
     snippets: snippets::SnippetsPage,
     prompt: prompt::PromptPage,
     hosts: hosts::HostsPage,
+    net: network::NetPage,
     shortcuts: shortcuts::ShortcutsPage,
     /// Rows that just got focus from a search result, briefly highlighted.
     highlight: Option<(SharedString, Instant)>,
@@ -447,7 +455,8 @@ impl SettingsWindow {
         let opener = cx.global::<AppSettings>().file.value.links.file_opener.clone().unwrap_or_default();
         let file_opener = cx.new(|cx| TextInput::new("code --goto {path}:{line}:{column}", opener, cx).label("Command to open files"));
         let gen_name = cx.new(|cx| TextInput::new("before trying fish", "", cx).label("Name for this version"));
-        let subs = vec![
+        let (net, net_sub) = network::NetPage::new(cx);
+        let mut subs = vec![
             cx.subscribe(&gen_name, |this, _, ev: &TextInputEvent, cx| {
                 if let TextInputEvent::Submitted(_) = ev {
                     this.save_generation_name(cx);
@@ -556,6 +565,7 @@ impl SettingsWindow {
             snippets: snippets::SnippetsPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
             hosts: hosts::HostsPage::new(cx),
+            net,
             shortcuts: shortcuts::ShortcutsPage::new(cx),
             highlight: None,
             copied: None,
@@ -566,7 +576,11 @@ impl SettingsWindow {
             gen_name,
             gen_diff: None,
             toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
-            _subs: subs,
+            _subs: {
+                subs.push(net_sub);
+                subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
+                subs
+            },
         };
         this.load_host(cx);
         this.load_plugins(false, cx);
@@ -597,12 +611,14 @@ impl SettingsWindow {
         self.gen_diff = None;
         self.plugins = plugins::PluginsPage::default();
         self.diag = diagnostics::DiagPage::default();
+        self.net.reset();
         self.path.reset();
         self.dotfiles.reset();
         self.load_host(cx);
         self.load_plugins(false, cx);
         match self.page {
             Page::Diagnostics => self.load_diagnostics(cx),
+            Page::Network => self.load_net(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
             _ => {}
@@ -633,6 +649,10 @@ impl SettingsWindow {
                 }
             }
             Page::Hosts => crate::hosts::refresh(cx),
+            Page::Network => {
+                self.load_net(cx);
+                crate::hosts::refresh(cx);
+            }
             Page::Snippets => {
                 if let Some(link) = &self.link {
                     crate::snippets::ensure(link, cx);

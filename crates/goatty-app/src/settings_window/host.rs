@@ -207,6 +207,15 @@ impl HostLink {
         }
     }
 
+    /// A tailnet operation on the host (its availability, pairing, paired
+    /// devices). Runs `tailscale` there: off the UI thread.
+    pub fn net(&self, req: &goatty_net::api::Request) -> Result<goatty_net::api::NetStatus> {
+        match self {
+            HostLink::Daemon(c) => serde_json::from_str::<goatty_net::api::Reply>(&c.net(serde_json::to_string(req)?)?)?.into_result(),
+            HostLink::Local(_) => bail!("the tailnet needs goattyd: this window runs its shell itself (--local)"),
+        }
+    }
+
     pub fn reload_shells(&self) -> Result<u32> {
         Ok(match self {
             HostLink::Daemon(c) => c.reload_shells()?,

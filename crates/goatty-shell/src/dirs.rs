@@ -12,6 +12,7 @@
 //!   installed/<plugin>/           installed goatty plugins (verified copies of their files)
 //!   installed/lock.json           which plugins are installed, from where, what was approved
 //!   registries/<name>/            verified snapshots of plugin registries
+//!   tailnet/                      device.key (0600), devices.json, hosts.json, state.json (goatty-net)
 //! $XDG_CONFIG_HOME/goatty/zshrc   the user's own additions (goatty never writes it)
 //! $XDG_CONFIG_HOME/goatty/registries.json   plugin registries added besides the official one
 //! $XDG_CACHE_HOME/goatty/         completion dump, downloads
@@ -95,6 +96,11 @@ impl Dirs {
     /// The user's own zsh additions, sourced late by the managed `.zshrc`.
     pub fn user_zshrc(&self) -> PathBuf {
         self.config.join("zshrc")
+    }
+    /// goatty over the tailnet (`goatty_net::Paths`): the device key, paired
+    /// devices, pinned hosts, whether this host is available.
+    pub fn tailnet_dir(&self) -> PathBuf {
+        self.data.join("tailnet")
     }
     /// What goatty imported from the user's own shell ([`crate::import`]).
     pub fn import_dir(&self) -> PathBuf {

@@ -45,6 +45,8 @@ pub(crate) struct Daemon {
     /// check to its registration; a restart takes it exclusively to set
     /// `restarting`, so it never misses a session being started.
     pub(crate) admission: RwLock<()>,
+    /// This host on the user's tailnet (`crate::net`), once used.
+    pub(crate) net: Mutex<Option<Arc<goatty_net::host::Host>>>,
 }
 
 /// What [`Daemon::start`] makes a session of: a PTY with its process, and
@@ -81,6 +83,7 @@ impl Daemon {
             exe: own_exe(),
             restarting: AtomicBool::new(false),
             admission: RwLock::new(()),
+            net: Mutex::new(None),
         }
     }
 
@@ -223,6 +226,10 @@ impl Daemon {
         // Give the connection writers a moment to flush the `Ok` reply.
         std::thread::sleep(Duration::from_millis(100));
         let _ = std::fs::remove_file(&self.socket);
+        // The Serve route stays (the next goattyd serves it again); the socket goes.
+        if let Some(net) = self.net.lock().as_ref() {
+            let _ = std::fs::remove_file(net.socket());
+        }
         std::process::exit(0);
     }
 }
@@ -320,6 +327,8 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
         let d = daemon.clone();
         std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, listener))?;
     }
+    // Serve the tailnet again if this host was made available.
+    crate::net::start(&daemon);
     // The first tab shouldn't wait for the import of the user's shell setup.
     {
         let host = daemon.host.clone();
@@ -333,6 +342,7 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
     let mut taken_over = false;
     loop {
         std::thread::sleep(Duration::from_secs(2));
+        crate::net::check(&daemon);
         let current = std::fs::metadata(&path).ok().map(|m| m.ino());
         if current == Some(ino) || daemon.restarting.load(Ordering::SeqCst) {
             continue;

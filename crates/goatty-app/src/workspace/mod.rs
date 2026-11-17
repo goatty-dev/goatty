@@ -1296,6 +1296,7 @@ impl Workspace {
                 Spawner::Daemon(conn) => match conn.endpoint() {
                     goatty_client::Endpoint::Local => Some(HostRef::Local),
                     goatty_client::Endpoint::Ssh(t) => Some(HostRef::Ssh(t.host.clone())),
+                    goatty_client::Endpoint::Tailnet(t) => Some(HostRef::Tailnet { dns: t.dns.clone(), name: t.name.clone() }),
                     goatty_client::Endpoint::Command { .. } => None,
                 },
                 Spawner::Plain { base, .. } => host_of(base),

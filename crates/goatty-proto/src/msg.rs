@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -52,6 +52,9 @@ pub const RESTART_SINCE: u32 = 10;
 /// (`FetchHistory` / `History`) and zstd-compressed snapshots
 /// (`Compress` / `ServerMsg::Zstd`).
 pub const HISTORY_SINCE: u32 = 11;
+
+/// v12: `Net` (the host's availability on the user's tailnet).
+pub const NET_SINCE: u32 = 12;
 
 /// The version to use with a peer whose newest version is `peer`, or
 /// `None` when the ranges don't overlap.
@@ -260,6 +263,14 @@ pub enum ClientMsg {
     Compress {
         zstd: bool,
     },
+    /// v12: a tailnet operation (`goatty_net::api::Request` as JSON:
+    /// status, make this host available or not, the pairing window, paired
+    /// devices). Answered off the reader thread, since it runs `tailscale`.
+    /// Reply: `Net`.
+    Net {
+        req: ReqId,
+        request: String,
+    },
 }
 
 /// Why the daemon sent `ServerMsg::TopLine`.
@@ -452,6 +463,11 @@ pub enum ServerMsg {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    /// v12: `goatty_net::api::Reply` as JSON.
+    Net {
+        req: ReqId,
+        reply: String,
+    },
 }
 
 impl ServerMsg {
@@ -468,6 +484,7 @@ impl ServerMsg {
             | ServerMsg::Plugin { req, .. }
             | ServerMsg::Layout { req, .. }
             | ServerMsg::Shell { req, .. }
+            | ServerMsg::Net { req, .. }
             | ServerMsg::History { req, .. } => Some(*req),
             ServerMsg::Error { req, .. } => *req,
             _ => None,
@@ -537,5 +554,8 @@ mod tests {
         let top = ServerMsg::TopLine { session: 1, line: 9, cause: TopLineCause::Attach };
         assert_eq!(postcard::to_allocvec(&top).unwrap()[0], 17);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Zstd { data: vec![] }).unwrap()[0], 19);
+        // v12 additions come after v11's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Net { req: 1, request: String::new() }).unwrap()[0], 26);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Net { req: 1, reply: String::new() }).unwrap()[0], 20);
     }
 }

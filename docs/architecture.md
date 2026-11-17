@@ -15,6 +15,8 @@ goatty-term ◄──────┼────────┼─────�
    ▲               │        │      │      │ │
    │   goatty-proto│        │      │      │ │   (wire protocol: messages, framing, socket path)
    │      ▲        │        │      │      │ │
+   │      │   goatty-net    │      │      │ │   (the tailnet: tailscale CLI, device keys, pairing, gateway; std only)
+   │      │     ▲  ▲        │      │      │ │
    │   goatty-client        │      │      │ │   (Connection, Control, transports; no UI)
    │      ▲     ▲           │      │      │ │
    │      │     └──── goatty-daemon ──────┘─┘   (lib + bin `goattyd`)
@@ -31,6 +33,7 @@ Rules:
 - **Client vs host settings** (#14): `ClientSettings` (`settings.json`) is read by the app; `HostSettings` (`host.json`) by goattyd/`HostService` on its own host. The GUI edits host settings through the protocol (`GetHostSettings`, `SetHostSettings`, …), never by writing a remote file. See [`profiles.md`](profiles.md).
 - **`goatty-plugin` knows the format, not the host.** Manifests, settings schema, templates, permissions, zsh rendering, the signed index and the JSON API live there with no knowledge of `Dirs`; `goatty-shell::plugins` decides where things go. The authoring/registry CLI (`goatty-plugin`) depends on nothing else in the workspace, so registry CI builds it quickly. See [`plugins.md`](plugins.md).
 - **Settings come from `goatty-config`.** Don't read `GOATTY_*` variables elsewhere (the exceptions: `GOATTY_SOCKET`, a location, in `goatty_proto::socket_path`; `GOATTY_ASKPASS`, goatty's marker to itself as ssh's askpass, in `goatty_client::askpass`).
+- **The tailnet** (#15, [`tailnet.md`](tailnet.md)): `goatty-net` knows Tailscale's CLI (`tailscale`), the device key (`identity`), pairing (`pairing`), the gateway handshake (`gateway`), byte streams to peers (`link`: TCP or `tailscale nc`), discovery, the `Net` JSON (`api`) and a host's availability with the gateway socket's accept loop (`host`). It knows nothing of the daemon or `Dirs`: callers pass `goatty_net::Paths` (`Dirs::tailnet_dir`). goattyd owns one `Host` (`goatty-daemon/src/net.rs`); `goatty_client::tailnet` connects (`Endpoint::Tailnet`), discovers and pairs. goatty only ever uses the user's installed Tailscale through its public CLI, and changes only its own Serve route.
 - **Remote hosts** (`goatty-client`): `transport` (endpoints; ssh with captured stderr and askpass), `remote` (the connect script and its `goatty-remote:` probe line, `RemoteProblem`, install/stop over ssh, bundled binaries), `askpass` (decode ssh's question), `service` (systemd user units), `ssh_config` (the hosts in `~/.ssh/config`, for the host list). The app turns `RemoteProblem`s into questions in `connect.rs`. `local` does the same for this computer's goattyd: `outdated` (the running daemon's `/proc/<pid>/exe` is another, older file than the goattyd a restart would start: next to `goatty`, or the systemd unit's), `restart_daemon` (keeps the sessions from protocol v10 on, else stops it with `force`), `stop_daemon` (any protocol version; `goattyd stop --force` uses it too), `LocalProblem`. See [`remote-architecture.md`](remote-architecture.md) §5a/§5b.
 
 ## Daemon (`crates/goatty-daemon`)
@@ -43,6 +46,7 @@ Rules:
 | `client`     | one connection: decode requests, its subscriptions, the writer thread    |
 | `session`    | PTY + authoritative `Terminal` + subscribers with flow control, the output pump (`poll` on the PTY and a wake pipe, so a restart can `Pause` it between two reads) |
 | `proxy`      | `goattyd proxy`: stdio ⇄ socket relay for remote transports              |
+| `net`        | this host on the tailnet: the `goatty_net::host::Host` (made on start when `tailnet/state.json` exists, else on the first `Net` request), its gateway connections handed to `client::handle`, `Net` requests; `net_cmd.rs` is `goattyd net …` |
 | `main.rs`    | clap CLI; control commands go through `goatty_client::Control`; `restart [--force]` (`goatty_client::local::restart_daemon`), `restore-version` (hidden: the state format it reads, checked before a restart runs it); `stop --force` (any protocol version, `goatty_client::local::stop_daemon`), `service install|uninstall|status`, `completions SHELL` (`serve` also writes `_goattyd` for the managed shell) |
 
 Threads per session: `s{id}-reader` (PTY → terminal → subscribers) and `s{id}-replies` (query answers → PTY). Per connection: a reader (the accept thread's spawn) and `c{conn}-writer`.
@@ -106,6 +110,7 @@ settings_window/
   plugins.rs   the Plugins page: installed list, each plugin's own page (schema-driven settings by group), browse, install review
   diagnostics.rs  the Diagnostics page: the host's `setup::Status` (features and their source, startup time, startup errors, your files), install missing tools, copy report
   hosts.rs     the Hosts page: open hosts in a tab or window, add/remove hosts, plain SSH per host, `~/.ssh/config` discovery
+  network.rs   the Network page (#15): the active tab's host on the tailnet over `Net` (Tailscale's state, availability, port, the missing-permission commands, the pairing window with codes to confirm, paired devices with revoke; refreshed every second while pairing is open), and this computer as a client (discovery switches, paired hosts with forget)
   profile.rs   files (copy path, open folder), problems, export/import, generations (summary, details: every change, file diff, name), reset
   about.rs     version, connection, links, "copy for a bug report"
 output_view/
@@ -144,6 +149,7 @@ snippets/
 typing.rs      which pane goatty may type a command into (the focused one, on the command's host, at a prompt); otherwise a toast offers to copy it (plugin commands and snippets)
 plugin_commands.rs  the active host's plugins' `[[command]]`s in the palette (`plugin.<id>.<cmd>`): catalog fetched off the UI thread when the host link changes or plugins change; picking one asks for its inputs and types the quoted line into the focused pane (a busy pane: offer to copy it); `MenuCommands`: those with a `[command.menu]`, for the pane menu (`start` fills in the selected text)
 shell_path.rs  "Shell: Add/Remove a folder to/from PATH…": asks, then changes `shell.path` on the active tab's host through its goattyd (the PATH page edits the same setting)
+tailnet.rs     computers on the user's tailnet (#15): `TailnetList` global (paired hosts + the last discovery, refreshed with `hosts::refresh`), their palette/switcher commands (`tailnet.host:<dns>` connects, `tailnet.pair:<dns>` pairs), pairing (`pair`: a toast with the code, "Codes match"/"Cancel", pinned once both sides confirmed), forget
 hosts.rs       hosts to connect to: `ssh.hosts` + `~/.ssh/config` (`HostList` global, read in the background), palette commands, `pool` (one shared Connection per host), `open` → a connecting tab of the last active window or a new window (`ssh.open_in`)
 shell_setup.rs installing a host's built-in tools with progress (`install`), the per-host install offer toast after a tab connects (`offer`)
 shell_sync.rs  bringing this computer's shell setup to the host a tab connects to (`on_connect`: compare off the UI thread, ask with a toast once per change made here, or sync right away per `ssh.sync`/`ssh.hosts[].sync` and after a fresh goattyd install), the progress/result toast, "Sync shell setup to this host" (`sync_now`)
@@ -210,4 +216,5 @@ Input: GPUI dispatches a bound action before the view's raw `on_key_down`. Short
 | A plugin operation (GUI/CLI)           | `goatty_plugin::api::Request`/`Reply` (no protocol bump), `HostService::plugin_request`, `settings_window/plugins.rs`, `plugins/cmd.rs` |
 | Local echo prediction (#16) | guessing, checking and drawing: `goatty-term/src/predict.rs` (`Predictor`, unit-tested); when to predict and draw (`ssh.local_echo`, RTT or measured echo delay, alt screen) and feeding it input/output: `Session::predict`/`ingest` (`goatty-app/src/session.rs`); overlay per frame in `terminal/element.rs`; see `remote-architecture.md` R3 |
 | Scrollback on demand, snapshot contents | line numbers, the client's line map and inserting fetched rows: `goatty-term/src/history.rs`; what a snapshot carries: `goatty-term/src/snapshot.rs`; when to fetch: `Session::fill_history` (`goatty-app/src/session.rs`); see `remote-architecture.md` §4a |
+| The tailnet (#15)                      | Tailscale CLI, handshake, pairing, availability: `goatty-net` (tested against `tests/fake-tailscale.sh`); a new host-side operation: `goatty_net::api::Request` (no protocol bump) + `Host::request`; client side: `goatty-client/src/tailnet.rs`; GUI: `tailnet.rs`, `settings_window/network.rs`; see [`tailnet.md`](tailnet.md) |
 | New wire messages                      | `goatty-proto/src/msg.rs`: a new variant at the *end* (append-only), bump `PROTOCOL_VERSION`, mark it `vN:`; handle in `goatty-daemon/src/client.rs` and `goatty-client/src/connection.rs`, which must not send it to a daemon that agreed on an older version (`Connection::protocol_version`) |

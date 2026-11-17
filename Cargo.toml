@@ -68,6 +68,7 @@ goatty-config = { path = "crates/goatty-config" }
 goatty-daemon = { path = "crates/goatty-daemon" }
 goatty-shell = { path = "crates/goatty-shell" }
 goatty-plugin = { path = "crates/goatty-plugin" }
+goatty-net = { path = "crates/goatty-net" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

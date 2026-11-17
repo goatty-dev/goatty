@@ -6,6 +6,7 @@
 //!   cargo run --release -p goatty-daemon --example netbench -- proxy   # same, through `goattyd proxy` (remote code path)
 //!   cargo run --release -p goatty-daemon --example netbench -- slow 2m  # proxy throttled to 2 MB/s by `pv -L`
 //!   cargo run --release -p goatty-daemon --example netbench -- ssh HOST
+//!   cargo run --release -p goatty-daemon --example netbench -- tailnet HOST.TAILNET.ts.net   # a paired tailnet host
 //!
 //! Env: FLOOD_MB (default 200).
 
@@ -78,6 +79,16 @@ fn main() -> anyhow::Result<()> {
     let mut daemon = None;
     let endpoint = match args.first().map(String::as_str) {
         Some("ssh") => Endpoint::ssh(args.get(1).expect("ssh HOST"), None),
+        Some("tailnet") => {
+            let dns = args.get(1).expect("tailnet MAGICDNS-NAME (of a host this computer paired with)").clone();
+            let dirs = goatty_shell::Dirs::from_env().expect("$HOME");
+            Endpoint::Tailnet(goatty_client::TailnetTarget {
+                name: dns.split('.').next().unwrap_or(&dns).to_string(),
+                dns,
+                paths: Some(goatty_net::Paths::new(dirs.tailnet_dir())),
+                tailscale: goatty_net::tailscale::Tailscale::system(),
+            })
+        }
         mode => {
             daemon = Some(Guard(
                 Command::new(&goattyd)

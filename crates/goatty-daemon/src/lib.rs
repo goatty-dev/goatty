@@ -10,6 +10,7 @@
 //! * `session`: PTY + terminal + subscribers with flow control,
 //! * `layouts`: each window's tabs and splits, restored by the next window,
 //! * `settings`: host settings, generations and rollback over the protocol,
+//! * `net`: this host on the user's tailnet (the gateway socket, pairing),
 //! * [`proxy`]: stdio ⇄ socket relay for remote transports,
 //! * `restore`: sessions that outlive goattyd (restart, upgrade, crash),
 //! * [`systemd`]: socket activation and the fd store.
@@ -18,6 +19,7 @@
 
 mod client;
 mod layouts;
+mod net;
 pub mod proxy;
 mod restore;
 pub mod server;

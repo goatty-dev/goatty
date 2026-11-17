@@ -152,6 +152,18 @@ impl Control {
         }
     }
 
+    /// A tailnet operation (`goatty_net::api::Request` as JSON); returns
+    /// the reply JSON. Needs protocol v12.
+    pub fn net(&mut self, request: String) -> Result<String> {
+        if self.version < goatty_proto::NET_SINCE {
+            bail!("goattyd (protocol v{}) is too old for the tailnet; restart it with `goattyd restart`", self.version);
+        }
+        match self.request(|req| ClientMsg::Net { req, request })? {
+            ServerMsg::Net { reply, .. } => Ok(reply),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
     /// Replace the daemon with `exe` (default: the goattyd it was started
     /// as), keeping every session (protocol v10). Returns once the old
     /// process image is gone: the daemon closes this connection when it

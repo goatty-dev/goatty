@@ -20,7 +20,7 @@ This turns the ideas in [`archive/remote-goattyd-plan.md`](archive/remote-goatty
 | D6 | **Wire types are goatty-owned** (`goatty-proto`). rio-vt types never cross the wire; snapshots are plain VT byte streams. | Swapping the VT core (rio → alacritty_terminal) doesn't break remote compatibility. |
 | D8 | **Two ways to reach a host: goattyd (default) or plain SSH (fallback). No third mode.** | See §5a. goattyd gives persistence, reconnect, the managed shell, host settings and plugins; goatty installs it with one confirmation. Plain SSH is `ssh host` in a session of the *local* goattyd, for hosts goattyd can't or shouldn't run on. A raw "remote PTY over an ssh channel" mode would fork every feature into two code paths (against D1) for no gain over plain SSH. |
 | D9 | **Peers negotiate a protocol version from a range; the wire grows append-only.** | §4. A GUI update no longer strands the sessions in a running daemon, as long as the ranges overlap. |
-| D7 | **Threads, not async**, still. Per connection: reader + writer thread. Per session: PTY reader + reply thread. | Simple and fast at the scale of "tens of sessions". Revisit only for a QUIC transport (R2), where quinn requires tokio. |
+| D7 | **Threads, not async**, still. Per connection: reader + writer thread. Per session: PTY reader + reply thread. | Simple and fast at the scale of "tens of sessions". The tailnet transport (R2) kept it: no QUIC, so no tokio. |
 
 ## 2. Why bytes plus a mirror VT, not structured screen updates
 
@@ -114,7 +114,7 @@ ssh's stderr is captured (logged, last 40 lines kept): a failed connect shows ss
 
 `goattyd proxy` connects to the host's daemon socket, starting the daemon if needed, and relays bytes in both directions. It writes stdout through the raw fd, because std's `Stdout` is line-buffered and would hold binary frames back.
 
-**Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. No goatty-specific network port is needed.
+**Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. Without SSH, paired tailnet hosts connect through `Endpoint::Tailnet` ([`tailnet.md`](tailnet.md)): still no network socket in goattyd, because tailscaled forwards into a Unix socket.
 
 ### Any stdio command (implemented: `goatty --via '<cmd>'`)
 E.g. `--via 'docker exec -i devbox goattyd proxy'`. The command line runs under `sh -c`, so shell quoting works for arguments with spaces. The tests use this with the local `goattyd proxy` to exercise the full remote path, including reconnect, without ssh.
@@ -246,11 +246,8 @@ Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow con
 10. **Daemon-side liveness**: drop subscribers whose connection has been silent for >60 s (pings), so the attached count and size control are correct after a client vanished without FIN.
 11. **Client vs host settings split** in the profile model (font/keys/theme are client; shell/plugins/env are host). The plugin manager always acts on the connected host.
 
-### R2: native network transport (optional, later)
-Only needed if SSH is the bottleneck or for zero-config pairing.
-- **QUIC (quinn) + TLS** with one QUIC stream per pane. That removes head-of-line blocking between panes entirely, and connection migration covers laptop roaming (Wi‑Fi → LTE). The protocol already fits: frames are per-session, and the flow-control logic carries over.
-- **Auth**: device pairing (a short code shown by `goattyd pair` → client cert pinned on both sides). Optionally Tailscale identity (`tailscale whois` on the peer address) when bound to the tailnet interface only.
-- Bind to loopback/tailnet only by default, and never to 0.0.0.0 without explicit opt-in (plan §10).
+### R2: hosts on the tailnet ✅ (#15, protocol v12)
+Paired in the app, no SSH setup: see [`tailnet.md`](tailnet.md). goatty uses the user's installed Tailscale. A host that is made available gets one `tailscale serve --tcp` route into a Unix socket of goattyd's, so goattyd still binds no network socket (D5). Each connection authenticates with a device key pinned by pairing (a 6-digit code confirmed on both screens). Outbound, the client uses plain TCP to the peer's tailnet address, or `tailscale nc` in userspace mode. QUIC was dropped: WireGuard already encrypts and authenticates, and Tailscale's stable addresses cover roaming. Per-pane streams without head-of-line blocking would be the only gain, and skip-and-resync bounds that (D7 stays).
 
 ### R3: latency hiding
 ✅ Mosh-style **local echo prediction** (#16), an overlay on the client's mirror VT with no protocol change (`goatty-term/src/predict.rs`). Typed printable, single-width characters are drawn underlined where they will land, with the cursor after them, and checked against the grid when the daemon's output arrives: once the real cursor has passed a guessed cell, a matching character confirms it (the overlay drops it; the real cell shows it), a different one drops every guess. The cursor leaving the line drops them too, and so does a guess that isn't echoed within 3 × RTT + 400 ms. Backspace takes back a guess that hasn't been echoed; prediction stops before the last column (wrapping is the application's business).
@@ -264,7 +261,7 @@ Guesses belong to *epochs*. Input we can't predict (Enter, arrows, control keys,
 | Risk | Mitigation |
 |---|---|
 | Version skew between GUI and remote daemon | Version range negotiation; install/restart from the connect screen (§5a) |
-| Head-of-line blocking across panes on one SSH stream | Bounded by Σ windows; R1 interactive priority; R2 QUIC streams |
+| Head-of-line blocking across panes on one SSH stream | Bounded by Σ windows; R1 interactive priority; several connections per host if measurements show a need |
 | Scrollback gaps after resync | Fetched from the daemon's scrollback on scroll-up (§4a); lost after a column resize |
 | Security: proxy access = full control of the daemon | Same trust as an SSH shell on that host; the daemon socket stays 0600 and is never exposed |
 | `$XDG_RUNTIME_DIR` removed on logout | Watchdog re-bind (done); systemd user unit + linger (done, opt-in) |

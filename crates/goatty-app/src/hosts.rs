@@ -18,6 +18,9 @@
 //! on a host doesn't log in again, and the switcher can show that host's
 //! link while any tab uses it.
 //!
+//! Computers on the user's tailnet that run goatty come from
+//! `crate::tailnet` (paired ones connect, found ones offer to pair).
+//!
 //! `~/.ssh/config` is read off the UI thread into the [`HostList`] global,
 //! when the app starts and whenever the palette or the Hosts page opens;
 //! views that show hosts observe the global.
@@ -52,6 +55,7 @@ pub mod pool {
         match endpoint {
             Endpoint::Local => Some("local".into()),
             Endpoint::Ssh(t) if t.remote_daemon.is_none() => Some(format!("ssh:{}", t.host)),
+            Endpoint::Tailnet(t) => Some(format!("tailnet:{}", t.dns)),
             _ => None,
         }
     }
@@ -91,6 +95,8 @@ pub enum HostRef {
     Local,
     /// What ssh is given: an alias or `user@host`.
     Ssh(String),
+    /// A paired computer on the user's tailnet, by its MagicDNS name.
+    Tailnet { dns: String, name: String },
 }
 
 impl HostRef {
@@ -103,6 +109,12 @@ impl HostRef {
                 target.askpass = std::env::current_exe().ok();
                 Endpoint::Ssh(target)
             }
+            HostRef::Tailnet { dns, name } => Endpoint::Tailnet(goatty_client::TailnetTarget {
+                dns: dns.clone(),
+                name: name.clone(),
+                paths: crate::tailnet::paths(),
+                tailscale: goatty_net::tailscale::Tailscale::system(),
+            }),
         }
     }
 
@@ -110,6 +122,7 @@ impl HostRef {
         match self {
             HostRef::Local => "this computer",
             HostRef::Ssh(host) => host,
+            HostRef::Tailnet { name, .. } => name,
         }
     }
 
@@ -118,6 +131,9 @@ impl HostRef {
     pub fn from_command_id(id: &str) -> Option<Self> {
         if id == LOCAL_ID {
             return Some(HostRef::Local);
+        }
+        if let Some(dns) = id.strip_prefix("tailnet.host:") {
+            return Some(HostRef::Tailnet { dns: dns.to_string(), name: crate::tailnet::name_of(dns) });
         }
         id.strip_prefix("ssh.host:").map(|h| HostRef::Ssh(h.to_string()))
     }
@@ -148,9 +164,11 @@ pub struct HostList {
 
 impl Global for HostList {}
 
-/// Re-read `~/.ssh/config` in the background; observers of [`HostList`]
-/// hear about it when it changed.
+/// Re-read `~/.ssh/config` and the tailnet's hosts in the background;
+/// observers of [`HostList`] (and `tailnet::TailnetList`) hear about it
+/// when they changed.
 pub fn refresh(cx: &mut App) {
+    crate::tailnet::refresh(cx);
     let list = cx.default_global::<HostList>();
     if list.reading {
         return;
@@ -235,7 +253,7 @@ pub fn connect(cx: &mut App, host: &str) {
 pub fn open(cx: &mut App, req: OpenRequest) {
     let plain = match &req.host {
         HostRef::Ssh(host) => cx.global::<AppSettings>().client.ssh.plain(host),
-        HostRef::Local => false,
+        HostRef::Local | HostRef::Tailnet { .. } => false,
     };
     log::info!("opening a session on {}{}", req.host.label(), if plain { " (plain SSH)" } else { "" });
     let plan = ConnectPlan { endpoint: req.host.endpoint(), mode: req.attach, open_settings: None, plain, conn: req.conn };

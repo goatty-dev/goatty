@@ -221,6 +221,12 @@ pub fn builtins() -> Vec<Command> {
         ),
         page("settings.profile", "Profile: export and import", Page::Profile, &["backup", "sync"]),
         page("settings.hosts", "Hosts: add hosts, plain SSH", Page::Hosts, &["ssh", "remote", "servers", "connect"]),
+        page(
+            "settings.network",
+            "Network: your computers over Tailscale, pairing",
+            Page::Network,
+            &["tailscale", "tailnet", "pair", "devices", "remote"],
+        ),
         page("settings.about", "About goatty", Page::About, &["version", "info", "bug report", "license"]),
         page("shell.diagnostics", "Shell diagnostics", Page::Diagnostics, &["doctor", "status", "startup", "slow", "missing", "tools"]),
         Command::handler("app.welcome", "goatty", "Welcome and setup", |_, cx| crate::welcome::open(cx)).keywords(&[

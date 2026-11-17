@@ -24,6 +24,7 @@ mod shell_path;
 mod shell_setup;
 mod shell_sync;
 mod snippets;
+mod tailnet;
 mod terminal;
 mod toast;
 mod typing;
