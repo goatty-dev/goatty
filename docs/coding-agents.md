@@ -30,13 +30,15 @@ Checked against the binaries installed on a development machine (Nov 2026):
 | Goose | — | not found in the binary | logo from the process name |
 | GitHub Copilot CLI | 1.0.112 | not found in the binary | logo from the process name |
 
-Reported by the agents' docs but not verified here: Pi (`PI_PROGRAM_STATUS`), Gemini CLI (OSC 9 / 777 via `general.notificationMethod`, no OSC 7501), Cursor Agent and Aider (no OSC 7501; Aider rings the bell with `--notifications`).
+Reported by the agents' docs but not verified here: Pi (`PI_PROGRAM_STATUS`), Gemini CLI (OSC 9 / 777 via `general.notificationMethod`, no OSC 7501), Cursor Agent (no OSC 7501).
 
 ## Which agent runs in a pane
 
 `agent::Identity::of`: the `app` of the pane's records (works over plain SSH and whatever runtime the agent runs on), else the foreground program (`Agent::from_process`). `goatty_term::process::display_name` names a runtime (`node`, `bun`, `python`, …) that runs a known agent package by the agent (`cursor-agent` runs as `node …/cursor-agent/…/index.js`). After an agent exits, its `done`/`error` record stays, but once the shell is back in the foreground the tab shows the shell's icon again.
 
-Known agents get their logo (`assets/agents/`, from LobeHub Icons, MIT; see its README): drawn in their colors through `img()`, or tinted with the tab's text color through `svg()` when the mark is black. An unknown `app` and Aider (no published mark) get a generic bot.
+Known agents get their logo (`assets/agents/`, from LobeHub Icons, MIT; see its README): in their colors, or tinted with the tab's text color through `svg()` when the mark is black. An unknown `app` gets a generic bot.
+
+Colored logos are rasterized at exactly the size they're drawn in device pixels and cached (`agent::rasterized`, an `img()` source with the window's scale factor). `img()` from an asset path would rasterize an SVG once at twice its intrinsic size and shrink it on the GPU without mipmaps, which leaves stray pixels at tab sizes. Pixel-art marks are drawn at a whole number of pixels per cell, the largest that fits the box (OpenCode, 12 cells: 12 px in a 14 px box; Pi, redrawn on its 4×4 grid: 12 px), or one pixel per cell, overflowing it a little (Claude Code, 16 cells, redrawn on its exact grid: 16 px). `svg()` rasterizes tinted marks at their exact size itself.
 
 ## How it shows
 

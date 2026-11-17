@@ -70,7 +70,6 @@ const AGENT_PACKAGES: &[(&str, &str)] = &[
     ("/@mariozechner/pi-coding-agent/", "pi"),
     ("/@sourcegraph/amp/", "amp"),
     ("/@qwen-code/qwen-code/", "qwen"),
-    ("/aider/", "aider"),
 ];
 
 /// The agent whose package an argument of the command line is in.
@@ -79,10 +78,6 @@ fn agent_package(cmdline: &[u8]) -> Option<&'static str> {
     for arg in args {
         if let Some((_, name)) = AGENT_PACKAGES.iter().find(|(dir, _)| arg.contains(dir)) {
             return Some(name);
-        }
-        // `python -m aider`
-        if arg == "aider" || arg.starts_with("aider.") {
-            return Some("aider");
         }
     }
     None
@@ -177,7 +172,6 @@ mod tests {
         assert_eq!(display_name("node", cursor).as_deref(), Some("cursor-agent"));
         let gemini = b"node\0/usr/lib/node_modules/@google/gemini-cli/dist/index.js\0";
         assert_eq!(display_name("node", gemini).as_deref(), Some("gemini"));
-        assert_eq!(display_name("python3.12", b"python3.12\0-m\0aider\0").as_deref(), Some("aider"));
         assert_eq!(display_name("node", b"node\0server.js\0").as_deref(), Some("node"));
         assert_eq!(display_name("vim", b"vim\0/x/@openai/codex/a.js\0").as_deref(), Some("vim"), "only runtimes");
     }

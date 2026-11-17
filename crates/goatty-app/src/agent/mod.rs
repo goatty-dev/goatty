@@ -9,6 +9,12 @@
 //! theme when the mark is black); any other program that reports a status
 //! gets a generic one.
 //!
+//! Colored logos are rasterized at exactly the size they're drawn in
+//! device pixels (and cached): GPUI's `img()` would rasterize an SVG once
+//! at a fixed size and shrink it on the GPU without mipmaps, which leaves
+//! stray pixels at small sizes. Pixel-art marks are drawn at a whole
+//! number of device pixels per cell.
+//!
 //! [`AgentStatus`] is what tabs show: the record that deserves the most
 //! attention (blocked, error, working, done), with `done` and `error`
 //! hidden once the user saw them. `notify` turns changes into
@@ -16,8 +22,14 @@
 
 pub mod notify;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use goatty_term::{BlockedKind, ProgramStatus, StatusRecord, StatusState};
-use gpui::{AnyElement, Hsla, IntoElement, Styled, img, px, svg};
+use gpui::{
+    AnyElement, App, DevicePixels, Global, Hsla, ImageCacheError, IntoElement, ParentElement, RenderImage, Styled, SvgSize, Window, div,
+    img, px, svg,
+};
 
 use crate::ui::icons::Icon;
 use crate::workspace::icons::is_shell;
@@ -36,18 +48,40 @@ pub enum Agent {
     Pi,
     Amp,
     Qwen,
-    Aider,
 }
 
 /// How an agent's logo is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Logo {
-    /// In its own colors (an image).
-    Color(&'static str),
-    /// A black mark, tinted with the text color (so it shows on dark themes).
-    Mono(&'static str),
+    /// One of the logo files.
+    Mark {
+        path: &'static str,
+        paint: Paint,
+        /// Pixel art `n` cells across its square viewBox: drawn at a whole
+        /// number of logical pixels per cell, so its edges land on the
+        /// pixel grid (the largest such size that fits, or one pixel per
+        /// cell, overflowing the box a little).
+        cells: Option<u16>,
+    },
     /// No logo of its own: one of goatty's icons.
     Glyph(Icon),
+}
+
+/// What colors a logo is drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paint {
+    /// Its own (an image).
+    Own,
+    /// A black mark, tinted with the text color (so it shows on dark themes).
+    Tint,
+}
+
+const fn mark(path: &'static str, paint: Paint) -> Logo {
+    Logo::Mark { path, paint, cells: None }
+}
+
+const fn pixel_art(path: &'static str, paint: Paint, cells: u16) -> Logo {
+    Logo::Mark { path, paint, cells: Some(cells) }
 }
 
 /// The logo files, by asset path.
@@ -83,7 +117,6 @@ impl Agent {
         Agent::Pi,
         Agent::Amp,
         Agent::Qwen,
-        Agent::Aider,
     ];
 
     /// The agent an OSC 7501 `app` names.
@@ -100,7 +133,6 @@ impl Agent {
             "pi" | "pi-coding-agent" => Agent::Pi,
             "amp" => Agent::Amp,
             "qwen" | "qwen-code" => Agent::Qwen,
-            "aider" => Agent::Aider,
             _ => return None,
         })
     }
@@ -119,7 +151,6 @@ impl Agent {
             "pi" => Agent::Pi,
             "amp" => Agent::Amp,
             "qwen" => Agent::Qwen,
-            "aider" => Agent::Aider,
             _ => return None,
         })
     }
@@ -138,24 +169,22 @@ impl Agent {
             Agent::Pi => "Pi",
             Agent::Amp => "Amp",
             Agent::Qwen => "Qwen Code",
-            Agent::Aider => "Aider",
         }
     }
 
     pub fn logo(self) -> Logo {
         match self {
-            Agent::ClaudeCode => Logo::Color("agents/claude-code.svg"),
-            Agent::Codex => Logo::Color("agents/codex.svg"),
-            Agent::OpenCode => Logo::Mono("agents/opencode.svg"),
-            Agent::Antigravity => Logo::Color("agents/antigravity.svg"),
-            Agent::Gemini => Logo::Color("agents/gemini-cli.svg"),
-            Agent::Copilot => Logo::Color("agents/copilot.svg"),
-            Agent::Cursor => Logo::Mono("agents/cursor.svg"),
-            Agent::Goose => Logo::Mono("agents/goose.svg"),
-            Agent::Pi => Logo::Mono("agents/pi.svg"),
-            Agent::Amp => Logo::Color("agents/amp.svg"),
-            Agent::Qwen => Logo::Color("agents/qwen.svg"),
-            Agent::Aider => Logo::Glyph(Icon::Bot),
+            Agent::ClaudeCode => pixel_art("agents/claude-code.svg", Paint::Own, 16),
+            Agent::Codex => mark("agents/codex.svg", Paint::Own),
+            Agent::OpenCode => pixel_art("agents/opencode.svg", Paint::Tint, 12),
+            Agent::Antigravity => mark("agents/antigravity.svg", Paint::Own),
+            Agent::Gemini => mark("agents/gemini-cli.svg", Paint::Own),
+            Agent::Copilot => mark("agents/copilot.svg", Paint::Own),
+            Agent::Cursor => mark("agents/cursor.svg", Paint::Tint),
+            Agent::Goose => mark("agents/goose.svg", Paint::Tint),
+            Agent::Pi => pixel_art("agents/pi.svg", Paint::Tint, 4),
+            Agent::Amp => mark("agents/amp.svg", Paint::Own),
+            Agent::Qwen => mark("agents/qwen.svg", Paint::Own),
         }
     }
 }
@@ -164,18 +193,65 @@ impl Logo {
     /// The asset it's drawn from, unless it's one of goatty's icons.
     pub fn path(self) -> Option<&'static str> {
         match self {
-            Logo::Color(p) | Logo::Mono(p) => Some(p),
+            Logo::Mark { path, .. } => Some(path),
             Logo::Glyph(_) => None,
         }
     }
 
-    /// The logo, `size` px square; `tint` colors the marks that take one.
+    /// The logo in a box `size` px square; `tint` colors the marks that
+    /// take one.
     pub fn element(self, size: f32, tint: Hsla) -> AnyElement {
-        match self {
-            Logo::Color(path) => img(path).flex_none().size(px(size)).into_any_element(),
-            Logo::Mono(path) => svg().path(path).flex_none().size(px(size)).text_color(tint).into_any_element(),
-            Logo::Glyph(icon) => icon.svg().size(px(size)).text_color(tint).into_any_element(),
+        let (path, paint, cells) = match self {
+            Logo::Mark { path, paint, cells } => (path, paint, cells),
+            Logo::Glyph(icon) => return icon.svg().size(px(size)).text_color(tint).into_any_element(),
+        };
+        let drawn = cells.map_or(size, |cells| pixel_size(size, cells));
+        // `svg()` rasterizes at the exact size itself; images need help.
+        let logo = match paint {
+            Paint::Own => img(rasterized(path, drawn)).flex_none().size(px(drawn)).into_any_element(),
+            Paint::Tint => svg().path(path).flex_none().size(px(drawn)).text_color(tint).into_any_element(),
+        };
+        if drawn == size {
+            return logo;
         }
+        // Centered on the box; a bigger drawing overflows it evenly.
+        div().flex_none().size(px(size)).flex().items_center().justify_center().child(logo).into_any_element()
+    }
+}
+
+/// The largest size up to `size` at which pixel art `cells` cells across
+/// has a whole number of logical pixels per cell; one pixel per cell if
+/// `size` is smaller than that.
+fn pixel_size(size: f32, cells: u16) -> f32 {
+    let cells = f32::from(cells);
+    (size / cells).floor().max(1.0) * cells
+}
+
+/// Logos rasterized for the screen, by path and size in device pixels.
+#[derive(Default)]
+struct Rasterized(HashMap<(&'static str, u32), Arc<RenderImage>>);
+
+impl Global for Rasterized {}
+
+/// An `img()` source drawing logo `path` at exactly `size` logical pixels
+/// in the window's device pixels.
+fn rasterized(path: &'static str, size: f32) -> impl Fn(&mut Window, &mut App) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    move |window, cx| {
+        let device = (size * window.scale_factor()).round().max(1.0) as u32;
+        if let Some(image) = cx.default_global::<Rasterized>().0.get(&(path, device)) {
+            return Some(Ok(image.clone()));
+        }
+        let renderer = cx.svg_renderer();
+        let side = DevicePixels(device as i32);
+        let image =
+            renderer.parse_svg(logo_bytes(path)?).and_then(|svg| renderer.render_parsed(&svg, SvgSize::ExactSize(gpui::size(side, side))));
+        Some(match image {
+            Ok(image) => {
+                cx.default_global::<Rasterized>().0.insert((path, device), image.clone());
+                Ok(image)
+            }
+            Err(e) => Err(e.into()),
+        })
     }
 }
 
@@ -430,6 +506,16 @@ mod tests {
         assert!(is_news(Some(&blocked.key()), &permission), "waiting for something else");
         let sub = AgentStatus { id: "sub".into(), ..rec(StatusState::Done) };
         assert!(is_news(Some(&rec(StatusState::Done).key()), &sub), "another record finished");
+    }
+
+    #[test]
+    fn pixel_art_gets_whole_pixels_per_cell() {
+        assert_eq!(pixel_size(14.0, 16), 16.0, "one pixel per cell, overflowing a little");
+        assert_eq!(pixel_size(17.0, 16), 16.0);
+        assert_eq!(pixel_size(32.0, 16), 32.0);
+        assert_eq!(pixel_size(14.0, 4), 12.0);
+        assert_eq!(pixel_size(17.0, 4), 16.0);
+        assert_eq!(pixel_size(14.0, 12), 12.0);
     }
 
     #[test]
