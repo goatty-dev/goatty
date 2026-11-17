@@ -112,6 +112,17 @@ impl Spawner {
         }
     }
 
+    /// Whether sessions from `self` and `other` live in the same place, so
+    /// their panes can share a tab.
+    pub fn same_host(&self, other: &Spawner) -> bool {
+        match (self, other) {
+            (Spawner::Local(a), Spawner::Local(b)) => Arc::ptr_eq(a, b),
+            (Spawner::Daemon(a), Spawner::Daemon(b)) => Arc::ptr_eq(a, b),
+            (Spawner::Plain { host: a, base: x }, Spawner::Plain { host: b, base: y }) => a == b && x.same_host(y),
+            _ => false,
+        }
+    }
+
     /// The goattyd connection its sessions live on, if any.
     pub fn connection(&self) -> Option<&Arc<Connection>> {
         match self {

@@ -111,6 +111,8 @@ actions!(
         ToggleVerticalTabs,
         SplitRight,
         SplitDown,
+        SplitLeft,
+        SplitUp,
         FocusPaneLeft,
         FocusPaneRight,
         FocusPaneUp,
@@ -127,6 +129,14 @@ actions!(
         SwapPaneUp,
         SwapPaneDown,
         MovePaneToNewTab,
+        /// Ask which tab (or a new one) the focused pane goes to.
+        MovePaneToTab,
+        /// Ask which other tab joins the active one, beside its panes.
+        MergeTab,
+        /// Every pane of the tab one place on (the last one first).
+        RotatePanes,
+        /// Every pane of the tab one place back.
+        RotatePanesBack,
     ]
 );
 
@@ -183,6 +193,8 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "toggle_vertical_tabs" => Box::new(ToggleVerticalTabs),
         "split_right" => Box::new(SplitRight),
         "split_down" => Box::new(SplitDown),
+        "split_left" => Box::new(SplitLeft),
+        "split_up" => Box::new(SplitUp),
         "focus_pane_left" => Box::new(FocusPaneLeft),
         "focus_pane_right" => Box::new(FocusPaneRight),
         "focus_pane_up" => Box::new(FocusPaneUp),
@@ -198,6 +210,10 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "swap_pane_up" => Box::new(SwapPaneUp),
         "swap_pane_down" => Box::new(SwapPaneDown),
         "move_pane_to_new_tab" => Box::new(MovePaneToNewTab),
+        "move_pane_to_tab" => Box::new(MovePaneToTab),
+        "merge_tab" => Box::new(MergeTab),
+        "rotate_panes" => Box::new(RotatePanes),
+        "rotate_panes_back" => Box::new(RotatePanesBack),
         _ => return None,
     })
 }

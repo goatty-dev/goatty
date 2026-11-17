@@ -77,10 +77,13 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "rename_tab", label: "Rename the tab", group: "Tabs" },
     ActionInfo { name: "duplicate_tab", label: "Duplicate the tab (a new shell in the same directory)", group: "Tabs" },
     ActionInfo { name: "close_other_tabs", label: "Close the other tabs", group: "Tabs" },
+    ActionInfo { name: "merge_tab", label: "Bring another tab into this one (side by side)", group: "Tabs" },
     ActionInfo { name: "toggle_tab_sidebar", label: "Fold or unfold the tab sidebar", group: "Tabs" },
     ActionInfo { name: "toggle_vertical_tabs", label: "Switch between vertical and horizontal tabs", group: "Tabs" },
     ActionInfo { name: "split_right", label: "Split: new pane on the right", group: "Panes" },
     ActionInfo { name: "split_down", label: "Split: new pane below", group: "Panes" },
+    ActionInfo { name: "split_left", label: "Split: new pane on the left", group: "Panes" },
+    ActionInfo { name: "split_up", label: "Split: new pane above", group: "Panes" },
     ActionInfo { name: "focus_pane_left", label: "Focus the pane on the left", group: "Panes" },
     ActionInfo { name: "focus_pane_right", label: "Focus the pane on the right", group: "Panes" },
     ActionInfo { name: "focus_pane_up", label: "Focus the pane above", group: "Panes" },
@@ -96,6 +99,9 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "swap_pane_up", label: "Swap the pane with the one above", group: "Panes" },
     ActionInfo { name: "swap_pane_down", label: "Swap the pane with the one below", group: "Panes" },
     ActionInfo { name: "move_pane_to_new_tab", label: "Move the pane to a new tab", group: "Panes" },
+    ActionInfo { name: "move_pane_to_tab", label: "Move the pane to another tab", group: "Panes" },
+    ActionInfo { name: "rotate_panes", label: "Rotate the panes (each one place on)", group: "Panes" },
+    ActionInfo { name: "rotate_panes_back", label: "Rotate the panes back", group: "Panes" },
 ];
 
 pub fn find_action(name: &str) -> Option<&'static ActionInfo> {

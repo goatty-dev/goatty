@@ -408,6 +408,8 @@ pub fn builtins() -> Vec<Command> {
         Command::action("tab.select_last", "Tabs", "Go to the last tab", "select_last_tab").keywords(&["end"]),
         Command::action("pane.split_right", "Panes", "Split right", "split_right").keywords(&["vertical", "side by side", "new pane"]),
         Command::action("pane.split_down", "Panes", "Split down", "split_down").keywords(&["horizontal", "below", "new pane"]),
+        Command::action("pane.split_left", "Panes", "Split left", "split_left").keywords(&["vertical", "side by side", "new pane"]),
+        Command::action("pane.split_up", "Panes", "Split up", "split_up").keywords(&["horizontal", "above", "new pane"]),
         Command::action("pane.close", "Panes", "Close the pane", "close_pane").keywords(&["kill", "exit"]),
         Command::action("pane.focus_left", "Panes", "Focus the pane on the left", "focus_pane_left").keywords(&["move", "go"]),
         Command::action("pane.focus_right", "Panes", "Focus the pane on the right", "focus_pane_right").keywords(&["move", "go"]),
@@ -436,6 +438,18 @@ pub fn builtins() -> Vec<Command> {
             "break out",
             "split off",
             "own tab",
+        ]),
+        Command::action("pane.move_to_tab", "Panes", "Move the pane to another tab…", "move_pane_to_tab")
+            .keywords(&["send", "transfer", "join", "merge", "combine"]),
+        Command::action("pane.rotate", "Panes", "Rotate the panes", "rotate_panes").keywords(&["cycle", "shift", "reorder", "move"]),
+        Command::action("pane.rotate_back", "Panes", "Rotate the panes back", "rotate_panes_back")
+            .keywords(&["cycle", "shift", "reorder", "move", "reverse"]),
+        Command::action("tab.merge", "Tabs", "Bring another tab into this one…", "merge_tab").keywords(&[
+            "join",
+            "combine",
+            "side by side",
+            "split",
+            "merge",
         ]),
         Command::action("notifications.dismiss_all", "Notifications", "Dismiss all", "dismiss_notifications")
             .keywords(&["toasts", "clear", "close", "hide"]),
