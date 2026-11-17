@@ -66,7 +66,8 @@ pub fn outdated(pid: u32) -> Option<Outdated> {
     outdated_than(pid, installed_daemon()?)
 }
 
-/// [`outdated`] against a given `installed` goattyd.
+/// [`outdated`] against a given `installed` goattyd. Linux only (it stats
+/// the running file through `/proc/<pid>/exe`); `None` elsewhere.
 pub fn outdated_than(pid: u32, installed: PathBuf) -> Option<Outdated> {
     let exe = PathBuf::from(format!("/proc/{pid}/exe"));
     let running = std::fs::read_link(&exe).ok()?;
