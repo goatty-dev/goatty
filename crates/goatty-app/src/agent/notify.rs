@@ -55,8 +55,10 @@ impl Notice {
         matches!(self, Notice::Agent(_))
     }
 
-    /// The headline and the details; `place` names the pane (its tab's label).
+    /// The headline and the details; `place` names the pane (its tab's
+    /// label, which a program may have set: cleaned like its text).
     pub fn text(&self, place: &str) -> (String, String) {
+        let place = clean(place, MAX_TITLE);
         match self {
             Notice::Agent(a) => {
                 let who = a.who();
@@ -74,7 +76,7 @@ impl Notice {
                 };
                 (title, body)
             }
-            Notice::Program { title, body } if title.is_empty() => (place.to_string(), body.clone()),
+            Notice::Program { title, body } if title.is_empty() => (place, body.clone()),
             Notice::Program { title, body } => (title.clone(), format!("{body}\nIn {place}").trim().to_string()),
         }
     }
@@ -194,6 +196,8 @@ mod tests {
         assert_eq!(agent(StatusState::Error, None).text("x").0, "Claude Code failed");
         let p = Notice::program("", "Build \u{202e}finished\n").unwrap();
         assert_eq!(p.text("make"), ("make".into(), "Build finished".into()));
+        assert_eq!(p.text("evil\u{202e}gnp.exe"), ("evilgnp.exe".into(), "Build finished".into()), "a title a program set is cleaned too");
+        assert_eq!(agent(StatusState::Done, None).text("a\u{200b}b").1, "Bash: cargo test\nIn ab");
         assert_eq!(Notice::program(" ", "\u{7}"), None);
     }
 

@@ -145,7 +145,7 @@ workspace/
   icons.rs     process name → Nerd Font glyph + theme color, drawn with the bundled font (tests check every code point against it)
   saved.rs     the window's layout as goattyd keeps it (JSON: tabs, split trees with session ids, names, focus, zoom, window size and state); `restore` claims and reattaches it
 agent/
-  mod.rs       coding agents (#205): `Agent` (known by OSC 7501 `app` or the foreground program), their logos (`assets/agents/`, in color or tinted), `AgentStatus` (the top record for tabs, done/error hidden once seen), `is_news` (which changes deserve a notification)
+  mod.rs       coding agents (#205): `Agent` (known by OSC 7501 `app` or the foreground program), their logos (`assets/agents/`, in color or tinted), `AgentStatus` (the top record for tabs, done/error hidden once seen; a notice from a news record)
   notify.rs    `Notice` (an agent waiting/done/failed, a program's OSC 9/777), its texts, when it goes out (`applies`), desktop notification tags and clicks
 pickers.rs     goatty's own pick-from-a-list commands on `Ask::pick` (#79): "Themes: Switch theme…" (live preview through `AppSettings::preview_theme`, Esc restores; following the system it changes the dark or light theme in use), "Themes: Dark, light or follow the system…", "Shell: Install a built-in tool…" (the active host's missing or outdated tools, then `shell_setup::start_install`)
 close_confirm.rs  "Close this pane?" dialog when a program other than the shell still runs (`panes.confirm_close`, "Don't ask again")

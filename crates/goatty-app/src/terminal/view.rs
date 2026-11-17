@@ -57,7 +57,7 @@ use crate::actions::{
     ViewLastOutput,
 };
 use crate::agent::notify::Notice;
-use crate::agent::{self, AgentStatus, Identity, StatusKey};
+use crate::agent::{AgentStatus, Identity};
 use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::{LinkStatus, Session};
 use crate::settings::{AppSettings, palette};
@@ -309,8 +309,6 @@ pub struct TerminalView {
     process: Option<String>,
     /// What the pane's programs said about themselves (OSC 7501, 9;4).
     status: ProgramStatus,
-    /// The agent status last judged for notifications (`agent::is_news`).
-    told: Option<StatusKey>,
     exited: bool,
     // Links.
     link_click: LinkClick,
@@ -450,8 +448,6 @@ impl TerminalView {
             app_title: DEFAULT_TITLE.into(),
             title: String::new(),
             process: None,
-            // What's there before the pane is (a reattach) isn't news.
-            told: agent::notable(&initial_status, None).map(|s| s.key()),
             status: initial_status,
             exited: false,
             link_click: settings.links.open_on,
@@ -573,7 +569,11 @@ impl TerminalView {
         // Tabs fall back to the directory when there's no title.
         let mut cwd_changed = self.session.take_cwd_dirty();
         let mut clear_stats = false;
-        let (mut status_changed, mut news) = (false, false);
+        let mut status_changed = false;
+        // Told after the drain: agents' news first, so a program's own
+        // notification of the same event is seen as its echo.
+        let mut news = Vec::new();
+        let mut program_notices = Vec::new();
         while let Ok(ev) = self.session.ui_events.try_recv() {
             match ev {
                 UiEvent::Title(t) => self.app_title = t,
@@ -587,20 +587,19 @@ impl TerminalView {
                     cx.emit(TerminalEvent::Activity(if failed { Activity::Failed } else { Activity::Finished }));
                 }
                 UiEvent::CommandLine(line) => self.command_line_arrived(line, cx),
-                UiEvent::Status { notify } => {
+                UiEvent::Status { news: record } => {
                     status_changed = true;
-                    news |= notify;
+                    news.extend(record);
                 }
-                UiEvent::Notification { title, body } => {
-                    if let Some(notice) = Notice::program(&title, &body) {
-                        cx.emit(TerminalEvent::Notice(notice));
-                    }
-                }
+                UiEvent::Notification { title, body } => program_notices.extend(Notice::program(&title, &body)),
                 UiEvent::Exit => {}
             }
         }
         if status_changed {
             self.status_changed(news, cx);
+        }
+        for notice in program_notices {
+            cx.emit(TerminalEvent::Notice(notice));
         }
         let bytes = self.session.bytes_in.load(Ordering::Relaxed);
         if bytes != self.seen_bytes {
@@ -649,18 +648,15 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Read the program status again; tell the workspace, and whether
-    /// there's news (`news`: a program reported, not a cleanup or replay).
-    fn status_changed(&mut self, news: bool, cx: &mut Context<'_, Self>) {
+    /// Read the program status again and tell the workspace, with each
+    /// record that was news (`goatty_term::status`: blocked, done or
+    /// failed, as reported then, in order).
+    fn status_changed(&mut self, news: Vec<goatty_term::StatusRecord>, cx: &mut Context<'_, Self>) {
         self.status = self.session.terminal.program_status();
-        let now = agent::notable(&self.status, self.process());
-        if news
-            && let Some(now) = &now
-            && agent::is_news(self.told.as_ref(), now)
-        {
-            cx.emit(TerminalEvent::Notice(Notice::Agent(now.clone())));
+        for record in &news {
+            let status = AgentStatus::from_record(record, &self.status, self.process());
+            cx.emit(TerminalEvent::Notice(Notice::Agent(status)));
         }
-        self.told = now.map(|s| s.key());
         cx.emit(TerminalEvent::StatusChanged);
     }
 

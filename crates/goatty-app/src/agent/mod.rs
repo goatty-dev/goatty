@@ -315,7 +315,9 @@ impl AgentStatus {
         Some(Self::from_record(top, status, process))
     }
 
-    fn from_record(r: &StatusRecord, status: &ProgramStatus, process: Option<&str>) -> AgentStatus {
+    /// `r`, one of `status`'s records (or one that was): who it's from is
+    /// its `app`, else the pane's agent.
+    pub fn from_record(r: &StatusRecord, status: &ProgramStatus, process: Option<&str>) -> AgentStatus {
         let who = match &r.app {
             Some(app) => Some(Agent::from_app(app).map_or_else(|| Identity::Other(app.clone()), Identity::Known)),
             None => Identity::of(status, process),
@@ -392,7 +394,7 @@ impl AgentStatus {
         }
     }
 
-    /// The parts of it a change is judged by (see [`is_news`]).
+    /// Which record, in which state (what a toast is about).
     pub fn key(&self) -> StatusKey {
         StatusKey { id: self.id.clone(), state: self.state, kind: self.kind }
     }
@@ -406,18 +408,12 @@ pub struct StatusKey {
     pub kind: Option<BlockedKind>,
 }
 
-/// The status a pane's notifications follow: the top record, without idle
-/// ones (an agent going idle after it finished isn't a change).
+/// The status a pane's notifications are about: the top record, without
+/// idle ones (an agent going idle after it finished hasn't moved on).
+/// Which reports are news is `goatty_term::status`'s call.
 pub fn notable(status: &ProgramStatus, process: Option<&str>) -> Option<AgentStatus> {
     let top = status.top(|r| r.state != StatusState::Idle)?;
     Some(AgentStatus::from_record(top, status, process))
-}
-
-/// Is `now` worth a notification after `before`? Only a move into
-/// blocked, done or error is, and only when it's not the same thing again
-/// (a program repeating its report, a snapshot replaying it).
-pub fn is_news(before: Option<&StatusKey>, now: &AgentStatus) -> bool {
-    matches!(now.state, StatusState::Blocked | StatusState::Done | StatusState::Error) && before != Some(&now.key())
 }
 
 /// The most important of several panes' statuses (a split tab).
@@ -492,20 +488,6 @@ mod tests {
         let s = AgentStatus::of(&blocked, None, 9).unwrap();
         assert_eq!(s.tooltip(), "OpenCode · Has a question");
         assert_eq!(s.icon(), Some(Icon::MessageCircleQuestion));
-    }
-
-    #[test]
-    fn news_is_a_change_into_something_to_tell() {
-        let rec = |state| AgentStatus { who: None, id: String::new(), state, kind: None, progress: None, title: None, msg: None, seq: 1 };
-        let blocked = rec(StatusState::Blocked);
-        assert!(is_news(None, &blocked));
-        assert!(!is_news(Some(&blocked.key()), &blocked), "the same report again");
-        assert!(is_news(Some(&rec(StatusState::Working).key()), &rec(StatusState::Done)));
-        assert!(!is_news(None, &rec(StatusState::Working)));
-        let permission = AgentStatus { kind: Some(BlockedKind::Permission), ..rec(StatusState::Blocked) };
-        assert!(is_news(Some(&blocked.key()), &permission), "waiting for something else");
-        let sub = AgentStatus { id: "sub".into(), ..rec(StatusState::Done) };
-        assert!(is_news(Some(&rec(StatusState::Done).key()), &sub), "another record finished");
     }
 
     #[test]

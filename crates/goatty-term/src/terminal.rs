@@ -16,7 +16,7 @@ use rio_vt::selection::{Selection, SelectionType};
 
 use crate::listener::Listener;
 use crate::marks::{Mark, MarkScanner, ShellState};
-use crate::status::{self, ProgramStatus, Report};
+use crate::status::{self, Applied, ProgramStatus, Report};
 use crate::{Palette, TermMode, UiEvent};
 
 /// Grid size in cells plus the pixel size (for TIOCSWINSZ / XTWINOPS).
@@ -208,7 +208,7 @@ impl Terminal {
                 self.set_shell(ShellState::Prompt);
                 // The program that reported is gone.
                 if self.inner.status.lock().prompt() {
-                    let _ = self.inner.ui.send(UiEvent::Status { notify: false });
+                    let _ = self.inner.ui.send(UiEvent::Status { news: None });
                 }
             }
             Mark::PromptContinuation => {
@@ -269,14 +269,16 @@ impl Terminal {
                 }
             }
             Mark::Status(report) => {
-                let notify = !matches!(report, Report::Set { restore: true, .. } | Report::Clear { .. });
-                if self.inner.status.lock().apply(report) {
-                    let _ = self.inner.ui.send(UiEvent::Status { notify });
-                }
+                let news = match self.inner.status.lock().apply(report) {
+                    Applied::Unchanged => return,
+                    Applied::Changed => None,
+                    Applied::News(record) => Some(record),
+                };
+                let _ = self.inner.ui.send(UiEvent::Status { news });
             }
             Mark::Reset => {
                 if self.inner.status.lock().reset() {
-                    let _ = self.inner.ui.send(UiEvent::Status { notify: false });
+                    let _ = self.inner.ui.send(UiEvent::Status { news: None });
                 }
             }
         }

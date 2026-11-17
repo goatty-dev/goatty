@@ -22,8 +22,15 @@
 //! Lifetime: a new prompt (OSC 133;A) drops `idle`, `working` and
 //! `blocked` records and keeps `done` and `error` ones until they're
 //! cleared or replaced (the UI hides those once the user saw them); a full
-//! reset (RIS) drops everything. Snapshots carry the records (with
-//! `goatty=restore`, so replaying them doesn't look like news).
+//! reset (RIS) drops everything. Snapshots carry the records with their
+//! sequence numbers (`goatty=restore.<seq>`, so replaying them neither
+//! looks like news nor like a newer report than the user saw).
+//!
+//! News: a program's own report that makes the record deserving the most
+//! attention (blocked > error > working > done, idle aside) blocked, done
+//! or failed, unless that's what it already was. It's found per report, in
+//! stream order, and travels with its [`UiEvent::Status`](crate::UiEvent),
+//! so a quick `working` → `done` between two frames still counts.
 //!
 //! Text from programs is checked here (valid UTF-8, no control
 //! characters, bidi and zero-width characters removed) but is still only
@@ -131,6 +138,13 @@ pub struct Record {
     pub seq: u64,
 }
 
+impl Record {
+    /// Which record, in which state: what tells news apart.
+    fn key(&self) -> (String, State, Option<BlockedKind>) {
+        (self.id.clone(), self.state, self.kind)
+    }
+}
+
 /// `OSC 9 ; 4` progress states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressState {
@@ -184,9 +198,20 @@ pub(crate) enum Report {
     /// `?`: does the terminal support it?
     Probe,
     /// `state=clear`: the record `id` and its children, or everything.
-    Clear { id: Option<String> },
-    /// A record to set. `restore`: goatty's own snapshot replaying it.
-    Set { record: Record, restore: bool },
+    /// `restore`: goatty's snapshot, with the newest sequence number so far.
+    Clear { id: Option<String>, restore: Option<u64> },
+    /// A record to set. `restore`: goatty's snapshot replaying it, with its
+    /// sequence number (0: unknown).
+    Set { record: Record, restore: Option<u64> },
+}
+
+/// What applying a report did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Applied {
+    Unchanged,
+    Changed,
+    /// Changed, and this record is news (see the module docs).
+    News(Record),
 }
 
 /// Parse the payload after `7501;`. `None`: malformed or over a limit
@@ -208,12 +233,15 @@ pub(crate) fn parse(payload: &[u8]) -> Option<Report> {
         fields.push((key, value));
     }
     let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+    // goatty's own snapshots: `goatty=restore[.<seq>]`.
+    let restore =
+        get("goatty").and_then(|v| v.strip_prefix("restore")).map(|seq| seq.strip_prefix('.').and_then(|n| n.parse().ok()).unwrap_or(0));
     let id = match get("id") {
         Some(id) => Some(valid_id(id)?.to_string()),
         None => None,
     };
     let state = match get("state")? {
-        "clear" => return Some(Report::Clear { id }),
+        "clear" => return Some(Report::Clear { id, restore }),
         "idle" => State::Idle,
         "working" => State::Working,
         "blocked" => State::Blocked,
@@ -251,7 +279,6 @@ pub(crate) fn parse(payload: &[u8]) -> Option<Report> {
         Some(m) => text_field(m, MAX_MSG_B64, MAX_MSG)?,
         None => None,
     };
-    let restore = get("goatty") == Some("restore");
     let record = Record { id: id.unwrap_or_default(), app, state, kind, progress, title, msg, seq: 0 };
     Some(Report::Set { record, restore })
 }
@@ -357,37 +384,52 @@ impl Store {
         ProgramStatus { records: self.records.clone(), progress: self.progress, latest: self.seq }
     }
 
-    /// Apply a report; whether anything changed.
-    pub(crate) fn apply(&mut self, report: Report) -> bool {
-        match report {
+    /// Apply a report.
+    pub(crate) fn apply(&mut self, report: Report) -> Applied {
+        let changed = match report {
             Report::Probe => false,
-            Report::Clear { id: None } => {
-                let changed = !self.records.is_empty();
-                self.records.clear();
-                changed
-            }
-            Report::Clear { id: Some(id) } => {
+            Report::Clear { id, restore } => {
+                if let Some(seq) = restore {
+                    self.seq = self.seq.max(seq);
+                }
                 let before = self.records.len();
-                self.records.retain(|r| !within(&r.id, &id));
+                match id {
+                    Some(id) => self.records.retain(|r| !within(&r.id, &id)),
+                    None => self.records.clear(),
+                }
                 before != self.records.len()
             }
-            Report::Set { mut record, .. } => {
-                let old = self.records.iter().position(|r| r.id == record.id);
+            Report::Set { mut record, restore } => {
+                let before = self.notable().map(Record::key);
                 if record.app.is_none() {
-                    record.app = self.inherited_app(&record.id).or_else(|| old.and_then(|i| self.records[i].app.clone()));
+                    record.app = self.inherited_app(&record.id);
                 }
-                if let Some(i) = old {
-                    self.records.remove(i);
-                }
-                self.seq += 1;
-                record.seq = self.seq;
+                self.records.retain(|r| r.id != record.id);
+                record.seq = match restore {
+                    Some(seq) if seq > 0 => seq,
+                    _ => self.seq + 1,
+                };
+                self.seq = self.seq.max(record.seq);
                 self.records.push(record);
                 if self.records.len() > MAX_RECORDS {
                     self.records.remove(0);
                 }
-                true
+                let news = self
+                    .notable()
+                    .filter(|r| restore.is_none() && matches!(r.state, State::Blocked | State::Done | State::Error))
+                    .filter(|r| Some(r.key()) != before);
+                return match news {
+                    Some(r) => Applied::News(r.clone()),
+                    None => Applied::Changed,
+                };
             }
-        }
+        };
+        if changed { Applied::Changed } else { Applied::Unchanged }
+    }
+
+    /// The record deserving the most attention, idle ones aside.
+    fn notable(&self) -> Option<&Record> {
+        self.records.iter().filter(|r| r.state != State::Idle).max_by_key(|r| (r.state.priority(), r.seq))
     }
 
     /// The `app` of the nearest ancestor of `id` that has one (the root is
@@ -436,11 +478,10 @@ impl Store {
     }
 
     /// The records and progress as sequences that rebuild them on a client
-    /// terminal. `replace`: clear what the client has first (a resync).
+    /// terminal, with their sequence numbers. `replace`: the client may have
+    /// a progress bar already (a resync); its records are cleared anyway.
     pub(crate) fn write_snapshot(&self, replace: bool, out: &mut String) {
-        if replace {
-            out.push_str("\x1b]7501;state=clear:goatty=restore\x1b\\");
-        }
+        let _ = write!(out, "\x1b]7501;state=clear:goatty=restore.{}\x1b\\", self.seq);
         for r in &self.records {
             let _ = write!(out, "\x1b]7501;state={}", r.state.name());
             if !r.id.is_empty() {
@@ -461,7 +502,7 @@ impl Store {
                     base64_encode(text.as_bytes(), out);
                 }
             }
-            out.push_str(":goatty=restore\x1b\\");
+            let _ = write!(out, ":goatty=restore.{}\x1b\\", r.seq);
         }
         match self.progress {
             Some(Progress { state, percent }) => {
@@ -517,8 +558,10 @@ mod tests {
         let r = set("state=working:app=codex:id=agent/1:progress=40");
         assert_eq!((r.state, r.progress, r.id.as_str()), (State::Working, Some(40), "agent/1"));
         assert_eq!(parse(b"?"), Some(Report::Probe));
-        assert_eq!(parse(b"state=clear"), Some(Report::Clear { id: None }));
-        assert_eq!(parse(b"state=clear:id=a/b"), Some(Report::Clear { id: Some("a/b".into()) }));
+        assert_eq!(parse(b"state=clear"), Some(Report::Clear { id: None, restore: None }));
+        assert_eq!(parse(b"state=clear:id=a/b"), Some(Report::Clear { id: Some("a/b".into()), restore: None }));
+        assert_eq!(parse(b"state=clear:goatty=restore.9"), Some(Report::Clear { id: None, restore: Some(9) }));
+        assert!(matches!(parse(b"state=done:goatty=restore"), Some(Report::Set { restore: Some(0), .. })));
     }
 
     #[test]
@@ -569,7 +612,7 @@ mod tests {
     #[test]
     fn records_replace_inherit_and_clear() {
         let mut s = Store::default();
-        let apply = |s: &mut Store, p: &str| s.apply(parse(p.as_bytes()).unwrap());
+        let apply = |s: &mut Store, p: &str| s.apply(parse(p.as_bytes()).unwrap()) != Applied::Unchanged;
         apply(&mut s, "state=working:app=claude-code");
         apply(&mut s, "state=blocked:id=sub/a");
         apply(&mut s, "state=done:id=sub/b:app=helper");
@@ -590,6 +633,32 @@ mod tests {
         assert!(!apply(&mut s, "state=clear:id=sub"));
         assert!(apply(&mut s, "state=clear"));
         assert!(s.status().records.is_empty());
+        // A new record of the same id doesn't take the old one's app: only
+        // an ancestor's.
+        apply(&mut s, "state=done:app=codex");
+        apply(&mut s, "state=working");
+        assert_eq!(s.status().app(), None);
+    }
+
+    #[test]
+    fn news_is_found_per_report() {
+        let mut s = Store::default();
+        let mut news = |p: &str| match s.apply(parse(p.as_bytes()).unwrap()) {
+            Applied::News(r) => Some((r.id, r.state)),
+            _ => None,
+        };
+        assert_eq!(news("state=working:app=codex"), None);
+        assert_eq!(news("state=done"), Some((String::new(), State::Done)));
+        assert_eq!(news("state=done"), None, "the same again");
+        // A quick turn between two frames: each report counts on its own.
+        assert_eq!(news("state=working"), None);
+        assert_eq!(news("state=done"), Some((String::new(), State::Done)));
+        assert_eq!(news("state=blocked:kind=permission"), Some((String::new(), State::Blocked)));
+        assert_eq!(news("state=blocked:kind=question"), Some((String::new(), State::Blocked)), "waiting for something else");
+        // A sub-record finishing under a waiting root isn't the news.
+        assert_eq!(news("state=done:id=sub"), None);
+        assert_eq!(news("state=idle:goatty=restore.3"), None);
+        assert_eq!(news("state=error:id=x:goatty=restore.4"), None, "replays are never news");
     }
 
     #[test]
@@ -630,23 +699,26 @@ mod tests {
         s.set_progress(Some(Progress { state: ProgressState::Indeterminate, percent: None }));
         let mut out = String::new();
         s.write_snapshot(true, &mut out);
-        // Parse it back as the client would.
-        let mut t = Store::default();
+        // Parse it back as the client would: into a fresh one, and into one
+        // that already has its own records and a higher count.
+        let mut fresh = Store::default();
+        let mut stale = Store::default();
+        for _ in 0..5 {
+            stale.apply(parse(b"state=working:id=old").unwrap());
+        }
         for seq in out.split("\x1b]7501;").skip(1) {
             let payload = seq.split('\x1b').next().unwrap();
-            match parse(payload.as_bytes()).unwrap() {
-                Report::Set { restore, record } => {
-                    assert!(restore);
-                    t.apply(Report::Set { record, restore });
-                }
-                other => {
-                    t.apply(other);
-                }
+            let report = parse(payload.as_bytes()).unwrap();
+            assert!(matches!(report, Report::Set { restore: Some(_), .. } | Report::Clear { restore: Some(_), .. }), "{payload}");
+            for t in [&mut fresh, &mut stale] {
+                assert!(!matches!(t.apply(report.clone()), Applied::News(_)));
             }
         }
-        let (a, b) = (s.status(), t.status());
-        let strip = |st: &ProgramStatus| st.records.iter().map(|r| Record { seq: 0, ..r.clone() }).collect::<Vec<_>>();
-        assert_eq!(strip(&a), strip(&b));
+        // The same records with the same sequence numbers, so what the user
+        // saw stays seen.
+        assert_eq!(fresh.status().records, s.status().records);
+        assert_eq!(stale.status().records, s.status().records);
+        assert!(fresh.status().latest >= s.status().records.last().unwrap().seq);
         assert!(out.ends_with("\x1b]9;4;3\x07"));
     }
 
@@ -686,8 +758,14 @@ mod tests {
             assert_eq!(st.records.len(), 1, "cut at {cut}");
             assert_eq!(st.records[0].title.as_deref().map(str::len), Some(150));
         }
-        assert!(ch.ui.try_iter().any(|e| matches!(e, UiEvent::Status { notify: true })));
-        t.feed(b"\x1b]7501;state=done:id=sub\x07\x1b]9;4;3\x07");
+        assert!(ch.ui.try_iter().all(|e| matches!(e, UiEvent::Status { news: None })), "working isn't news");
+        t.feed(b"\x1b]7501;state=done\x07\x1b]9;4;3\x07");
+        let news: Vec<_> = ch.ui.try_iter().filter_map(|e| if let UiEvent::Status { news } = e { news } else { None }).collect();
+        assert_eq!(
+            news.iter().map(|r| (r.state, r.app.as_deref())).collect::<Vec<_>>(),
+            [(State::Done, None)],
+            "no app: the root has no ancestor"
+        );
         assert_eq!(t.program_status().progress, Some(Progress { state: ProgressState::Indeterminate, percent: None }));
         // The shell's next prompt: what's left is the result.
         t.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
@@ -697,7 +775,7 @@ mod tests {
         let _ = ch.ui.try_iter().count();
         t.feed(b"\x1bc");
         assert!(t.program_status().is_empty());
-        assert!(matches!(ch.ui.try_iter().collect::<Vec<_>>().as_slice(), [UiEvent::Status { notify: false }]));
+        assert!(matches!(ch.ui.try_iter().collect::<Vec<_>>().as_slice(), [UiEvent::Status { news: None }]));
         // Too long: dropped, and what follows is still seen.
         let huge = format!("\x1b]7501;state=done:msg={}\x07\x1b]7501;state=error\x07", "A".repeat(5000));
         t.feed(huge.as_bytes());

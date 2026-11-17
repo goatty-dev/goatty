@@ -622,7 +622,7 @@ mod tests {
         assert_eq!(sb.app(), Some("claude-code"));
         assert_eq!(sa.progress, sb.progress);
         // Replaying isn't news.
-        assert!(cb.ui.try_iter().all(|e| !matches!(e, UiEvent::Status { notify: true })));
+        assert!(cb.ui.try_iter().all(|e| !matches!(e, UiEvent::Status { news: Some(_) })));
 
         // A resync replaces what the client had.
         a.feed(b"\x1b]7501;state=done:app=claude-code\x07\x1b]9;4;0\x07");

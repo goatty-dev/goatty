@@ -53,7 +53,7 @@ impl Workspace {
         }
         let Some((index, _)) = self.find_pane(pane) else { return };
         let tab = &self.tabs[index];
-        let visible = index == self.active && (!tab.zoomed || tab.focused == pane);
+        let visible = index == self.active && tab.shows(pane);
         let active = window.is_window_active();
         let place = self.tab_label(tab, cx);
         if applies(settings.in_app, active, visible) {
@@ -97,7 +97,8 @@ impl Workspace {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let panes: Vec<PaneId> = tab.panes.iter().map(|p| p.id).collect();
+        // A pane hidden behind a zoomed one isn't seen.
+        let panes: Vec<PaneId> = tab.panes.iter().map(|p| p.id).filter(|&id| tab.shows(id)).collect();
         for pane in panes {
             if let Some((id, _)) = self.notices.toasts.remove(&pane) {
                 toast::dismiss(cx, id);
@@ -105,9 +106,12 @@ impl Workspace {
         }
     }
 
-    /// `pane` is gone.
-    pub(super) fn forget_notices(&mut self, pane: PaneId) {
-        self.notices.toasts.remove(&pane);
+    /// `pane` is gone, and so is its toast (a waiting agent's stays up
+    /// otherwise, its "Show" pointing nowhere).
+    pub(super) fn forget_notices(&mut self, pane: PaneId, cx: &mut Context<'_, Self>) {
+        if let Some((id, _)) = self.notices.toasts.remove(&pane) {
+            toast::dismiss(cx, id);
+        }
         self.notices.agent_at.remove(&pane);
         self.notices.system_at.remove(&pane);
     }

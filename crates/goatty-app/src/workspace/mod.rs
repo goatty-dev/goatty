@@ -136,6 +136,11 @@ impl Tab {
     fn focused_view(&self) -> Option<&Entity<TerminalView>> {
         self.pane(self.focused).map(|p| &p.view)
     }
+
+    /// Is pane `id` drawn when the tab is (not hidden by a zoomed pane)?
+    fn shows(&self, id: PaneId) -> bool {
+        !self.zoomed || self.focused == id
+    }
 }
 
 /// Where a new pane goes.
@@ -830,7 +835,7 @@ impl Workspace {
         let pos = order.iter().position(|&p| p == id).unwrap_or(0);
         tab.tree.remove(id);
         tab.panes.retain(|p| p.id != id);
-        self.forget_notices(id);
+        self.forget_notices(id, cx);
         let tab = &mut self.tabs[index];
         if self.paste.as_ref().is_some_and(|(_, pane, _)| *pane == id) {
             self.paste = None;
@@ -857,7 +862,7 @@ impl Workspace {
         }
         let tab = self.tabs.remove(index);
         for pane in &tab.panes {
-            self.forget_notices(pane.id);
+            self.forget_notices(pane.id, cx);
         }
         if self.rename.as_ref().is_some_and(|r| r.tab == tab.id) {
             self.rename = None;
@@ -1250,6 +1255,8 @@ impl Workspace {
             return;
         }
         tab.zoomed = !tab.zoomed;
+        // Unzoomed, the other panes are on screen again.
+        self.notices_seen(window, cx);
         self.save_layout(cx);
         cx.notify();
     }
@@ -1708,7 +1715,8 @@ impl Render for Workspace {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.activity = None;
             if looking {
-                for pane in &mut tab.panes {
+                let (zoomed, focused) = (tab.zoomed, tab.focused);
+                for pane in tab.panes.iter_mut().filter(|p| !zoomed || p.id == focused) {
                     pane.seen = pane.view.read(cx).program_status().latest;
                 }
             }

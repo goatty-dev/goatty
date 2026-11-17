@@ -1,6 +1,6 @@
 # Coding agents
 
-goatty shows which coding agent runs in a tab, what it's doing, and tells the user when it needs them or finished (#205). It uses what agents already send to terminals; nothing has to be installed or configured on the agent's side.
+goatty shows which coding agent runs in a tab, what it's doing, and tells the user when it needs them or finished (#205). It uses what agents already send to terminals. Agents that report their state (OSC 7501: Claude Code, Codex, OpenCode, Antigravity; see [the table](#which-agents-send-what)) need no setup. Others get their logo from the process name, and notifications only if they send OSC 9 / 777 (which some must be configured to do).
 
 ## What goatty reads
 
@@ -15,7 +15,7 @@ Agents send the probe followed by `CSI c` and treat OSC 7501 as supported only i
 
 Limits follow the protocol: 4096 bytes per sequence, 16-byte keys, `app` `[A-Za-z0-9_.+-]{1,32}`, `id` up to 8 segments of 32 bytes (128 in all), `title` 256 base64 / 192 decoded bytes, `msg` 2732 / 2048. A report that breaks one, has a duplicate key, invalid base64, invalid UTF-8 or a control character in its text is dropped whole. Bidi controls and zero-width characters are removed from text, which is only ever shown as plain text and never written back to the PTY. Unknown keys and unknown `kind` values are ignored (forward compatible); `kind` and `progress` are ignored where they don't apply. A terminal keeps at most 128 records (the least recently reported goes first).
 
-Lifetime: a report replaces the record its `id` names (`app` is inherited from the nearest ancestor, the root being every record's ancestor); `state=clear` removes a record and its children, or everything without an `id`. A new prompt (`OSC 133 ; A`) drops `idle`, `working` and `blocked` records and the progress bar and keeps `done`/`error`; RIS drops everything; the alternate screen and DECSTR keep them. The reattach, resync and restore snapshots replay the records after the screen rows (whose prompt marks would otherwise drop them) with `goatty=restore`, so a reattached window doesn't announce them again; resync clears the client's first.
+Lifetime: a report replaces the record its `id` names (without `app`, it inherits the nearest ancestor's, the root being every record's ancestor; never the replaced record's); `state=clear` removes a record and its children, or everything without an `id`. A new prompt (`OSC 133 ; A`) drops `idle`, `working` and `blocked` records and the progress bar and keeps `done`/`error`; RIS drops everything; the alternate screen and DECSTR keep them. The reattach, resync and restore snapshots replay the records after the screen rows (whose prompt marks would otherwise drop them), after a `state=clear` with the newest sequence number, each with its own (`goatty=restore.<seq>`): a reattached window doesn't announce them again, and a result the user saw stays seen after a resync.
 
 ## Which agents send what
 
@@ -53,7 +53,7 @@ Colored logos are rasterized at exactly the size they're drawn in device pixels 
 
 `notifications.in_app` and `notifications.system` (Settings → Workspace → Notifications) each pick never, when not looking (the pane isn't on screen: another tab, or goatty isn't focused; the default in goatty), when goatty isn't focused (the default on the desktop), or always. `agent_waiting`, `agent_done` and `programs` pick the events.
 
-- A pane notifies on a *change* into blocked, done or error (`agent::is_news`: another record, state or kind than last time), only for reports the program sent (not lifecycle cleanups or snapshot replays), so repeated identical reports and reattaching stay quiet.
+- A pane notifies on *news*: a report that makes the record deserving the most attention blocked, done or failed when it wasn't that already (another record, state or kind). `goatty-term` decides per report, in stream order, and sends the record with `UiEvent::Status`, so a quick `working` → `done` between two frames still counts. Lifecycle cleanups and snapshot replays are never news, so repeated identical reports and reattaching stay quiet. A pane's agent news is told before its program's own notifications from the same read, so the echo rule below sees them in order.
 - One toast per pane (keyed): blocked stays until dealt with; it goes when the agent moves on (back to work, cleared) or the user looks at the pane. "Show" brings the pane forward.
 - Desktop notifications carry the tag `goatty-pane:<window>:<pane>`; clicking one activates that window, tab and pane. At most one per pane every 3 s.
 - A program notification (OSC 9 / 777) within 5 s after the same pane's agent notified is the same news and is dropped. ConEmu's numbered OSC 9 subcommands (`9;1;…`) aren't notifications.

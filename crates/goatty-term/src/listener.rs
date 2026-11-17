@@ -29,11 +29,13 @@ pub enum UiEvent {
     /// asked for it with `Terminal::LINE_KEYS`; `OSC 7337;line=`).
     CommandLine(String),
     /// What a program says about itself changed (OSC 7501, OSC 9;4); read
-    /// it with `Terminal::program_status`. `notify`: the program reported
-    /// something new (not a lifecycle cleanup, not a snapshot replaying
-    /// what was already there), so a change of state is news.
+    /// it with `Terminal::program_status`. `news`: the report that made the
+    /// record deserving the most attention blocked, done or failed (not
+    /// what it already was; never a lifecycle cleanup or a snapshot's
+    /// replay), as it was then: one per report, in stream order, so none
+    /// is lost when several arrive between two reads.
     Status {
-        notify: bool,
+        news: Option<crate::status::Record>,
     },
     /// A program asked for a desktop notification (OSC 9 or OSC 777;
     /// untrusted text, show it as plain text).
@@ -111,7 +113,7 @@ impl EventListener for Listener {
                 };
                 let percent = report.progress.map(|p| p.min(100)).filter(|_| state != Some(ProgressState::Indeterminate));
                 if self.status.lock().set_progress(state.map(|state| Progress { state, percent })) {
-                    let _ = self.ui.send(UiEvent::Status { notify: false });
+                    let _ = self.ui.send(UiEvent::Status { news: None });
                 }
             }
             RioEvent::DesktopNotification { title, body } => {

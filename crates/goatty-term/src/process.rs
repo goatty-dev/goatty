@@ -59,17 +59,20 @@ fn is_runtime(name: &str) -> bool {
     matches!(name, "node" | "nodejs" | "bun" | "deno" | "python" | "uv" | "uvx")
 }
 
-/// Where coding agents installed as packages live, and the name each goes by.
+/// Where coding agents installed as packages live, and the name each goes
+/// by: npm/bun packages under a `node_modules` folder, Cursor's installer's
+/// versions folder. Only an installed package matches, not a project
+/// folder that happens to have the name.
 const AGENT_PACKAGES: &[(&str, &str)] = &[
-    ("/@anthropic-ai/claude-code/", "claude"),
-    ("/@openai/codex/", "codex"),
-    ("/opencode-ai/", "opencode"),
-    ("/@google/gemini-cli/", "gemini"),
-    ("/@github/copilot/", "copilot"),
-    ("/cursor-agent/", "cursor-agent"),
-    ("/@mariozechner/pi-coding-agent/", "pi"),
-    ("/@sourcegraph/amp/", "amp"),
-    ("/@qwen-code/qwen-code/", "qwen"),
+    ("/node_modules/@anthropic-ai/claude-code/", "claude"),
+    ("/node_modules/@openai/codex/", "codex"),
+    ("/node_modules/opencode-ai/", "opencode"),
+    ("/node_modules/@google/gemini-cli/", "gemini"),
+    ("/node_modules/@github/copilot/", "copilot"),
+    ("/cursor-agent/versions/", "cursor-agent"),
+    ("/node_modules/@mariozechner/pi-coding-agent/", "pi"),
+    ("/node_modules/@sourcegraph/amp/", "amp"),
+    ("/node_modules/@qwen-code/qwen-code/", "qwen"),
 ];
 
 /// The agent whose package an argument of the command line is in.
@@ -173,6 +176,8 @@ mod tests {
         let gemini = b"node\0/usr/lib/node_modules/@google/gemini-cli/dist/index.js\0";
         assert_eq!(display_name("node", gemini).as_deref(), Some("gemini"));
         assert_eq!(display_name("node", b"node\0server.js\0").as_deref(), Some("node"));
+        let project = b"node\0/home/me/src/cursor-agent/index.js\0/home/me/opencode-ai/x.js\0";
+        assert_eq!(display_name("node", project).as_deref(), Some("node"), "a project folder isn't the package");
         assert_eq!(display_name("vim", b"vim\0/x/@openai/codex/a.js\0").as_deref(), Some("vim"), "only runtimes");
     }
 
