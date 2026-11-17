@@ -162,6 +162,10 @@ impl HostService {
             api::Request::Suggest { owner, snippet, input, values, cwd } => self.plugins(|p| {
                 crate::snippets::suggest(p.dirs, &settings, &owner, &snippet, &input, &values, cwd.as_deref()).map(api::Reply::Suggestions)
             }),
+            api::Request::CommandSuggest { plugin, command, input, values, cwd } => self.plugins(|p| {
+                crate::snippets::suggest_command(p.dirs, &settings, &plugin, &command, &input, &values, cwd.as_deref())
+                    .map(api::Reply::Suggestions)
+            }),
         }
     }
 

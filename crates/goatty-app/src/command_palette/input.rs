@@ -9,6 +9,15 @@
 //! back, Tab: complete), and calls [`Ask::then`] with the [`Answers`]
 //! after it closed, so the answer handler can act on the focused terminal.
 //!
+//! A list to pick from is a field too ([`Field::list`], or [`Ask::pick`]
+//! for a one-step pick): the palette lists the items with the same fuzzy
+//! search, the current value selected. [`Field::on_select`] runs whenever
+//! the selection moves (a live preview: the theme switcher shows each
+//! theme as you go), and [`Ask::on_cancel`] when the palette closes
+//! without an answer (Esc puts the old theme back). A field's items can
+//! also come from a [`Loader`] (a plugin's `[command.input.source]` runs
+//! on the host).
+//!
 //! The checks are `goatty_plugin::commands::check_value` (types, limits,
 //! patterns, choices: the same for plugins and built-ins) plus an optional
 //! extra check per field. Paths are only looked at on disk when the host
@@ -46,6 +55,13 @@ pub struct Loaded {
     pub note: Option<String>,
 }
 
+/// Runs when the selection in a list moves, with the selected value: a
+/// live preview. Not for answering (that's [`Ask::then`]).
+pub type OnSelect = Rc<dyn Fn(&str, &mut App)>;
+
+/// Runs when the palette closes without an answer: undo a preview.
+pub type OnCancel = Rc<dyn Fn(&mut App)>;
+
 /// The finished line shown above the fields while they're asked, updated
 /// as you type: (answers so far, the field being asked, its text).
 pub type Preview = Rc<dyn Fn(&Answers, &str, &str) -> Vec<goatty_plugin::snippets::Seg>>;
@@ -64,6 +80,9 @@ pub enum Tone {
     Warn,
     Danger,
 }
+
+/// The field id of [`Ask::pick`]'s one field.
+const PICKED: &str = "picked";
 
 /// Most suggestions listed for a folder.
 const MAX_PATH_SUGGESTIONS: usize = 200;
@@ -87,6 +106,8 @@ pub struct Field {
     /// Takes several values: Enter adds one, Enter on an empty field goes
     /// on. The answer is the values separated by `\n`.
     pub multiple: bool,
+    /// A pick-from-list field's live preview (see [`OnSelect`]).
+    pub on_select: Option<OnSelect>,
 }
 
 /// An entry under the field.
@@ -115,6 +136,8 @@ impl Field {
                 pattern_help: None,
                 choices: Vec::new(),
                 must_exist: false,
+                source: None,
+                strict: false,
             },
             check: None,
             suggestions: Vec::new(),
@@ -122,6 +145,7 @@ impl Field {
             trim: false,
             loader: None,
             multiple: false,
+            on_select: None,
         }
     }
 
@@ -163,6 +187,26 @@ impl Field {
         f
     }
 
+    /// One of `items`, picked from a list (only these are answers).
+    pub fn list(id: &str, label: &str, items: Vec<Suggestion>) -> Self {
+        let mut f = Self::new(id, label, InputKind::Choice);
+        f.spec.choices = items
+            .iter()
+            .map(|s| InputChoice { value: s.value.clone(), label: Some(s.label.clone()), help: s.detail.clone().unwrap_or_default() })
+            .collect();
+        f.suggestions = items;
+        f.custom = false;
+        f
+    }
+
+    /// One of the items `loader` finds (fetched when the field is asked).
+    pub fn loaded_list(id: &str, label: &str, loader: Loader) -> Self {
+        let mut f = Self::text(id, label);
+        f.loader = Some(loader);
+        f.custom = false;
+        f
+    }
+
     /// An ssh destination (`user@host`, an alias); `known`: the hosts to
     /// suggest (host, label).
     pub fn host(id: &str, label: &str, known: Vec<(String, String)>) -> Self {
@@ -179,13 +223,18 @@ impl Field {
         f
     }
 
-    /// A field from a plugin's `[[command.input]]`.
-    pub fn from_plugin(spec: &CommandInput) -> Self {
+    /// A field from a plugin's `[[command.input]]`. `loader` fetches its
+    /// source's suggestions (`[command.input.source]`, run on the host).
+    pub fn from_plugin(spec: &CommandInput, loader: Option<Loader>) -> Self {
         let mut f = Self::new(&spec.id, &spec.label, spec.kind);
         f.spec = spec.clone();
         if spec.kind == InputKind::Choice {
             f.suggestions = choice_suggestions(&spec.choices);
             f.custom = false;
+        }
+        if spec.source.is_some() {
+            f.loader = loader;
+            f.custom = !spec.strict;
         }
         f
     }
@@ -193,7 +242,7 @@ impl Field {
     /// A field for a snippet's input: choices and flags pick from a list,
     /// a source's suggestions come from `loader`.
     pub fn from_snippet(input: &goatty_plugin::snippets::SnippetInput, loader: Option<Loader>) -> Self {
-        let mut f = Self::from_plugin(&input.spec());
+        let mut f = Self::from_plugin(&input.spec(), None);
         if input.kind == InputKind::Flag {
             let on = input.on.clone().unwrap_or_default();
             f.suggestions = vec![
@@ -294,6 +343,9 @@ pub struct Ask {
     pub done_label: Option<SharedString>,
     /// Answers to start with (going back into a filled-in snippet).
     pub answers: Answers,
+    /// Runs when the palette closes without answering (Esc, a click
+    /// outside, another palette replacing it): undo a live preview.
+    pub on_cancel: Option<OnCancel>,
 }
 
 impl Ask {
@@ -309,7 +361,40 @@ impl Ask {
             back: None,
             done_label: None,
             answers: Answers::new(),
+            on_cancel: None,
         }
+    }
+
+    /// Pick one of `items` (`current` selected to start with), then
+    /// `then` with its value: a command's second step ("Switch theme…").
+    pub fn pick(
+        title: impl Into<SharedString>,
+        label: &str,
+        items: Vec<Suggestion>,
+        current: Option<&str>,
+        then: impl Fn(&str, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        let mut field = Field::list(PICKED, label, items);
+        field.spec.default = current.map(str::to_string);
+        Self::new(title, vec![field], move |answers, window, cx| {
+            if let Some(v) = answers.get(PICKED) {
+                then(v, window, cx);
+            }
+        })
+    }
+
+    /// Call `f` when the palette closes without an answer.
+    pub fn on_cancel(mut self, f: impl Fn(&mut App) + 'static) -> Self {
+        self.on_cancel = Some(Rc::new(f));
+        self
+    }
+
+    /// The first field's live preview (see [`Field::on_select`]).
+    pub fn on_select(mut self, f: impl Fn(&str, &mut App) + 'static) -> Self {
+        if let Some(field) = self.fields.first_mut() {
+            field.on_select = Some(Rc::new(f));
+        }
+        self
     }
 
     /// The answers are for another host: don't look at this computer's files.
@@ -450,6 +535,21 @@ mod tests {
         assert_eq!(opt.validate("a b"), Err("No spaces".into()));
         assert_eq!(Field::text("t", "T").validate(" a "), Ok(" a ".into()), "text keeps its spaces");
         assert_eq!(Field::folder("d", "D", false).validate("/tmp/build "), Ok("/tmp/build ".into()), "paths too");
+    }
+
+    #[test]
+    fn lists_pick_one_of_their_items() {
+        let item = |v: &str, l: &str| Suggestion { value: v.into(), label: l.into(), detail: None };
+        let f = Field::list("t", "Theme", vec![item("dracula", "Dracula"), item("nord", "Nord")]);
+        assert!(f.strict());
+        assert_eq!(f.validate("nord"), Ok("nord".into()));
+        assert_eq!(f.validate("Nord"), Err("Pick one from the list".into()), "values, not labels");
+        let ask = Ask::pick("Switch theme", "Theme", vec![item("nord", "Nord")], Some("nord"), |_, _, _| {}).on_select(|_, _| {});
+        assert_eq!(ask.fields[0].spec.default.as_deref(), Some("nord"));
+        assert!(ask.fields[0].on_select.is_some() && ask.on_cancel.is_none());
+        let loaded = Field::loaded_list("c", "Container", Rc::new(|_: &Answers| -> Job { Box::new(Loaded::default) }));
+        assert!(loaded.strict() && loaded.loader.is_some());
+        assert_eq!(loaded.validate("anything"), Ok("anything".into()), "checked against what the loader found");
     }
 
     #[test]

@@ -36,7 +36,8 @@ pub enum Permission {
     /// Offers snippets and expansions (`[[snippet]]`, `[[expansion]]`):
     /// text that's only ever inserted at the prompt.
     Snippets,
-    /// Runs programs to suggest snippet values (`[snippet.input.source]`).
+    /// Runs programs to suggest snippet or command values
+    /// (`[snippet.input.source]`, `[command.input.source]`).
     SnippetSources,
 }
 
@@ -82,7 +83,7 @@ impl Permission {
             Permission::ConfigFiles => "Generates config files",
             Permission::Commands => "Adds commands to the command palette",
             Permission::Snippets => "Adds snippets and expansions",
-            Permission::SnippetSources => "Runs programs to suggest snippet values",
+            Permission::SnippetSources => "Runs programs to suggest values",
         }
     }
 
@@ -106,7 +107,7 @@ impl Permission {
                 "Nothing runs: a snippet's line is put on your prompt for you to read and run, and an expansion rewrites words you typed (shown before it runs, Backspace undoes it)."
             }
             Permission::SnippetSources => {
-                "When you fill in a snippet, these programs run on the tab's host (in the pane's folder, without a shell, stopped after a few seconds) to list suggestions."
+                "When you fill in a snippet or a command, these programs run on the tab's host (in the pane's folder, without a shell, stopped after a few seconds) to list suggestions."
             }
         }
     }
@@ -151,7 +152,9 @@ pub fn derived(m: &Manifest) -> Vec<Permission> {
     if !m.snippets.is_empty() || !m.expansions.is_empty() {
         v.push(Permission::Snippets);
     }
-    if m.snippets.iter().flat_map(|s| &s.inputs).any(|i| i.source.is_some()) {
+    if m.snippets.iter().flat_map(|s| &s.inputs).any(|i| i.source.is_some())
+        || m.commands.iter().flat_map(|c| &c.inputs).any(|i| i.source.is_some())
+    {
         v.push(Permission::SnippetSources);
     }
     v.sort();
@@ -206,7 +209,7 @@ fn what_uses(p: Permission) -> &'static str {
     match p {
         Permission::Binaries => "installs programs ([[package]])",
         Permission::ShellCode => "runs shell code (zsh.init)",
-        Permission::SnippetSources => "runs programs for snippet suggestions ([snippet.input.source])",
+        Permission::SnippetSources => "runs programs for suggestions ([snippet.input.source] or [command.input.source])",
         _ => "uses it",
     }
 }
@@ -269,6 +272,12 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                     .iter()
                     .flat_map(|s| s.inputs.iter().filter_map(move |i| i.source.as_ref().map(|src| (s, i, src))))
                     .map(|(s, i, src)| format!("{} → {}: {}", s.title, i.label, src.describe()))
+                    .chain(
+                        m.commands
+                            .iter()
+                            .flat_map(|c| c.inputs.iter().filter_map(move |i| i.source.as_ref().map(|src| (c, i, src))))
+                            .map(|(c, i, src)| format!("{} → {}: {}", c.title, i.label, src.describe())),
+                    )
                     .collect(),
             };
             Granted {

@@ -11,13 +11,19 @@
 //! Commands with a `[command.menu]` are also in the terminal's right-click
 //! menu (#186): [`MenuCommands`] lists them for the workspace, and
 //! [`start`] asks for their inputs with the selected text filled in.
+//!
+//! An input with a `[command.input.source]` lists what to pick from (#79):
+//! the host runs the plugin's own definition (`Request::CommandSuggest`;
+//! the client only names the plugin, command and input) in the focused
+//! pane's directory, and the palette lists the results.
 
 use std::rc::Rc;
 
 use goatty_plugin::api::{Installed, Reply, Request};
-use goatty_plugin::commands::{MenuWhen, PaletteCommand, command_line};
+use goatty_plugin::commands::{CommandInput, MenuWhen, PaletteCommand, command_line};
 use gpui::{App, AsyncApp, Global, Window};
 
+use crate::command_palette::input::Loader;
 use crate::command_palette::registry::Source;
 use crate::command_palette::{Answers, Ask, Command, CommandRegistry, Field, ask};
 use crate::settings_window::{HostLink, HostLinkGlobal};
@@ -34,6 +40,8 @@ impl Global for State {}
 /// A plugin command that is in the right-click menu too.
 #[derive(Clone)]
 pub struct MenuCommand {
+    /// The plugin's id.
+    pub plugin_id: String,
     /// The plugin's name.
     pub plugin: String,
     pub command: Rc<PaletteCommand>,
@@ -129,7 +137,12 @@ fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
             .iter()
             .filter(|p| p.enabled && p.incompatible.is_none())
             .flat_map(|p| p.manifest.commands.iter().filter(|c| c.menu.is_some()).map(move |c| (p, c)))
-            .map(|(p, c)| MenuCommand { plugin: p.manifest.name.clone(), command: Rc::new(c.clone()), origin: link.clone() })
+            .map(|(p, c)| MenuCommand {
+                plugin_id: p.manifest.id.clone(),
+                plugin: p.manifest.name.clone(),
+                command: Rc::new(c.clone()),
+                origin: link.clone(),
+            })
             .collect(),
         None => Vec::new(),
     };
@@ -149,9 +162,9 @@ pub fn command_id(plugin: &str, command: &str) -> String {
 fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
     let cmd = Rc::new(c.clone());
     let origin = link.clone();
-    let plugin_name = name.to_string();
+    let (plugin_id, plugin_name) = (plugin.to_string(), name.to_string());
     let mut out = Command::handler(&command_id(plugin, &c.id), name, &c.title, move |window, cx| {
-        start(&plugin_name, &cmd, &origin, None, window, cx)
+        start(&plugin_id, &plugin_name, &cmd, &origin, None, window, cx)
     });
     let mut words: Vec<&str> = c.keywords.iter().map(String::as_str).collect();
     words.push(plugin);
@@ -161,21 +174,38 @@ fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Com
     out
 }
 
-/// Ask for `cmd`'s inputs (none: run it right away). `selection`: the text
-/// selected in the pane, for the input its menu entry fills (still asked,
-/// so the user sees and can change it).
-pub fn start(plugin: &str, cmd: &Rc<PaletteCommand>, origin: &HostLink, selection: Option<&str>, window: &mut Window, cx: &mut App) {
+/// Ask for `cmd`'s inputs (none: run it right away). `plugin_id`/`plugin`:
+/// the plugin's id and name. `selection`: the text selected in the pane,
+/// for the input its menu entry fills (still asked, so the user sees and
+/// can change it).
+pub fn start(
+    plugin_id: &str,
+    plugin: &str,
+    cmd: &Rc<PaletteCommand>,
+    origin: &HostLink,
+    selection: Option<&str>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let fill = cmd.menu.as_ref().and_then(|m| m.fill.as_deref());
     let selection = selection.map(selection_value);
     if cmd.inputs.is_empty() {
         run(cmd, origin, &Answers::new(), window, cx);
         return;
     }
+    // Sources run in the focused pane's directory (on the host it reports).
+    let cwd = window
+        .root::<crate::workspace::Workspace>()
+        .flatten()
+        .and_then(|ws| ws.read(cx).focused_terminal())
+        .and_then(|v| v.read(cx).cwd())
+        .map(|c| c.to_string_lossy().into_owned());
     let fields = cmd
         .inputs
         .iter()
         .map(|i| {
-            let field = Field::from_plugin(i);
+            let loader = i.source.as_ref().map(|_| source_loader(origin, plugin_id, &cmd.id, i, cwd.clone()));
+            let field = Field::from_plugin(i, loader);
             match &selection {
                 Some(text) if fill == Some(i.id.as_str()) => field.initial(text.clone()),
                 _ => field,
@@ -186,6 +216,23 @@ pub fn start(plugin: &str, cmd: &Rc<PaletteCommand>, origin: &HostLink, selectio
     let title = format!("{plugin}: {}", cmd.title);
     let a = Ask::new(title, fields, move |answers, window, cx| run(&then, &then_origin, answers, window, cx)).remote(!origin.is_local());
     ask(window, cx, a);
+}
+
+/// Fetches `input`'s suggestions from the host (`CommandSuggest`) with the
+/// answers so far.
+fn source_loader(link: &HostLink, plugin: &str, command: &str, input: &CommandInput, cwd: Option<String>) -> Loader {
+    let (link, plugin, command, input) = (link.clone(), plugin.to_string(), command.to_string(), input.id.clone());
+    Rc::new(move |answers: &Answers| {
+        let req = Request::CommandSuggest {
+            plugin: plugin.clone(),
+            command: command.clone(),
+            input: input.clone(),
+            values: answers.clone(),
+            cwd: cwd.clone(),
+        };
+        let link = link.clone();
+        Box::new(move || crate::snippets::suggestions(link.plugin(req)))
+    })
 }
 
 /// Selected text as one input value: the first non-empty line, trimmed,

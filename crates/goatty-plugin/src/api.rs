@@ -51,6 +51,16 @@ pub enum Request {
         values: std::collections::BTreeMap<String, String>,
         cwd: Option<String>,
     },
+    /// Suggestions for one input of a plugin's palette command
+    /// (`[command.input.source]`): like [`Request::Suggest`], the host
+    /// looks the source up in the enabled plugin's own manifest.
+    CommandSuggest {
+        plugin: String,
+        command: String,
+        input: String,
+        values: std::collections::BTreeMap<String, String>,
+        cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,7 +121,8 @@ pub struct HostExpansion {
     pub enabled: bool,
 }
 
-/// What a snippet input's source suggested ([`Request::Suggest`]).
+/// What a snippet or command input's source suggested ([`Request::Suggest`],
+/// [`Request::CommandSuggest`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Suggestions {
     pub items: Vec<crate::snippets::Item>,

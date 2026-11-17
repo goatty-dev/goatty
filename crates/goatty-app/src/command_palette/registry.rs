@@ -267,6 +267,15 @@ pub fn builtins() -> Vec<Command> {
             toast::show(cx, Toast::info("Opening the themes folder").body(dir.display().to_string()).key("themes.open_folder"));
         })
         .keywords(&["directory", "files"]),
+        Command::handler("themes.switch", "Themes", "Switch theme…", crate::pickers::switch_theme).keywords(&[
+            "color scheme",
+            "colors",
+            "palette",
+            "appearance",
+            "preview",
+        ]),
+        Command::handler("themes.appearance", "Themes", "Dark, light or follow the system…", crate::pickers::switch_appearance)
+            .keywords(&["dark mode", "light mode", "night", "day", "system", "appearance", "auto"]),
         Command::action("snippets.find", "Snippets", "Find and fill in a command", "snippets").keywords(&[
             "cheatsheet",
             "how do i",
@@ -317,6 +326,8 @@ pub fn builtins() -> Vec<Command> {
             "directory",
             "delete",
         ]),
+        Command::handler("shell.install_tool", "Shell", "Install a built-in tool…", crate::pickers::install_tool)
+            .keywords(&["fzf", "starship", "zoxide", "eza", "bat", "managed", "download", "update", "missing"]),
         Command::handler("shell.sync", "Shell", "Sync shell setup to this host", |_, cx| crate::shell_sync::sync_now(cx))
             .keywords(&["copy", "mirror", "remote", "plugins", "aliases", "prompt", "dotfiles", "same"]),
         Command::action("terminal.copy", "Terminal", "Copy the selection", "copy").keywords(&["clipboard"]),

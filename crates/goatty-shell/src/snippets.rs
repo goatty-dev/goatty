@@ -1,6 +1,7 @@
 //! Snippets and expansions on this host (#89): the user's own from
 //! `host.json` and the enabled plugins', listed for the picker
-//! ([`list`]), suggestion sources run for it ([`suggest`]), and the
+//! ([`list`]), suggestion sources run for it ([`suggest`]; plugins'
+//! palette commands' too, [`suggest_command`]), and the
 //! expansion table the managed zsh reads ([`render_expansions`]).
 //!
 //! The format is `goatty_plugin::snippets`. What this module adds is the
@@ -209,6 +210,36 @@ pub fn suggest(
     if !user && matches!(cmd, Command::Shell(_)) {
         bail!("plugins can't run a shell");
     }
+    run_source(dirs, settings, &src, &cmd, cwd)
+}
+
+/// Run the source of input `input` of plugin `plugin`'s palette command
+/// `command` (`[command.input.source]`, looked up in the enabled plugin's
+/// manifest here) with the earlier `values`, in `cwd`.
+pub fn suggest_command(
+    dirs: &Dirs,
+    settings: &HostSettings,
+    plugin: &str,
+    command: &str,
+    input: &str,
+    values: &snippets::Answers,
+    cwd: Option<&str>,
+) -> Result<Suggestions> {
+    let (active, _) = plugins::active(dirs, settings);
+    let a = active.iter().find(|a| a.manifest.id == plugin).with_context(|| format!("plugin {plugin:?} isn't on (or installed) here"))?;
+    let c = a.manifest.commands.iter().find(|c| c.id == command).with_context(|| format!("{plugin} has no command {command:?}"))?;
+    let i = c.inputs.iter().find(|i| i.id == input).with_context(|| format!("{} has no input {input:?}", c.title))?;
+    let src = i.source.clone().ok_or_else(|| anyhow!("{} has no suggestions", i.label))?;
+    let argv = match goatty_plugin::commands::source_argv(c, i, values) {
+        Ok(argv) => argv,
+        Err(why) => return Ok(Suggestions { items: Vec::new(), note: Some(why), truncated: false }),
+    };
+    run_source(dirs, settings, &src, &Command::Argv(argv), cwd)
+}
+
+/// Run a source's `cmd` in `cwd` (the pane's directory; the home directory
+/// when it's missing, gone, or the source says so) and read its output.
+fn run_source(dirs: &Dirs, settings: &HostSettings, src: &snippets::Source, cmd: &Command, cwd: Option<&str>) -> Result<Suggestions> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     let dir = match (src.cwd, cwd) {
         (snippets::SourceCwd::Pane, Some(c)) if Path::new(c).is_dir() => PathBuf::from(c),
@@ -216,7 +247,7 @@ pub fn suggest(
     };
     let path = managed_path(dirs, settings);
     let fail = |what: String| Suggestions { items: Vec::new(), note: Some(src.on_fail.clone().unwrap_or(what)), truncated: false };
-    let out = match run(&cmd, &dir, &path, src.timeout()) {
+    let out = match run(cmd, &dir, &path, src.timeout()) {
         Ok(o) => o,
         Err(e) => return Ok(fail(format!("{e:#}"))),
     };
@@ -224,7 +255,7 @@ pub fn suggest(
         let first = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it failed").to_string();
         return Ok(fail(first));
     }
-    let (items, truncated) = snippets::parse_output(&out.stdout, &src);
+    let (items, truncated) = snippets::parse_output(&out.stdout, src);
     if items.is_empty() {
         return Ok(Suggestions { items, note: src.on_fail.clone().or(Some("Nothing to suggest".into())), truncated });
     }
