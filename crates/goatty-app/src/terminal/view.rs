@@ -33,7 +33,7 @@ use goatty_term::input::{
     Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
 };
 use goatty_term::paste::{self, PasteRisk};
-use goatty_term::{CursorKind, Frame, Link, SelectKind, TermMode, UiEvent};
+use goatty_term::{CursorKind, Frame, Link, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, Global, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
@@ -48,8 +48,9 @@ use super::keys::{mods, terminal_key};
 use super::links::{self, Place, Target};
 use super::stats::Stats;
 use crate::actions::{
-    ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, OpenContextMenu,
-    Paste, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo, ViewLastOutput,
+    ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, NextPrompt,
+    OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo,
+    ViewLastOutput,
 };
 use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::Session;
@@ -163,6 +164,8 @@ pub struct TerminalView {
     /// while there are predictions.
     expiring: bool,
     scroll_accum: f32,
+    /// A jump to the previous prompt waits for older lines from the daemon.
+    prompt_jump_pending: bool,
     cursor_visible: bool,
     last_activity: Instant,
     last_bytes: u64,
@@ -298,6 +301,7 @@ impl TerminalView {
             autoscroll: None,
             expiring: false,
             scroll_accum: 0.0,
+            prompt_jump_pending: false,
             cursor_visible: true,
             last_activity: Instant::now(),
             last_bytes: 0,
@@ -432,10 +436,15 @@ impl TerminalView {
         if self.hover.is_some() {
             self.refresh_hover(cx);
         }
+        // Older lines may have come in (each fetch wakes the view).
+        if self.prompt_jump_pending {
+            self.jump_to_prompt(PromptJump::Previous, None, cx);
+        }
         cx.notify();
     }
 
     fn send(&mut self, bytes: &[u8], cx: &mut Context<'_, Self>) {
+        self.prompt_jump_pending = false;
         self.session.terminal.scroll_to_bottom();
         self.session.write(bytes);
         self.arm_expiry(cx);
@@ -971,6 +980,46 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn previous_prompt(&mut self, _: &PreviousPrompt, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.jump_to_prompt(PromptJump::Previous, Some(window), cx);
+    }
+
+    fn next_prompt(&mut self, _: &NextPrompt, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.jump_to_prompt(PromptJump::Next, Some(window), cx);
+    }
+
+    /// Without prompts to jump between (a full-screen program, a shell
+    /// without integration) the key goes to the program instead. While the
+    /// daemon sends older lines the jump waits for them: `on_wake` resumes
+    /// it (`window` is `None` then).
+    fn jump_to_prompt(&mut self, dir: PromptJump, window: Option<&Window>, cx: &mut Context<'_, Self>) {
+        self.prompt_jump_pending = false;
+        match self.session.terminal.scroll_to_prompt(dir) {
+            PromptJumped::NoPrompts => {
+                if window.is_some() {
+                    cx.propagate();
+                }
+            }
+            PromptJumped::Moved => cx.notify(),
+            PromptJumped::Fetching => {
+                self.prompt_jump_pending = true;
+                // The redraw fetches the lines near the view.
+                cx.notify();
+            }
+            PromptJumped::Boundary => {
+                let toast = match dir {
+                    PromptJump::Previous => Toast::info("No earlier command").body("This is the oldest command in the scrollback."),
+                    PromptJump::Next => Toast::info("No later command").body("This is the newest output."),
+                }
+                .key("terminal.prompt_jump");
+                match window {
+                    Some(window) => toast::show_in(window, cx, toast),
+                    None => toast::show(cx, toast),
+                };
+            }
+        }
+    }
+
     /// Zoom this pane (0 resets) and show the new size in a toast that
     /// replaces itself while zooming.
     fn zoom_by(&mut self, delta: f32, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1220,6 +1269,7 @@ impl TerminalView {
             ScrollDelta::Lines(p) => p.y * 3.0,
             ScrollDelta::Pixels(p) => p.y / geom.cell.height.max(px(1.0)),
         };
+        self.prompt_jump_pending = false;
         self.scroll_accum += lines;
         let whole = self.scroll_accum.trunc() as i32;
         if whole == 0 {
@@ -1473,6 +1523,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::scroll_page_up))
             .on_action(cx.listener(Self::scroll_page_down))
+            .on_action(cx.listener(Self::previous_prompt))
+            .on_action(cx.listener(Self::next_prompt))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))

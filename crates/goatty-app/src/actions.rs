@@ -30,6 +30,10 @@ actions!(
         ScrollPageUp,
         /// Scroll forward one screen.
         ScrollPageDown,
+        /// Scroll so the previous command's prompt is at the top.
+        PreviousPrompt,
+        /// Scroll so the next command's prompt is at the top (or to the bottom).
+        NextPrompt,
         /// The output viewer on all output, with the search field focused.
         Find,
         /// The output viewer on the last (or running) command's output.
@@ -134,6 +138,8 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "paste" => Box::new(Paste),
         "scroll_page_up" => Box::new(ScrollPageUp),
         "scroll_page_down" => Box::new(ScrollPageDown),
+        "previous_prompt" => Box::new(PreviousPrompt),
+        "next_prompt" => Box::new(NextPrompt),
         "find" => Box::new(Find),
         "view_last_output" => Box::new(ViewLastOutput),
         "increase_font_size" => Box::new(IncreaseFontSize),

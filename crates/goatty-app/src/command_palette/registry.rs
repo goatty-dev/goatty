@@ -354,6 +354,10 @@ pub fn builtins() -> Vec<Command> {
             .keywords(&["delete", "erase", "empty", "kill"]),
         Command::action("terminal.scroll_page_up", "Terminal", "Scroll back one screen", "scroll_page_up"),
         Command::action("terminal.scroll_page_down", "Terminal", "Scroll forward one screen", "scroll_page_down"),
+        Command::action("terminal.previous_prompt", "Terminal", "Scroll to the previous command", "previous_prompt")
+            .keywords(&["prompt", "jump", "back", "up", "block", "mark"]),
+        Command::action("terminal.next_prompt", "Terminal", "Scroll to the next command", "next_prompt")
+            .keywords(&["prompt", "jump", "forward", "down", "block", "mark"]),
         Command::action("output.find", "Output", "Find in the output", "find").keywords(&[
             "search",
             "grep",

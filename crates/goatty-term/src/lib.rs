@@ -33,4 +33,4 @@ pub use links::{Found, Link, LinkKind, LinkSpan, find_links};
 pub use listener::UiEvent;
 pub use mode::TermMode;
 pub use terminal::{DEFAULT_SCROLLBACK, SelectKind, TermSize, Terminal, TerminalChannels};
-pub use transcript::{CommandBlock, Span, Transcript, TranscriptLine};
+pub use transcript::{CommandBlock, PromptJump, PromptJumped, Span, Transcript, TranscriptLine};

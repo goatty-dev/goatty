@@ -40,6 +40,8 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "clear_command_line", label: "Clear the command typed at the prompt", group: "Command line" },
     ActionInfo { name: "scroll_page_up", label: "Scroll back one screen", group: "Scrolling" },
     ActionInfo { name: "scroll_page_down", label: "Scroll forward one screen", group: "Scrolling" },
+    ActionInfo { name: "previous_prompt", label: "Scroll to the previous command", group: "Scrolling" },
+    ActionInfo { name: "next_prompt", label: "Scroll to the next command", group: "Scrolling" },
     ActionInfo { name: "find", label: "Find in the output", group: "Output" },
     ActionInfo { name: "view_last_output", label: "View the last command's output", group: "Output" },
     ActionInfo { name: "increase_font_size", label: "Bigger text", group: "Text size" },
@@ -108,6 +110,10 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl-v", "paste"),
     ("shift-pageup", "scroll_page_up"),
     ("shift-pagedown", "scroll_page_down"),
+    // Between the shell's prompts (OSC 133); without them (a full-screen
+    // program, no shell integration) the key goes to the program.
+    ("ctrl-shift-up", "previous_prompt"),
+    ("ctrl-shift-down", "next_prompt"),
     // The output viewer: everything, searched, or the last command's output.
     ("ctrl-shift-f", "find"),
     ("ctrl-shift-l", "view_last_output"),

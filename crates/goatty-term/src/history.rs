@@ -114,6 +114,14 @@ impl LineMap {
     }
 }
 
+/// Room for older lines above the mirror's oldest row, when the daemon has
+/// some and nothing unmapped is above (the map is normalized).
+fn older_room(t: &Term, map: &LineMap, evicted: u64) -> Option<u64> {
+    let (c0, h0) = *map.anchors.first()?;
+    let room = (DEFAULT_SCROLLBACK as u64).saturating_sub(t.history_size() as u64);
+    (c0 == evicted && h0 > map.oldest && room > 0).then_some(room)
+}
+
 /// The mirror's own absolute numbers: of its oldest row, and of its screen's top row.
 fn own_rows(t: &Term) -> (u64, u64) {
     let evicted = t.grid.lines_evicted();
@@ -214,11 +222,28 @@ impl Terminal {
         }
         // Older lines, if there's room for them and nothing unmapped above.
         let (c0, h0) = map.anchors[0];
-        let room = (DEFAULT_SCROLLBACK as u64).saturating_sub(t.history_size() as u64);
-        if c0 == evicted && h0 > map.oldest && room > 0 && near(c0) {
+        if let Some(room) = older_room(&t, &map, evicted)
+            && near(c0)
+        {
             return Some(HistoryWanted { before: h0, count: chunk((h0 - map.oldest).min(room)) });
         }
         None
+    }
+
+    /// Whether the daemon has lines older than this mirror's oldest row
+    /// that [`wanted_history`](Self::wanted_history) would fetch once the
+    /// view is near that row. Call it with the terminal locked (`t`).
+    pub(crate) fn older_history_missing(&self, t: &Term) -> bool {
+        if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let mut map = self.inner.lines.lock();
+        if map.resized.is_some() || map.anchors.is_empty() {
+            return false;
+        }
+        let evicted = own_rows(t).0;
+        map.normalize(evicted);
+        older_room(t, &map, evicted).is_some()
     }
 
     /// Put rows from the daemon (`rows`: [`HistoryRows`] fetched for host
@@ -382,6 +407,44 @@ mod tests {
         assert_eq!(fill(&a, &b) + 1, 3);
         assert_eq!(lines(&b), lines(&a));
         assert_eq!(b.history_size(), a.history_size());
+    }
+
+    #[test]
+    fn a_prompt_jump_fetches_older_history_until_it_finds_the_prompt() {
+        use crate::{PromptJump, PromptJumped};
+        let size = TermSize::new(30, 5);
+        let a = term(size, true);
+        let cmd = |t: &Terminal, name: &str, out: &[u8]| {
+            t.feed(format!("\x1b]133;A\x07$ \x1b]133;B\x07{name}\r\n\x1b]133;C\x07").as_bytes());
+            t.feed(out);
+            t.feed(b"\x1b]133;D;0\x07");
+        };
+        // A prompt, then far more output than one fetch margin, then another.
+        cmd(&a, "old", &numbered(0..3000));
+        cmd(&a, "new", &numbered(0..5));
+        a.feed(b"\x1b]133;A\x07$ ");
+        let b = term(size, false);
+        b.feed(&a.reattach_snapshot_with_history(100));
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Attach);
+        assert_eq!(b.scroll_to_prompt(PromptJump::Previous), PromptJumped::Moved);
+        assert_eq!(screen(&b)[0], "$ new");
+        // The app's loop: the redraw fetches near the view, then it jumps again.
+        let mut fetches = 0;
+        loop {
+            match b.scroll_to_prompt(PromptJump::Previous) {
+                PromptJumped::Fetching => {
+                    let w = b.wanted_history(10).expect("the view is at the oldest row held");
+                    assert!(b.insert_history(w.before, &a.history_rows(w.before, w.count as usize)));
+                    fetches += 1;
+                    assert!(fetches < 10, "keeps fetching");
+                }
+                PromptJumped::Moved => break,
+                other => panic!("{other:?} before reaching the old prompt"),
+            }
+        }
+        assert_eq!(screen(&b)[0], "$ old");
+        assert_eq!(fetches, 3);
+        assert_eq!(b.scroll_to_prompt(PromptJump::Previous), PromptJumped::Boundary);
     }
 
     #[test]
