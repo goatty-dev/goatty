@@ -215,9 +215,16 @@ fn alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     return std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .is_ok_and(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) != Some('Z'));
-    // No /proc: whether it can still be signalled (a zombie that isn't
-    // our child is reaped by its parent soon enough).
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    // SAFETY: `info` is plain data valid for writes of the size passed.
+    return unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size
+            && info.pbi_status != libc::SZOMB
+    };
+    // Elsewhere: whether it can still be signalled.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     // SAFETY: plain syscall; signal 0 only checks.
     return unsafe { libc::kill(pid as i32, 0) } == 0;
 }
