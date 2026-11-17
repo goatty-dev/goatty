@@ -8,4 +8,5 @@ mod links;
 mod stats;
 mod view;
 
+pub use links::{cleanup_remote_cache, cleanup_stale_remote_cache};
 pub use view::{Activity, PasteRequest, TerminalEvent, TerminalView};

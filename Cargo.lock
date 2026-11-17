@@ -2028,6 +2028,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "libc",
  "log",
  "parking_lot 0.13.0",
  "regex",

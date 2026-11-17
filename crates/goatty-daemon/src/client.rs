@@ -5,14 +5,42 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use goatty_proto::{ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, ServerMsg, SessionId, encode, encode_server, read_msg};
+use goatty_proto::{
+    ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, ServerMsg, SessionId, encode, encode_server, read_msg,
+};
 use goatty_term::Palette;
 
 use crate::server::Daemon;
 use crate::session::{Session, SubFeatures, Subscriber};
+
+/// Max concurrent `StatPath` worker threads per connection (bounds thread
+/// leaks if a remote mount stalls `stat`).
+const MAX_STAT_WORKERS: usize = 4;
+/// Max concurrent `ReadFile` worker threads per connection (bounds memory and
+/// stream head-of-line delay).
+const MAX_FILE_WORKERS: usize = 2;
+
+struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_worker(counter: &Arc<AtomicUsize>, limit: usize) -> Option<WorkerGuard> {
+    let mut cur = counter.load(Ordering::Acquire);
+    while cur < limit {
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(WorkerGuard(counter.clone())),
+            Err(next) => cur = next,
+        }
+    }
+    None
+}
 
 /// Serve one client connection until it closes. Its subscriptions end with
 /// it; the sessions keep running.
@@ -55,6 +83,8 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // The protocol version agreed in the handshake.
     let mut agreed_version = 0;
     let mut features = SubFeatures::default();
+    let stat_workers = Arc::new(AtomicUsize::new(0));
+    let file_workers = Arc::new(AtomicUsize::new(0));
     let mut rstream = BufReader::with_capacity(64 << 10, stream);
     let result = (|| -> Result<()> {
         loop {
@@ -76,6 +106,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     log::debug!("connection {conn}: {client} (protocol v{agreed})");
                     agreed_version = agreed;
                     features.lines = agreed >= HISTORY_SINCE;
+                    features.cwd = agreed >= REMOTE_FILES_SINCE;
                     reply(ServerMsg::Hello { version: agreed, daemon_pid, host });
                 }
                 ClientMsg::ListSessions { req } => reply(ServerMsg::Sessions { req, list: daemon.list() }),
@@ -233,6 +264,41 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         (Some(s), Some(p)) => s.term.set_palette(Arc::new(p)),
                         (_, None) => log::debug!("connection {conn}: bad palette ({} colors)", colors.len()),
                         (None, _) => {}
+                    }
+                }
+                ClientMsg::StatPath { req, session, candidates } => {
+                    // Stat off the reader thread in case the host has a slow/hung mount.
+                    let Some(guard) = try_acquire_worker(&stat_workers, MAX_STAT_WORKERS) else {
+                        reply(ServerMsg::PathStat { req, info: None });
+                        continue;
+                    };
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-stat")).spawn(move || {
+                        let _guard = guard;
+                        let info = crate::files::stat_path(&daemon, session, &candidates);
+                        if let Ok(f) = encode(&ServerMsg::PathStat { req, info }) {
+                            let _ = tx.send(f);
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't stat path: {e}") });
+                    }
+                }
+                ClientMsg::ReadFile { req, path, max_bytes } => {
+                    let Some(guard) = try_acquire_worker(&file_workers, MAX_FILE_WORKERS) else {
+                        reply(ServerMsg::Error { req: Some(req), message: "too many concurrent file reads".into() });
+                        continue;
+                    };
+                    let (tx, zstd) = (tx.clone(), features.zstd);
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-file")).spawn(move || {
+                        let _guard = guard;
+                        let msg = crate::files::read_file(req, &path, max_bytes);
+                        if let Ok(f) = encode_server(&msg, zstd) {
+                            let _ = tx.send(f);
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't read file: {e}") });
                     }
                 }
             }

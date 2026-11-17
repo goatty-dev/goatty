@@ -4,6 +4,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 use goatty_proto::{Frame, ReqId, ServerMsg, SessionId, SessionInfo, StreamOpts, TopLineCause, WinSize, encode, encode_server};
 use goatty_term::process::ForegroundWatch;
 use goatty_term::pty::Pty;
-use goatty_term::{TermSize, Terminal};
+use goatty_term::{TermSize, Terminal, UiEvent};
 use parking_lot::{Condvar, Mutex};
 
 use crate::systemd::StoredPty;
@@ -33,6 +34,8 @@ pub(crate) struct Subscriber {
     skipped: AtomicU64,
     /// The client speaks v11: it gets `TopLine`s.
     lines: bool,
+    /// The client speaks v13: it gets `Cwd` updates.
+    cwd: bool,
     /// Compress snapshots (the connection sent `Compress`).
     pub(crate) zstd: AtomicBool,
 }
@@ -42,6 +45,7 @@ pub(crate) struct Subscriber {
 pub(crate) struct SubFeatures {
     pub(crate) lines: bool,
     pub(crate) zstd: bool,
+    pub(crate) cwd: bool,
 }
 
 impl Subscriber {
@@ -73,6 +77,12 @@ pub(crate) struct Session {
     pub(crate) created_unix: u64,
     /// The foreground program, kept current by `fg` (see [`Session::watch_foreground`]).
     pub(crate) process: Mutex<Option<String>>,
+    /// The session's current working directory (OSC 7 preferred to preserve
+    /// symlinks, with `/proc/<pid>/cwd` fallback).
+    pub(crate) cwd: Mutex<Option<String>>,
+    /// Last `/proc/<pid>/cwd` observed, so a subsequent foreground probe doesn't
+    /// clobber a symlinked OSC 7 path when `/proc` didn't change.
+    pub(crate) last_proc_cwd: Mutex<Option<PathBuf>>,
     pub(crate) fg: OnceLock<ForegroundWatch>,
     /// goatty's managed zsh (it handles reload requests).
     pub(crate) managed: bool,
@@ -83,6 +93,8 @@ pub(crate) struct Session {
     /// The fd is open as long as `pty` is.
     pub(crate) pid: Option<u32>,
     pub(crate) master_fd: RawFd,
+    /// Terminal UI events (used to observe OSC 7 `CwdChanged`).
+    pub(crate) ui_events: flume::Receiver<UiEvent>,
     /// The terminal's query answers on their way to the PTY: the replies
     /// thread's queue and how many it took and wrote, so a restart can wait
     /// until none is left behind.
@@ -177,12 +189,20 @@ impl Pause {
 }
 
 impl Session {
-    /// Start tracking the foreground program: subscribers get
-    /// `ServerMsg::Process` whenever it changes.
+    /// Start tracking the foreground program and working directory: subscribers
+    /// get `ServerMsg::Process` and `ServerMsg::Cwd` whenever they change.
     pub(crate) fn watch_foreground(self: &Arc<Self>) -> std::io::Result<()> {
         let probe = {
             let s: Weak<Self> = Arc::downgrade(self);
-            move || s.upgrade().and_then(|s| s.pty.lock().foreground_name())
+            move || {
+                let s = s.upgrade()?;
+                let (name, proc_cwd) = {
+                    let pty = s.pty.lock();
+                    (pty.foreground_name(), pty.cwd())
+                };
+                s.maybe_update_proc_cwd(proc_cwd);
+                name
+            }
         };
         let on_change = {
             let s: Weak<Self> = Arc::downgrade(self);
@@ -213,14 +233,54 @@ impl Session {
         }
     }
 
+    pub(crate) fn current_cwd(&self) -> Option<String> {
+        self.cwd.lock().clone().or_else(|| self.pty.lock().cwd().map(|p| p.to_string_lossy().into_owned()))
+    }
+
+    fn maybe_update_proc_cwd(&self, proc_cwd: Option<PathBuf>) {
+        let Some(path) = proc_cwd else { return };
+        {
+            let mut last = self.last_proc_cwd.lock();
+            if last.as_ref() == Some(&path) {
+                return;
+            }
+            *last = Some(path.clone());
+        }
+        self.set_cwd(Some(path.to_string_lossy().into_owned()));
+    }
+
+    pub(crate) fn set_osc_cwd(&self, cwd: String, proc_cwd: Option<PathBuf>) {
+        if proc_cwd.is_some() {
+            *self.last_proc_cwd.lock() = proc_cwd;
+        }
+        self.set_cwd(Some(cwd));
+    }
+
+    fn set_cwd(&self, cwd: Option<String>) {
+        {
+            let mut cur = self.cwd.lock();
+            if *cur == cwd {
+                return;
+            }
+            *cur = cwd.clone();
+        }
+        let Ok(frame) = encode(&ServerMsg::Cwd { session: self.id, cwd }) else { return };
+        for sub in self.subs.lock().iter() {
+            if sub.cwd {
+                sub.push(frame.clone(), 0);
+            }
+        }
+    }
+
     pub(crate) fn info(&self) -> SessionInfo {
         let (cols, rows) = self.term.size();
+        let tracked_cwd = self.cwd.lock().clone();
         let pty = self.pty.lock();
         SessionInfo {
             id: self.id,
             pid: pty.pid(),
             title: self.term.title(),
-            cwd: pty.cwd().map(|p| p.to_string_lossy().into_owned()),
+            cwd: tracked_cwd.or_else(|| pty.cwd().map(|p| p.to_string_lossy().into_owned())),
             cols,
             rows,
             attached: self.subs.lock().len() as u32,
@@ -296,6 +356,7 @@ impl Session {
             lagging: AtomicBool::new(false),
             skipped: AtomicU64::new(0),
             lines: features.lines,
+            cwd: features.cwd,
             zstd: AtomicBool::new(features.zstd),
         });
         sub.push_snapshot(&ServerMsg::Attached { req, session: self.id, snapshot });
@@ -305,6 +366,14 @@ impl Session {
             && let Ok(f) = encode(&ServerMsg::Process { session: self.id, name })
         {
             sub.push(f, 0);
+        }
+        if sub.cwd {
+            let cwd = self.cwd.lock().clone();
+            if cwd.is_some()
+                && let Ok(f) = encode(&ServerMsg::Cwd { session: self.id, cwd })
+            {
+                sub.push(f, 0);
+            }
         }
         subs.push(sub.clone());
         sub
@@ -382,27 +451,37 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
             Ok(0) => break,
             Ok(n) => {
                 s.poke_foreground();
-                let mut subs = s.subs.lock();
-                s.term.feed(&buf[..n]);
-                // Encode once, lazily: nobody may be listening, or everyone
-                // may be lagging.
-                let mut frame: Option<Frame> = None;
-                subs.retain(|sub| {
-                    if sub.lagging.load(Ordering::Acquire) {
-                        sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
-                        return true;
+                {
+                    let mut subs = s.subs.lock();
+                    s.term.feed(&buf[..n]);
+                    // Encode once, lazily: nobody may be listening, or everyone
+                    // may be lagging.
+                    let mut frame: Option<Frame> = None;
+                    subs.retain(|sub| {
+                        if sub.lagging.load(Ordering::Acquire) {
+                            sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
+                            return true;
+                        }
+                        let in_flight = sub.in_flight();
+                        if in_flight > 0 && in_flight + n as u64 > sub.window {
+                            sub.lagging.store(true, Ordering::Release);
+                            sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
+                            return true;
+                        }
+                        let f = frame
+                            .get_or_insert_with(|| encode(&ServerMsg::Output { session: s.id, data: buf[..n].to_vec() }).expect("encode"))
+                            .clone();
+                        sub.push(f, n)
+                    });
+                }
+                for ev in s.ui_events.try_iter() {
+                    if matches!(ev, UiEvent::CwdChanged)
+                        && let Some(dir) = s.term.current_directory()
+                    {
+                        let proc_cwd = s.pty.lock().cwd();
+                        s.set_osc_cwd(dir.to_string_lossy().into_owned(), proc_cwd);
                     }
-                    let in_flight = sub.in_flight();
-                    if in_flight > 0 && in_flight + n as u64 > sub.window {
-                        sub.lagging.store(true, Ordering::Release);
-                        sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
-                        return true;
-                    }
-                    let f = frame
-                        .get_or_insert_with(|| encode(&ServerMsg::Output { session: s.id, data: buf[..n].to_vec() }).expect("encode"))
-                        .clone();
-                    sub.push(f, n)
-                });
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break, // EIO when the child exits

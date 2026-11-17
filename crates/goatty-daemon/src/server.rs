@@ -146,6 +146,12 @@ impl Daemon {
     pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
         let NewSession { id, pty, reader, term, chans, created_unix, managed } = n;
         let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
+        let proc_cwd = pty.cwd();
+        let init_cwd = term
+            .current_directory()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
+        for _ in chans.ui.try_iter() {}
         let session = Arc::new(Session {
             id,
             term,
@@ -153,11 +159,14 @@ impl Daemon {
             subs: Mutex::new(Vec::new()),
             created_unix,
             process: Mutex::new(None),
+            cwd: Mutex::new(init_cwd),
+            last_proc_cwd: Mutex::new(proc_cwd),
             fg: OnceLock::new(),
             managed,
             pause: Pause::new()?,
             pid,
             master_fd,
+            ui_events: chans.ui.clone(),
             replies: chans.replies.clone(),
             replies_taken: AtomicU64::new(0),
             replies_written: AtomicU64::new(0),

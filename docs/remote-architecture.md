@@ -102,6 +102,15 @@ The attach snapshot replays only the newest lines (2000 remote, 5000 local; the 
 
 Covered by `goatty-term`'s `history` tests (trimmed attach, resync gap, resize, hyperlinks and the pen surviving an insert), `scrollback_is_fetched_from_the_daemon_on_demand` (4000 lines over `goattyd proxy`: the second client attaches with 2000, scrolls up and ends with all 4000 in order) and `snapshots_and_history_are_compressed_when_asked`.
 
+## 4b. Remote working directory and file access (v13, #110)
+
+When hovering or clicking a file path in a remote tab, the client checks whether the path exists on the remote host and either opens it in a remote editor or fetches a read-only local copy over the existing session link (D1, D4).
+
+- **`Cwd { session, cwd }`** (v13): the daemon pushes the session's working directory on attach (gated per subscriber version) and whenever OSC 7 updates it (`set_cwd`), so relative link paths resolve against the remote shell's directory instead of the local GUI process's.
+- **`StatPath { req, session, cwd, candidates }` → `PathStat { req, exists, is_dir, size, resolved_path }`** (`crates/goatty-daemon/src/files.rs`): resolves up to 16 candidates against the session cwd (or client-supplied fallback, `~/`, and `/`) and stats the first existing regular file or directory. Candidates containing `..` are canonicalized through the kernel rather than collapsed lexically so symlinked OSC 7 working directories resolve like the shell's filesystem; FIFOs, sockets, and devices are ignored. Bounded to 4 concurrent stat workers per connection so hung network mounts cannot exhaust threads.
+- **`ReadFile { req, session, cwd, path, max_bytes }` → `FileData { req, resolved_path, data, truncated }`** (`crates/goatty-daemon/src/files.rs`): opens regular files with `O_NONBLOCK | O_NOCTTY` after `stat`, re-checks `fstat` to defeat stat-to-open races, and caps reads at `min(max_bytes, HARD_MAX_FILE_BYTES)` (`MAX_FRAME - 64 KiB`). Bounded to 2 concurrent read workers per connection.
+- **Head-of-line trade-off and client cache:** `FileData` travels as one postcard frame (zstd-compressed when enabled) on the connection's single writer queue, so large transfers temporarily queue with live terminal `Output` on slow links. To keep transfers bounded, `max_bytes` defaults to `links.remote_max_size_mb` (10 MiB, prompting before larger fetches up to `HARD_MAX_FILE_BYTES`), and `Connection::read_file` scales its request timeout from `max_bytes`. Fetched files are cached under `$XDG_CACHE_HOME/goatty/remote/<host-path-hash>/<basename>` as read-only (`0444`) files written via temp-and-rename; `p<pid>` prefixes keep tabs isolated and let startup cleanup remove stale caches after 24 hours only when the owning PID is no longer alive.
+
 ## 5. Transports
 
 ### Local

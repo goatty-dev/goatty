@@ -4,6 +4,7 @@
 //! doesn't care which backend is in use.
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -74,6 +75,12 @@ pub struct Session {
     pub status: Mutex<LinkStatus>,
     /// `user@host` for remote daemons, `None` locally.
     pub host_label: Option<String>,
+    /// Connectable SSH host destination (`SshTarget::host` or Tailnet MagicDNS), `None` locally or for `--via`.
+    pub ssh_host: Option<String>,
+    /// Authoritative shell directory from `ServerMsg::Cwd` (daemon v13+).
+    remote_cwd: Mutex<Option<String>>,
+    /// Set whenever `PaneEvent::Cwd` updates `remote_cwd`.
+    cwd_dirty: AtomicBool,
     /// The foreground program (`zsh`, `nvim`, …), when known.
     pub process: Mutex<Option<String>>,
     /// Local sessions watch their own PTY; daemon sessions hear it from goattyd.
@@ -201,6 +208,10 @@ impl PaneSink for Sink {
             }
             PaneEvent::Exited(_) => s.exited.store(true, Ordering::Release),
             PaneEvent::Process(name) => *s.process.lock() = name,
+            PaneEvent::Cwd(cwd) => {
+                *s.remote_cwd.lock() = cwd;
+                s.cwd_dirty.store(true, Ordering::Release);
+            }
         }
         s.waker.wake();
     }
@@ -231,7 +242,13 @@ impl PaneSink for Sink {
 }
 
 impl Session {
-    fn new(terminal: Terminal, ui: flume::Receiver<UiEvent>, backend: Backend, host_label: Option<String>) -> Self {
+    fn new(
+        terminal: Terminal,
+        ui: flume::Receiver<UiEvent>,
+        backend: Backend,
+        host_label: Option<String>,
+        ssh_host: Option<String>,
+    ) -> Self {
         let (waker, wake_rx) = Waker::new();
         Self {
             terminal,
@@ -242,6 +259,9 @@ impl Session {
             bytes_in: AtomicU64::new(0),
             status: Mutex::new(LinkStatus::Connected),
             host_label,
+            ssh_host,
+            remote_cwd: Mutex::new(None),
+            cwd_dirty: AtomicBool::new(false),
             process: Mutex::new(None),
             fg: std::sync::OnceLock::new(),
             waker,
@@ -280,7 +300,7 @@ impl Session {
             host.track_shell(pid);
         }
         let (terminal, chans) = Terminal::new(size, true, Arc::new(Palette::default()));
-        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Local(Mutex::new(pty)), None));
+        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Local(Mutex::new(pty)), None, None));
         let probe = {
             let weak = Arc::downgrade(&s);
             move || match &weak.upgrade()?.backend {
@@ -342,9 +362,11 @@ impl Session {
             let h = conn.host();
             format!("{}@{}", h.user, h.hostname)
         });
+        let ssh_host = (!conn.endpoint().is_local()).then(|| conn.ssh_host()).flatten();
         // Client-side terminal never answers queries; the daemon's does.
         let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
-        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, host_label));
+        let s =
+            Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, host_label, ssh_host));
         let sink = Arc::new(Sink(Arc::downgrade(&s)));
         let id = match target {
             Some(id) => {
@@ -370,7 +392,7 @@ impl Session {
     /// `ssh host` in a session of the local daemon).
     pub fn daemon_run(conn: Arc<Connection>, size: TermSize, argv: Vec<String>) -> Result<Arc<Self>> {
         let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
-        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, None));
+        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, None, None));
         let sink = Arc::new(Sink(Arc::downgrade(&s)));
         let cwd = conn.endpoint().is_local().then(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())).flatten();
         let id = conn.run(win(size), cwd, argv, sink)?;
@@ -541,6 +563,35 @@ impl Session {
             Backend::Local(_) => None,
             Backend::Daemon { id, .. } => Some(id.load(Ordering::Relaxed)),
         }
+    }
+
+    /// The goattyd connection behind this session, if any.
+    pub fn connection(&self) -> Option<&Arc<Connection>> {
+        match &self.backend {
+            Backend::Local(_) => None,
+            Backend::Daemon { conn, .. } => Some(conn),
+        }
+    }
+
+    /// Whether this session runs on a remote host.
+    pub fn is_remote(&self) -> bool {
+        self.host_label.is_some()
+    }
+
+    /// The shell's working directory on the session's host: daemon-tracked
+    /// CWD (OSC 7 with `/proc` fallback) when available, else client OSC 7.
+    pub fn cwd(&self) -> Option<PathBuf> {
+        self.remote_cwd.lock().as_deref().map(PathBuf::from).or_else(|| self.terminal.current_directory())
+    }
+
+    /// String form of [`Self::cwd`], used to key cached remote path lookups.
+    pub fn remote_cwd_str(&self) -> Option<String> {
+        self.remote_cwd.lock().clone().or_else(|| self.terminal.current_directory().map(|p| p.to_string_lossy().into_owned()))
+    }
+
+    /// Consume any pending CWD change pushed by `PaneEvent::Cwd`.
+    pub fn take_cwd_dirty(&self) -> bool {
+        self.cwd_dirty.swap(false, Ordering::AcqRel)
     }
 
     /// Window title: the app's title plus host and link state when remote.

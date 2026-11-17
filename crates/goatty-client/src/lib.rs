@@ -37,7 +37,7 @@ pub mod transport;
 
 pub use connection::{Connection, HostSettingsApplied, HostSettingsReply};
 pub use control::Control;
-pub use goatty_proto::TopLineCause;
+pub use goatty_proto::{RemotePathInfo, TopLineCause};
 pub use handshake::VersionMismatch;
 pub use local::LocalProblem;
 pub use remote::RemoteProblem;
@@ -90,4 +90,6 @@ pub enum PaneEvent {
     Lost(String),
     /// The foreground program changed (`zsh`, `nvim`, …).
     Process(Option<String>),
+    /// The session's working directory on the daemon host changed.
+    Cwd(Option<String>),
 }

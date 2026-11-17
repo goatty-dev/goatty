@@ -2,7 +2,8 @@
 //! (startup, tabs, panes).
 
 use goatty_config::{
-    CopyOnSelect, LinkClick, MiddleClick, OnLaunch, PaneSettings, PasteConfirm, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
+    CopyOnSelect, LinkClick, LinkSettings, MiddleClick, OnLaunch, PaneSettings, PasteConfirm, RemoteFileOpen, RightClick, TabActivity,
+    TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -22,6 +23,10 @@ impl SettingsWindow {
     pub(super) fn terminal(&self, ui: Ui, cx: &Context<'_, Self>) -> AnyElement {
         let s = &cx.global::<AppSettings>().file.value;
         let ctrl = if cfg!(target_os = "macos") { "Cmd+click" } else { "Ctrl+click" };
+        let opener_off = matches!(s.links.remote_files, RemoteFileOpen::Fetch | RemoteFileOpen::Copy);
+        let max_mb = s.links.remote_max_size_mb.clamp(LinkSettings::MIN_REMOTE_MAX_SIZE_MB, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
+        let min_mb = LinkSettings::MIN_REMOTE_MAX_SIZE_MB;
+        let max_limit = LinkSettings::MAX_REMOTE_MAX_SIZE_MB;
         let links = section(ui, "Links")
             .child(row(ui, "Open links").desc("Web addresses, file paths and links programs mark up").control(self.select(
                 "links-open-on",
@@ -40,7 +45,66 @@ impl SettingsWindow {
                     .desc("A command, or empty for the desktop's default app. Enter saves; {path}, {line} and {column} are filled in")
                     .below(self.file_opener.clone()),
             )
-            .footer("Paths count when the file exists. On a remote host, clicking one copies it instead.");
+            .child(row(ui, "Remote files").desc("How links to files and folders on remote hosts open").control(self.select(
+                "links-remote-files",
+                "Remote files",
+                opts(&[
+                    (RemoteFileOpen::Auto, "Automatic", "Use remote editor if set for SSH, else open read-only copy"),
+                    (RemoteFileOpen::Fetch, "Open read-only copy", "Fetch over the session link and open locally"),
+                    (RemoteFileOpen::RemoteOpener, "Open in remote editor", "Run the command below for SSH hosts (else fetch)"),
+                    (RemoteFileOpen::Copy, "Copy path", "Copy the remote path to the clipboard"),
+                ]),
+                &s.links.remote_files,
+                cx,
+                |v, _, cx| AppSettings::update(cx, |s| s.links.remote_files = v),
+            )))
+            .child(
+                row(ui, "Open remote files with")
+                    .desc(if opener_off {
+                        "Set Remote files to Automatic or Open in remote editor to use this command"
+                    } else {
+                        "For SSH sessions. Enter saves; {host}, {user}, {hostname}, {path}, {line} and {column} are filled in"
+                    })
+                    .disabled(opener_off)
+                    .below(self.remote_file_opener.clone()),
+            )
+            .child(
+                row(ui, "Max remote file download")
+                    .desc(if s.links.remote_files == RemoteFileOpen::Copy {
+                        "Fetching is off while Remote files copies paths"
+                    } else {
+                        "Larger files ask first before fetching over the session link"
+                    })
+                    .disabled(s.links.remote_files == RemoteFileOpen::Copy)
+                    .control(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(slider(
+                                "links-remote-max-size",
+                                (max_mb - min_mb) as f32 / (max_limit - min_mb) as f32,
+                                ui,
+                                move |t, done, _, cx| {
+                                    let v = (min_mb as f32 + t * (max_limit - min_mb) as f32).round() as u32;
+                                    let v = v.clamp(min_mb, max_limit);
+                                    if done {
+                                        AppSettings::update(cx, |s| s.links.remote_max_size_mb = v);
+                                    } else if cx.global::<AppSettings>().file.value.links.remote_max_size_mb != v {
+                                        AppSettings::preview(cx, |s| s.links.remote_max_size_mb = v);
+                                    }
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .w(px(52.))
+                                    .text_size(px(text::LABEL))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(SharedString::from(format!("{max_mb} MiB"))),
+                            ),
+                    ),
+            )
+            .footer("Paths count when the file or folder exists on that host. Right-click a link for all options.");
 
         let copy_opts = if PRIMARY_SELECTION {
             opts(&[

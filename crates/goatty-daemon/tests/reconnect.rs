@@ -98,7 +98,11 @@ fn pump_until(s: &mut UnixStream, session: SessionId, t: &Terminal, consumed: &m
             ServerMsg::Attached { session: id, snapshot, .. } | ServerMsg::Resync { session: id, snapshot, .. } if id == session => {
                 t.feed(&snapshot);
             }
-            ServerMsg::Output { .. } | ServerMsg::Pong { .. } | ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
+            ServerMsg::Output { .. }
+            | ServerMsg::Pong { .. }
+            | ServerMsg::Process { .. }
+            | ServerMsg::Cwd { .. }
+            | ServerMsg::TopLine { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
         send(s, &ClientMsg::Ack { session, consumed: *consumed });
@@ -110,8 +114,8 @@ fn create(s: &mut UnixStream, opts: StreamOpts) -> (SessionId, u64) {
     loop {
         match read_msg::<_, ServerMsg>(s).unwrap() {
             ServerMsg::Attached { req: 1, session, snapshot } => return (session, snapshot.len() as u64),
-            // Another session's foreground program or line numbers (multiplexed connection).
-            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
+            // Another session's foreground program, cwd, or line numbers (multiplexed connection).
+            ServerMsg::Process { .. } | ServerMsg::Cwd { .. } | ServerMsg::TopLine { .. } => {}
             other => panic!("{other:?}"),
         }
     }
@@ -208,7 +212,7 @@ fn sessions_multiplex_over_one_connection() {
                 c2 += data.len() as u64;
                 t2.feed(&data);
             }
-            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
+            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } | ServerMsg::Cwd { .. } => {}
             other => panic!("{other:?}"),
         }
     }
@@ -456,7 +460,7 @@ fn snapshots_and_history_are_compressed_when_asked() {
         let line = loop {
             match read_msg::<_, ServerMsg>(&mut c2).unwrap() {
                 ServerMsg::TopLine { line, cause: goatty_proto::TopLineCause::Attach, .. } => break line,
-                ServerMsg::Process { .. } | ServerMsg::Output { .. } => {}
+                ServerMsg::Process { .. } | ServerMsg::Cwd { .. } | ServerMsg::Output { .. } => {}
                 other => panic!("{other:?}"),
             }
         };
@@ -480,7 +484,7 @@ fn snapshots_and_history_are_compressed_when_asked() {
                 assert!(text.ends_with("\r\n"));
                 break;
             }
-            ServerMsg::Process { .. } | ServerMsg::Output { .. } => {}
+            ServerMsg::Process { .. } | ServerMsg::Cwd { .. } | ServerMsg::Output { .. } => {}
             other => panic!("{other:?}"),
         }
     }

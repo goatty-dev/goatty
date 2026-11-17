@@ -69,6 +69,10 @@ pub const INDEX: &[Entry] = &[
     e(Page::Appearance, "Window", "Blur behind the window", "blur frosted glass").keys(&["terminal.blur"]),
     e(Page::Terminal, "Links", "Open links", "url hyperlink click osc 8").keys(&["links.open_on"]),
     e(Page::Terminal, "Links", "Open files with", "editor file opener path vscode").keys(&["links.file_opener"]),
+    e(Page::Terminal, "Links", "Remote files", "ssh remote file fetch download read-only copy").keys(&["links.remote_files"]),
+    e(Page::Terminal, "Links", "Open remote files with", "ssh remote editor opener vscode zed neovim").keys(&["links.remote_file_opener"]),
+    e(Page::Terminal, "Links", "Max remote file download", "remote file size limit megabytes mib fetch")
+        .keys(&["links.remote_max_size_mb"]),
     e(Page::Terminal, "Selection", "Copy selected text", "copy on select primary clipboard").keys(&["selection.copy_on_select"]),
     e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),

@@ -21,6 +21,7 @@
 //! widgets ([`LineEdit`]): its text comes back as `UiEvent::CommandLine`.
 
 use std::cell::{Cell as StdCell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -28,12 +29,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use goatty_client::RemotePathInfo;
 use goatty_config::{ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, Renderer, RightClick};
 use goatty_term::input::{
     Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
 };
 use goatty_term::paste::{self, PasteRisk};
-use goatty_term::{CursorKind, Frame, Link, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
+use goatty_term::{CursorKind, Frame, Link, LinkKind, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, Font, Global, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
@@ -45,7 +47,7 @@ use gpui::{
 use super::element::{Geom, TerminalElement, hsla};
 use super::glyphs::GlyphCache;
 use super::keys::{mods, terminal_key};
-use super::links::{self, Place, Target};
+use super::links::{self, Place, RemoteAction, RemoteLookup, Target};
 use super::stats::Stats;
 use crate::actions::{
     ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, NextPrompt,
@@ -53,7 +55,7 @@ use crate::actions::{
     ViewLastOutput,
 };
 use crate::output_view::{self, OutputEvent, OutputView};
-use crate::session::Session;
+use crate::session::{LinkStatus, Session};
 use crate::settings::{AppSettings, palette};
 use crate::toast::{self, Toast};
 use crate::ui::context_menu::{Entry, Item};
@@ -69,6 +71,12 @@ const ZOOM_TOAST: Duration = Duration::from_millis(1800);
 const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
 /// How long goatty waits for the shell to report the command line.
 const LINE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long positive remote `StatPath` results stay cached before re-checking.
+const STAT_FOUND_TTL: Duration = Duration::from_secs(30);
+/// How long negative remote `StatPath` results stay cached before re-checking.
+const STAT_MISSING_TTL: Duration = Duration::from_secs(3);
+/// Backoff after a failed remote `StatPath` RPC before retrying on hover.
+const STAT_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 
 /// What a pane tells its parent.
 #[derive(Debug, Clone, PartialEq)]
@@ -128,10 +136,29 @@ pub fn needs_confirmation(confirm: PasteConfirm, risks: &[PasteRisk]) -> bool {
 
 /// The link under the mouse and what it resolved to (`None`: looks like a
 /// link but isn't one here, e.g. a path that doesn't exist). Kept so moving
-/// over the same link doesn't check the file system again.
+/// over the same link doesn't check the file system again unless a remote
+/// `StatPath` lookup is still pending.
 struct HoveredLink {
     link: Link,
     target: Option<Target>,
+    pending: bool,
+}
+
+#[derive(Clone)]
+enum CachedStat {
+    Found { info: RemotePathInfo, at: Instant },
+    Missing(Instant),
+    Error(Instant),
+}
+
+impl CachedStat {
+    fn is_fresh(&self, now: Instant) -> bool {
+        match self {
+            Self::Found { at, .. } => now.saturating_duration_since(*at) < STAT_FOUND_TTL,
+            Self::Missing(at) => now.saturating_duration_since(*at) < STAT_MISSING_TTL,
+            Self::Error(at) => now.saturating_duration_since(*at) < STAT_ERROR_BACKOFF,
+        }
+    }
 }
 
 pub struct TerminalView {
@@ -188,6 +215,10 @@ pub struct TerminalView {
     /// unless the press turned into a selection.
     pressed_link: Option<Target>,
     hostname: Option<String>,
+    /// Cached remote `StatPath` results keyed by `(remote_cwd, raw_target)`.
+    remote_stats: HashMap<(Option<String>, String), CachedStat>,
+    /// In-flight remote `StatPath` queries to deduplicate hover lookups.
+    remote_stat_inflight: HashSet<(Option<String>, String)>,
     /// The output viewer, while it covers the grid.
     viewer: Option<(Entity<OutputView>, Subscription)>,
     /// Asked the shell for the command line (and gives up when this ends).
@@ -316,6 +347,8 @@ impl TerminalView {
             hover: None,
             pressed_link: None,
             hostname: links::hostname(),
+            remote_stats: HashMap::new(),
+            remote_stat_inflight: HashSet::new(),
             viewer: None,
             line_request: None,
             menu_cell: None,
@@ -382,9 +415,9 @@ impl TerminalView {
         self.process.as_deref()
     }
 
-    /// The shell's directory (OSC 7), on the session's host.
+    /// The shell's directory on the session's host (OSC 7 or daemon `/proc` fallback).
     pub fn cwd(&self) -> Option<PathBuf> {
-        self.session.terminal.current_directory()
+        self.session.cwd()
     }
 
     pub fn session(&self) -> &Arc<Session> {
@@ -395,7 +428,8 @@ impl TerminalView {
         self.session.clear_wake();
         self.poke_cursor();
         // Tabs fall back to the directory when there's no title.
-        let mut cwd_changed = false;
+        let mut cwd_changed = self.session.take_cwd_dirty();
+        let mut clear_stats = false;
         while let Ok(ev) = self.session.ui_events.try_recv() {
             match ev {
                 UiEvent::Title(t) => self.app_title = t,
@@ -404,6 +438,7 @@ impl TerminalView {
                 UiEvent::CwdChanged => cwd_changed = true,
                 UiEvent::Bell => cx.emit(TerminalEvent::Activity(Activity::Bell)),
                 UiEvent::CommandFinished { exit } => {
+                    clear_stats = true;
                     let failed = exit.is_some_and(|code| code != 0);
                     cx.emit(TerminalEvent::Activity(if failed { Activity::Failed } else { Activity::Finished }));
                 }
@@ -423,7 +458,15 @@ impl TerminalView {
         // re-check even without a Title event.
         let title = self.title();
         let process = self.session.process.lock().clone();
-        if title != self.title || process != self.process || cwd_changed {
+        let process_changed = process != self.process;
+        if clear_stats || process_changed {
+            self.remote_stats.clear();
+            self.hover = None;
+        }
+        if cwd_changed {
+            self.hover = None;
+        }
+        if title != self.title || process_changed || cwd_changed {
             self.title = title;
             self.process = process;
             cx.emit(TerminalEvent::TitleChanged);
@@ -432,8 +475,8 @@ impl TerminalView {
             self.exited = true;
             cx.emit(TerminalEvent::Exited);
         }
-        // Output can move or overwrite the hovered link.
-        if self.hover.is_some() {
+        // Output, CWD changes, or finished commands/process transitions can move or change the hovered link.
+        if self.hover.is_some() || ((cwd_changed || clear_stats || process_changed) && self.mouse_cell.is_some()) {
             self.refresh_hover(cx);
         }
         // Older lines may have come in (each fetch wakes the view).
@@ -725,35 +768,94 @@ impl TerminalView {
     pub fn menu_entries(&mut self, cx: &mut Context<'_, Self>) -> Vec<Entry> {
         let me = cx.entity().downgrade();
         let mut out: Vec<Entry> = Vec::new();
-        let link = self.menu_cell.take().and_then(|(c, r)| self.session.terminal.link_at(c, r)).and_then(|l| self.resolve_link(&l));
+        let link = self
+            .menu_cell
+            .take()
+            .and_then(|(c, r)| self.session.terminal.link_at(c, r))
+            .and_then(|l| self.resolve_link(&l, false, cx).0.or_else(|| self.fallback_remote_menu_target(&l)));
         if let Some(target) = link {
-            let (label, icon) = match &target {
-                Target::Url(_) | Target::Other(_) => ("Open the link", Icon::ExternalLink),
-                Target::File { .. } => ("Open the file", Icon::FileText),
-                Target::Remote { .. } => ("Copy the remote path", Icon::Copy),
-            };
-            let (open, me2) = (target.clone(), me.clone());
-            out.push(
-                Item::new(label, move |window, cx| {
-                    let _ = me2.update(cx, |v, cx| v.open_link(open.clone(), window, cx));
-                })
-                .icon(icon)
-                .into(),
-            );
-            if !matches!(target, Target::Remote { .. }) {
-                let text = match &target {
-                    Target::Url(u) | Target::Other(u) => u.clone(),
-                    t => t.describe(),
-                };
-                let label = if matches!(target, Target::File { .. }) { "Copy the path" } else { "Copy the link" };
-                out.push(
-                    Item::new(label, move |window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                        toast::show_in(window, cx, Toast::success("Copied").body(text.clone()).key("terminal.link"));
-                    })
-                    .icon(Icon::Link)
-                    .into(),
-                );
+            match &target {
+                Target::Url(_) | Target::Other(_) => {
+                    let (open, me2) = (target.clone(), me.clone());
+                    out.push(
+                        Item::new("Open the link", move |window, cx| {
+                            let _ = me2.update(cx, |v, cx| v.open_link(open.clone(), window, cx));
+                        })
+                        .icon(Icon::ExternalLink)
+                        .into(),
+                    );
+                    let text = match &target {
+                        Target::Url(u) | Target::Other(u) => u.clone(),
+                        _ => unreachable!(),
+                    };
+                    out.push(
+                        Item::new("Copy the link", move |window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            toast::show_in(window, cx, Toast::success("Copied").body(text.clone()).key("terminal.link"));
+                        })
+                        .icon(Icon::Link)
+                        .into(),
+                    );
+                }
+                Target::File { .. } => {
+                    let (open, me2) = (target.clone(), me.clone());
+                    out.push(
+                        Item::new("Open the file", move |window, cx| {
+                            let _ = me2.update(cx, |v, cx| v.open_link(open.clone(), window, cx));
+                        })
+                        .icon(Icon::FileText)
+                        .into(),
+                    );
+                    let text = target.describe();
+                    out.push(
+                        Item::new("Copy the path", move |window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            toast::show_in(window, cx, Toast::success("Copied").body(text.clone()).key("terminal.link"));
+                        })
+                        .icon(Icon::Link)
+                        .into(),
+                    );
+                }
+                Target::Remote { path, host, line, column, size, can_fetch, .. } => {
+                    let action = self.plan_remote(&target, cx);
+                    let (open, me2) = (target.clone(), me.clone());
+                    let (label, icon) = match &action {
+                        RemoteAction::OpenInEditor { host, .. } => (format!("Open on {host}"), Icon::ExternalLink),
+                        RemoteAction::Fetch { .. } => ("Open read-only copy".to_string(), Icon::FileText),
+                        RemoteAction::Copy => ("Copy the remote path".to_string(), Icon::Copy),
+                    };
+                    out.push(
+                        Item::new(label, move |window, cx| {
+                            let _ = me2.update(cx, |v, cx| v.open_link(open.clone(), window, cx));
+                        })
+                        .icon(icon)
+                        .into(),
+                    );
+                    if matches!(action, RemoteAction::OpenInEditor { .. }) && *can_fetch {
+                        let (p, h, l, c, sz, me3) = (path.clone(), host.clone(), *line, *column, *size, me.clone());
+                        let max_bytes = cx.global::<AppSettings>().client.links.remote_max_bytes();
+                        out.push(
+                            Item::new("Open local copy (read-only)", move |window, cx| {
+                                let _ = me3.update(cx, |v, cx| {
+                                    v.open_remote_fetch(p.clone(), h.clone(), l, c, sz, max_bytes, true, window, cx);
+                                });
+                            })
+                            .icon(Icon::FileText)
+                            .into(),
+                        );
+                    }
+                    if !matches!(action, RemoteAction::Copy) {
+                        let copy_text = path.clone();
+                        out.push(
+                            Item::new("Copy the remote path", move |window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                toast::show_in(window, cx, Toast::success("Copied").body(copy_text.clone()).key("terminal.link"));
+                            })
+                            .icon(Icon::Copy)
+                            .into(),
+                        );
+                    }
+                }
             }
             out.push(Entry::Separator);
         }
@@ -820,7 +922,7 @@ impl TerminalView {
 
     /// Re-detect the link under the mouse. Returns whether what's shown
     /// (underline, hint) changed.
-    fn refresh_hover(&mut self, cx: &App) -> bool {
+    fn refresh_hover(&mut self, cx: &mut Context<'_, Self>) -> bool {
         let wanted = match self.link_click {
             LinkClick::Off => false,
             LinkClick::Click => true,
@@ -832,10 +934,10 @@ impl TerminalView {
         let before = self.hover_shown();
         self.hover = match (link, self.hover.take()) {
             (None, _) => None,
-            (Some(link), Some(h)) if h.link == link => Some(h),
+            (Some(link), Some(h)) if h.link == link && !h.pending => Some(h),
             (Some(link), _) => {
-                let target = self.resolve_link(&link);
-                Some(HoveredLink { link, target })
+                let (target, pending) = self.resolve_link(&link, true, cx);
+                Some(HoveredLink { link, target, pending })
             }
         };
         self.hover_shown() != before
@@ -851,18 +953,165 @@ impl TerminalView {
         self.hover.as_ref()?.target.as_ref()
     }
 
-    fn resolve_link(&self, link: &Link) -> Option<Target> {
-        let cwd = self.session.terminal.current_directory();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+    /// Resolve `link`, returning `(target, pending)` where `pending` is true if
+    /// an asynchronous remote `StatPath` lookup is still awaited for it.
+    fn resolve_link(&mut self, link: &Link, trigger_stat: bool, cx: &mut Context<'_, Self>) -> (Option<Target>, bool) {
+        let is_remote = self.session.is_remote();
+        let conn = self.session.connection().cloned();
+        let supports_remote = is_remote && conn.as_ref().is_some_and(|c| c.supports_remote_files());
+        let remote_hostname = if is_remote { conn.as_ref().map(|c| c.host().hostname) } else { self.hostname.clone() };
+        let cwd = if is_remote { None } else { self.session.cwd() };
+        let home = if is_remote { None } else { std::env::var_os("HOME").map(PathBuf::from) };
         let exists = |p: &Path| p.exists();
-        let place = Place {
-            cwd: cwd.as_deref(),
-            home: home.as_deref(),
-            remote_host: self.session.host_label.as_deref(),
-            hostname: self.hostname.as_deref(),
-            exists: &exists,
+
+        let pending_stat_for: RefCell<Option<(Option<String>, String)>> = RefCell::new(None);
+        let saw_pending = StdCell::new(false);
+        let cwd_key = supports_remote.then(|| self.session.remote_cwd_str()).flatten();
+        let now = Instant::now();
+        let remote_stat_fn = |text: &str| -> RemoteLookup {
+            let key = (cwd_key.clone(), text.to_string());
+            if let Some(cached) = self.remote_stats.get(&key).filter(|c| c.is_fresh(now)) {
+                match cached {
+                    CachedStat::Found { info, .. } => RemoteLookup::Found(info.clone()),
+                    CachedStat::Missing(_) | CachedStat::Error(_) => RemoteLookup::Missing,
+                }
+            } else {
+                saw_pending.set(true);
+                if trigger_stat {
+                    *pending_stat_for.borrow_mut() = Some(key);
+                }
+                RemoteLookup::Pending
+            }
         };
-        links::resolve(link, &place)
+        let result = {
+            let place = Place {
+                cwd: cwd.as_deref(),
+                home: home.as_deref(),
+                remote_host: self.session.host_label.as_deref(),
+                hostname: remote_hostname.as_deref(),
+                exists: &exists,
+                remote_stat: supports_remote.then_some(&remote_stat_fn as &dyn Fn(&str) -> RemoteLookup),
+                remote_can_fetch: supports_remote,
+            };
+            links::resolve(link, &place)
+        };
+        if let Some(key) = pending_stat_for.into_inner()
+            && let Some(conn) = conn
+        {
+            self.request_remote_stat(conn, key, cx);
+        }
+        (result, saw_pending.get())
+    }
+
+    /// Fallback for right-click context menus when the user didn't hover first
+    /// to warm `remote_stats` and the token is explicitly rooted (`/...` or `~/`).
+    fn fallback_remote_menu_target(&self, link: &Link) -> Option<Target> {
+        if !self.session.is_remote() || link.kind != LinkKind::Path {
+            return None;
+        }
+        if !link.target.starts_with('/') && !link.target.starts_with("~/") {
+            return None;
+        }
+        let key = (self.session.remote_cwd_str(), link.target.clone());
+        if self.remote_stats.get(&key).is_some_and(|c| c.is_fresh(Instant::now())) {
+            return None;
+        }
+        Some(Target::Remote {
+            path: link.target.clone(),
+            host: self.session.host_label.clone()?,
+            line: link.line,
+            column: link.column,
+            is_dir: false,
+            size: None,
+            on_session_host: true,
+            can_fetch: self.session.connection().is_some_and(|c| c.supports_remote_files()),
+        })
+    }
+
+    fn request_remote_stat(&mut self, conn: Arc<goatty_client::Connection>, key: (Option<String>, String), cx: &mut Context<'_, Self>) {
+        if *self.session.status.lock() != LinkStatus::Connected || !conn.is_connected() || !self.remote_stat_inflight.insert(key.clone()) {
+            return;
+        }
+        let candidates = links::remote_candidates(&key.1);
+        let session_id = self.session.daemon_id();
+        let (tx, rx) = flume::bounded(1);
+        if let Err(e) = std::thread::Builder::new().name("remote-stat".into()).spawn(move || {
+            let _ = tx.send(conn.stat_path(session_id, candidates));
+        }) {
+            self.remote_stat_inflight.remove(&key);
+            log::debug!("couldn't spawn remote-stat thread for {}: {e}", key.1);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let res = rx.recv_async().await;
+            let _ = this.update(cx, |view, cx| {
+                view.remote_stat_inflight.remove(&key);
+                let now = Instant::now();
+                if view.remote_stats.len() >= 256 {
+                    view.remote_stats.retain(|_, v| v.is_fresh(now));
+                    if view.remote_stats.len() >= 256 {
+                        view.remote_stats.clear();
+                    }
+                }
+                match res {
+                    Ok(Ok(info)) => {
+                        let entry = match info {
+                            Some(info) => CachedStat::Found { info, at: now },
+                            None => CachedStat::Missing(now),
+                        };
+                        view.remote_stats.insert(key.clone(), entry);
+                    }
+                    Ok(Err(e)) => {
+                        log::debug!("remote stat_path failed for {}: {e:#}", key.1);
+                        view.remote_stats.insert(key.clone(), CachedStat::Error(now));
+                    }
+                    Err(_) => {
+                        view.remote_stats.insert(key.clone(), CachedStat::Error(now));
+                    }
+                }
+                if view.hover.as_ref().is_some_and(|h| h.link.target == key.1) {
+                    view.hover = None;
+                }
+                if view.refresh_hover(cx) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn plan_remote(&self, target: &Target, cx: &App) -> RemoteAction {
+        match target {
+            Target::Remote { path, line, column, on_session_host, can_fetch, .. } => {
+                self.plan_remote_parts(path, *line, *column, *on_session_host, *can_fetch, cx)
+            }
+            _ => RemoteAction::Copy,
+        }
+    }
+
+    fn plan_remote_parts(
+        &self,
+        path: &str,
+        line: Option<u32>,
+        column: Option<u32>,
+        on_session_host: bool,
+        can_fetch: bool,
+        cx: &App,
+    ) -> RemoteAction {
+        let host_info = self.session.connection().map(|c| c.host());
+        let remote_user = host_info.as_ref().map(|h| h.user.as_str());
+        let remote_hostname = host_info.as_ref().map(|h| h.hostname.as_str());
+        links::plan_remote_action(
+            &cx.global::<AppSettings>().client.links,
+            self.session.ssh_host.as_deref(),
+            remote_user,
+            remote_hostname,
+            path,
+            line,
+            column,
+            on_session_host,
+            can_fetch,
+        )
     }
 
     fn open_link(&mut self, target: Target, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -892,14 +1141,243 @@ impl TerminalView {
                     None => cx.open_with_system(&path),
                 }
             }
-            Target::Remote { path, host } => {
-                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                let toast = Toast::info(format!("Copied {path}"))
-                    .body(format!("The file is on {host}; goatty opens files on this computer only."))
-                    .key("terminal.link");
-                toast::show_in(window, cx, toast);
+            Target::Remote { path, host, line, column, is_dir, size, on_session_host, can_fetch } => {
+                match self.plan_remote_parts(&path, line, column, on_session_host, can_fetch, cx) {
+                    RemoteAction::OpenInEditor { argv, .. } => {
+                        if let Err(e) = links::spawn_opener(&argv) {
+                            let copy_path = path.clone();
+                            let toast = Toast::error(format!("Couldn't run {}", argv[0]))
+                                .body(format!("{e}. Change the command under Settings → Terminal → Open remote files with."))
+                                .action("Copy path", move |_, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone())))
+                                .key("terminal.link");
+                            toast::show_in(window, cx, toast);
+                        }
+                    }
+                    RemoteAction::Fetch { max_bytes, prompt_if_larger } => {
+                        self.open_remote_fetch(path, host, line, column, size, max_bytes, prompt_if_larger, window, cx);
+                    }
+                    RemoteAction::Copy => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                        let body = if !on_session_host || !self.session.is_remote() {
+                            format!("The file is on {host}; goatty only fetches files from the active session's host.")
+                        } else if !self.session.connection().is_some_and(|c| c.supports_remote_files()) {
+                            format!("goattyd on {host} is too old to fetch files (protocol v13 required).")
+                        } else if is_dir {
+                            format!("{host}:{path} is a folder; set \"Open remote files with\" under Settings → Terminal to open folders.")
+                        } else {
+                            format!("Copied path on {host}.")
+                        };
+                        toast::show_in(window, cx, Toast::info(format!("Copied {path}")).body(body).key("terminal.link"));
+                    }
+                }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_remote_fetch(
+        &mut self,
+        path: String,
+        host: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        size: Option<u64>,
+        max_bytes: u64,
+        prompt_if_larger: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(sz) = size {
+            if sz > goatty_proto::HARD_MAX_FILE_BYTES {
+                let size_str = links::format_bytes(sz);
+                let hard_str = links::format_bytes(goatty_proto::HARD_MAX_FILE_BYTES);
+                let copy_path = path.clone();
+                let toast = Toast::error(format!("Remote file is {size_str}"))
+                    .body(format!("{path}\nToo large to fetch over the session link (limit is {hard_str})."))
+                    .action("Copy path", move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                    })
+                    .key("terminal.link");
+                toast::show_in(window, cx, toast);
+                return;
+            }
+            if prompt_if_larger && sz > max_bytes {
+                let size_str = links::format_bytes(sz);
+                let limit_str = links::format_bytes(max_bytes);
+                let me = cx.entity().downgrade();
+                let p2 = path.clone();
+                let h2 = host.clone();
+                let copy_path = path.clone();
+                let toast = Toast::warning(format!("Remote file is {size_str}"))
+                    .body(format!("{path}\nLarger than your {limit_str} download limit."))
+                    .action("Fetch anyway", move |window, cx| {
+                        let _ = me.update(cx, |v, cx| {
+                            v.open_remote_fetch(p2.clone(), h2.clone(), line, column, Some(sz), sz.max(max_bytes), false, window, cx);
+                        });
+                    })
+                    .action("Copy path", move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                    })
+                    .key("terminal.link");
+                toast::show_in(window, cx, toast);
+                return;
+            }
+        }
+        let Some(conn) = self.session.connection().cloned() else {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            toast::show_in(window, cx, Toast::info(format!("Copied {path}")).key("terminal.link"));
+            return;
+        };
+        let filename = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string();
+        let toast_id =
+            toast::show_in(window, cx, Toast::loading(format!("Fetching {filename}…")).body(format!("{host}:{path}")).key("terminal.link"));
+        let req_path = path.clone();
+        let req_host = host.clone();
+        let session_id = self.session.daemon_id();
+        let need_prestat = size.is_none();
+
+        enum FetchOutcome {
+            Opened { resolved_path: String, local_path: PathBuf },
+            IsDir { resolved_path: String },
+            TooLargeHard { resolved_path: String, size: u64 },
+            ConfirmLarge { resolved_path: String, size: u64 },
+        }
+
+        let (tx, rx) = flume::bounded(1);
+        if let Err(e) = std::thread::Builder::new().name("remote-fetch".into()).spawn(move || {
+            let res = (|| -> anyhow::Result<FetchOutcome> {
+                let mut fetch_path = req_path.clone();
+                if need_prestat
+                    && conn.supports_remote_files()
+                    && let Ok(Some(info)) = conn.stat_path(session_id, links::remote_candidates(&req_path))
+                {
+                    if info.is_dir {
+                        return Ok(FetchOutcome::IsDir { resolved_path: info.path });
+                    }
+                    if info.size > goatty_proto::HARD_MAX_FILE_BYTES {
+                        return Ok(FetchOutcome::TooLargeHard { resolved_path: info.path, size: info.size });
+                    }
+                    if prompt_if_larger && info.size > max_bytes {
+                        return Ok(FetchOutcome::ConfirmLarge { resolved_path: info.path, size: info.size });
+                    }
+                    fetch_path = info.path;
+                }
+                let (resolved_path, data) = conn.read_file(&fetch_path, max_bytes)?;
+                let local_path = links::save_remote_copy(&req_host, &resolved_path, &data)?;
+                Ok(FetchOutcome::Opened { resolved_path, local_path })
+            })();
+            let _ = tx.send(res);
+        }) {
+            let copy_path = path.clone();
+            toast::update(
+                cx,
+                toast_id,
+                Toast::error("Couldn't fetch remote file")
+                    .body(format!("{e}"))
+                    .action("Copy path", move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                    })
+                    .key("terminal.link"),
+            );
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let res = rx.recv_async().await.unwrap_or_else(|_| Err(anyhow::anyhow!("fetch worker terminated")));
+            cx.update(|cx| match res {
+                Ok(FetchOutcome::Opened { resolved_path, local_path }) => {
+                    let command = cx.global::<AppSettings>().client.links.file_command(&local_path.to_string_lossy(), line, column);
+                    match command {
+                        Some(argv) => {
+                            if let Err(e) = links::spawn_opener(&argv) {
+                                toast::update(
+                                    cx,
+                                    toast_id,
+                                    Toast::error(format!("Couldn't run {}", argv[0]))
+                                        .body(format!("{e}. Change the command under Settings → Terminal → Open files with."))
+                                        .key("terminal.link"),
+                                );
+                                return;
+                            }
+                        }
+                        None => cx.open_with_system(&local_path),
+                    }
+                    toast::update(
+                        cx,
+                        toast_id,
+                        Toast::success(format!("Opened {filename}"))
+                            .body(format!("Read-only copy from {host}:{resolved_path}"))
+                            .key("terminal.link"),
+                    );
+                }
+                Ok(FetchOutcome::IsDir { resolved_path }) => {
+                    let copy_path = resolved_path.clone();
+                    toast::update(
+                        cx,
+                        toast_id,
+                        Toast::info(format!("{filename} is a folder"))
+                            .body(format!(
+                                "{host}:{resolved_path} is a folder; set \"Open remote files with\" under Settings → Terminal to open folders."
+                            ))
+                            .action("Copy path", move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                            })
+                            .key("terminal.link"),
+                    );
+                }
+                Ok(FetchOutcome::TooLargeHard { resolved_path, size: sz }) => {
+                    let size_str = links::format_bytes(sz);
+                    let hard_str = links::format_bytes(goatty_proto::HARD_MAX_FILE_BYTES);
+                    let copy_path = resolved_path.clone();
+                    toast::update(
+                        cx,
+                        toast_id,
+                        Toast::error(format!("Remote file is {size_str}"))
+                            .body(format!("{resolved_path}\nToo large to fetch over the session link (limit is {hard_str})."))
+                            .action("Copy path", move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                            })
+                            .key("terminal.link"),
+                    );
+                }
+                Ok(FetchOutcome::ConfirmLarge { resolved_path, size: sz }) => {
+                    let size_str = links::format_bytes(sz);
+                    let limit_str = links::format_bytes(max_bytes);
+                    let p2 = resolved_path.clone();
+                    let h2 = host.clone();
+                    let copy_path = resolved_path.clone();
+                    toast::update(
+                        cx,
+                        toast_id,
+                        Toast::warning(format!("Remote file is {size_str}"))
+                            .body(format!("{resolved_path}\nLarger than your {limit_str} download limit."))
+                            .action("Fetch anyway", move |window, cx| {
+                                let _ = this.update(cx, |v, cx| {
+                                    v.open_remote_fetch(p2.clone(), h2.clone(), line, column, Some(sz), sz.max(max_bytes), false, window, cx);
+                                });
+                            })
+                            .action("Copy path", move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                            })
+                            .key("terminal.link"),
+                    );
+                }
+                Err(e) => {
+                    let copy_path = path.clone();
+                    toast::update(
+                        cx,
+                        toast_id,
+                        Toast::error("Couldn't fetch remote file")
+                            .body(format!("{e:#}"))
+                            .action("Copy path", move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                            })
+                            .key("terminal.link"),
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     fn on_modifiers_changed(&mut self, ev: &ModifiersChangedEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1487,7 +1965,14 @@ impl Render for TerminalView {
                 _ if cfg!(target_os = "macos") => "Cmd+click",
                 _ => "Ctrl+click",
             };
-            let what = if matches!(t, Target::Remote { .. }) { "copy" } else { "open" };
+            let what: std::borrow::Cow<'static, str> = match t {
+                Target::Remote { .. } => match self.plan_remote(t, cx) {
+                    RemoteAction::OpenInEditor { host, .. } => format!("open on {host}").into(),
+                    RemoteAction::Fetch { .. } => "open read-only copy".into(),
+                    RemoteAction::Copy => "copy".into(),
+                },
+                _ => "open".into(),
+            };
             (t.describe(), format!("{how} to {what}"))
         });
         let link_spans = self.hover_shown().map(|(spans, _)| spans).unwrap_or_default();
@@ -1646,5 +2131,22 @@ mod tests {
         assert!(needs_confirmation(PasteConfirm::Suspicious, &runs));
         assert!(needs_confirmation(PasteConfirm::Multiline, &multiline));
         assert!(!needs_confirmation(PasteConfirm::Never, &runs));
+    }
+
+    #[test]
+    fn cached_stat_respects_ttls() {
+        let t0 = Instant::now();
+        let found = CachedStat::Found { info: RemotePathInfo { path: "/a".into(), is_dir: false, size: 1 }, at: t0 };
+        let missing = CachedStat::Missing(t0);
+        let err = CachedStat::Error(t0);
+
+        assert!(found.is_fresh(t0 + Duration::from_secs(29)));
+        assert!(!found.is_fresh(t0 + STAT_FOUND_TTL));
+
+        assert!(missing.is_fresh(t0 + Duration::from_secs(2)));
+        assert!(!missing.is_fresh(t0 + STAT_MISSING_TTL));
+
+        assert!(err.is_fresh(t0 + Duration::from_secs(4)));
+        assert!(!err.is_fresh(t0 + STAT_ERROR_BACKOFF));
     }
 }

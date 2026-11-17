@@ -383,6 +383,7 @@ pub struct SettingsWindow {
     /// The PATH page's "Add a folder" field (shell.path).
     path_entry: Entity<TextInput>,
     file_opener: Entity<TextInput>,
+    remote_file_opener: Entity<TextInput>,
     show_all_fonts: bool,
     show_all_ui_fonts: bool,
     /// The color editor is open (Appearance).
@@ -454,6 +455,11 @@ impl SettingsWindow {
         let theme_name = cx.new(|cx| TextInput::new("Name for a new theme", "", cx).label("Theme name"));
         let opener = cx.global::<AppSettings>().file.value.links.file_opener.clone().unwrap_or_default();
         let file_opener = cx.new(|cx| TextInput::new("code --goto {path}:{line}:{column}", opener, cx).label("Command to open files"));
+        let remote_opener = cx.global::<AppSettings>().file.value.links.remote_file_opener.clone().unwrap_or_default();
+        let remote_file_opener = cx.new(|cx| {
+            TextInput::new("code --remote ssh-remote+{host} --goto {path}:{line}:{column}", remote_opener, cx)
+                .label("Command to open remote files")
+        });
         let gen_name = cx.new(|cx| TextInput::new("before trying fish", "", cx).label("Name for this version"));
         let (net, net_sub) = network::NetPage::new(cx);
         let mut subs = vec![
@@ -464,7 +470,10 @@ impl SettingsWindow {
             }),
             // The colors can change underneath the editor (theme switch,
             // desktop light/dark, outside edits): keep the picker current.
-            cx.observe_global::<AppSettings>(|this, cx| this.sync_picker(cx)),
+            cx.observe_global::<AppSettings>(|this, cx| {
+                this.sync_picker(cx);
+                this.sync_remote_opener_disabled(cx);
+            }),
             cx.subscribe(&font_filter, |_, _, _: &TextInputEvent, cx| cx.notify()),
             cx.subscribe(&ui_font_filter, |_, _, _: &TextInputEvent, cx| cx.notify()),
             cx.subscribe(&search, |this, _, ev: &TextInputEvent, cx| {
@@ -495,6 +504,12 @@ impl SettingsWindow {
                 if let TextInputEvent::Submitted(text) = ev {
                     let text = text.trim().to_string();
                     AppSettings::update(cx, |s| s.links.file_opener = (!text.is_empty()).then_some(text));
+                }
+            }),
+            cx.subscribe(&remote_file_opener, |_, _, ev: &TextInputEvent, cx| {
+                if let TextInputEvent::Submitted(text) = ev {
+                    let text = text.trim().to_string();
+                    AppSettings::update(cx, |s| s.links.remote_file_opener = (!text.is_empty()).then_some(text));
                 }
             }),
             cx.subscribe(&path_entry, |this, _, ev: &TextInputEvent, cx| match ev {
@@ -540,6 +555,7 @@ impl SettingsWindow {
             shell_path,
             path_entry,
             file_opener,
+            remote_file_opener,
             show_all_fonts: false,
             show_all_ui_fonts: false,
             colors_open: false,
@@ -585,6 +601,7 @@ impl SettingsWindow {
         this.load_host(cx);
         this.load_plugins(false, cx);
         this.select_slot(ColorSlot::Background, cx);
+        this.sync_remote_opener_disabled(cx);
         crate::hosts::refresh(cx);
         this
     }
@@ -754,6 +771,14 @@ impl SettingsWindow {
             p.set_contrast(refs, cx);
         });
         cx.notify();
+    }
+
+    fn sync_remote_opener_disabled(&self, cx: &mut Context<'_, Self>) {
+        let off = matches!(
+            cx.global::<AppSettings>().file.value.links.remote_files,
+            goatty_config::RemoteFileOpen::Fetch | goatty_config::RemoteFileOpen::Copy
+        );
+        self.remote_file_opener.update(cx, |i, cx| i.set_disabled(off, cx));
     }
 
     /// The picker moved to `color`: show it live, and save it once the changes stop.

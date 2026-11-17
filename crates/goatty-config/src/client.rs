@@ -431,7 +431,23 @@ pub enum LinkClick {
     Off,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// How links to files and directories on remote hosts open (#110).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteFileOpen {
+    /// Run `remote_file_opener` when set for an SSH host, otherwise fetch a
+    /// read-only local copy over the session link.
+    #[default]
+    Auto,
+    /// Fetch a read-only local copy over the session link.
+    Fetch,
+    /// Run `remote_file_opener` (falls back to fetching if unset or no SSH target).
+    RemoteOpener,
+    /// Copy the remote path to the clipboard.
+    Copy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LinkSettings {
     pub open_on: LinkClick,
@@ -440,27 +456,96 @@ pub struct LinkSettings {
     /// shell involved); without `{path}` the path is appended. `None`:
     /// the desktop's default application.
     pub file_opener: Option<String>,
+    /// How links to files and directories on remote hosts open (#110).
+    pub remote_files: RemoteFileOpen,
+    /// Command template for opening remote files directly in a local editor,
+    /// e.g. `code --remote ssh-remote+{host} --goto {path}:{line}:{column}`.
+    /// Tokens: `{host}`, `{user}`, `{hostname}`, `{path}`, `{line}`, `{column}`.
+    pub remote_file_opener: Option<String>,
+    /// Maximum remote file size (in MiB) fetched automatically (`1`–`60`).
+    pub remote_max_size_mb: u32,
+}
+
+impl Default for LinkSettings {
+    fn default() -> Self {
+        Self {
+            open_on: LinkClick::default(),
+            file_opener: None,
+            remote_files: RemoteFileOpen::default(),
+            remote_file_opener: None,
+            remote_max_size_mb: Self::DEFAULT_REMOTE_MAX_SIZE_MB,
+        }
+    }
 }
 
 impl LinkSettings {
+    pub const DEFAULT_REMOTE_MAX_SIZE_MB: u32 = 10;
+    pub const MIN_REMOTE_MAX_SIZE_MB: u32 = 1;
+    pub const MAX_REMOTE_MAX_SIZE_MB: u32 = 60;
+
     /// The opener's argv for a file, or `None` to use the desktop default.
     pub fn file_command(&self, path: &str, line: Option<u32>, column: Option<u32>) -> Option<Vec<String>> {
         let template = self.file_opener.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
         let words = split_words(template)?;
         let (line, column) = (line.unwrap_or(1).to_string(), column.unwrap_or(1).to_string());
+        let subs = [("{path}", path), ("{line}", &line), ("{column}", &column)];
         let mut has_path = false;
-        let mut argv: Vec<String> = words
-            .iter()
-            .map(|w| {
-                has_path |= w.contains("{path}");
-                w.replace("{path}", path).replace("{line}", &line).replace("{column}", &column)
-            })
-            .collect();
+        let mut argv: Vec<String> = words.iter().map(|w| substitute_tokens(w, &subs, &mut has_path)).collect();
         if !has_path {
             argv.push(path.to_string());
         }
         Some(argv)
     }
+
+    /// The remote opener's argv for a file/directory, or `None` when unset or invalid.
+    pub fn remote_file_command(
+        &self,
+        host: &str,
+        user: &str,
+        hostname: &str,
+        path: &str,
+        line: Option<u32>,
+        column: Option<u32>,
+    ) -> Option<Vec<String>> {
+        let template = self.remote_file_opener.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+        let words = split_words(template)?;
+        let (line, column) = (line.unwrap_or(1).to_string(), column.unwrap_or(1).to_string());
+        let subs =
+            [("{host}", host), ("{user}", user), ("{hostname}", hostname), ("{path}", path), ("{line}", &line), ("{column}", &column)];
+        let mut has_path = false;
+        let mut argv: Vec<String> = words.iter().map(|w| substitute_tokens(w, &subs, &mut has_path)).collect();
+        if !has_path {
+            argv.push(path.to_string());
+        }
+        Some(argv)
+    }
+
+    /// Automatic remote fetch limit in bytes.
+    pub fn remote_max_bytes(&self) -> u64 {
+        (self.remote_max_size_mb.clamp(Self::MIN_REMOTE_MAX_SIZE_MB, Self::MAX_REMOTE_MAX_SIZE_MB) as u64) * 1024 * 1024
+    }
+}
+
+/// Replace `{token}` placeholders in a single pass so values containing literal
+/// placeholder text (e.g. a path named `{line}`) are never re-substituted.
+fn substitute_tokens(word: &str, subs: &[(&str, &str)], saw_path: &mut bool) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while !rest.is_empty() {
+        if let Some((token, val)) = subs.iter().find(|(t, _)| rest.starts_with(t)) {
+            if *token == "{path}" {
+                *saw_path = true;
+            }
+            out.push_str(val);
+            rest = &rest[token.len()..];
+        } else {
+            let skip = rest.chars().next().map_or(0, char::len_utf8);
+            let next = rest[skip..].find('{').map_or(rest.len(), |i| skip + i);
+            out.push_str(&rest[..next]);
+            rest = &rest[next..];
+        }
+    }
+    out
 }
 
 /// Split a command line into words: whitespace separates, '…' and "…"
@@ -822,6 +907,27 @@ impl Document for ClientSettings {
                 self.links.file_opener = None;
             }
         }
+        if let Some(opener) = &self.links.remote_file_opener {
+            if opener.trim().is_empty() {
+                self.links.remote_file_opener = None;
+            } else if split_words(opener).is_none() {
+                issues.push(Issue::new("links.remote_file_opener", "unterminated quote; falling back to local read-only copies"));
+                self.links.remote_file_opener = None;
+            }
+        }
+        let max_mb = self.links.remote_max_size_mb.clamp(LinkSettings::MIN_REMOTE_MAX_SIZE_MB, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
+        if max_mb != self.links.remote_max_size_mb {
+            issues.push(Issue::new(
+                "links.remote_max_size_mb",
+                format!(
+                    "{} is outside {}–{}; using {max_mb}",
+                    self.links.remote_max_size_mb,
+                    LinkSettings::MIN_REMOTE_MAX_SIZE_MB,
+                    LinkSettings::MAX_REMOTE_MAX_SIZE_MB
+                ),
+            ));
+            self.links.remote_max_size_mb = max_mb;
+        }
         let mut seen = std::collections::HashSet::new();
         let mut i = 0;
         self.ssh.hosts.retain_mut(|h| {
@@ -971,6 +1077,14 @@ impl ClientSettings {
         {
             issues.push(Issue::new("links.file_opener", format!("{program:?} isn't installed or not on PATH; opening files will fail")));
         }
+        if let Some(program) = self.links.remote_file_opener.as_deref().and_then(split_words).and_then(|w| w.into_iter().next())
+            && !has_program(&program)
+        {
+            issues.push(Issue::new(
+                "links.remote_file_opener",
+                format!("{program:?} isn't installed or not on PATH; opening remote files will fail"),
+            ));
+        }
         issues
     }
 }
@@ -1116,6 +1230,58 @@ mod tests {
         let issues = s.validate();
         assert_eq!(issues[0].path, "links.file_opener");
         assert_eq!(s.links.file_opener, None);
+    }
+
+    #[test]
+    fn remote_file_settings_and_commands() {
+        let mut links = LinkSettings::default();
+        assert_eq!(links.remote_files, RemoteFileOpen::Auto);
+        assert_eq!(links.remote_max_size_mb, 10);
+        assert_eq!(links.remote_max_bytes(), 10 * 1024 * 1024);
+        assert_eq!(links.remote_file_command("box", "alice", "box.local", "/a b", None, None), None);
+
+        links.remote_file_opener = Some("code --remote ssh-remote+{host} --goto {path}:{line}:{column}".into());
+        assert_eq!(
+            links.remote_file_command("box", "alice", "box.local", "/a b", Some(12), Some(4)).unwrap(),
+            ["code", "--remote", "ssh-remote+box", "--goto", "/a b:12:4"]
+        );
+
+        links.remote_file_opener = Some("zed ssh://{user}@{hostname}{path}:{line}".into());
+        assert_eq!(
+            links.remote_file_command("box", "alice", "box.local", "/srv/app.rs", Some(7), None).unwrap(),
+            ["zed", "ssh://alice@box.local/srv/app.rs:7"]
+        );
+
+        links.remote_file_opener = Some("nvim".into());
+        assert_eq!(links.remote_file_command("box", "alice", "box.local", "/etc/hosts", None, None).unwrap(), ["nvim", "/etc/hosts"]);
+
+        let mut s = ClientSettings::default();
+        s.links.remote_file_opener = Some("code 'oops".into());
+        s.links.remote_max_size_mb = 500;
+        let issues = s.validate();
+        let paths: Vec<_> = issues.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["links.remote_file_opener", "links.remote_max_size_mb"]);
+        assert_eq!(s.links.remote_file_opener, None);
+        assert_eq!(s.links.remote_max_size_mb, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
+
+        s.links.remote_max_size_mb = 0;
+        assert_eq!(s.validate().len(), 1);
+        assert_eq!(s.links.remote_max_size_mb, LinkSettings::MIN_REMOTE_MAX_SIZE_MB);
+
+        s.links.remote_max_size_mb = 61;
+        assert_eq!(s.validate().len(), 1);
+        assert_eq!(s.links.remote_max_size_mb, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
+
+        // Values containing literal placeholder syntax or UTF-8 must not be re-substituted.
+        links.remote_file_opener = Some("ed --h={hostname} --u={user} --p={path}:{line}:{column}".into());
+        assert_eq!(
+            links.remote_file_command("b{user}", "u{path}", "h{path}ä", "/tmp/{line}/{column}.rs", Some(9), Some(2)).unwrap(),
+            ["ed", "--h=h{path}ä", "--u=u{path}", "--p=/tmp/{line}/{column}.rs:9:2"]
+        );
+
+        let parsed: ClientSettings = serde_json::from_str(r#"{"links":{"remote_files":"fetch","remote_max_size_mb":25}}"#).unwrap();
+        assert_eq!(parsed.links.remote_files, RemoteFileOpen::Fetch);
+        assert_eq!(parsed.links.remote_max_size_mb, 25);
     }
 
     #[test]
