@@ -52,6 +52,9 @@ const MAX_APP: usize = 32;
 const MAX_ID: usize = 128;
 const MAX_SEGMENT: usize = 32;
 const MAX_SEGMENTS: usize = 8;
+/// The largest sequence number a snapshot may restore: far beyond any
+/// real count, far below where adding to it could overflow.
+const MAX_SEQ: u64 = 1 << 48;
 /// Records kept per terminal; the least recently reported one goes first.
 pub(crate) const MAX_RECORDS: usize = 128;
 
@@ -234,8 +237,11 @@ pub(crate) fn parse(payload: &[u8]) -> Option<Report> {
     }
     let get = |key: &str| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     // goatty's own snapshots: `goatty=restore[.<seq>]`.
-    let restore =
-        get("goatty").and_then(|v| v.strip_prefix("restore")).map(|seq| seq.strip_prefix('.').and_then(|n| n.parse().ok()).unwrap_or(0));
+    let restore = get("goatty").and_then(|v| v.strip_prefix("restore")).map(|seq| {
+        // Any program can write this: a number past what goatty ever
+        // counts to is unknown (0), so the count can't run out.
+        seq.strip_prefix('.').and_then(|n| n.parse().ok()).filter(|&n| n <= MAX_SEQ).unwrap_or(0)
+    });
     let id = match get("id") {
         Some(id) => Some(valid_id(id)?.to_string()),
         None => None,
@@ -407,7 +413,7 @@ impl Store {
                 self.records.retain(|r| r.id != record.id);
                 record.seq = match restore {
                     Some(seq) if seq > 0 => seq,
-                    _ => self.seq + 1,
+                    _ => self.seq.saturating_add(1),
                 };
                 self.seq = self.seq.max(record.seq);
                 self.records.push(record);
@@ -472,7 +478,7 @@ impl Store {
         if self.progress == progress {
             return false;
         }
-        self.seq += 1;
+        self.seq = self.seq.saturating_add(1);
         self.progress = progress;
         true
     }
@@ -562,6 +568,15 @@ mod tests {
         assert_eq!(parse(b"state=clear:id=a/b"), Some(Report::Clear { id: Some("a/b".into()), restore: None }));
         assert_eq!(parse(b"state=clear:goatty=restore.9"), Some(Report::Clear { id: None, restore: Some(9) }));
         assert!(matches!(parse(b"state=done:goatty=restore"), Some(Report::Set { restore: Some(0), .. })));
+        // A program claiming a huge count gets none: the next report still counts up.
+        let huge = format!("state=clear:goatty=restore.{}", u64::MAX);
+        assert_eq!(parse(huge.as_bytes()), Some(Report::Clear { id: None, restore: Some(0) }));
+        let mut s = Store::default();
+        s.apply(parse(huge.as_bytes()).unwrap());
+        s.apply(parse(format!("state=done:goatty=restore.{}", MAX_SEQ + 1).as_bytes()).unwrap());
+        s.apply(parse(b"state=working:id=next").unwrap());
+        let seqs: Vec<u64> = s.status().records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, [1, 2]);
     }
 
     #[test]
