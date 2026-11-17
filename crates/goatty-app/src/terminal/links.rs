@@ -111,7 +111,7 @@ fn resolve_path(text: &str, line: Option<u32>, column: Option<u32>, place: &Plac
     }
     let candidates: Vec<PathBuf> = if let Some(rest) = text.strip_prefix("~/") {
         vec![place.home?.join(rest)]
-    } else if text.starts_with('/') || is_windows_drive_path(text) {
+    } else if Path::new(text).is_absolute() {
         vec![PathBuf::from(text)]
     } else {
         let cwd = place.cwd?;
