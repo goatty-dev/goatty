@@ -15,9 +15,31 @@ use serde::{Deserialize, Serialize};
 /// Id of a pane within a workspace.
 pub type PaneId = u64;
 
-/// The smallest share of its split a part can be resized to.
-const MIN_SHARE: f32 = 0.06;
+/// The smallest share of its split a part can be resized to, whatever
+/// [`MinSize`] says.
+const MIN_SHARE: f32 = 0.02;
 const EPS: f32 = 1e-4;
+
+/// The smallest a pane may be made by resizing, as a share of the tab's
+/// area in each direction: the workspace works it out from the cell size
+/// (a few columns and rows), so a split can't become unusably small.
+/// [`MinSize::NONE`] leaves only [`MIN_SHARE`].
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MinSize {
+    pub w: f32,
+    pub h: f32,
+}
+
+impl MinSize {
+    pub const NONE: MinSize = MinSize { w: 0.0, h: 0.0 };
+
+    fn along(self, axis: Axis) -> f32 {
+        match axis {
+            Axis::Horizontal => self.w,
+            Axis::Vertical => self.h,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,6 +208,46 @@ impl Node {
         true
     }
 
+    /// Whether splitting `target` towards `dir` leaves both halves at least
+    /// `min` big. False when `target` isn't in the tree.
+    pub fn can_split(&self, target: PaneId, dir: Direction, min: MinSize) -> bool {
+        let (leaves, _) = self.layout(Rect::FULL);
+        let axis = dir.axis();
+        leaves.iter().find(|(id, _)| *id == target).is_some_and(|(_, r)| r.len(axis) + EPS >= 2.0 * min.along(axis))
+    }
+
+    /// Put the whole of `other` next to this tree on the `dir` side, each
+    /// getting half of the area.
+    pub fn join(&mut self, other: Node, dir: Direction) {
+        let this = std::mem::replace(self, Node::Leaf(0));
+        let children = if dir.forward() { vec![this, other] } else { vec![other, this] };
+        *self = Node::Split { axis: dir.axis(), children, sizes: vec![0.5, 0.5] };
+        self.normalize();
+    }
+
+    /// Move every pane one place on, in reading order (`forward`), or one
+    /// place back; the last one comes round to the first place. The places
+    /// keep their sizes. False with fewer than two panes.
+    pub fn rotate(&mut self, forward: bool) -> bool {
+        let mut order = self.leaves();
+        if order.len() < 2 {
+            return false;
+        }
+        if forward {
+            order.rotate_right(1);
+        } else {
+            order.rotate_left(1);
+        }
+        fn walk(n: &mut Node, next: &mut std::vec::IntoIter<PaneId>) {
+            match n {
+                Node::Leaf(id) => *id = next.next().expect("one id per leaf"),
+                Node::Split { children, .. } => children.iter_mut().for_each(|c| walk(c, next)),
+            }
+        }
+        walk(self, &mut order.into_iter());
+        true
+    }
+
     /// Take `target` out; its space goes to the part before it (or after,
     /// for the first part). The root leaf can't be removed (close the tab
     /// instead): returns false then, and when `target` isn't in the tree.
@@ -315,17 +377,23 @@ impl Node {
             .map(|(id, _, _)| id)
     }
 
-    /// Move a divider of `target`'s area by `amount` (a share of the split)
-    /// in direction `dir`: the one on that side of the pane, else the one on
-    /// the other side. Returns false when no split along that axis contains
-    /// `target`.
-    pub fn resize(&mut self, target: PaneId, dir: Direction, amount: f32) -> bool {
+    /// Move a divider of `target`'s area by `amount` (a share of the tab's
+    /// length along that axis) in direction `dir`: the one on that side of
+    /// the pane, else the one on the other side. No part gets smaller than
+    /// `min`. Returns false when no split along that axis contains `target`
+    /// (true when the divider is already as far as it goes).
+    pub fn resize(&mut self, target: PaneId, dir: Direction, amount: f32, min: MinSize) -> bool {
         let Some((path, i)) = self.resize_target(target, dir.axis()) else { return false };
-        let Some(Node::Split { sizes, .. }) = self.at_mut(&path) else { return false };
+        let Some(rect) = self.rect_at(&path) else { return false };
+        let Some(node @ Node::Split { .. }) = self.at_mut(&path) else { return false };
+        let mins = node.part_mins(rect, min);
+        let Node::Split { axis, sizes, .. } = node else { return false };
         // Divider between parts i and i+1, or i-1 and i.
         let index = if i + 1 < sizes.len() { i } else { i - 1 };
-        let delta = if dir.forward() { amount } else { -amount };
-        shift(sizes, index, delta);
+        let total: f32 = sizes.iter().sum();
+        let len = rect.len(*axis).max(EPS);
+        let delta = (if dir.forward() { amount } else { -amount }) / len * total;
+        shift(sizes, index, delta, &mins);
         true
     }
 
@@ -356,6 +424,47 @@ impl Node {
         best
     }
 
+    /// The area of the node at `path` (child indices from the root).
+    fn rect_at(&self, path: &[usize]) -> Option<Rect> {
+        let (mut node, mut rect) = (self, Rect::FULL);
+        for &i in path {
+            let Node::Split { axis, children, sizes } = node else { return None };
+            let total: f32 = sizes.iter().sum::<f32>().max(EPS);
+            let before: f32 = sizes.get(..i)?.iter().sum();
+            let (start, len) = (rect.len(*axis) * before / total, rect.len(*axis) * sizes.get(i)? / total);
+            rect = match axis {
+                Axis::Horizontal => Rect { x: rect.x + start, w: len, ..rect },
+                Axis::Vertical => Rect { y: rect.y + start, h: len, ..rect },
+            };
+            node = children.get(i)?;
+        }
+        Some(rect)
+    }
+
+    /// The least length along `axis` this node can shrink to: every pane
+    /// at least `min`.
+    fn min_len(&self, axis: Axis, min: MinSize) -> f32 {
+        match self {
+            Node::Leaf(_) => min.along(axis),
+            // The parts keep their shares, so the split needs room for
+            // the part that is smallest for its minimum.
+            Node::Split { axis: a, children, sizes } if *a == axis => {
+                let total: f32 = sizes.iter().sum::<f32>().max(EPS);
+                children.iter().zip(sizes).map(|(c, s)| c.min_len(axis, min) * total / s.max(EPS)).fold(0.0, f32::max)
+            }
+            Node::Split { children, .. } => children.iter().map(|c| c.min_len(axis, min)).fold(0.0, f32::max),
+        }
+    }
+
+    /// For a split filling `rect`: each part's smallest size, in the units
+    /// of its `sizes`.
+    fn part_mins(&self, rect: Rect, min: MinSize) -> Vec<f32> {
+        let Node::Split { axis, children, sizes } = self else { return Vec::new() };
+        let total: f32 = sizes.iter().sum();
+        let len = rect.len(*axis).max(EPS);
+        children.iter().map(|c| (c.min_len(*axis, min) / len).max(MIN_SHARE) * total).collect()
+    }
+
     fn at_mut(&mut self, path: &[usize]) -> Option<&mut Node> {
         let mut node = self;
         for &i in path {
@@ -367,16 +476,19 @@ impl Node {
 
     /// Drag a divider: put the boundary between parts `index` and
     /// `index + 1` of the split at `path` at `fraction` (0..1) of the split's
-    /// length, within limits.
-    pub fn set_divider(&mut self, path: &[usize], index: usize, fraction: f32) {
-        let Some(Node::Split { sizes, .. }) = self.at_mut(path) else { return };
+    /// length, keeping both parts at least `min`.
+    pub fn set_divider(&mut self, path: &[usize], index: usize, fraction: f32, min: MinSize) {
+        let Some(rect) = self.rect_at(path) else { return };
+        let Some(node @ Node::Split { .. }) = self.at_mut(path) else { return };
+        let mins = node.part_mins(rect, min);
+        let Node::Split { sizes, .. } = node else { return };
         if index + 1 >= sizes.len() {
             return;
         }
         let total: f32 = sizes.iter().sum();
         let before: f32 = sizes[..index].iter().sum::<f32>() / total;
         let current = before + sizes[index] / total;
-        shift(sizes, index, (fraction - current) * total);
+        shift(sizes, index, (fraction - current) * total, &mins);
     }
 
     /// Give every part of every split the same share.
@@ -387,16 +499,29 @@ impl Node {
             children.iter_mut().for_each(Node::equalize);
         }
     }
+
+    /// Give the parts of the split at `path` the same share (the splits
+    /// inside them keep theirs): double-clicking its divider.
+    pub fn equalize_split(&mut self, path: &[usize]) {
+        if let Some(Node::Split { sizes, .. }) = self.at_mut(path) {
+            let n = sizes.len() as f32;
+            sizes.iter_mut().for_each(|s| *s = 1.0 / n);
+        }
+    }
 }
 
 /// Move `delta` of size from part `index + 1` to part `index` (negative:
-/// the other way), keeping both above the minimum.
-fn shift(sizes: &mut [f32], index: usize, delta: f32) {
-    let total: f32 = sizes.iter().sum();
-    let min = MIN_SHARE * total;
-    let (lo, hi) = (min - sizes[index], sizes[index + 1] - min);
+/// the other way), keeping both at their minimum (`mins`, one per part) or
+/// above. When the two parts are too small for their minimums anyway (a
+/// small window), only [`MIN_SHARE`] holds, so the divider still moves.
+fn shift(sizes: &mut [f32], index: usize, delta: f32, mins: &[f32]) {
+    let floor = MIN_SHARE * sizes.iter().sum::<f32>();
+    let (mut lo, mut hi) = (mins[index] - sizes[index], sizes[index + 1] - mins[index + 1]);
     if lo > hi {
-        return; // both parts already at the minimum
+        (lo, hi) = (floor - sizes[index], sizes[index + 1] - floor);
+    }
+    if lo > hi {
+        return; // both parts already at the floor
     }
     let delta = delta.clamp(lo, hi);
     sizes[index] += delta;
@@ -489,7 +614,7 @@ mod tests {
         assert_eq!(t.neighbor(1, Direction::Left), None);
         assert_eq!(t.neighbor(1, Direction::Up), None);
         // A bigger shared edge wins.
-        t.resize(2, Direction::Down, 0.3);
+        t.resize(2, Direction::Down, 0.3, MinSize::NONE);
         assert_eq!(t.neighbor(1, Direction::Right), Some(2));
     }
 
@@ -497,16 +622,16 @@ mod tests {
     fn resizing() {
         let mut t = Node::Leaf(1);
         t.split(1, 2, Direction::Right);
-        assert!(t.resize(1, Direction::Right, 0.1));
+        assert!(t.resize(1, Direction::Right, 0.1, MinSize::NONE));
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(close(sizes[0], 0.6));
         // The last part moves its left divider.
-        assert!(t.resize(2, Direction::Right, 0.1));
+        assert!(t.resize(2, Direction::Right, 0.1, MinSize::NONE));
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(close(sizes[0], 0.7));
-        assert!(!t.resize(1, Direction::Up, 0.1), "no vertical split");
+        assert!(!t.resize(1, Direction::Up, 0.1, MinSize::NONE), "no vertical split");
         // Clamped to the minimum share.
-        t.resize(1, Direction::Right, 5.0);
+        t.resize(1, Direction::Right, 5.0, MinSize::NONE);
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(close(sizes[1], MIN_SHARE));
     }
@@ -540,7 +665,7 @@ mod tests {
         let mut t = Node::Leaf(1);
         t.split(1, 2, Direction::Right);
         t.split(2, 3, Direction::Down);
-        t.resize(1, Direction::Right, 0.2);
+        t.resize(1, Direction::Right, 0.2, MinSize::NONE);
         let before = t.layout(Rect::FULL).0;
         assert!(t.swap(1, 3));
         assert_eq!(t.leaves(), [3, 2, 1]);
@@ -567,14 +692,154 @@ mod tests {
         let mut t = Node::Leaf(1);
         t.split(1, 2, Direction::Right);
         t.split(2, 3, Direction::Right);
-        t.set_divider(&[], 1, 0.9);
+        t.set_divider(&[], 1, 0.9, MinSize::NONE);
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(close(sizes[0], 0.5) && close(sizes[1], 0.4) && close(sizes[2], 0.1));
-        t.set_divider(&[], 0, 0.0);
+        t.set_divider(&[], 0, 0.0, MinSize::NONE);
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(close(sizes[0], MIN_SHARE));
         t.equalize();
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(sizes.iter().all(|s| close(*s, 1.0 / 3.0)));
+    }
+
+    #[test]
+    fn minimum_sizes_in_tab_units() {
+        // 1 | (2 / 3): the right half can't get narrower than one pane,
+        // the left pane neither.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Direction::Right);
+        t.split(2, 3, Direction::Down);
+        let min = MinSize { w: 0.2, h: 0.3 };
+        assert!(t.resize(1, Direction::Right, 0.9, min));
+        let Node::Split { sizes, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.8), "{sizes:?}");
+        t.set_divider(&[], 0, 0.0, min);
+        let Node::Split { sizes, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.2), "{sizes:?}");
+        // The vertical split inside the right part: 0.3 of the tab's height each.
+        assert!(t.resize(2, Direction::Down, 0.9, min));
+        let (leaves, _) = t.layout(Rect::FULL);
+        assert!(close(leaves[1].1.h, 0.7) && close(leaves[2].1.h, 0.3), "{leaves:?}");
+        // Already at the minimum: the divider stays, but there is a split.
+        assert!(t.resize(2, Direction::Down, 0.1, min));
+        assert!(close(t.layout(Rect::FULL).0[2].1.h, 0.3));
+        // Minimums that can't both be met (a small window) don't freeze the divider.
+        let big = MinSize { w: 0.0, h: 0.6 };
+        assert!(t.resize(2, Direction::Up, 0.2, big));
+        assert!(close(t.layout(Rect::FULL).0[2].1.h, 0.5));
+    }
+
+    #[test]
+    fn a_part_holding_panes_side_by_side_needs_room_for_each() {
+        // (1 / (2 | 3)) | 4: the left part can't get narrower than 2 and 3.
+        let mut t = Node::Leaf(1);
+        t.split(1, 4, Direction::Right);
+        t.split(1, 2, Direction::Down);
+        t.split(2, 3, Direction::Right);
+        assert_eq!(t.leaves(), [1, 2, 3, 4]);
+        t.set_divider(&[], 0, 0.0, MinSize { w: 0.15, h: 0.0 });
+        let Node::Split { sizes, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.3), "{sizes:?}");
+    }
+
+    #[test]
+    fn a_part_with_unequal_panes_side_by_side_keeps_the_small_one_usable() {
+        // (1 / (2 | 3)) | 4 with 2 | 3 at 0.8 / 0.2: 3 is 0.1 wide only when
+        // the left part is 0.5 wide.
+        let mut t = Node::Leaf(1);
+        t.split(1, 4, Direction::Right);
+        t.split(1, 2, Direction::Down);
+        t.split(2, 3, Direction::Right);
+        t.set_divider(&[0, 1], 0, 0.8, MinSize::NONE);
+        t.set_divider(&[], 0, 0.0, MinSize { w: 0.1, h: 0.0 });
+        let Node::Split { sizes, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.5), "{sizes:?}");
+    }
+
+    #[test]
+    fn resizing_moves_by_a_share_of_the_tab() {
+        // A split as wide as the tab: a step of 0.1 is 0.1 of the split.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Direction::Right);
+        t.split(2, 3, Direction::Down);
+        assert!(t.resize(1, Direction::Right, 0.1, MinSize::NONE));
+        let Node::Split { sizes, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.6));
+        // A split that is half the tab wide moves by the same distance.
+        let mut u = Node::Leaf(1);
+        u.split(1, 2, Direction::Right);
+        u.split(2, 3, Direction::Right);
+        assert!(u.resize(2, Direction::Right, 0.1, MinSize::NONE));
+        let (leaves, _) = u.layout(Rect::FULL);
+        assert!(close(leaves[1].1.w, 0.35), "{leaves:?}");
+    }
+
+    #[test]
+    fn splitting_needs_room() {
+        let mut t = Node::Leaf(1);
+        let min = MinSize { w: 0.3, h: 0.4 };
+        assert!(t.can_split(1, Direction::Right, min));
+        t.split(1, 2, Direction::Right);
+        assert!(!t.can_split(1, Direction::Left, min), "half the width is less than two minimums");
+        assert!(t.can_split(1, Direction::Down, min));
+        assert!(!t.can_split(9, Direction::Down, min));
+    }
+
+    #[test]
+    fn equalizing_one_split() {
+        // 1 | (2 / 3), both splits uneven.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Direction::Right);
+        t.split(2, 3, Direction::Down);
+        t.resize(1, Direction::Right, 0.2, MinSize::NONE);
+        t.resize(2, Direction::Down, 0.2, MinSize::NONE);
+        t.equalize_split(&[]);
+        let Node::Split { sizes, children, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.5));
+        let Node::Split { sizes, .. } = &children[1] else { panic!() };
+        assert!(close(sizes[0], 0.7), "the inner split keeps its sizes");
+        t.equalize_split(&[1]);
+        let Node::Split { children, .. } = &t else { panic!() };
+        let Node::Split { sizes, .. } = &children[1] else { panic!() };
+        assert!(close(sizes[0], 0.5));
+        t.equalize_split(&[0]); // a leaf: nothing happens
+    }
+
+    #[test]
+    fn rotating_moves_panes_through_the_places() {
+        // 1 | (2 / 3), the left part wider.
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Direction::Right);
+        t.split(2, 3, Direction::Down);
+        t.resize(1, Direction::Right, 0.2, MinSize::NONE);
+        let places: Vec<Rect> = t.layout(Rect::FULL).0.into_iter().map(|(_, r)| r).collect();
+        assert!(t.rotate(true));
+        assert_eq!(t.leaves(), [3, 1, 2]);
+        let after: Vec<Rect> = t.layout(Rect::FULL).0.into_iter().map(|(_, r)| r).collect();
+        assert_eq!(after, places, "the places keep their sizes");
+        assert!(t.rotate(false));
+        assert_eq!(t.leaves(), [1, 2, 3]);
+        let mut single = Node::Leaf(1);
+        assert!(!single.rotate(true));
+    }
+
+    #[test]
+    fn joining_trees() {
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Direction::Right);
+        let mut other = Node::Leaf(3);
+        other.split(3, 4, Direction::Down);
+        t.join(other.clone(), Direction::Right);
+        // Same axis: one split of 1, 2 and the stacked 3 / 4, which gets half.
+        let Node::Split { axis, children, sizes } = &t else { panic!() };
+        assert_eq!(*axis, Axis::Horizontal);
+        assert_eq!(children.len(), 3);
+        assert!(close(sizes[0], 0.25) && close(sizes[2], 0.5), "{sizes:?}");
+        assert_eq!(t.leaves(), [1, 2, 3, 4]);
+        let mut u = Node::Leaf(5);
+        u.join(other, Direction::Up);
+        assert_eq!(u.leaves(), [3, 4, 5]);
+        assert!(matches!(&u, Node::Split { axis: Axis::Vertical, children, .. } if children.len() == 3));
     }
 }

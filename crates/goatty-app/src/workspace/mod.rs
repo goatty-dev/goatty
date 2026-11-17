@@ -11,7 +11,10 @@
 //!   to reorder, the mouse wheel.
 //! - `sidebar`: the vertical tab style, a resizable sidebar that folds into
 //!   a rail of icons, next to the panes drawn as a rounded card.
-//! - `menu`: the right-click menus of tabs and panes (#186).
+//! - `menu`: the right-click menus of tabs, panes and dividers (#186).
+//! - `arrange`: rearranging panes and tabs (#124): swap, rotate, move a
+//!   pane to another tab, bring a tab into another one, the minimum pane
+//!   size and resizing by cells.
 //! - `gestures`: the pointer maths of the above (pure, unit-tested).
 //! - `icons`: Nerd Font icons for the program running in a tab.
 //! - `saved`: the layout goattyd keeps for the window, so the next
@@ -34,6 +37,7 @@
 //! active, the settings window and "reload shells" act on its active tab's
 //! host (`settings_window::set_host_link`).
 
+mod arrange;
 mod gestures;
 pub(crate) mod icons;
 mod layout;
@@ -79,8 +83,6 @@ use saved::{SavedTab, SavedWindow, SavedWorkspace, Startup};
 const DIVIDER: f32 = 1.0;
 /// The grab area around it.
 const DIVIDER_GRAB: f32 = 6.0;
-/// How far the resize actions move a divider (share of the split).
-const RESIZE_STEP: f32 = 0.05;
 
 struct Pane {
     id: PaneId,
@@ -228,8 +230,10 @@ pub struct Workspace {
     /// stops and when the drag ends.
     sidebar_drag: Option<(Sidebar, Sidebar)>,
     save_sidebar: Option<Task<()>>,
-    /// The open right-click menu (a tab's or a pane's).
+    /// The open right-click menu (a tab's, a pane's or a divider's).
     menu: Option<menu::OpenMenu>,
+    /// Where the panes were last painted, for sizes in cells.
+    panes_bounds: Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -286,6 +290,7 @@ impl Workspace {
             sidebar_drag: None,
             save_sidebar: None,
             menu: None,
+            panes_bounds: Rc::default(),
             _subscriptions: vec![appearance, settings, activation, bounds],
         };
         match initial {
@@ -726,12 +731,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let min = self.min_pane_size(cx);
         let pane = self.make_pane(session, window, cx);
         let id = pane.id;
 
-        // A split whose pane went away while the shell started opens a tab.
+        // A split whose pane went away, or no longer has room (another split
+        // finished first), while the shell started opens a tab.
         let target = match placement {
-            Placement::Split { tab, of, dir } => self.tab_index(tab).filter(|&i| self.tabs[i].tree.contains(of)).map(|i| (i, of, dir)),
+            Placement::Split { tab, of, dir } => {
+                let found = self.tab_index(tab).filter(|&i| self.tabs[i].tree.contains(of));
+                let fits = found.filter(|&i| self.tabs[i].tree.can_split(of, dir, min));
+                if found.is_some() && fits.is_none() {
+                    let toast = Toast::info("Opened in a new tab").body("There was no longer room for another pane there.");
+                    toast::show_in(window, cx, toast.key("pane.split"));
+                }
+                fits.map(|i| (i, of, dir))
+            }
             Placement::NewTab => None,
         };
         let index = match target {
@@ -769,10 +784,10 @@ impl Workspace {
     /// with its last pane, the window with its last tab.
     fn remove_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some((index, _)) = self.find_pane(id) else { return };
-        // Its menu's items would act on whatever pane has focus next.
-        if self.menu.as_ref().is_some_and(|m| m.owner == menu::MenuOwner::Pane(id)) {
-            self.close_menu(window, cx);
-        }
+        // The tab's menus would act on a changed tree: a pane's items on
+        // whatever pane has focus next, a divider's on a shifted split.
+        let tab_id = self.tabs[index].id;
+        self.close_menu_of_tab(tab_id, window, cx);
         let tab = &mut self.tabs[index];
         if tab.tree == Node::Leaf(id) {
             self.remove_tab(index, window, cx);
@@ -1142,9 +1157,18 @@ impl Workspace {
     // ---- actions: panes ---------------------------------------------------------
 
     fn split(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if let Some(tab) = self.active_tab() {
-            self.spawn(Placement::Split { tab: tab.id, of: tab.focused, dir }, window, cx);
+        let min = self.min_pane_size(cx);
+        let Some(tab) = self.active_tab() else { return };
+        // A zoomed pane fills the tab, but splitting it goes back to the split.
+        if tab.connecting.is_none() && !tab.tree.can_split(tab.focused, dir, min) {
+            let way = if dir.axis() == Axis::Horizontal { "side by side" } else { "on top of each other" };
+            let toast = Toast::info("Not enough room for another pane")
+                .body(format!("Two panes {way} wouldn't fit here. Make the window bigger, close a pane, or split the other way."))
+                .key("pane.split");
+            toast::show_in(window, cx, toast);
+            return;
         }
+        self.spawn(Placement::Split { tab: tab.id, of: tab.focused, dir }, window, cx);
     }
 
     /// Alt+arrow: the neighbouring pane, or the key goes to the shell when
@@ -1162,9 +1186,10 @@ impl Workspace {
     }
 
     fn resize_pane(&mut self, dir: Direction, cx: &mut Context<'_, Self>) {
+        let (step, min) = (self.resize_step(dir, cx), self.min_pane_size(cx));
         let Some(tab) = self.active_tab_mut() else { return };
         let focused = tab.focused;
-        if tab.zoomed || !tab.tree.resize(focused, dir, RESIZE_STEP) {
+        if tab.zoomed || !tab.tree.resize(focused, dir, step, min) {
             cx.propagate();
             return;
         }
@@ -1207,7 +1232,8 @@ impl Workspace {
             return;
         }
         let fraction = (pos / total - start) / len;
-        self.tabs[i].tree.set_divider(&d.path, d.index, fraction);
+        let min = self.min_pane_size(cx);
+        self.tabs[i].tree.set_divider(&d.path, d.index, fraction, min);
         self.save_layout(cx);
         cx.notify();
     }
@@ -1417,13 +1443,14 @@ impl Workspace {
             PaletteEvent::Answered(then, answers) => {
                 let (then, answers) = (then.clone(), answers.clone());
                 this.close_palette(window, cx);
-                then(&answers, window, cx);
+                // After this update: answers may update the workspace.
+                window.defer(cx, move |window, cx| then(&answers, window, cx));
             }
             PaletteEvent::Dismissed => this.close_palette(window, cx),
             PaletteEvent::Back(back) => {
                 let back = back.clone();
                 this.close_palette(window, cx);
-                back(window, cx);
+                window.defer(cx, move |window, cx| back(window, cx));
             }
             PaletteEvent::Run(command) => {
                 let command = command.clone();
@@ -1459,6 +1486,8 @@ impl Workspace {
             .overflow_hidden()
             .bg(ui.border)
             .on_drag_move(cx.listener(Self::on_divider_drag));
+        let bounds = self.panes_bounds.clone();
+        area = area.child(gpui::canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full());
         let Some(tab) = self.active_tab() else { return area };
         if let Some((view, _)) = &tab.connecting {
             return area.child(view.clone());
@@ -1507,6 +1536,24 @@ impl Workspace {
                     .w(relative(d.split.w))
                     .cursor_row_resize(),
             };
+            let (tab_id, path) = (tab.id, d.path.clone());
+            let handle = handle
+                .tooltip(crate::ui::controls::tooltip("Drag to resize · double-click to even out · right-click for more"))
+                .on_click(cx.listener({
+                    let path = path.clone();
+                    move |this, ev: &gpui::ClickEvent, _, cx| {
+                        if ev.click_count() == 2 {
+                            this.equalize_split(tab_id, &path, cx);
+                        }
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                        this.open_divider_menu(tab_id, path.clone(), ev.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                );
             area = area.child(handle.on_drag(drag, |_, _, _, cx| cx.new(|_| gpui::EmptyView)));
         }
         area
@@ -1629,6 +1676,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_vertical_tabs))
             .on_action(cx.listener(|this, _: &SplitRight, w, cx| this.split(Direction::Right, w, cx)))
             .on_action(cx.listener(|this, _: &SplitDown, w, cx| this.split(Direction::Down, w, cx)))
+            .on_action(cx.listener(|this, _: &SplitLeft, w, cx| this.split(Direction::Left, w, cx)))
+            .on_action(cx.listener(|this, _: &SplitUp, w, cx| this.split(Direction::Up, w, cx)))
             .on_action(cx.listener(|this, _: &FocusPaneLeft, w, cx| this.focus_pane(Direction::Left, w, cx)))
             .on_action(cx.listener(|this, _: &FocusPaneRight, w, cx| this.focus_pane(Direction::Right, w, cx)))
             .on_action(cx.listener(|this, _: &FocusPaneUp, w, cx| this.focus_pane(Direction::Up, w, cx)))
@@ -1644,6 +1693,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SwapPaneUp, _, cx| this.swap_pane(Direction::Up, cx)))
             .on_action(cx.listener(|this, _: &SwapPaneDown, _, cx| this.swap_pane(Direction::Down, cx)))
             .on_action(cx.listener(|this, _: &MovePaneToNewTab, w, cx| this.move_pane_to_new_tab(w, cx)))
+            .on_action(cx.listener(|this, _: &MovePaneToTab, w, cx| this.ask_move_pane(w, cx)))
+            .on_action(cx.listener(|this, _: &MergeTab, w, cx| this.ask_merge_tab(w, cx)))
+            .on_action(cx.listener(|this, _: &RotatePanes, w, cx| this.rotate_panes(true, w, cx)))
+            .on_action(cx.listener(|this, _: &RotatePanesBack, w, cx| this.rotate_panes(false, w, cx)))
             .children(self.render_menu())
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {

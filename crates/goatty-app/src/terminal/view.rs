@@ -387,6 +387,17 @@ impl TerminalView {
         self.session.terminal.current_directory()
     }
 
+    /// The size of one cell as last painted; `None` before the first paint.
+    pub fn cell_size(&self) -> Option<gpui::Size<Pixels>> {
+        let cell = self.geom.get().cell;
+        (cell.width > px(0.) && cell.height > px(0.)).then_some(cell)
+    }
+
+    /// The padding around the grid (`terminal.padding`).
+    pub fn padding(&self) -> gpui::Edges<Pixels> {
+        self.padding
+    }
+
     pub fn session(&self) -> &Arc<Session> {
         &self.session
     }
