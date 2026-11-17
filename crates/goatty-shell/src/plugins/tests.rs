@@ -451,6 +451,9 @@ fn required_plugins_are_planned_installed_and_offered_for_removal() {
 
     // Dependencies first, each with its own plan; one digest covers them all.
     let c = p.find("top", None).unwrap();
+    let mut off = settings.clone();
+    off.edit_plugin("mid", |x| x.enabled = false);
+    assert!(p.plan(&c, &off).unwrap().all().all(|x| x.warnings.is_empty()), "mid comes along and gets turned on");
     let plan = p.plan(&c, &settings).unwrap();
     let ids: Vec<&str> = plan.all().map(|x| x.id.as_str()).collect();
     assert_eq!(ids, ["demo", "mid", "top"]);
@@ -489,6 +492,10 @@ fn required_plugins_are_planned_installed_and_offered_for_removal() {
     p.install(&demo, &p.plan(&demo, &settings).unwrap().digest, &settings).unwrap();
     let plan = p.plan(&c, &settings).unwrap();
     assert_eq!(plan.dependencies.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["mid"]);
+    let mut off = settings.clone();
+    off.edit_plugin("demo", |x| x.enabled = false);
+    let warned = p.plan(&c, &off).unwrap();
+    assert!(warned.dependencies[0].warnings.iter().any(|w| w.contains("needs the demo plugin, which is turned off")), "{warned:?}");
     p.install(&c, &plan.digest, &settings).unwrap();
     assert_eq!(p.uninstall("top").unwrap().1, ["mid"]);
 }

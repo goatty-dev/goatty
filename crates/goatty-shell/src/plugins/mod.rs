@@ -426,7 +426,9 @@ impl Plugins<'_> {
             .collect();
 
         let mut warnings = Vec::new();
-        for dep in m.requires.plugins.iter().filter(|d| settings.plugins.get(*d).is_some_and(|p| !p.enabled)) {
+        // (One installed along with it gets turned on.)
+        let installed = |d: &str| lock.plugins.contains_key(d) || builtins::get(d).is_some();
+        for dep in m.requires.plugins.iter().filter(|d| installed(d) && settings.plugins.get(*d).is_some_and(|p| !p.enabled)) {
             warnings.push(format!("{} needs the {dep} plugin, which is turned off here: turn it on for {} to work.", m.name, m.name));
         }
         if c.is_local() {
