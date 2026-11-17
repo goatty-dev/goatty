@@ -151,19 +151,188 @@ fn paths(text: &[char]) -> Vec<Found> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < text.len() {
+        // Quoted path: `'My Documents/x.txt'` or `"My Documents/x.txt"`.
+        if matches!(text[i], '\'' | '"')
+            && let Some((f, next)) = quoted_path(text, i)
+        {
+            out.push(f);
+            i = next;
+            continue;
+        }
         if path_delim(text[i]) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < text.len() && !path_delim(text[i]) {
-            i += 1;
+        let win_drive = text.get(start).is_some_and(char::is_ascii_alphabetic)
+            && text.get(start + 1) == Some(&':')
+            && text.get(start + 2) == Some(&'\\');
+        while i < text.len() {
+            // Escaped space in a POSIX path (`My\ Documents/x.txt`).
+            if text[i] == '\\' && text.get(i + 1) == Some(&' ') && !win_drive {
+                i += 2;
+            } else if path_delim(text[i]) {
+                break;
+            } else {
+                i += 1;
+            }
         }
-        if let Some(f) = path_token(&text[start..i], start) {
+        if let Some((f, next)) = path_with_suffix(text, start, i) {
             out.push(f);
+            i = next;
         }
     }
     out
+}
+
+fn parse_u32(s: &str) -> Option<u32> {
+    (!s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u32>().ok()).flatten()
+}
+
+fn parse_pos_chars(chars: &[char]) -> Option<u32> {
+    let s: String = chars.iter().collect();
+    parse_u32(&s)
+}
+
+/// MSVC / .NET `(12)`, `(12,5)`, `(12, 5)`, `(12,5,12,10)` right after a path.
+fn msvc_suffix(text: &[char], at: usize) -> Option<(u32, Option<u32>, usize)> {
+    if text.get(at) != Some(&'(') {
+        return None;
+    }
+    let mut i = at + 1;
+    let mut nums = [0u32; 4];
+    let mut count = 0;
+    loop {
+        while text.get(i) == Some(&' ') {
+            i += 1;
+        }
+        let d_start = i;
+        while text.get(i).is_some_and(char::is_ascii_digit) {
+            i += 1;
+        }
+        nums[count] = parse_pos_chars(&text[d_start..i])?;
+        count += 1;
+        while text.get(i) == Some(&' ') {
+            i += 1;
+        }
+        match text.get(i) {
+            Some(&')') => return Some((nums[0], (count >= 2).then_some(nums[1]), i + 1)),
+            Some(&',') if count < 4 => i += 1,
+            _ => return None,
+        }
+    }
+}
+
+/// Python traceback `, line 12` after `File "x.py"`.
+fn python_line_suffix(text: &[char], at: usize) -> Option<(u32, usize)> {
+    let mut i = at;
+    if text.get(i) != Some(&',') {
+        return None;
+    }
+    i += 1;
+    while text.get(i) == Some(&' ') {
+        i += 1;
+    }
+    if !starts_with_ci(text, i, "line ") {
+        return None;
+    }
+    i += 5;
+    while text.get(i) == Some(&' ') {
+        i += 1;
+    }
+    let start = i;
+    while text.get(i).is_some_and(char::is_ascii_digit) {
+        i += 1;
+    }
+    let line = parse_pos_chars(&text[start..i])?;
+    Some((line, i))
+}
+
+/// `:line` or `:line:col` right after a quoted path.
+fn colon_suffix(text: &[char], at: usize) -> Option<(u32, Option<u32>, usize)> {
+    if text.get(at) != Some(&':') {
+        return None;
+    }
+    let l_start = at + 1;
+    let mut l_end = l_start;
+    while text.get(l_end).is_some_and(char::is_ascii_digit) {
+        l_end += 1;
+    }
+    let line = parse_pos_chars(&text[l_start..l_end])?;
+    if text.get(l_end) == Some(&':') {
+        let c_start = l_end + 1;
+        let mut c_end = c_start;
+        while text.get(c_end).is_some_and(char::is_ascii_digit) {
+            c_end += 1;
+        }
+        if let Some(col) = parse_pos_chars(&text[c_start..c_end]) {
+            return Some((line, Some(col), c_end));
+        }
+    }
+    Some((line, None, l_end))
+}
+
+fn quoted_path(text: &[char], quote_idx: usize) -> Option<(Found, usize)> {
+    let q = text[quote_idx];
+    let start = quote_idx + 1;
+    let mut i = start;
+    while i < text.len() && text[i] != q {
+        if text[i].is_control() || is_frame(text[i]) || text[i] == '\0' {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= text.len() || i == start {
+        return None;
+    }
+    let close_quote = i;
+    let after_quote = close_quote + 1;
+
+    // A Python traceback `File "<stdin>", line 1` isn't a file path; check
+    // `path_token` first before consuming any suffix.
+    // Don't strip sentence punctuation at the end of a quoted token if it's
+    // only recognized because of its quotes.
+    let inner = &text[start..close_quote];
+    if inner.last().is_some_and(|c| matches!(c, '.' | ',' | '!' | '?')) {
+        return None;
+    }
+    let mut found = path_token(inner, start, true)?;
+
+    if found.line.is_none() {
+        if let Some((line, end)) = python_line_suffix(text, after_quote) {
+            found.line = Some(line);
+            found.range = start..end;
+            return Some((found, end));
+        }
+        if let Some((line, col, end)) = msvc_suffix(text, after_quote).or_else(|| colon_suffix(text, after_quote)) {
+            found.line = Some(line);
+            found.column = col;
+            found.range = start..end;
+            return Some((found, end));
+        }
+    }
+
+    // Without a suffix outside the quotes, only treat the quoted string as a
+    // path here if it wouldn't be found identically as an unquoted token (e.g.
+    // because it contains spaces or other `path_delim` characters).
+    if inner.iter().any(|&c| path_delim(c)) {
+        return Some((found, after_quote));
+    }
+    None
+}
+
+fn path_with_suffix(text: &[char], start: usize, end: usize) -> Option<(Found, usize)> {
+    let mut found = path_token(&text[start..end], start, false)?;
+    if found.line.is_none()
+        && found.range.end == end
+        && let Some((line, col, after_msvc)) = msvc_suffix(text, end)
+    {
+        found.line = Some(line);
+        found.column = col;
+        found.range = start..after_msvc;
+        return Some((found, after_msvc));
+    }
+    Some((found, end))
 }
 
 /// Split `src/main.rs:12:5:` into the path and its position.
@@ -173,15 +342,33 @@ fn split_position(token: &str) -> (&str, Option<u32>, Option<u32>) {
     let last = parts.next().unwrap_or_default();
     let mid = parts.next();
     let rest = parts.next();
-    let num = |s: &str| (!s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u32>().ok()).flatten();
-    match (rest, mid.and_then(num), num(last)) {
-        (Some(p), Some(l), Some(c)) => (p, Some(l), Some(c)),
-        (_, _, Some(l)) if mid.is_some() => (&token[..token.len() - last.len() - 1], Some(l), None),
+    match (rest, mid.and_then(parse_u32), parse_u32(last)) {
+        (Some(p), Some(l), Some(c)) if !p.is_empty() => (p, Some(l), Some(c)),
+        (_, _, Some(l)) if mid.is_some() => {
+            let p = &token[..token.len() - last.len() - 1];
+            // Don't mistake a drive letter (`C:\123`) for a `:line` suffix.
+            if p.len() == 1 && p.as_bytes()[0].is_ascii_alphabetic() { (token, None, None) } else { (p, Some(l), None) }
+        }
         _ => (token, None, None),
     }
 }
 
-fn path_token(token: &[char], offset: usize) -> Option<Found> {
+fn unescape_spaces(s: &str) -> String {
+    if s.contains("\\ ") && !s.contains(":\\") { s.replace("\\ ", " ") } else { s.to_string() }
+}
+
+fn is_windows_drive_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && matches!(b[2], b'\\' | b'/')
+        && !p[3..].is_empty()
+        && !p[2..].contains("//")
+        && !p[2..].contains("\\\\")
+}
+
+fn path_token(token: &[char], offset: usize, quoted: bool) -> Option<Found> {
     // Sentence punctuation after a path ("see src/lib.rs.") isn't part of it.
     let mut len = token.len();
     while len > 0 && matches!(token[len - 1], '.' | ',' | '!' | '?') {
@@ -194,31 +381,47 @@ fn path_token(token: &[char], offset: usize) -> Option<Found> {
     let (path, line, column) = split_position(&s);
     // A trailing ':' that wasn't a position is punctuation ("error in foo.rs:").
     let path = path.trim_end_matches(':');
-    if !looks_like_path(path) {
+    let unescaped = if quoted { path.to_string() } else { unescape_spaces(path) };
+    if !looks_like_path(&unescaped) {
         return None;
     }
     let shown = s.trim_end_matches(':').chars().count();
-    Some(Found { kind: LinkKind::Path, range: offset..offset + shown, target: path.to_string(), line, column })
+    Some(Found { kind: LinkKind::Path, range: offset..offset + shown, target: unescaped, line, column })
 }
 
 fn looks_like_path(p: &str) -> bool {
-    if p.is_empty() || p.chars().all(|c| c == '/' || c == '.' || c == '~') {
+    if p.is_empty() || p.chars().all(|c| c == '/' || c == '\\' || c == '.' || c == '~') {
         return false;
-    }
-    if p.starts_with('/') || p.starts_with("~/") || p.starts_with("./") || p.starts_with("../") {
-        return true;
     }
     if p.starts_with('-') || p.starts_with('$') || p.contains("//") {
         return false;
     }
+    if is_windows_drive_path(p) {
+        return true;
+    }
+    if p.starts_with('/') || p.starts_with("~/") || p.starts_with("./") || p.starts_with("../") {
+        return true;
+    }
     if p.contains('/') {
-        // `src/main.rs`, `docs/`; not `1/2` or `and/or`-style prose.
+        // `src/main.rs`, `docs/`; not `1/2`, `and/or`, or `"hello / world"` prose.
+        if p.contains(" /") || p.contains("/ ") {
+            return false;
+        }
         return p.chars().any(|c| c.is_ascii_alphabetic()) && (p.contains('.') || p.ends_with('/') || p.matches('/').count() >= 2);
     }
-    // A bare file name needs an extension: `Cargo.toml`, `notes.md`.
+    if p.contains('\\') {
+        if p.ends_with('\\') || p.contains("\\\\") || p.contains(" \\") || p.contains("\\ ") {
+            return false;
+        }
+        return p.chars().any(|c| c.is_ascii_alphabetic()) && (p.contains('.') || p.matches('\\').count() >= 2);
+    }
+    // A bare file name needs an extension: `Cargo.toml`, `notes.md`, `"my script.py"`.
     match p.rsplit_once('.') {
         Some((stem, ext)) => {
             !stem.is_empty()
+                && !stem.starts_with(' ')
+                && !stem.ends_with(' ')
+                && !stem.contains("  ")
                 && !ext.is_empty()
                 && ext.len() <= 10
                 && ext.chars().all(|c| c.is_ascii_alphanumeric())
@@ -384,8 +587,53 @@ mod tests {
     }
 
     #[test]
+    fn msvc_and_python_traceback_positions() {
+        use LinkKind::Path;
+        assert_eq!(found("file.cs(12,5): error CS1002"), [(Path, "file.cs".into(), Some(12), Some(5))]);
+        assert_eq!(found("src/App.cs(42): warning"), [(Path, "src/App.cs".into(), Some(42), None)]);
+        assert_eq!(found("src/App.cs(12,5,12,10): error"), [(Path, "src/App.cs".into(), Some(12), Some(5))]);
+        assert_eq!(found("  File \"x.py\", line 12, in <module>"), [(Path, "x.py".into(), Some(12), None)]);
+        assert_eq!(found("  File \"my script.py\", line 12"), [(Path, "my script.py".into(), Some(12), None)]);
+        assert_eq!(found("  File \"/app/my script.py\", line 99"), [(Path, "/app/my script.py".into(), Some(99), None)]);
+        assert!(found("  File \"<stdin>\", line 1").is_empty());
+
+        // Hovering the `(12,5)` or `, line 12` suffix resolves the same link.
+        let chars: Vec<char> = "  File \"x.py\", line 12, in main".chars().collect();
+        let f = &find_links(&chars)[0];
+        assert_eq!(&chars[f.range.clone()].iter().collect::<String>(), "x.py\", line 12");
+    }
+
+    #[test]
+    fn paths_with_spaces_quoted_or_escaped() {
+        use LinkKind::Path;
+        assert_eq!(found("open 'My Documents/x.txt' now"), [(Path, "My Documents/x.txt".into(), None, None)]);
+        assert_eq!(found("\"/tmp/some dir/file.rs:10:2\""), [(Path, "/tmp/some dir/file.rs".into(), Some(10), Some(2))]);
+        assert_eq!(found("'/tmp/some dir/file.rs':10:2"), [(Path, "/tmp/some dir/file.rs".into(), Some(10), Some(2))]);
+        assert_eq!(found("cat My\\ Documents/x.txt"), [(Path, "My Documents/x.txt".into(), None, None)]);
+        assert_eq!(found("My\\ Documents/x.txt:15:3"), [(Path, "My Documents/x.txt".into(), Some(15), Some(3))]);
+        assert_eq!(found("my\\ script.py:4"), [(Path, "my script.py".into(), Some(4), None)]);
+        assert_eq!(found("cd ~/My\\ Documents/notes"), [(Path, "~/My Documents/notes".into(), None, None)]);
+        assert_eq!(found(r"'/tmp/a\ b.rs'"), [(Path, r"/tmp/a\ b.rs".into(), None, None)]);
+        assert_eq!(found(r"/tmp/a\\b.rs"), [(Path, r"/tmp/a\\b.rs".into(), None, None)]);
+        assert_eq!(found("\"/tmp/ report.txt\""), [(Path, "/tmp/ report.txt".into(), None, None)]);
+        assert_eq!(found("/tmp/\\ report.txt"), [(Path, "/tmp/ report.txt".into(), None, None)]);
+    }
+
+    #[test]
+    fn windows_drive_paths() {
+        use LinkKind::Path;
+        assert_eq!(found(r"C:\Users\me\file.rs:12:5"), [(Path, r"C:\Users\me\file.rs".into(), Some(12), Some(5))]);
+        assert_eq!(found(r"C:\Users\me\file.rs:12"), [(Path, r"C:\Users\me\file.rs".into(), Some(12), None)]);
+        assert_eq!(found(r"C:\Users\me\file.rs"), [(Path, r"C:\Users\me\file.rs".into(), None, None)]);
+        assert_eq!(found(r"D:/proj/src/main.rs:7"), [(Path, r"D:/proj/src/main.rs".into(), Some(7), None)]);
+        assert_eq!(found(r"C:\proj\Program.cs(12,5): error"), [(Path, r"C:\proj\Program.cs".into(), Some(12), Some(5))]);
+        assert_eq!(found(r#""C:\My Documents\x.txt":9"#), [(Path, r"C:\My Documents\x.txt".into(), Some(9), None)]);
+        assert_eq!(found(r"C:\123"), [(Path, r"C:\123".into(), None, None)]);
+    }
+
+    #[test]
     fn things_that_are_not_paths() {
-        for s in ["1/2", "and/or", "v1.2.3", "3.14", "...", "/", "-o", "$HOME/x", "a//b", "10:30"] {
+        for s in ["1/2", "and/or", "v1.2.3", "3.14", "...", "/", "-o", "$HOME/x", "a//b", "10:30", r"C:\", r"C:\\x", r#""hello / world""#] {
             assert!(found(s).is_empty(), "{s:?} → {:?}", found(s));
         }
         // A URL isn't also a path.

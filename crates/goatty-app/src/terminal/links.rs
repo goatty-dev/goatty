@@ -98,15 +98,20 @@ fn resolve_uri(uri: &str, place: &Place<'_>) -> Option<Target> {
     }
 }
 
+fn is_windows_drive_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
 fn resolve_path(text: &str, line: Option<u32>, column: Option<u32>, place: &Place<'_>) -> Option<Target> {
     if let Some(host) = place.remote_host {
         // Nothing to check against, so only paths that can't be misread.
-        return (text.starts_with('/') || text.starts_with("~/"))
+        return (text.starts_with('/') || text.starts_with("~/") || is_windows_drive_path(text))
             .then(|| Target::Remote { path: text.to_string(), host: host.to_string() });
     }
     let candidates: Vec<PathBuf> = if let Some(rest) = text.strip_prefix("~/") {
         vec![place.home?.join(rest)]
-    } else if text.starts_with('/') {
+    } else if Path::new(text).is_absolute() {
         vec![PathBuf::from(text)]
     } else {
         let cwd = place.cwd?;
@@ -237,6 +242,7 @@ mod tests {
         let place = Place { remote_host: Some("me@server"), ..local(&never) };
         let path = |t: &str| resolve(&link(LinkKind::Path, t), &place);
         assert_eq!(path("/var/log/syslog"), Some(Target::Remote { path: "/var/log/syslog".into(), host: "me@server".into() }));
+        assert_eq!(path(r"C:\Users\me\file.rs"), Some(Target::Remote { path: r"C:\Users\me\file.rs".into(), host: "me@server".into() }));
         assert_eq!(path("src/main.rs"), None);
         let osc8 = resolve(&link(LinkKind::Hyperlink, "file:///srv/x"), &place);
         assert_eq!(osc8, Some(Target::Remote { path: "/srv/x".into(), host: "me@server".into() }));
