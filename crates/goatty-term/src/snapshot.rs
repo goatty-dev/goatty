@@ -11,7 +11,9 @@
 //!   * the OSC 133 prompt marks on rows and soft wraps in the scrollback,
 //!     so the client's [transcript](crate::transcript) finds the same
 //!     commands and unwrapped lines,
-//!   * OSC 8 hyperlinks.
+//!   * OSC 8 hyperlinks,
+//!   * what programs said about themselves (OSC 7501 records, the OSC 9;4
+//!     progress bar; see [`crate::status`]).
 
 use std::fmt::Write as _;
 
@@ -42,7 +44,11 @@ impl Terminal {
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info()))
+        self.with_term(|t| {
+            let mut out = serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info());
+            self.write_status(false, &mut out);
+            out.into_bytes()
+        })
     }
 
     /// Everything another process needs to rebuild this terminal (goattyd
@@ -61,7 +67,17 @@ impl Terminal {
     /// (rio's `ED 2` on the primary screen pushes the viewport up) and the
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
-        self.with_term(|t| resync(t, self.shell_info(), self.primary_kitty()))
+        self.with_term(|t| {
+            let mut out = resync(t, self.shell_info(), self.primary_kitty());
+            self.write_status(true, &mut out);
+            out.into_bytes()
+        })
+    }
+
+    /// The program status records, after the rows (whose prompt marks would
+    /// drop them on the client). `replace`: the client may have some already.
+    fn write_status(&self, replace: bool, out: &mut String) {
+        self.inner.status.lock().write_snapshot(replace, out);
     }
 
     /// The primary screen's kitty keyboard flags as of its last switch to
@@ -73,7 +89,7 @@ impl Terminal {
 
 /// `primary`: the primary screen's kitty keyboard flags, used while the
 /// alternate screen is active (each screen has its own).
-fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> Vec<u8> {
+fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> String {
     let mode = TermMode::of(t);
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
@@ -93,10 +109,10 @@ fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> Vec<u8> {
     // Mouse protocols are one setting in rio: reset, then set what's active.
     out.push_str("\x1b[?1000l\x1b[?1005l\x1b[?1006l");
     write_modes(t, mode, &mut out);
-    out.into_bytes()
+    out
 }
 
-fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
+fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo) -> String {
     let mode = TermMode::of(t);
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
@@ -118,7 +134,7 @@ fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
     }
     write_shell_state(shell, &mut out);
     write_modes(t, mode, &mut out);
-    out.into_bytes()
+    out
 }
 
 /// The primary screen with up to `max_history` lines of scrollback, and the
@@ -588,6 +604,32 @@ mod tests {
         f.feed(&e.reattach_snapshot());
         assert_eq!(f.mode().kitty_flags(), 2);
         assert_eq!(primary_of(&f), 5);
+    }
+
+    #[test]
+    fn snapshots_carry_program_status() {
+        use crate::{StatusState, UiEvent};
+        let size = TermSize::new(20, 5);
+        let (a, _ca) = Terminal::new(size, true, Arc::new(Palette::default()));
+        a.feed(b"\x1b]133;A\x07$ claude\r\n\x1b]133;C\x07");
+        a.feed(b"\x1b]7501;state=blocked:app=claude-code:kind=permission:title=QmFzaA\x1b\\\x1b]9;4;1;40\x07");
+        let (b, cb) = Terminal::new(size, false, Arc::new(Palette::default()));
+        b.feed(&a.reattach_snapshot());
+        let (sa, sb) = (a.program_status(), b.program_status());
+        assert_eq!(sb.records.len(), 1);
+        assert_eq!(sb.records[0].state, StatusState::Blocked);
+        assert_eq!(sb.records[0].title.as_deref(), Some("Bash"));
+        assert_eq!(sb.app(), Some("claude-code"));
+        assert_eq!(sa.progress, sb.progress);
+        // Replaying isn't news.
+        assert!(cb.ui.try_iter().all(|e| !matches!(e, UiEvent::Status { news: Some(_) })));
+
+        // A resync replaces what the client had.
+        a.feed(b"\x1b]7501;state=done:app=claude-code\x07\x1b]9;4;0\x07");
+        b.feed(&a.resync_snapshot());
+        let sb = b.program_status();
+        assert_eq!(sb.records.iter().map(|r| r.state).collect::<Vec<_>>(), [StatusState::Done]);
+        assert_eq!(sb.progress, None);
     }
 
     #[test]

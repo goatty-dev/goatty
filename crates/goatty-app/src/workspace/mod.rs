@@ -18,7 +18,10 @@
 //! - `groups`: tabs grouped by host, with a colored label per host that
 //!   folds its tabs away (once the window has a tab on another host).
 //! - `gestures`: the pointer maths of the above (pure, unit-tested).
-//! - `icons`: Nerd Font icons for the program running in a tab.
+//! - `icons`: Nerd Font icons for the program running in a tab (coding
+//!   agents get their logos, `crate::agent`).
+//! - `notices`: what panes have to tell (an agent waiting, done; a
+//!   program's notification) as toasts and desktop notifications (#205).
 //! - `saved`: the layout goattyd keeps for the window, so the next
 //!   `goatty` restores every tab and split (#118).
 //!
@@ -45,6 +48,7 @@ mod groups;
 pub(crate) mod icons;
 mod layout;
 mod menu;
+mod notices;
 pub mod saved;
 mod sidebar;
 mod tab_bar;
@@ -90,6 +94,9 @@ const DIVIDER_GRAB: f32 = 6.0;
 struct Pane {
     id: PaneId,
     view: Entity<TerminalView>,
+    /// The newest program status report the user has seen (its tab was on
+    /// screen in the focused window): `done`/`error` up to it aren't shown.
+    seen: u64,
     _subscriptions: [Subscription; 2],
 }
 
@@ -128,6 +135,11 @@ impl Tab {
 
     fn focused_view(&self) -> Option<&Entity<TerminalView>> {
         self.pane(self.focused).map(|p| &p.view)
+    }
+
+    /// Is pane `id` drawn when the tab is (not hidden by a zoomed pane)?
+    fn shows(&self, id: PaneId) -> bool {
+        !self.zoomed || self.focused == id
     }
 }
 
@@ -177,6 +189,8 @@ pub(super) struct DraggedTab {
     label: gpui::SharedString,
     /// The program's icon (glyph, color), when the tab shows one.
     icon: Option<(char, gpui::Hsla)>,
+    /// The coding agent's logo instead, when it runs there.
+    agent: Option<crate::agent::Identity>,
 }
 
 /// The layout one goattyd keeps for this window's tabs on it.
@@ -241,6 +255,8 @@ pub struct Workspace {
     folded: Vec<groups::HostKey>,
     /// The tab last active in each host's group (by id).
     group_focus: Vec<(groups::HostKey, u64)>,
+    /// What panes told (toasts, desktop notifications; `notices`).
+    notices: notices::Notices,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -300,6 +316,7 @@ impl Workspace {
             panes_bounds: Rc::default(),
             folded: Vec::new(),
             group_focus: Vec::new(),
+            notices: Default::default(),
             _subscriptions: vec![appearance, settings, activation, bounds],
         };
         match initial {
@@ -344,6 +361,9 @@ impl Workspace {
         // window never act on a host the user isn't looking at.
         let link = self.active_tab().and_then(|t| t.host.as_ref()).map(Spawner::host_link);
         crate::settings_window::set_host_link(cx, link);
+        // The active tab is being looked at again.
+        self.notices_seen(window, cx);
+        cx.notify();
     }
 
     /// The layout entry for `conn` (a new one for a host the window had no tabs on).
@@ -546,6 +566,7 @@ impl Workspace {
         }
         self.active = index;
         self.update_window_title(window, cx);
+        self.notices_seen(window, cx);
         self.save_layout(cx);
         cx.notify();
     }
@@ -569,6 +590,7 @@ impl Workspace {
             // None while the tab connects (see `window_activated`).
             crate::settings_window::set_host_link(cx, self.tabs[index].host.as_ref().map(Spawner::host_link));
         }
+        self.notices_seen(window, cx);
         self.save_layout(cx);
         cx.notify();
     }
@@ -735,7 +757,7 @@ impl Workspace {
         let focus = view.focus_handle(cx);
         // Focus inside counts too: the output viewer covers the pane.
         let focused = cx.on_focus_in(&focus, window, move |this, window, cx| this.pane_focused(id, window, cx));
-        Pane { id, view, _subscriptions: [events, focused] }
+        Pane { id, view, seen: 0, _subscriptions: [events, focused] }
     }
 
     /// Put `session` (from `spawner`) at `placement`.
@@ -813,6 +835,8 @@ impl Workspace {
         let pos = order.iter().position(|&p| p == id).unwrap_or(0);
         tab.tree.remove(id);
         tab.panes.retain(|p| p.id != id);
+        self.forget_notices(id, cx);
+        let tab = &mut self.tabs[index];
         if self.paste.as_ref().is_some_and(|(_, pane, _)| *pane == id) {
             self.paste = None;
         }
@@ -837,6 +861,9 @@ impl Workspace {
             self.close_menu_of_tab(id, window, cx);
         }
         let tab = self.tabs.remove(index);
+        for pane in &tab.panes {
+            self.forget_notices(pane.id, cx);
+        }
         if self.rename.as_ref().is_some_and(|r| r.tab == tab.id) {
             self.rename = None;
         }
@@ -986,6 +1013,8 @@ impl Workspace {
             TerminalEvent::ConfirmPaste(request) => self.confirm_paste(id, request.clone(), window, cx),
             TerminalEvent::Activity(activity) => self.mark_activity(id, *activity, cx),
             TerminalEvent::ContextMenu { at, keyboard } => self.open_pane_menu(id, *at, *keyboard, window, cx),
+            TerminalEvent::StatusChanged => self.pane_status_changed(id, cx),
+            TerminalEvent::Notice(notice) => self.notice(id, notice.clone(), window, cx),
         }
     }
 
@@ -1226,6 +1255,8 @@ impl Workspace {
             return;
         }
         tab.zoomed = !tab.zoomed;
+        // Unzoomed, the other panes are on screen again.
+        self.notices_seen(window, cx);
         self.save_layout(cx);
         cx.notify();
     }
@@ -1498,6 +1529,7 @@ impl Workspace {
         let ui = Ui::get(cx);
         let app = cx.global::<AppSettings>();
         let dim = app.client.panes.dim_inactive;
+        let ui_font = app.ui_font.clone();
         let bg = gpui::Hsla::from(gpui::rgb(app.colors.background.0));
         let mut area = div()
             .id("panes")
@@ -1519,6 +1551,9 @@ impl Workspace {
         for (id, r) in leaves {
             let Some(pane) = tab.pane(id) else { continue };
             let faded = split && dim > 0.0 && id != tab.focused;
+            // In a split, the pane whose agent waits for the user says so.
+            let waiting =
+                split.then(|| pane.view.read(cx).agent_status(u64::MAX)).flatten().filter(|s| s.state == goatty_term::StatusState::Blocked);
             area = area.child(
                 div()
                     .id(gpui::ElementId::NamedInteger("pane".into(), id))
@@ -1535,7 +1570,8 @@ impl Workspace {
                             .size_full()
                             .relative()
                             .child(pane.view.clone())
-                            .when(faded, |d| d.child(div().absolute().inset_0().bg(bg.opacity(dim)))),
+                            .when(faded, |d| d.child(div().absolute().inset_0().bg(bg.opacity(dim))))
+                            .when_some(waiting, |d, status| d.child(waiting_badge(&status, ui, ui_font.clone()))),
                     ),
             );
         }
@@ -1582,6 +1618,32 @@ impl Workspace {
     }
 }
 
+/// A ring around a split pane whose agent waits for the user, and a pill
+/// in its corner saying what for.
+fn waiting_badge(status: &crate::agent::AgentStatus, ui: Ui, font: gpui::SharedString) -> impl IntoElement {
+    let icon = status.icon().unwrap_or(crate::ui::icons::Icon::Hand);
+    let pill = div()
+        .absolute()
+        .top(px(8.))
+        .right(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(9.))
+        .py(px(3.))
+        .rounded_full()
+        .bg(ui.menu)
+        .border_1()
+        .border_color(ui.warning.opacity(0.6))
+        .shadow_md()
+        .font_family(font)
+        .text_size(px(crate::ui::style::text::CAPTION))
+        .text_color(ui.text)
+        .child(icon.svg().size(px(12.)).text_color(ui.warning))
+        .child(format!("{} · {}", status.who(), status.summary()));
+    div().absolute().inset_0().border_2().border_color(ui.warning.opacity(0.7)).child(pill)
+}
+
 /// A dialog centered over the window, which it dims.
 fn modal(dialog: impl IntoElement) -> impl IntoElement {
     div().absolute().inset_0().bg(gpui::black().opacity(0.35)).flex().items_center().justify_center().px_4().child(dialog)
@@ -1594,10 +1656,14 @@ fn busy_programs<'a>(panes: impl Iterator<Item = &'a Pane>, cx: &gpui::App) -> V
 }
 
 /// What a pane is called when its tab has no name: the application's
-/// title, else the running program, else the directory's name.
+/// title, else the coding agent in it, else the running program, else the
+/// directory's name.
 fn pane_label(view: &TerminalView) -> String {
     if let Some(t) = view.app_title() {
         return t.to_string();
+    }
+    if let Some(agent) = view.agent() {
+        return agent.name().to_string();
     }
     if let Some(p) = view.process().filter(|p| !icons::is_shell(p)) {
         return p.to_string();
@@ -1643,9 +1709,17 @@ pub fn background_appearance(t: &goatty_config::TerminalSettings) -> gpui::Windo
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        // However a tab became the active one, it's being looked at now.
+        // However a tab became the active one, it's being looked at now
+        // (its agents' results too, while the window has focus).
+        let looking = window.is_window_active();
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.activity = None;
+            if looking {
+                let (zoomed, focused) = (tab.zoomed, tab.focused);
+                for pane in tab.panes.iter_mut().filter(|p| !zoomed || p.id == focused) {
+                    pane.seen = pane.view.read(cx).program_status().latest;
+                }
+            }
         }
         // A drag that ended anywhere (even outside the window) is over.
         if !cx.has_active_drag() {

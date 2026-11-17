@@ -37,13 +37,53 @@ pub fn process_name(pid: u32) -> Option<String> {
 /// not `python3`), and programs that rename themselves (Node's
 /// `process.title`) update it. But the kernel cuts it to 15 bytes, so a
 /// longer name comes from `argv[0]` when that starts with it. A login
-/// shell's leading `-` (`-zsh`) is dropped.
+/// shell's leading `-` (`-zsh`) is dropped. A runtime (`node`, `bun`,
+/// `python3`…) running a known coding agent's package is reported as the
+/// agent (`cursor-agent` runs as `node …/cursor-agent/…/index.js`).
 pub fn display_name(comm: &str, cmdline: &[u8]) -> Option<String> {
     let argv0 = cmdline.split(|&b| b == 0).next().map(String::from_utf8_lossy).unwrap_or_default();
     let base = argv0.rsplit('/').next().unwrap_or_default().trim_start_matches('-').to_string();
     let comm = comm.trim_start_matches('-');
     let name = if comm.is_empty() || (comm.len() >= 15 && base.starts_with(comm)) { base } else { comm.to_string() };
+    if is_runtime(&name)
+        && let Some(agent) = agent_package(cmdline)
+    {
+        return Some(agent.to_string());
+    }
     (!name.is_empty()).then_some(name)
+}
+
+/// Interpreters that run other programs' code.
+fn is_runtime(name: &str) -> bool {
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    matches!(name, "node" | "nodejs" | "bun" | "deno" | "python" | "uv" | "uvx")
+}
+
+/// Where coding agents installed as packages live, and the name each goes
+/// by: npm/bun packages under a `node_modules` folder, Cursor's installer's
+/// versions folder. Only an installed package matches, not a project
+/// folder that happens to have the name.
+const AGENT_PACKAGES: &[(&str, &str)] = &[
+    ("/node_modules/@anthropic-ai/claude-code/", "claude"),
+    ("/node_modules/@openai/codex/", "codex"),
+    ("/node_modules/opencode-ai/", "opencode"),
+    ("/node_modules/@google/gemini-cli/", "gemini"),
+    ("/node_modules/@github/copilot/", "copilot"),
+    ("/cursor-agent/versions/", "cursor-agent"),
+    ("/node_modules/@mariozechner/pi-coding-agent/", "pi"),
+    ("/node_modules/@sourcegraph/amp/", "amp"),
+    ("/node_modules/@qwen-code/qwen-code/", "qwen"),
+];
+
+/// The agent whose package an argument of the command line is in.
+fn agent_package(cmdline: &[u8]) -> Option<&'static str> {
+    let args = cmdline.split(|&b| b == 0).skip(1).take(8).map(String::from_utf8_lossy);
+    for arg in args {
+        if let Some((_, name)) = AGENT_PACKAGES.iter().find(|(dir, _)| arg.contains(dir)) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// Watches a PTY's foreground process on its own thread.
@@ -130,6 +170,15 @@ mod tests {
         // comm is cut to 15 bytes.
         assert_eq!(display_name("rust-analyzer-p", b"/x/rust-analyzer-proc-macro-srv\0").as_deref(), Some("rust-analyzer-proc-macro-srv"));
         assert_eq!(display_name("", b"").as_deref(), None);
+        // Coding agents under a runtime go by their own name.
+        let cursor = b"/home/me/.local/share/cursor-agent/versions/1/node\0--use-system-ca\0/home/me/.local/share/cursor-agent/versions/1/index.js\0";
+        assert_eq!(display_name("node", cursor).as_deref(), Some("cursor-agent"));
+        let gemini = b"node\0/usr/lib/node_modules/@google/gemini-cli/dist/index.js\0";
+        assert_eq!(display_name("node", gemini).as_deref(), Some("gemini"));
+        assert_eq!(display_name("node", b"node\0server.js\0").as_deref(), Some("node"));
+        let project = b"node\0/home/me/src/cursor-agent/index.js\0/home/me/opencode-ai/x.js\0";
+        assert_eq!(display_name("node", project).as_deref(), Some("node"), "a project folder isn't the package");
+        assert_eq!(display_name("vim", b"vim\0/x/@openai/codex/a.js\0").as_deref(), Some("vim"), "only runtimes");
     }
 
     #[test]

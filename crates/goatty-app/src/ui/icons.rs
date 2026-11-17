@@ -50,6 +50,7 @@ icons! {
     Bell => "bell.svg",
     BookOpen => "book-open.svg",
     BookmarkPlus => "bookmark-plus.svg",
+    Bot => "bot.svg",
     Bug => "bug.svg",
     CaseSensitive => "case-sensitive.svg",
     Check => "check.svg",
@@ -69,13 +70,16 @@ icons! {
     FolderOpen => "folder-open.svg",
     GitCommit => "git-commit.svg",
     Globe => "globe.svg",
+    Hand => "hand.svg",
     History => "history.svg",
+    KeyRound => "key-round.svg",
     Keyboard => "keyboard.svg",
     Link => "link.svg",
     Link2 => "link-2.svg",
     ListFilter => "list-filter.svg",
     Maximize2 => "maximize-2.svg",
     Menu => "menu.svg",
+    MessageCircleQuestion => "message-circle-question.svg",
     Monitor => "monitor.svg",
     MousePointerClick => "mouse-pointer-click.svg",
     Package => "package.svg",
@@ -119,16 +123,19 @@ impl Icon {
     }
 }
 
-/// goatty's embedded assets, installed with `Application::with_assets`.
+/// goatty's embedded assets, installed with `Application::with_assets`:
+/// the icons and the coding agents' logos (`crate::agent`).
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
-        Ok(Icon::ALL.iter().find(|i| i.path() == path).map(|i| Cow::Borrowed(i.bytes())))
+        let icon = Icon::ALL.iter().find(|i| i.path() == path).map(|i| i.bytes());
+        Ok(icon.or_else(|| crate::agent::logo_bytes(path)).map(Cow::Borrowed))
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        Ok(Icon::ALL.iter().map(|i| i.path()).filter(|p| p.starts_with(path)).map(SharedString::from).collect())
+        let all = Icon::ALL.iter().map(|i| i.path()).chain(crate::agent::Agent::ALL.iter().filter_map(|a| a.logo().path()));
+        Ok(all.filter(|p| p.starts_with(path)).map(SharedString::from).collect())
     }
 }
 
@@ -144,6 +151,10 @@ mod tests {
         }
         assert!(Assets.load("icons/nope.svg").unwrap().is_none());
         assert_eq!(Assets.list("icons/").unwrap().len(), Icon::ALL.len());
+        for path in Assets.list("agents/").unwrap() {
+            let bytes = Assets.load(&path).unwrap().unwrap();
+            assert!(std::str::from_utf8(&bytes).unwrap().starts_with("<svg"), "{path}");
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 A fast (GPU-rendered via GPUI), batteries-included, opinionated terminal: managed zsh with curated defaults, a GUI for every setting, declarative plugins, and a GUI that is always a client of a `goattyd` (local, or remote over SSH). goatty never takes over the host.
 
-Read the relevant doc before larger work: `docs/architecture.md` (crate rules and **where new work goes**), `docs/goatty-project-plan.md` (stages, roadmap), `docs/remote-architecture.md`, `docs/tailnet.md`, `docs/managed-zsh.md`, `docs/profiles.md`, `docs/plugins.md`, `docs/snippets.md`, `docs/stage0-findings.md`, `docs/releasing.md`. Per-crate conventions load from `.claude/rules/` when you work in that crate. Progress lives in GitHub issues/milestones and `git log`, not here.
+Read the relevant doc before larger work: `docs/architecture.md` (crate rules and **where new work goes**), `docs/goatty-project-plan.md` (stages, roadmap), `docs/remote-architecture.md`, `docs/tailnet.md`, `docs/managed-zsh.md`, `docs/profiles.md`, `docs/plugins.md`, `docs/snippets.md`, `docs/coding-agents.md`, `docs/stage0-findings.md`, `docs/releasing.md`. Per-crate conventions load from `.claude/rules/` when you work in that crate. Progress lives in GitHub issues/milestones and `git log`, not here.
 
 ## Workflow
 

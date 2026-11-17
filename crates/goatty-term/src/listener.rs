@@ -5,8 +5,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use rio_vt::event::{EventListener, RioEvent, WindowId};
+use parking_lot::Mutex;
+use rio_vt::event::{EventListener, ProgressState as RioProgress, RioEvent, WindowId};
 
+use crate::status::{Progress, ProgressState, Store};
 use crate::terminal::SharedPalette;
 
 /// Events the terminal emits that the *UI* cares about.
@@ -26,6 +28,21 @@ pub enum UiEvent {
     /// The shell reported the command line typed at its prompt (goatty
     /// asked for it with `Terminal::LINE_KEYS`; `OSC 7337;line=`).
     CommandLine(String),
+    /// What a program says about itself changed (OSC 7501, OSC 9;4); read
+    /// it with `Terminal::program_status`. `news`: the report that made the
+    /// record deserving the most attention blocked, done or failed (not
+    /// what it already was; never a lifecycle cleanup or a snapshot's
+    /// replay), as it was then: one per report, in stream order, so none
+    /// is lost when several arrive between two reads.
+    Status {
+        news: Option<crate::status::Record>,
+    },
+    /// A program asked for a desktop notification (OSC 9 or OSC 777;
+    /// untrusted text, show it as plain text).
+    Notification {
+        title: String,
+        body: String,
+    },
     Exit,
 }
 
@@ -43,6 +60,8 @@ pub(crate) struct Listener {
     pub(crate) answer_queries: bool,
     pub(crate) palette: SharedPalette,
     pub(crate) size: Arc<AtomicU32>, // packed (cols << 16 | rows)
+    /// Progress reports (OSC 9;4) land here, next to the OSC 7501 records.
+    pub(crate) status: Arc<Mutex<Store>>,
 }
 
 impl EventListener for Listener {
@@ -83,6 +102,26 @@ impl EventListener for Listener {
             }
             RioEvent::CurrentDirectoryChanged(_) => {
                 let _ = self.ui.send(UiEvent::CwdChanged);
+            }
+            RioEvent::ProgressReport(report) => {
+                let state = match report.state {
+                    RioProgress::Remove => None,
+                    RioProgress::Set => Some(ProgressState::Normal),
+                    RioProgress::Error => Some(ProgressState::Error),
+                    RioProgress::Indeterminate => Some(ProgressState::Indeterminate),
+                    RioProgress::Pause => Some(ProgressState::Paused),
+                };
+                let percent = report.progress.map(|p| p.min(100)).filter(|_| state != Some(ProgressState::Indeterminate));
+                if self.status.lock().set_progress(state.map(|state| Progress { state, percent })) {
+                    let _ = self.ui.send(UiEvent::Status { news: None });
+                }
+            }
+            RioEvent::DesktopNotification { title, body } => {
+                // ConEmu's other numbered OSC 9 commands (`9;1;ms` sleeps,
+                // `9;12` marks a prompt…) aren't notifications.
+                if !(title.is_empty() && body.bytes().all(|b| b.is_ascii_digit())) {
+                    let _ = self.ui.send(UiEvent::Notification { title, body });
+                }
             }
             RioEvent::Exit | RioEvent::CloseTerminal(_) => {
                 let _ = self.ui.send(UiEvent::Exit);

@@ -1,7 +1,7 @@
 //! Icons for the program running in a tab: Nerd Font glyphs for known
 //! tools, drawn with the bundled JetBrainsMono Nerd Font (`crate::fonts`),
 //! whatever the terminal font is. The tests check every code point against
-//! that font.
+//! that font. Coding agents get their own logos instead (`crate::agent`).
 
 /// What a tab shows for a program: a glyph and a theme color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +96,7 @@ pub fn icon_for(process: &str) -> Option<ProcessIcon> {
         "tmux" | "zellij" | "screen" => (COLUMNS, Ansi(2)),
         "sudo" | "doas" | "su" | "run0" => (SHIELD, Ansi(1)),
         "watch" | "sleep" => (CLOCK, Text),
-        "claude" | "codex" | "aider" | "gemini" | "ollama" | "goose" => (ROBOT, Ansi(3)),
+        "ollama" | "llama-cli" | "llama-server" => (ROBOT, Ansi(3)),
         _ => return None,
     };
     Some(ProcessIcon { glyph, color })
@@ -124,7 +124,7 @@ mod tests {
         for n in names {
             assert!(ALL_GLYPHS.contains(&icon_for(n).unwrap().glyph), "{n}");
         }
-        for n in ["lua", "psql", "ssh", "htop", "man", "yazi", "fzf", "curl", "make", "tmux", "sudo", "watch", "claude", "zsh"] {
+        for n in ["lua", "psql", "ssh", "htop", "man", "yazi", "fzf", "curl", "make", "tmux", "sudo", "watch", "ollama", "zsh"] {
             assert!(ALL_GLYPHS.contains(&icon_for(n).unwrap().glyph), "{n}");
         }
     }

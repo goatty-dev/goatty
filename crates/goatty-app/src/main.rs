@@ -5,6 +5,7 @@
 //! `GOATTY_*` environment variables.
 
 mod actions;
+mod agent;
 mod app;
 mod askpass;
 mod cli;

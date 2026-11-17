@@ -3,14 +3,17 @@
 //! per tab, and the panes as a rounded card beside it.
 //!
 //! - **Rows**: the program's icon, the title and, below it, the directory
-//!   (plus the host when remote); activity markers, the pane count, a close
-//!   button on hover. The active row is raised in the terminal's color.
+//!   (plus the host when remote) or, while a coding agent works or waits,
+//!   what it's doing (#205); activity or agent markers, the pane count, a
+//!   close button on hover. The active row is raised in the terminal's
+//!   color; a background row whose agent waits for the user is tinted.
 //!   "New tab" ends the list; the list scrolls and keeps the active tab in
 //!   view.
 //! - **Rail**: folded (`tabs.sidebar_collapsed`, Ctrl+Shift+B, the button in
 //!   the footer, or dragging the edge far left) it's a column of icon tiles
-//!   with their markers as dots and the title as a tooltip. A tab without
-//!   an icon shows its title's first letter.
+//!   with their markers as dots (an agent's state as a small badge) and the
+//!   title as a tooltip. A tab without an icon shows its title's first
+//!   letter.
 //! - **Edge**: drag it to resize (`tabs.sidebar_width`; at most 45 % of the
 //!   window), past [`gestures::RAIL_WIDTH`]'s neighbourhood to fold or
 //!   unfold, double-click to fold or unfold. The width is saved shortly
@@ -29,6 +32,7 @@
 
 use std::time::Duration;
 
+use goatty_term::StatusState;
 use gpui::{
     AnyElement, Context, DragMoveEvent, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     Window, div, prelude::*, px,
@@ -37,7 +41,7 @@ use gpui::{
 use super::Workspace;
 use super::gestures::{RAIL_WIDTH, Sidebar};
 use super::groups::{Group, StripItem};
-use super::tab_bar::{Axis, Colors, TabView, activity_look};
+use super::tab_bar::{Axis, Colors, TabView, activity_look, group_mark, is_waiting, progress_line, status_color};
 use crate::actions::{NewTab, OpenSettings, ToggleTabSidebar};
 use crate::settings::AppSettings;
 use crate::ui::controls::tooltip;
@@ -228,8 +232,16 @@ impl Workspace {
     fn sidebar_row(&self, t: TabView, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
         let icon = self.tab_icon(&t, 15.0, c, cx, || Icon::Terminal.svg().size(px(15.)).text_color(c.ui.muted).into_any_element());
         let title = self.tab_title(&t, cx);
-        let detail = t.detail.clone().filter(|d| *d != t.label && self.rename.as_ref().is_none_or(|r| r.tab != t.id));
-        let marker = self.activity_marker(&t, 13.0, c);
+        let renaming = self.rename.as_ref().is_some_and(|r| r.tab == t.id);
+        let detail = t.detail.clone().filter(|d| *d != t.label && !renaming);
+        // While an agent works or waits, what it does says more than where.
+        let doing = t.status.as_ref().filter(|s| !renaming && matches!(s.state, StatusState::Working | StatusState::Blocked)).map(|s| {
+            let words = s.details(60).map(|d| format!("{} · {d}", s.summary())).unwrap_or_else(|| s.summary());
+            let color = if s.state == StatusState::Blocked { status_color(s.state, c) } else { c.ui.muted };
+            (SharedString::from(words), color)
+        });
+        let marker = self.tab_marker(&t, 13.0, c);
+        let waiting = !t.active && is_waiting(&t);
         let close = self.close_button(&t, 22.0, c, cx);
         let panes = (t.panes > 1).then(|| {
             div()
@@ -247,7 +259,10 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(div().flex().min_w_0().text_size(px(text::LABEL)).child(title))
-            .when_some(detail, |d, detail| {
+            .when_some(doing.clone(), |d, (words, color)| {
+                d.child(div().min_w_0().truncate().text_size(px(text::CAPTION)).text_color(color).child(words))
+            })
+            .when_some(detail.filter(|_| doing.is_none()), |d, detail| {
                 d.child(div().min_w_0().truncate().text_size(px(text::CAPTION)).text_color(c.ui.faint).child(detail))
             });
         self.tab_shell(&t, Axis::Column, cx)
@@ -263,6 +278,7 @@ impl Workspace {
             .when(!t.active, |d| {
                 d.border_color(gpui::transparent_black()).text_color(c.ui.muted).hover(|s| s.bg(c.hover).text_color(c.ui.text))
             })
+            .when(waiting, |d| d.bg(c.ui.warning.opacity(0.12)).border_color(c.ui.warning.opacity(0.35)).text_color(c.ui.text))
             .child(icon)
             .child(text)
             .children(marker)
@@ -271,6 +287,7 @@ impl Workspace {
             .when_some(t.group, |d, color| {
                 d.child(div().absolute().left(px(3.)).top(px(9.)).bottom(px(9.)).w(px(2.)).rounded_full().bg(color))
             })
+            .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 10.0, c)))
             .into_any_element()
     }
 
@@ -293,7 +310,7 @@ impl Workspace {
                 .text_color(c.ui.muted)
                 .child(SharedString::from(g.tabs.len().to_string()))
         });
-        let mark = g.activity.filter(|_| folded).map(|a| div().flex_none().size(px(7.)).rounded_full().bg(activity_look(a, c).1));
+        let mark = group_mark(&g, c).filter(|_| folded).map(|color| div().flex_none().size(px(7.)).rounded_full().bg(color));
         let plus = div()
             .id(gpui::ElementId::NamedInteger("tab-group-new".into(), id))
             .flex_none()
@@ -394,9 +411,8 @@ impl Workspace {
                 .child(div().w(px(22.)).h(px(3.)).rounded_full().bg(g.color))
                 .into_any_element();
         }
-        let dot = g.activity.map(|a| {
-            div().absolute().top(px(3.)).right(px(3.)).size(px(9.)).rounded_full().border_2().border_color(c.bar).bg(activity_look(a, c).1)
-        });
+        let dot = group_mark(&g, c)
+            .map(|color| div().absolute().top(px(3.)).right(px(3.)).size(px(9.)).rounded_full().border_2().border_color(c.bar).bg(color));
         base.relative()
             .h(px(TILE))
             .bg(g.color.opacity(0.14))
@@ -433,9 +449,15 @@ impl Workspace {
             (None, 1) => t.label.to_string(),
             (None, n) => format!("{} · {n} panes", t.label),
         };
-        let dot = t.activity.map(|a| {
+        // An agent's state as a small badge on the corner, else the activity dot.
+        let badge = t.status.as_ref().map(|s| rail_badge(s.state, s.icon(), c));
+        let dot = t.activity.filter(|_| badge.is_none()).map(|a| {
             div().absolute().top(px(3.)).right(px(3.)).size(px(9.)).rounded_full().border_2().border_color(c.bar).bg(activity_look(a, c).1)
         });
+        let tip = match &t.status {
+            Some(s) => format!("{tip}\n{}", s.tooltip()),
+            None => tip,
+        };
         self.tab_shell(&t, Axis::Column, cx)
             .flex_none()
             .size(px(TILE))
@@ -445,11 +467,14 @@ impl Workspace {
             .when(t.active, |d| d.bg(c.terminal).border_color(c.edge).shadow_sm())
             .when(!t.active, |d| d.border_color(gpui::transparent_black()).hover(|s| s.bg(c.hover)))
             .tooltip(tooltip(tip))
+            .when(!t.active && is_waiting(&t), |d| d.bg(c.ui.warning.opacity(0.14)))
             .child(icon)
             .children(dot)
+            .children(badge)
             .when_some(t.group, |d, color| {
                 d.child(div().absolute().left(px(1.)).top(px(10.)).bottom(px(10.)).w(px(2.)).rounded_full().bg(color))
             })
+            .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 7.0, c)))
             .into_any_element()
     }
 
@@ -526,6 +551,29 @@ impl Workspace {
 }
 
 /// The sidebar's size in the settings.
+/// An agent's state on a rail tile's corner: its icon on a disc in the
+/// state's color, ringed in the sidebar's color.
+fn rail_badge(state: StatusState, icon: Option<Icon>, c: Colors) -> AnyElement {
+    let color = status_color(state, c);
+    let disc = div()
+        .absolute()
+        .top(px(1.))
+        .right(px(1.))
+        .size(px(14.))
+        .rounded_full()
+        .border_2()
+        .border_color(c.bar)
+        .bg(color)
+        .flex()
+        .items_center()
+        .justify_center();
+    match (state, icon) {
+        // A spinner reads badly at this size: a plain dot.
+        (StatusState::Working, _) | (_, None) => disc.size(px(10.)).top(px(3.)).right(px(3.)).into_any_element(),
+        (_, Some(icon)) => disc.child(icon.svg().size(px(8.)).text_color(c.bar)).into_any_element(),
+    }
+}
+
 fn saved_sidebar(cx: &gpui::App) -> Sidebar {
     let tabs = &cx.global::<AppSettings>().client.tabs;
     Sidebar { width: tabs.sidebar_width, folded: tabs.sidebar_collapsed }
