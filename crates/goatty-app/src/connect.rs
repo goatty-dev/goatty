@@ -413,6 +413,11 @@ impl ConnectView {
     }
 
     /// The host, for the tab's label.
+    /// Connecting to this computer's goattyd.
+    pub fn is_local(&self) -> bool {
+        self.plan.endpoint.is_local()
+    }
+
     pub fn host_label(&self) -> &str {
         match &self.plan.endpoint {
             Endpoint::Local => "local",

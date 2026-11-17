@@ -17,6 +17,10 @@
 //! scrolled into view. A background tab shows what happened in it since it
 //! was last shown (#122, `tabs.mark_bell` / `tabs.mark_activity`): a bell,
 //! or a dot for a finished command (red when it failed) or for new output.
+//!
+//! With tabs on several hosts (`groups`), each host's tabs follow a label
+//! in the host's color (click: fold, right-click: the host's menu), and
+//! each tab carries a line in that color.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +32,7 @@ use gpui::{
 };
 
 use super::gestures::{Wheel, reorder_target};
+use super::groups::{Group, StripItem};
 use super::icons::{IconColor, icon_for};
 use super::{DraggedTab, Tab, Workspace, marks};
 use crate::actions::NewTab;
@@ -45,6 +50,8 @@ const MIN_TAB: f32 = 96.0;
 const MAX_TAB: f32 = 220.0;
 /// Narrower modern tabs only show a close button when active.
 const NARROW_TAB: f32 = 120.0;
+/// About how wide a host group's label is, kept free when sizing tabs.
+const GROUP_LABEL_ROOM: f32 = 110.0;
 
 /// Colors of the tabs, from the theme.
 #[derive(Clone, Copy)]
@@ -131,6 +138,8 @@ pub(super) struct TabView {
     pub connecting: bool,
     /// Being dragged: drawn faded where it is.
     pub dragged: bool,
+    /// Its host group's color, when tabs are grouped by host.
+    pub group: Option<Hsla>,
 }
 
 /// Which way tabs are laid out (for dragging).
@@ -142,15 +151,25 @@ pub(super) enum Axis {
 
 impl Workspace {
     pub(super) fn render_tab_bar(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
-        let tabs = self.tab_views(cx);
+        let strip = self.strip_items(cx);
         let c = Colors::get(cx);
         let style = cx.global::<AppSettings>().client.tabs.style;
-        let width = modern_tab_width(f32::from(window.viewport_size().width), tabs.len());
-        let (height, items) = match style {
-            TabStyle::Compact => (COMPACT_HEIGHT, tabs.into_iter().map(|t| self.compact_tab(t, c, cx)).collect::<Vec<_>>()),
-            _ => (MODERN_HEIGHT, tabs.into_iter().map(|t| self.modern_tab(t, width, c, cx)).collect()),
-        };
         let modern = style != TabStyle::Compact;
+        let (labels, tabs) = strip.iter().fold((0, 0), |(l, t), i| match i {
+            StripItem::Group(_) => (l + 1, t),
+            StripItem::Tab(_) => (l, t + 1),
+        });
+        let room = f32::from(window.viewport_size().width) - labels as f32 * GROUP_LABEL_ROOM;
+        let width = modern_tab_width(room, tabs);
+        let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
+        let items: Vec<AnyElement> = strip
+            .into_iter()
+            .map(|item| match item {
+                StripItem::Group(g) => self.group_label(g, modern, c, cx),
+                StripItem::Tab(t) if modern => self.modern_tab(t, width, c, cx),
+                StripItem::Tab(t) => self.compact_tab(t, c, cx),
+            })
+            .collect();
         let new_tab = div()
             .id("tab-new")
             .flex_none()
@@ -255,6 +274,7 @@ impl Workspace {
             detail,
             connecting,
             dragged: self.dragging == Some(tab.id),
+            group: None,
         }
     }
 
@@ -464,6 +484,7 @@ impl Workspace {
                 d.child(div().flex_none().text_xs().text_color(c.ui.muted).child(SharedString::from(format!("{}", t.panes))))
             })
             .children(close)
+            .when_some(t.group, |d, color| d.child(group_line(color, t.active, true)))
             .into_any_element()
     }
 
@@ -488,8 +509,78 @@ impl Workspace {
             .child(title)
             .children(marker)
             .when(t.panes > 1, |d| d.child(div().flex_none().opacity(0.7).child(SharedString::from(format!("[{}]", t.panes)))))
+            .when_some(t.group, |d, color| d.child(group_line(color, t.active, false)))
             .into_any_element()
     }
+
+    /// A host group's label in the strip: the host's icon and name in its
+    /// color; folded, also how many tabs it holds and their activity.
+    /// Click: fold or unfold; right-click: the group's menu.
+    fn group_label(&self, g: Group, modern: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+        let key = g.key.clone();
+        let menu_key = g.key.clone();
+        let folded = g.folded;
+        let tip = group_tooltip(&g);
+        let icon = if g.local { Icon::Monitor } else { Icon::Server };
+        let count = folded.then(|| {
+            div()
+                .flex_none()
+                .px(px(5.))
+                .rounded_full()
+                .bg(g.color.opacity(0.25))
+                .text_size(px(11.))
+                .child(SharedString::from(g.tabs.len().to_string()))
+        });
+        let mark = g.activity.filter(|_| folded).map(|a| div().flex_none().size(px(7.)).rounded_full().bg(activity_look(a, c).1));
+        let label = div()
+            .id(gpui::ElementId::NamedInteger("tab-group".into(), g.ids[0]))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .max_w(px(180.))
+            .cursor_pointer()
+            .text_color(c.ui.text)
+            .bg(g.color.opacity(if g.active { 0.24 } else { 0.14 }))
+            .hover(|s| s.bg(g.color.opacity(0.32)))
+            .tooltip(tooltip(tip))
+            .child(icon.svg().size(px(13.)).text_color(g.color))
+            .child(div().min_w_0().truncate().child(g.label.clone()))
+            .children(count)
+            .children(mark)
+            .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                    this.open_group_menu(menu_key.clone(), ev.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        if modern {
+            label.h(px(24.)).mb(px(4.)).mx(px(2.)).px(px(8.)).rounded(px(radius::CONTROL)).text_size(px(12.)).into_any_element()
+        } else {
+            label.h_full().px(px(8.)).into_any_element()
+        }
+    }
+}
+
+/// A host group's label, hovered: the host, its tabs, what a click does.
+pub(super) fn group_tooltip(g: &Group) -> String {
+    let mut tip = g.label.to_string();
+    if let Some(d) = &g.detail {
+        tip.push_str(&format!(" ({d})"));
+    }
+    let n = g.tabs.len();
+    let tabs = if n == 1 { "1 tab".to_string() } else { format!("{n} tabs") };
+    let click = if g.folded { "click to show them" } else { "click to fold them" };
+    format!("{tip}\n{tabs} · {click} · right-click for more")
+}
+
+/// The line in a host group's color on a tab: across the top of the active
+/// modern tab (it merges into the panes below), else along the bottom.
+fn group_line(color: Hsla, active: bool, modern: bool) -> impl IntoElement {
+    let line = div().absolute().h(px(2.)).rounded_full().bg(color);
+    if modern && active { line.top_0().left(px(8.)).right(px(8.)) } else { line.bottom_0().left(px(4.)).right(px(4.)).opacity(0.85) }
 }
 
 /// What an activity marker says and its color.

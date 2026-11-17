@@ -15,6 +15,11 @@
 //!   window), past [`gestures::RAIL_WIDTH`]'s neighbourhood to fold or
 //!   unfold, double-click to fold or unfold. The width is saved shortly
 //!   after the drag stops, not every frame.
+//! - **Host groups** (`groups`): with tabs on several hosts, a header row
+//!   per host (fold chevron, the host's icon and name in its color, a +
+//!   for a new tab there) over its tabs, which carry a line in that color;
+//!   in the rail, a short line in the host's color over its tiles, or one
+//!   tile for a folded host.
 //! - **Card**: the panes get a margin and rounded corners. The terminal
 //!   draws square, so a ring in the sidebar's color is drawn over its
 //!   corners: a border as wide as the margin whose outer radius is the
@@ -31,6 +36,7 @@ use gpui::{
 
 use super::Workspace;
 use super::gestures::{RAIL_WIDTH, Sidebar};
+use super::groups::{Group, StripItem};
 use super::tab_bar::{Axis, Colors, TabView, activity_look};
 use crate::actions::{NewTab, OpenSettings, ToggleTabSidebar};
 use crate::settings::AppSettings;
@@ -113,7 +119,7 @@ impl Workspace {
         let sidebar = self.sidebar(cx);
         let width = sidebar.drawn_width(f32::from(window.viewport_size().width));
         let c = Colors::get(cx);
-        let tabs = self.tab_views(cx);
+        let strip = self.strip_items(cx);
         let ui_font = cx.global::<AppSettings>().ui_font.clone();
         let frame = div()
             .id("tab-sidebar")
@@ -126,7 +132,13 @@ impl Workspace {
             .text_color(c.ui.text)
             .on_scroll(cx.listener(Self::on_tabs_scroll));
         if sidebar.folded {
-            let tiles: Vec<_> = tabs.into_iter().map(|t| self.rail_tile(t, c, cx)).collect();
+            let tiles: Vec<_> = strip
+                .into_iter()
+                .map(|item| match item {
+                    StripItem::Group(g) => self.rail_group(g, c, cx),
+                    StripItem::Tab(t) => self.rail_tile(t, c, cx),
+                })
+                .collect();
             let new_tab = sidebar_button("tab-rail-new", Icon::Plus, "New tab", c).size(px(TILE)).on_click(dispatch(NewTab));
             frame
                 .px(px((RAIL_WIDTH - TILE) / 2.))
@@ -155,7 +167,14 @@ impl Workspace {
                 )
                 .into_any_element()
         } else {
-            let rows: Vec<_> = tabs.into_iter().map(|t| self.sidebar_row(t, c, cx)).collect();
+            let rows: Vec<_> = strip
+                .into_iter()
+                .enumerate()
+                .map(|(n, item)| match item {
+                    StripItem::Group(g) => self.sidebar_group(g, n == 0, c, cx),
+                    StripItem::Tab(t) => self.sidebar_row(t, c, cx),
+                })
+                .collect();
             let new_tab = div()
                 .id("tab-sidebar-new")
                 .flex_none()
@@ -249,6 +268,150 @@ impl Workspace {
             .children(marker)
             .children(panes)
             .child(close)
+            .when_some(t.group, |d, color| {
+                d.child(div().absolute().left(px(3.)).top(px(9.)).bottom(px(9.)).w(px(2.)).rounded_full().bg(color))
+            })
+            .into_any_element()
+    }
+
+    /// A host group's header in the unfolded sidebar: a chevron, the host's
+    /// icon and name in its color, a + for a new tab there; folded, how
+    /// many tabs it holds and their activity. Click: fold or unfold;
+    /// right-click: the group's menu.
+    fn sidebar_group(&self, g: Group, first: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+        let (key, menu_key, new_key) = (g.key.clone(), g.key.clone(), g.key.clone());
+        let folded = g.folded;
+        let id = g.ids[0];
+        let hover_group = SharedString::from(format!("tab-group-{id}"));
+        let count = folded.then(|| {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .rounded_full()
+                .bg(c.ui.text.opacity(0.08))
+                .text_size(px(text::CAPTION))
+                .text_color(c.ui.muted)
+                .child(SharedString::from(g.tabs.len().to_string()))
+        });
+        let mark = g.activity.filter(|_| folded).map(|a| div().flex_none().size(px(7.)).rounded_full().bg(activity_look(a, c).1));
+        let plus = div()
+            .id(gpui::ElementId::NamedInteger("tab-group-new".into(), id))
+            .flex_none()
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(radius::SMALL))
+            .invisible()
+            .group_hover(hover_group.clone(), |s| s.visible())
+            .hover(|s| s.bg(c.ui.text.opacity(0.1)))
+            .tooltip(tooltip(format!("New tab on {}", g.label)))
+            .child(Icon::Plus.svg().size(px(13.)).text_color(c.ui.muted))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.new_tab_in_group(&new_key, window, cx);
+            }));
+        let detail = g.detail.clone().filter(|_| !folded);
+        div()
+            .id(gpui::ElementId::NamedInteger("tab-group".into(), id))
+            .group(hover_group)
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(28.))
+            .when(!first, |d| d.mt(px(8.)))
+            .px(px(6.))
+            .rounded(px(radius::CONTROL))
+            .cursor_pointer()
+            .hover(|s| s.bg(c.hover))
+            .tooltip(tooltip(super::tab_bar::group_tooltip(&g)))
+            .child((if folded { Icon::ChevronRight } else { Icon::ChevronDown }).svg().size(px(12.)).text_color(c.ui.faint))
+            .child((if g.local { Icon::Monitor } else { Icon::Server }).svg().size(px(13.)).text_color(g.color))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w_full()
+                            .truncate()
+                            .text_size(px(text::CAPTION))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(c.ui.text)
+                            .child(g.label.clone()),
+                    )
+                    .when_some(detail, |d, detail| {
+                        d.child(div().min_w_0().truncate().text_size(px(11.)).text_color(c.ui.faint).child(detail))
+                    }),
+            )
+            .children(mark)
+            .children(count)
+            // A connecting tab has no host to open another tab on yet.
+            .when(!matches!(g.key, super::groups::HostKey::Connecting(_)), |d| d.child(plus))
+            .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                    this.open_group_menu(menu_key.clone(), ev.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// A host group in the rail: a short line in its color over its tiles,
+    /// or, folded, one tile with the host's icon and how many tabs it holds.
+    fn rail_group(&self, g: Group, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+        let (key, menu_key) = (g.key.clone(), g.key.clone());
+        let folded = g.folded;
+        let base = div()
+            .id(gpui::ElementId::NamedInteger("tab-group".into(), g.ids[0]))
+            .flex_none()
+            .w(px(TILE))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .rounded(px(radius::CONTROL))
+            .tooltip(tooltip(super::tab_bar::group_tooltip(&g)))
+            .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                    this.open_group_menu(menu_key.clone(), ev.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        if !folded {
+            return base
+                .h(px(12.))
+                .hover(|s| s.bg(c.hover))
+                .child(div().w(px(22.)).h(px(3.)).rounded_full().bg(g.color))
+                .into_any_element();
+        }
+        let dot = g.activity.map(|a| {
+            div().absolute().top(px(3.)).right(px(3.)).size(px(9.)).rounded_full().border_2().border_color(c.bar).bg(activity_look(a, c).1)
+        });
+        base.relative()
+            .h(px(TILE))
+            .bg(g.color.opacity(0.14))
+            .hover(|s| s.bg(g.color.opacity(0.28)))
+            .child((if g.local { Icon::Monitor } else { Icon::Server }).svg().size(px(16.)).text_color(g.color))
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(2.))
+                    .right(px(4.))
+                    .text_size(px(10.))
+                    .text_color(c.ui.muted)
+                    .child(SharedString::from(g.tabs.len().to_string())),
+            )
+            .children(dot)
             .into_any_element()
     }
 
@@ -284,6 +447,9 @@ impl Workspace {
             .tooltip(tooltip(tip))
             .child(icon)
             .children(dot)
+            .when_some(t.group, |d, color| {
+                d.child(div().absolute().left(px(1.)).top(px(10.)).bottom(px(10.)).w(px(2.)).rounded_full().bg(color))
+            })
             .into_any_element()
     }
 

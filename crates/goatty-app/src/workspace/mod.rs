@@ -15,6 +15,8 @@
 //! - `arrange`: rearranging panes and tabs (#124): swap, rotate, move a
 //!   pane to another tab, bring a tab into another one, the minimum pane
 //!   size and resizing by cells.
+//! - `groups`: tabs grouped by host, with a colored label per host that
+//!   folds its tabs away (once the window has a tab on another host).
 //! - `gestures`: the pointer maths of the above (pure, unit-tested).
 //! - `icons`: Nerd Font icons for the program running in a tab.
 //! - `saved`: the layout goattyd keeps for the window, so the next
@@ -39,6 +41,7 @@
 
 mod arrange;
 mod gestures;
+mod groups;
 pub(crate) mod icons;
 mod layout;
 mod menu;
@@ -234,6 +237,10 @@ pub struct Workspace {
     menu: Option<menu::OpenMenu>,
     /// Where the panes were last painted, for sizes in cells.
     panes_bounds: Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// The host groups folded down to their label.
+    folded: Vec<groups::HostKey>,
+    /// The tab last active in each host's group (by id).
+    group_focus: Vec<(groups::HostKey, u64)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -291,6 +298,8 @@ impl Workspace {
             save_sidebar: None,
             menu: None,
             panes_bounds: Rc::default(),
+            folded: Vec::new(),
+            group_focus: Vec::new(),
             _subscriptions: vec![appearance, settings, activation, bounds],
         };
         match initial {
@@ -546,8 +555,14 @@ impl Workspace {
             return;
         }
         self.finish_rename(true, window, cx);
+        // Each host's tabs stay together (a tab may just have joined a host).
+        let id = self.tabs[index].id;
         self.active = index;
-        self.tab_scroll.scroll_to_item(index);
+        self.regroup();
+        let index = self.tab_index(id).unwrap_or(index);
+        self.active = index;
+        self.group_activated(index);
+        self.tab_scroll.scroll_to_item(self.strip_index(index, cx));
         self.focus_active(window, cx);
         self.update_window_title(window, cx);
         if window.is_window_active() {
@@ -663,6 +678,7 @@ impl Workspace {
         if was_active {
             self.activate(show, window, cx);
         } else {
+            self.regroup();
             self.save_layout(cx);
             cx.notify();
         }
@@ -1073,14 +1089,19 @@ impl Workspace {
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + 1) % self.tabs.len(), window, cx);
-        }
+        self.cycle_tab(true, window, cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + self.tabs.len() - 1) % self.tabs.len(), window, cx);
+        self.cycle_tab(false, window, cx);
+    }
+
+    /// The next (or previous) tab, coming round at the ends and skipping
+    /// folded host groups.
+    fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let hidden: Vec<bool> = (0..self.tabs.len()).map(|i| self.hidden(i, cx)).collect();
+        if let Some(to) = groups::cycle_visible(self.active, forward, &hidden) {
+            self.activate(to, window, cx);
         }
     }
 
@@ -1147,8 +1168,9 @@ impl Workspace {
 
     /// Move `steps` tabs forward (negative: back), stopping at the ends.
     fn step_tab(&mut self, steps: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let last = self.tabs.len().saturating_sub(1) as isize;
-        let to = (self.active as isize + steps).clamp(0, last) as usize;
+        // Folded host groups are skipped.
+        let hidden: Vec<bool> = (0..self.tabs.len()).map(|i| self.hidden(i, cx)).collect();
+        let to = groups::step_visible(self.active, steps, &hidden);
         if to != self.active {
             self.activate(to, window, cx);
         }
@@ -1697,6 +1719,16 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &MergeTab, w, cx| this.ask_merge_tab(w, cx)))
             .on_action(cx.listener(|this, _: &RotatePanes, w, cx| this.rotate_panes(true, w, cx)))
             .on_action(cx.listener(|this, _: &RotatePanesBack, w, cx| this.rotate_panes(false, w, cx)))
+            .on_action(cx.listener(|this, _: &NextHost, w, cx| this.step_group(1, w, cx)))
+            .on_action(cx.listener(|this, _: &PreviousHost, w, cx| this.step_group(-1, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowOnlyThisHost, w, cx| match this.active_group_key(cx) {
+                Some(key) => this.show_only_group(&key, w, cx),
+                None => {
+                    let toast = Toast::info("All tabs are on this computer").body("Tabs on other hosts get grouped by host.");
+                    toast::show_in(w, cx, toast.key("tab.fold"));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ShowAllHosts, _, cx| this.show_all_groups(cx)))
             .children(self.render_menu())
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {
