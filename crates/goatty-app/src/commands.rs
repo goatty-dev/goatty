@@ -210,62 +210,52 @@ fn offer_imported_plugins_with(
         return Ok(report);
     }
 
-    // Install in passes so plugins that depend on another plugin in the same
-    // profile can plan and install once their dependency is in place.
-    let mut pending = installable;
-    loop {
-        let mut deferred = Vec::new();
-        let mut progress = false;
-        for (id, enabled) in pending {
-            let plan = match target.plugin(api::Request::Plan { id: id.clone(), version: None }) {
-                Ok(api::Reply::Plan(p)) => p,
-                Ok(other) => {
-                    eprintln!("⚠ Couldn't plan {id}: unexpected reply {other:?}");
-                    report.failed.push(id);
-                    continue;
-                }
-                Err(e) => {
-                    deferred.push((id, enabled, e));
-                    continue;
-                }
-            };
-            if !enabled {
-                println!("Note: {id} was disabled in the imported profile; installing it will enable it.");
-            }
-            goatty_shell::plugins::cmd::print_plan(&plan);
-            if ask(&format!("Install {}?", plan.name))? {
-                match target.plugin(api::Request::Install {
-                    id: plan.id.clone(),
-                    version: Some(plan.version.clone()),
-                    approved: plan.digest.clone(),
-                }) {
-                    Ok(api::Reply::Changed(c)) => {
-                        goatty_shell::plugins::cmd::print_changed(&c);
-                        report.installed.push(id);
-                        progress = true;
-                    }
-                    Ok(other) => {
-                        eprintln!("⚠ Couldn't install {id}: unexpected reply {other:?}");
-                        report.failed.push(id);
-                    }
-                    Err(e) => {
-                        eprintln!("⚠ Couldn't install {id}: {e:#}");
-                        report.failed.push(id);
-                    }
-                }
-            } else {
-                println!("Skipped {}.", plan.name);
-                report.skipped.push(id);
-            }
+    // A plan includes the plugins it needs: ones installed along with an
+    // earlier plugin aren't asked about again.
+    for (id, enabled) in installable {
+        if report.installed.contains(&id) {
+            continue;
         }
-        if !progress || deferred.is_empty() {
-            for (id, _, e) in deferred {
+        let plan = match target.plugin(api::Request::Plan { id: id.clone(), version: None }) {
+            Ok(api::Reply::Plan(p)) => p,
+            Ok(other) => {
+                eprintln!("⚠ Couldn't plan {id}: unexpected reply {other:?}");
+                report.failed.push(id);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("⚠ Couldn't install {id}: {e:#}");
+                report.failed.push(id);
+                continue;
+            }
+        };
+        if !enabled {
+            println!("Note: {id} was disabled in the imported profile; installing it will enable it.");
+        }
+        goatty_shell::plugins::cmd::print_plan(&plan);
+        if !ask(&goatty_shell::plugins::cmd::question(&plan))? {
+            println!("Skipped {}.", plan.name);
+            report.skipped.push(id);
+            continue;
+        }
+        match target.plugin(api::Request::Install {
+            id: plan.id.clone(),
+            version: Some(plan.version.clone()),
+            approved: plan.digest.clone(),
+        }) {
+            Ok(api::Reply::Changed(c)) => {
+                goatty_shell::plugins::cmd::print_changed(&c);
+                report.installed.extend(plan.all().map(|p| p.id.clone()));
+            }
+            Ok(other) => {
+                eprintln!("⚠ Couldn't install {id}: unexpected reply {other:?}");
+                report.failed.push(id);
+            }
+            Err(e) => {
                 eprintln!("⚠ Couldn't install {id}: {e:#}");
                 report.failed.push(id);
             }
-            break;
         }
-        pending = deferred.into_iter().map(|(id, enabled, _)| (id, enabled)).collect();
     }
     Ok(report)
 }
@@ -626,8 +616,8 @@ shell-code = "uses greet"
     #[test]
     fn import_reviews_and_installs_approved_plugins_with_dependencies() {
         let (_tmp, mut host) = test_world();
-        // Put `addon` before `greet` in the list: `addon` requires `greet`
-        // and must succeed on the retry pass after `greet` installs.
+        // Put `addon` before `greet` in the list: `addon` requires `greet`,
+        // which its plan installs first; `greet` isn't asked about again.
         let issues = host.apply(r#"{"version": 3, "plugins": {"addon": {}, "greet": {}}}"#.into()).unwrap();
         let mut prompts = Vec::new();
         let report = offer_imported_plugins_with(&mut host, &[("addon".into(), true), ("greet".into(), true)], &issues, false, true, |q| {
@@ -638,7 +628,7 @@ shell-code = "uses greet"
         assert_eq!(report.listed, vec!["addon", "greet"]);
         assert_eq!(report.installed, vec!["greet", "addon"]);
         assert!(report.failed.is_empty());
-        assert_eq!(prompts, vec!["Review and install them now?", "Install Greet?", "Install Addon?"]);
+        assert_eq!(prompts, vec!["Review and install them now?", "Install Greet and Addon?"]);
         let api::Reply::Catalog(cat) = host.plugin(api::Request::Catalog { refresh: false }).unwrap() else { panic!("expected catalog") };
         let installed: BTreeSet<_> = cat.installed.iter().map(|i| i.id.as_str()).collect();
         assert!(installed.contains("greet") && installed.contains("addon"), "{installed:?}");
@@ -656,9 +646,9 @@ shell-code = "uses greet"
         })
         .unwrap();
         assert_eq!(report.installed, Vec::<String>::new());
-        assert_eq!(report.skipped, vec!["greet"]);
-        assert_eq!(report.failed, vec!["addon"]);
-        assert_eq!(prompts, vec!["Review and install them now?", "Install Greet?"]);
+        assert_eq!(report.skipped, vec!["addon", "greet"]);
+        assert!(report.failed.is_empty());
+        assert_eq!(prompts, vec!["Review and install them now?", "Install Greet and Addon?", "Install Greet?"]);
     }
 
     #[test]

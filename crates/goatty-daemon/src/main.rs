@@ -214,7 +214,12 @@ enum PluginCmd {
         yes: bool,
     },
     /// Remove plugins, their programs and their settings.
-    Uninstall { plugins: Vec<String> },
+    Uninstall {
+        plugins: Vec<String>,
+        /// Also remove the plugins they needed that nothing else needs, without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Installed plugins and their state.
     List,
     /// Load an installed plugin in new shells again.
@@ -429,7 +434,7 @@ fn main() -> Result<()> {
                 PluginCmd::Info { id } => cmd::info(&svc, &id),
                 PluginCmd::Install { plugins, path, yes } => cmd::install(&svc, &plugins, path.as_deref(), yes),
                 PluginCmd::Update { plugins, yes } => cmd::update(&svc, &plugins, yes),
-                PluginCmd::Uninstall { plugins } => cmd::uninstall(&svc, &plugins),
+                PluginCmd::Uninstall { plugins, yes } => cmd::uninstall(&svc, &plugins, yes),
                 PluginCmd::List => cmd::list(&svc),
                 PluginCmd::Enable { id } => cmd::set_enabled(&svc, &id, true),
                 PluginCmd::Disable { id } => cmd::set_enabled(&svc, &id, false),

@@ -201,27 +201,42 @@ impl HostService {
         let settings = self.settings().value;
         let plan = self.plugins(|p| p.install_with(c, approved, &settings, job))?;
         let id = plan.id.clone();
-        let outcome = self.edit(|h| match c.builtin {
-            // Built-in plugins are on by default: keep host.json sparse.
-            Some(_) => h.edit_plugin(&id, |p| p.enabled = true),
-            None => h.plugins.entry(id).or_default().enabled = true,
+        let outcome = self.edit(|h| {
+            // Dependencies are never built in (those are always there).
+            for d in &plan.dependencies {
+                h.plugins.entry(d.id.clone()).or_default().enabled = true;
+            }
+            match c.builtin {
+                // Built-in plugins are on by default: keep host.json sparse.
+                Some(_) => h.edit_plugin(&id, |p| p.enabled = true),
+                None => h.plugins.entry(id).or_default().enabled = true,
+            }
         })?;
-        let verb = match &plan.replaces {
+        let mut verb = match &plan.replaces {
             Some(old) if *old != plan.version => format!("Updated {} from {old} to {}", plan.name, plan.version),
             Some(_) => format!("Reinstalled {} {}", plan.name, plan.version),
             None => format!("Installed {} {}", plan.name, plan.version),
         };
+        if !plan.dependencies.is_empty() {
+            let deps: Vec<String> = plan.dependencies.iter().map(|d| format!("{} {}", d.name, d.version)).collect();
+            verb.push_str(&format!(" with {}, which it needs", deps.join(", ")));
+        }
         Ok(changed(verb, &outcome))
     }
 
     /// Remove a plugin and its settings, and build the shell configuration.
     pub fn uninstall_plugin(&self, id: &str) -> Result<Changed> {
-        let entry = self.plugins(|p| p.uninstall(id))?;
+        let (entry, unneeded) = self.plugins(|p| p.uninstall(id))?;
         let id = id.to_owned();
         let outcome = self.edit(|h| {
             h.plugins.remove(&id);
         })?;
-        Ok(changed(format!("Uninstalled {id} {}", entry.version), &outcome))
+        let mut c = changed(format!("Uninstalled {id} {}", entry.version), &outcome);
+        if !unneeded.is_empty() {
+            c.lines.push(format!("Installed only because other plugins needed them, and unused now: {}.", unneeded.join(", ")));
+        }
+        c.unneeded = unneeded;
+        Ok(c)
     }
 
     pub fn generations(&self) -> Vec<Generation> {
@@ -277,7 +292,7 @@ fn changed(what: String, o: &ApplyOutcome) -> Changed {
         _ => format!("{what}."),
     }];
     lines.extend(o.issues.iter().map(|i| format!("⚠ {i}")));
-    Changed { lines, generation: o.generation, reload: !o.diff.is_empty() }
+    Changed { lines, generation: o.generation, reload: !o.diff.is_empty(), unneeded: Vec::new() }
 }
 
 #[cfg(test)]
@@ -352,5 +367,28 @@ mod tests {
         assert!(c.lines[0].starts_with("Uninstalled demo"));
         assert!(!std::fs::read_to_string(&file).unwrap().contains("\"demo\""));
         assert!(!std::fs::read_to_string(w.dirs.zsh_dir().join("plugins.zsh")).unwrap().contains("alias --"));
+    }
+
+    #[test]
+    fn installing_a_plugin_enables_what_it_needs_and_uninstalling_offers_it() {
+        let w = crate::plugins::tests::world();
+        crate::plugins::tests::publish_dependents(&w);
+        let file = w.tmp.path().join("config/host.json");
+        let svc = HostService::new(Launcher::new(Some(w.dirs.clone()), None), Some(file.clone()))
+            .with_plugin_sources(Arc::new(w.fetch.clone()), w.sources.clone());
+        let api::Reply::Plan(plan) = svc.plugin_request(api::Request::Plan { id: "top".into(), version: None }).unwrap() else { panic!() };
+        // Through the protocol's JSON, as a client sees it.
+        let plan: api::Plan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(plan.dependencies.len(), 2);
+        let req = api::Request::Install { id: "top".into(), version: None, approved: plan.digest };
+        let api::Reply::Changed(c) = svc.plugin_request(req).unwrap() else { panic!() };
+        assert!(c.lines[0].starts_with("Installed TOP 1.0.0 with Demo 1.0.0, MID 1.0.0, which it needs"), "{:?}", c.lines);
+        let host = svc.settings().value;
+        assert!(["demo", "mid", "top"].iter().all(|id| host.plugins.get(*id).is_some_and(|p| p.enabled)), "{:?}", host.plugins);
+        assert!(std::fs::read_to_string(w.dirs.zsh_dir().join("plugins.zsh")).unwrap().contains("alias -- d='demo'"));
+
+        let api::Reply::Changed(c) = svc.plugin_request(api::Request::Uninstall { id: "top".into() }).unwrap() else { panic!() };
+        assert_eq!(c.unneeded, ["mid", "demo"]);
+        assert!(c.lines.iter().any(|l| l.contains("unused now: mid, demo")), "{:?}", c.lines);
     }
 }

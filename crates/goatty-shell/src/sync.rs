@@ -354,6 +354,10 @@ fn registry_trusted(local: &LocalSetup, host: &HostSetup, name: &str) -> Result<
 /// another review: it must be exactly the plugin approved here (same
 /// signed registry, same version).
 pub fn check_plan(step: &PluginStep, plan: &api::Plan) -> Result<()> {
+    if !plan.dependencies.is_empty() {
+        let ids: Vec<&str> = plan.dependencies.iter().map(|d| d.id.as_str()).collect();
+        bail!("{} also needs {} on that host, which wasn't reviewed here; review it on that host", plan.id, ids.join(", "));
+    }
     let ok = !plan.builtin && plan.verified && plan.id == step.id && plan.source == step.registry && plan.version == step.version;
     ok.then_some(()).with_context(|| {
         format!(
@@ -709,6 +713,7 @@ mod tests {
             shell_code: None,
             requires: vec![],
             warnings: vec![],
+            dependencies: vec![],
             digest: String::new(),
         };
         assert!(check_plan(&step, &p).is_ok());
