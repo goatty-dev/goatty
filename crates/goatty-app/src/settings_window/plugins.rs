@@ -523,15 +523,25 @@ impl SettingsWindow {
     }
 
     pub fn uninstall_plugin(&mut self, id: String, cx: &mut Context<'_, Self>) {
-        self.uninstall_plugins(vec![id], cx);
+        let host = self.link.clone();
+        self.uninstall_plugins(vec![id], host, cx);
     }
 
     /// Uninstall `ids` one after the other (each before the ones it
     /// needs), stopping at the first that fails. When the last one leaves
     /// plugins that were only installed for it, offers to remove those too.
-    fn uninstall_plugins(&mut self, mut ids: Vec<String>, cx: &mut Context<'_, Self>) {
+    /// Only on `host`: nothing is removed once the window shows another one.
+    fn uninstall_plugins(&mut self, mut ids: Vec<String>, host: Option<HostLink>, cx: &mut Context<'_, Self>) {
         self.plugins.confirm_uninstall = None;
         if ids.is_empty() {
+            return;
+        }
+        let same = match (&self.link, &host) {
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        if !same {
+            toast::show(cx, Toast::info("Not uninstalled").body("The settings window shows another host now."));
             return;
         }
         let id = ids.remove(0);
@@ -547,9 +557,9 @@ impl SettingsWindow {
                 let unneeded = result.as_ref().map(|c| c.unneeded.clone()).unwrap_or_default();
                 view.after_change(result, vec![id.clone()], false, None, cx);
                 if let Some(rest) = next {
-                    view.uninstall_plugins(rest, cx);
+                    view.uninstall_plugins(rest, host, cx);
                 } else if !unneeded.is_empty() {
-                    view.offer_unneeded(&id, unneeded, cx);
+                    view.offer_unneeded(&id, unneeded, host, cx);
                 }
             }),
             cx,
@@ -558,7 +568,7 @@ impl SettingsWindow {
 
     /// A toast offering to uninstall the plugins `id` needed that nothing
     /// needs now.
-    fn offer_unneeded(&self, id: &str, unneeded: Vec<String>, cx: &mut Context<'_, Self>) {
+    fn offer_unneeded(&self, id: &str, unneeded: Vec<String>, host: Option<HostLink>, cx: &mut Context<'_, Self>) {
         let name = |i: &str| {
             self.plugins
                 .catalog
@@ -574,7 +584,7 @@ impl SettingsWindow {
             .key("plugins.unneeded")
             .duration(std::time::Duration::from_secs(20))
             .action("Uninstall", move |_, cx| {
-                let _ = this.update(cx, |v, cx| v.uninstall_plugins(unneeded.clone(), cx));
+                let _ = this.update(cx, |v, cx| v.uninstall_plugins(unneeded.clone(), host.clone(), cx));
             });
         toast::show(cx, t);
     }

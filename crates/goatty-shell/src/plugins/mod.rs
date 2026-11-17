@@ -646,8 +646,12 @@ impl Plugins<'_> {
                 permissions: permissions::all(m),
                 digest: plan.digest.clone(),
                 installed: now(),
-                // An update keeps what it was installed as.
-                dependency: previous.as_ref().map_or(dependency, |p| p.dependency),
+                // An update keeps what it was installed as; installing the
+                // same version again on purpose makes it the user's own.
+                dependency: match &previous {
+                    Some(p) if p.version != m.version => p.dependency,
+                    _ => dependency,
+                },
             },
         );
         lock.save(self.dirs)?;

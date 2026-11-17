@@ -497,7 +497,10 @@ fn required_plugins_are_planned_installed_and_offered_for_removal() {
     let warned = p.plan(&c, &off).unwrap();
     assert!(warned.dependencies[0].warnings.iter().any(|w| w.contains("needs the demo plugin, which is turned off")), "{warned:?}");
     p.install(&c, &plan.digest, &settings).unwrap();
-    assert_eq!(p.uninstall("top").unwrap().1, ["mid"]);
+    // Installed again on purpose, mid is the user's too.
+    let mid = p.find("mid", None).unwrap();
+    p.install(&mid, &p.plan(&mid, &settings).unwrap().digest, &settings).unwrap();
+    assert!(p.uninstall("top").unwrap().1.is_empty());
 }
 
 #[test]
