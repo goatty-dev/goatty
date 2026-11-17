@@ -30,6 +30,22 @@
 //! choices = [{ value = "sh" }, { value = "bash" }]
 //! ```
 //!
+//! An input can list what to pick from by running a program on the tab's
+//! host, like a snippet input's source (`docs/snippets.md`): `run` (argv,
+//! no shell; the first word a program the plugin provides or requires,
+//! the others may use earlier inputs), how to read its output, a time
+//! limit. With `strict = true` only its suggestions are answers, so the
+//! input is a list to pick from:
+//!
+//! ```toml
+//! [[command.input]]
+//! id = "branch"
+//! label = "Branch"
+//! strict = true
+//! [command.input.source]
+//! run = ["git", "branch", "--format=%(refname:short)"]
+//! ```
+//!
 //! A command can also be in the terminal's right-click menu (#186), under
 //! the plugin's name, with one of goatty's icons ([`MENU_ICONS`]). With
 //! `when = "selection"` it shows only while text is selected, and `fill`
@@ -166,6 +182,18 @@ pub struct CommandInput {
     /// `path`/`folder`: it must exist (checked when the host is this computer).
     #[serde(default)]
     pub must_exist: bool,
+    /// `text`: suggestions from a program on the tab's host, run when the
+    /// input is asked (`[command.input.source]`, the same format as a
+    /// snippet input's source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::snippets::Source>,
+    /// With a source: only its suggestions are answers (pick from a list).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -356,6 +384,25 @@ pub fn command_line(c: &PaletteCommand, values: &BTreeMap<String, String>) -> St
     words.join(" ")
 }
 
+/// What `input`'s source runs for the earlier `values` (argv, never a
+/// shell); `Err` says what to fill in first.
+pub fn source_argv(c: &PaletteCommand, input: &CommandInput, values: &BTreeMap<String, String>) -> Result<Vec<String>, String> {
+    let src = input.source.as_ref().ok_or_else(|| format!("{} has no suggestions", input.label))?;
+    if src.sh.is_some() {
+        return Err("plugins can't run a shell".into());
+    }
+    // Unanswered, or empty without being optional (an optional one left
+    // empty is simply left out of the arguments).
+    let optional = |d: &str| c.inputs.iter().any(|i| i.id == d && i.optional);
+    let missing =
+        crate::snippets::source_depends(&src.run).into_iter().find(|d| values.get(d).is_none_or(|v| v.is_empty() && !optional(d)));
+    if let Some(d) = missing {
+        let label = c.inputs.iter().find(|i| i.id == d).map_or(d.clone(), |i| i.label.clone());
+        return Err(format!("Fill in {label} first"));
+    }
+    crate::snippets::source_argv(&src.run, values)
+}
+
 /// The command line with `{input}` placeholders, for the install plan.
 pub fn describe(c: &PaletteCommand) -> String {
     c.run.join(" ")
@@ -438,6 +485,22 @@ pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
             }
             for p in check_input(input, &at) {
                 err(p.path, p.message);
+            }
+            if input.strict && input.source.is_none() {
+                err(format!("{at}.strict"), "only for inputs with a source".into());
+            }
+            if let Some(src) = &input.source {
+                if input.kind != InputKind::Text {
+                    err(
+                        format!("{at}.source"),
+                        format!("{} inputs list their own values; a source is for text inputs", input.kind.label()),
+                    );
+                }
+                let earlier: Vec<&str> = c.inputs[..j].iter().map(|i| i.id.as_str()).collect();
+                let all: Vec<&str> = c.inputs.iter().map(|i| i.id.as_str()).collect();
+                for p in crate::snippets::check_plugin_source(src, &earlier, &all, programs, &format!("{at}.source")) {
+                    err(p.path, p.message);
+                }
             }
         }
         if let Some(menu) = &c.menu {
@@ -614,6 +677,74 @@ type = "choice"
         assert!(has("input[0].pattern: pattern is for text inputs"), "{p:?}");
         assert!(has("input[1].id: \"n\" is used twice"), "{p:?}");
         assert!(has("input[1].choices: a choice input needs choices"), "{p:?}");
+    }
+
+    #[test]
+    fn sources_list_what_to_pick() {
+        let src = r#"
+[[command]]
+id = "pick"
+title = "Show a file in a folder"
+run = ["eza", "{dir}", "{file}"]
+
+[[command.input]]
+id = "dir"
+label = "Folder"
+
+[[command.input]]
+id = "file"
+label = "File"
+strict = true
+[command.input.source]
+run = ["eza", "-1", "--only-files", "{dir}"]
+"#;
+        let perms = "\n[permissions]\nsnippet-sources = \"eza lists the folder's files to pick from.\"\n";
+        let m = with_commands(src).map(|_| ()).unwrap_err();
+        assert!(m.0.iter().any(|p| p.path == "permissions.snippet-sources"), "the source needs a reason: {m:?}");
+        let (head, rest) = EXAMPLE.split_once("[permissions]").unwrap();
+        let m = parse(&format!("{head}{src}{perms}{}", rest.trim_start_matches('\n')), None).unwrap();
+        let c = &m.commands[0];
+        let file = &c.inputs[1];
+        assert!(file.strict);
+        let mut v = BTreeMap::new();
+        assert_eq!(source_argv(c, file, &v), Err("Fill in Folder first".into()));
+        v.insert("dir".to_string(), "my dir".to_string());
+        assert_eq!(source_argv(c, file, &v), Ok(vec!["eza".into(), "-1".into(), "--only-files".into(), "my dir".into()]));
+        // An optional earlier input left empty is left out, not missing.
+        let mut opt = c.clone();
+        opt.inputs[0].optional = true;
+        v.insert("dir".to_string(), String::new());
+        assert_eq!(source_argv(&opt, &opt.inputs[1], &v), Ok(vec!["eza".into(), "-1".into(), "--only-files".into()]));
+        assert_eq!(source_argv(c, file, &v), Err("Fill in Folder first".into()), "a required one is still missing");
+        use crate::permissions::{Permission, derived, describe};
+        assert!(derived(&m).contains(&Permission::SnippetSources));
+        let g = describe(&m).into_iter().find(|g| g.permission == Permission::SnippetSources).unwrap();
+        assert_eq!(g.details, ["Show a file in a folder → File: eza -1 --only-files {dir}"]);
+        // An older goatty refuses unknown fields: nothing new without a source.
+        let plain = with_commands(COMMANDS).unwrap();
+        let json = serde_json::to_string(&plain.commands[0]).unwrap();
+        assert!(!json.contains("source") && !json.contains("strict"), "{json}");
+
+        let bad = |input: &str| -> Vec<String> {
+            let toml = format!(
+                "[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\n[[command.input]]\nid = \"a\"\nlabel = \"A\"\n[[command.input]]\nid = \"b\"\nlabel = \"B\"\n{input}"
+            );
+            with_commands(&toml).unwrap_err().0.iter().map(|p| format!("{}: {}", p.path, p.message)).collect()
+        };
+        let has = |p: &[String], s: &str| p.iter().any(|x| x.contains(s));
+        let p = bad("strict = true");
+        assert!(has(&p, "input[1].strict: only for inputs with a source"), "{p:?}");
+        let p = bad("[command.input.source]\nrun = [\"rm\", \"{c}\"]");
+        assert!(has(&p, "input[1].source.run: \"rm\" is neither"), "{p:?}");
+        assert!(has(&p, "{c}: no input"), "{p:?}");
+        let p = bad("[command.input.source]\nsh = \"ls | head\"");
+        assert!(has(&p, "input[1].source.sh: plugins list a program"), "{p:?}");
+        let p = bad("type = \"integer\"\n[command.input.source]\nrun = [\"eza\"]");
+        assert!(has(&p, "input[1].source: integer inputs list their own values"), "{p:?}");
+        // Only earlier inputs: `a` may use nothing asked after it.
+        let toml = "[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\n[[command.input]]\nid = \"a\"\nlabel = \"A\"\n[command.input.source]\nrun = [\"eza\", \"{b}\"]\n[[command.input]]\nid = \"b\"\nlabel = \"B\"\n";
+        let p: Vec<String> = with_commands(toml).unwrap_err().0.iter().map(|p| format!("{}: {}", p.path, p.message)).collect();
+        assert!(has(&p, "{b} is asked later"), "{p:?}");
     }
 
     #[test]

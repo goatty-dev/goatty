@@ -23,7 +23,9 @@
 //! The palette also asks for input ([`input`], #91): a command (or any
 //! code) hands it an [`input::Ask`], and it shows one field at a time with
 //! a label, placeholder, live check and suggestions, then emits
-//! [`PaletteEvent::Answered`].
+//! [`PaletteEvent::Answered`]. A field can be a list to pick from (#79):
+//! moving through it calls the field's live preview, and closing the
+//! palette without an answer calls the asker's `on_cancel` (Esc restores).
 
 pub mod fuzzy;
 pub mod input;
@@ -214,6 +216,18 @@ struct Asking {
     /// Shown under the field instead of its help: the loader's note.
     note: Option<SharedString>,
     _load: Option<Task<()>>,
+    /// Runs when the palette goes away without an answer.
+    on_cancel: Option<input::OnCancel>,
+    answered: bool,
+    /// The step is set up: selection moves from now on are the user's
+    /// (and preview).
+    ready: bool,
+    /// The value the live preview shows now.
+    previewed: Option<String>,
+    /// A pick-from-list step's starting value (its default, or the answer
+    /// when going back): selected whenever the list (re)appears, also
+    /// once a loader's items arrive, until the user moves or types.
+    want: Option<String>,
 }
 
 impl Asking {
@@ -461,10 +475,26 @@ impl CommandPalette {
             loaded: Default::default(),
             note: None,
             _load: None,
+            on_cancel: ask.on_cancel,
+            answered: false,
+            ready: false,
+            previewed: None,
+            want: None,
         });
         if let Some(a) = &mut this.asking {
             a.answers = ask.answers;
         }
+        // However the palette closes (Esc, a click outside, another
+        // palette replacing it), an unanswered ask undoes its preview.
+        let release = cx.on_release(|this, cx| {
+            if let Some(a) = &this.asking
+                && !a.answered
+                && let Some(cancel) = a.on_cancel.clone()
+            {
+                cancel(cx);
+            }
+        });
+        this._subscriptions.push(release);
         if this.asking.as_ref().is_some_and(|a| a.fields.is_empty()) {
             // Nothing to ask: answer right away (after the palette is set up).
             cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.finish_ask(cx)).ok()).detach();
@@ -559,7 +589,31 @@ impl CommandPalette {
         if !self.hits.is_empty() {
             self.scroll.scroll_to_item(self.selected, ScrollStrategy::Nearest);
         }
+        self.preview_selection(cx);
         cx.notify();
+    }
+
+    /// The selected entry of a pick-from-list field, if any.
+    fn selected_value(&self) -> Option<String> {
+        self.hits.get(self.selected).map(|h| self.commands[h.index].id.to_string())
+    }
+
+    /// Show the selected entry with the field's live preview (once per
+    /// value; not while a step is being set up, which selects its current
+    /// value).
+    fn preview_selection(&mut self, cx: &mut Context<'_, Self>) {
+        let value = self.selected_value();
+        let Some(a) = &mut self.asking else { return };
+        if !a.ready || !a.field().strict() || a.field().multiple {
+            return;
+        }
+        let Some(on_select) = a.field().on_select.clone() else { return };
+        let Some(value) = value else { return };
+        if a.previewed.as_ref() == Some(&value) {
+            return;
+        }
+        a.previewed = Some(value.clone());
+        on_select(&value, cx);
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<'_, Self>) {
@@ -652,6 +706,7 @@ impl CommandPalette {
         if let Some(a) = &mut self.asking {
             a.picked = true;
             a.moved = true;
+            a.want = None;
         }
     }
 
@@ -664,6 +719,7 @@ impl CommandPalette {
     fn start_step(&mut self, step: usize, text: Option<String>, cx: &mut Context<'_, Self>) {
         let Some(a) = &mut self.asking else { return };
         a.step = step;
+        a.ready = false;
         a.tried = false;
         a.picked = false;
         a.message = None;
@@ -685,6 +741,7 @@ impl CommandPalette {
         let (text, preselect) = if a.fields[step].strict() && !multiple { (String::new(), Some(text)) } else { (text, None) };
         let placeholder = if spec.placeholder.is_empty() { format!("{}…", spec.label) } else { spec.placeholder.clone() };
         let label = spec.label.clone();
+        a.want = preselect;
         self.input.update(cx, |input, cx| {
             input.set_text(text.clone(), cx);
             input.set_placeholder(placeholder, cx);
@@ -693,10 +750,13 @@ impl CommandPalette {
             input.select_all_text(cx);
         });
         self.ask_changed(&text, cx);
-        if let Some(value) = preselect
-            && let Some(ix) = self.hits.iter().position(|h| self.commands[h.index].id == value)
-        {
-            self.select(ix, cx);
+        // The current value (selected by `ask_changed`) is what's shown
+        // already; anything else previews once selected.
+        let selected = self.selected_value();
+        let shown = self.asking.as_ref().and_then(|a| a.want.clone()).filter(|w| selected.as_ref() == Some(w));
+        if let Some(a) = &mut self.asking {
+            a.ready = true;
+            a.previewed = shown;
         }
         self.load_suggestions(step, cx);
     }
@@ -743,6 +803,9 @@ impl CommandPalette {
     fn ask_changed(&mut self, text: &str, cx: &mut Context<'_, Self>) {
         self.query = text.to_string();
         let Some(a) = &mut self.asking else { return };
+        if !text.trim().is_empty() {
+            a.want = None;
+        }
         a.picked = a.field().strict();
         let field = a.field().clone();
         a.message = message_for(&field, text, a.tried);
@@ -791,10 +854,12 @@ impl CommandPalette {
         self.show_suggestions(list, text, cx);
         // A default or earlier answer selects its own choice, not the
         // first fuzzy match (a label may look like another's value).
-        if field.strict()
-            && let Some(ix) = self.hits.iter().position(|h| self.commands[h.index].id == text)
-        {
-            self.select(ix, cx);
+        if field.strict() {
+            let want = self.asking.as_ref().and_then(|a| a.want.clone());
+            let at = |v: &str| self.hits.iter().position(|h| self.commands[h.index].id == v);
+            if let Some(ix) = at(text).or_else(|| want.as_deref().and_then(at)) {
+                self.select(ix, cx);
+            }
         }
     }
 
@@ -955,7 +1020,8 @@ impl CommandPalette {
     }
 
     fn finish_ask(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(a) = &self.asking else { return };
+        let Some(a) = &mut self.asking else { return };
+        a.answered = true;
         cx.emit(PaletteEvent::Answered(a.then.clone(), a.answers.clone()));
     }
 
@@ -1653,7 +1719,10 @@ mod tests {
         assert_eq!(top("rel sh"), "Shell: Reload running shells");
         assert_eq!(top("zoom in"), "View: Bigger text");
         assert_eq!(top("paste"), "Terminal: Paste");
-        assert_eq!(top("theme"), "Themes: Open the themes folder");
+        assert_eq!(top("theme"), "Themes: Switch theme…");
+        assert_eq!(top("themes folder"), "Themes: Open the themes folder");
+        assert_eq!(top("dark mode"), "Themes: Dark, light or follow the system…");
+        assert_eq!(top("install tool"), "Shell: Install a built-in tool…");
         assert_eq!(top("quit"), "goatty: Quit");
         assert_eq!(top("ssh"), "SSH: Connect to a host…");
         assert_eq!(top("connect"), "SSH: Connect to a host…");

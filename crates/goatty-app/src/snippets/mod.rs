@@ -182,8 +182,8 @@ pub fn ask_for(hs: &HostSnippet, link: &HostLink, cwd: Option<PathBuf>, back: Op
     ask
 }
 
-/// A `Suggest` reply as the palette's suggestions.
-fn suggestions(reply: anyhow::Result<Reply>) -> Loaded {
+/// A `Suggest` (or `CommandSuggest`) reply as the palette's suggestions.
+pub(crate) fn suggestions(reply: anyhow::Result<Reply>) -> Loaded {
     match reply {
         Ok(Reply::Suggestions(s)) => Loaded {
             items: s

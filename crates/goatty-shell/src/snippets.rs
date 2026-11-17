@@ -1,6 +1,7 @@
 //! Snippets and expansions on this host (#89): the user's own from
 //! `host.json` and the enabled plugins', listed for the picker
-//! ([`list`]), suggestion sources run for it ([`suggest`]), and the
+//! ([`list`]), suggestion sources run for it ([`suggest`]; plugins'
+//! palette commands' too, [`suggest_command`]), and the
 //! expansion table the managed zsh reads ([`render_expansions`]).
 //!
 //! The format is `goatty_plugin::snippets`. What this module adds is the
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use goatty_config::HostSettings;
 use goatty_plugin::api::{HostExpansion, HostSnippet, Origin, SnippetList, Suggestions};
+use goatty_plugin::commands::InputKind;
 use goatty_plugin::snippets::{self, Command, Compiled, Expansion, Owner, Snippet, SnippetInput};
 
 use crate::dirs::Dirs;
@@ -201,7 +203,8 @@ pub fn suggest(
 ) -> Result<Suggestions> {
     let (s, i, user) = find(dirs, settings, owner, snippet, input)?;
     let src = i.source.clone().ok_or_else(|| anyhow!("{} has no suggestions", i.label))?;
-    let cmd = match snippets::source_command(&s, &i, values) {
+    let values = expand_paths(values, |id| s.input(id).map(|i| i.kind));
+    let cmd = match snippets::source_command(&s, &i, &values) {
         Ok(c) => c,
         Err(why) => return Ok(Suggestions { items: Vec::new(), note: Some(why), truncated: false }),
     };
@@ -209,6 +212,56 @@ pub fn suggest(
     if !user && matches!(cmd, Command::Shell(_)) {
         bail!("plugins can't run a shell");
     }
+    run_source(dirs, settings, &src, &cmd, cwd)
+}
+
+/// Run the source of input `input` of plugin `plugin`'s palette command
+/// `command` (`[command.input.source]`, looked up in the enabled plugin's
+/// manifest here) with the earlier `values`, in `cwd`.
+pub fn suggest_command(
+    dirs: &Dirs,
+    settings: &HostSettings,
+    plugin: &str,
+    command: &str,
+    input: &str,
+    values: &snippets::Answers,
+    cwd: Option<&str>,
+) -> Result<Suggestions> {
+    let (active, _) = plugins::active(dirs, settings);
+    let a = active.iter().find(|a| a.manifest.id == plugin).with_context(|| format!("plugin {plugin:?} isn't on (or installed) here"))?;
+    let c = a.manifest.commands.iter().find(|c| c.id == command).with_context(|| format!("{plugin} has no command {command:?}"))?;
+    let i = c.inputs.iter().find(|i| i.id == input).with_context(|| format!("{} has no input {input:?}", c.title))?;
+    let src = i.source.clone().ok_or_else(|| anyhow!("{} has no suggestions", i.label))?;
+    let values = expand_paths(values, |id| c.inputs.iter().find(|i| i.id == id).map(|i| i.kind));
+    let argv = match goatty_plugin::commands::source_argv(c, i, &values) {
+        Ok(argv) => argv,
+        Err(why) => return Ok(Suggestions { items: Vec::new(), note: Some(why), truncated: false }),
+    };
+    run_source(dirs, settings, &src, &Command::Argv(argv), cwd)
+}
+
+/// The answers with a leading `~` of path and folder values (`kind_of`
+/// an input's type) made the home directory: a source runs without a
+/// shell, which would have expanded it. The stored answers keep their `~`.
+fn expand_paths(values: &snippets::Answers, kind_of: impl Fn(&str) -> Option<InputKind>) -> snippets::Answers {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    values
+        .iter()
+        .map(|(id, v)| {
+            let path = matches!(kind_of(id), Some(InputKind::Path | InputKind::Folder));
+            let v = if path {
+                v.split('\n').map(|p| crate::path_report::expand(p, home.as_deref())).collect::<Vec<_>>().join("\n")
+            } else {
+                v.clone()
+            };
+            (id.clone(), v)
+        })
+        .collect()
+}
+
+/// Run a source's `cmd` in `cwd` (the pane's directory; the home directory
+/// when it's missing, gone, or the source says so) and read its output.
+fn run_source(dirs: &Dirs, settings: &HostSettings, src: &snippets::Source, cmd: &Command, cwd: Option<&str>) -> Result<Suggestions> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     let dir = match (src.cwd, cwd) {
         (snippets::SourceCwd::Pane, Some(c)) if Path::new(c).is_dir() => PathBuf::from(c),
@@ -216,7 +269,7 @@ pub fn suggest(
     };
     let path = managed_path(dirs, settings);
     let fail = |what: String| Suggestions { items: Vec::new(), note: Some(src.on_fail.clone().unwrap_or(what)), truncated: false };
-    let out = match run(&cmd, &dir, &path, src.timeout()) {
+    let out = match run(cmd, &dir, &path, src.timeout()) {
         Ok(o) => o,
         Err(e) => return Ok(fail(format!("{e:#}"))),
     };
@@ -224,7 +277,7 @@ pub fn suggest(
         let first = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it failed").to_string();
         return Ok(fail(first));
     }
-    let (items, truncated) = snippets::parse_output(&out.stdout, &src);
+    let (items, truncated) = snippets::parse_output(&out.stdout, src);
     if items.is_empty() {
         return Ok(Suggestions { items, note: src.on_fail.clone().or(Some("Nothing to suggest".into())), truncated });
     }
@@ -328,6 +381,15 @@ mod tests {
 
     fn settings(snippets: serde_json::Value) -> HostSettings {
         HostSettings { snippets: serde_json::from_value(snippets).unwrap(), ..HostSettings::default() }
+    }
+
+    #[test]
+    fn sources_get_paths_with_the_home_directory() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+        let values: snippets::Answers = [("dir".to_string(), "~/src\n/opt".to_string()), ("text".to_string(), "~/src".to_string())].into();
+        let out = expand_paths(&values, |id| Some(if id == "dir" { InputKind::Folder } else { InputKind::Text }));
+        assert_eq!(out["dir"], format!("{}/src\n/opt", home.display()));
+        assert_eq!(out["text"], "~/src", "only paths");
     }
 
     #[test]

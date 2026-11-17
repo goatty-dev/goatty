@@ -296,6 +296,9 @@ impl SnippetInput {
             pattern_help: self.pattern_help.clone(),
             choices: self.choices.clone(),
             must_exist: self.must_exist,
+            // The snippet asks its own source (`Request::Suggest`).
+            source: None,
+            strict: false,
         }
     }
 
@@ -869,7 +872,9 @@ pub enum Command {
 /// an input that has no value yet.
 pub fn source_command(s: &Snippet, input: &SnippetInput, values: &Answers) -> Result<Command, String> {
     let src = input.source.as_ref().ok_or_else(|| format!("{} has no suggestions", input.id))?;
-    let missing = input.depends().into_iter().find(|d| values.get(d).is_none_or(String::is_empty));
+    // An optional input left empty is answered (and left out).
+    let optional = |d: &str| s.input(d).is_some_and(|i| i.optional);
+    let missing = input.depends().into_iter().find(|d| values.get(d).is_none_or(|v| v.is_empty() && !optional(d)));
     if let Some(d) = missing {
         let label = s.input(&d).map_or(d.clone(), |i| i.label.clone());
         return Err(format!("Fill in {label} first"));
@@ -878,8 +883,15 @@ pub fn source_command(s: &Snippet, input: &SnippetInput, values: &Answers) -> Re
         let tmp = Snippet { line: sh.clone(), ..s.clone() };
         return Ok(Command::Shell(tmp.render(values)));
     }
+    source_argv(&src.run, values).map(Command::Argv)
+}
+
+/// A source's `run` with the `values` filled in: a whole-argument
+/// `{input}` becomes one argument per value (none for an empty one), one
+/// inside an argument is replaced in place.
+pub fn source_argv(run: &[String], values: &Answers) -> Result<Vec<String>, String> {
     let mut argv = Vec::new();
-    for (i, t) in src.run.iter().enumerate() {
+    for (i, t) in run.iter().enumerate() {
         if i == 0 {
             argv.push(t.clone());
             continue;
@@ -899,7 +911,23 @@ pub fn source_command(s: &Snippet, input: &SnippetInput, values: &Answers) -> Re
         }
         argv.push(a);
     }
-    Ok(Command::Argv(argv))
+    Ok(argv)
+}
+
+/// The earlier inputs a source's `run` uses (`{branch}`), in order.
+pub fn source_depends(run: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in run.iter().skip(1) {
+        for p in parts(t).unwrap_or_default() {
+            if let Part::Var(v) = p
+                && is_input_id(v)
+                && !out.iter().any(|o| o == v)
+            {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Read a source's output: skip the header lines, split each line into
@@ -1065,6 +1093,28 @@ pub fn check_snippet(s: &Snippet, at: &str, owner: Owner<'_>) -> Vec<Problem> {
 }
 
 fn check_source(s: &Snippet, index: usize, src: &Source, at: &str, owner: Owner<'_>, err: &mut impl FnMut(String, String)) {
+    if let (Some(sh), None, Owner::User) = (&src.sh, src.run.first(), owner) {
+        let tmp = Snippet { line: sh.clone(), ..s.clone() };
+        if let Err(e) = tmp.pieces() {
+            err(format!("{at}.sh"), e);
+        }
+    }
+    let ids: Vec<&str> = s.inputs.iter().map(|i| i.id.as_str()).collect();
+    check_source_common(src, &ids[..index.min(ids.len())], &ids, at, owner, err);
+}
+
+/// Problems with a plugin command input's source (`[command.input.source]`):
+/// `earlier` are the inputs asked before it, `all` every input.
+pub(crate) fn check_plugin_source(src: &Source, earlier: &[&str], all: &[&str], programs: &BTreeSet<&str>, at: &str) -> Vec<Problem> {
+    let mut out = Vec::new();
+    let mut err = |path: String, message: String| out.push(Problem { path, message });
+    check_source_common(src, earlier, all, at, Owner::Plugin(programs), &mut err);
+    out
+}
+
+/// The checks a source gets wherever it is: what runs, its arguments'
+/// placeholders (earlier inputs only), columns, the time limit.
+fn check_source_common(src: &Source, earlier: &[&str], all: &[&str], at: &str, owner: Owner<'_>, err: &mut impl FnMut(String, String)) {
     match (&src.sh, src.run.first(), owner) {
         (Some(_), _, Owner::Plugin(_)) => {
             err(format!("{at}.sh"), "plugins list a program and its arguments in `run`; `sh` is for your own snippets".into())
@@ -1076,12 +1126,6 @@ fn check_source(s: &Snippet, index: usize, src: &Source, at: &str, owner: Owner<
         }
         (None, Some(p), _) if p.is_empty() || p.contains(['{', '}', '/', ' ']) && !p.starts_with('/') => {
             err(format!("{at}.run"), format!("{p:?}: the first word is a program's name"))
-        }
-        (Some(sh), None, Owner::User) => {
-            let tmp = Snippet { line: sh.clone(), ..s.clone() };
-            if let Err(e) = tmp.pieces() {
-                err(format!("{at}.sh"), e);
-            }
         }
         _ => {}
     }
@@ -1099,11 +1143,11 @@ fn check_source(s: &Snippet, index: usize, src: &Source, at: &str, owner: Owner<
             if let Part::Var(v) = p
                 && is_input_id(v)
             {
-                match s.inputs.iter().position(|i| i.id == v) {
-                    Some(k) if k < index => {}
-                    Some(_) => err(format!("{at}.run"), format!("{{{v}}} is asked later: a source can only use earlier inputs")),
-                    None if src.sh.is_none() => err(format!("{at}.run"), format!("{{{v}}}: no input {v:?}")),
-                    None => {}
+                match (earlier.contains(&v), all.contains(&v)) {
+                    (true, _) => {}
+                    (false, true) => err(format!("{at}.run"), format!("{{{v}}} is asked later: a source can only use earlier inputs")),
+                    (false, false) if src.sh.is_none() => err(format!("{at}.run"), format!("{{{v}}}: no input {v:?}")),
+                    _ => {}
                 }
             }
         }

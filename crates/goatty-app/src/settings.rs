@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use goatty_config::{ClientSettings, Document, FileStamp, Issue, Loaded, ThemeColors, ThemeLibrary, store};
+use goatty_config::{ClientSettings, Document, FileStamp, Issue, Loaded, ThemeColors, ThemeLibrary, ThemeSettings, store};
 use goatty_term::Palette;
 use gpui::{App, BorrowAppContext, ClipboardItem, Global, WindowAppearance};
 
@@ -62,6 +62,9 @@ pub struct AppSettings {
     /// Settings that parse but don't work on this machine (a font that
     /// isn't installed, a file opener that isn't on PATH).
     pub env_issues: Vec<Issue>,
+    /// While a theme picker previews (`preview_theme`), the theme settings
+    /// it started from: what saves write until the pick is confirmed.
+    theme_base: Option<ThemeSettings>,
 }
 
 pub fn is_dark(a: WindowAppearance) -> bool {
@@ -109,6 +112,7 @@ impl AppSettings {
             save_toast: None,
             announced: Vec::new(),
             owed_all_clear: Vec::new(),
+            theme_base: None,
         };
         s.recompute();
         log::info!(
@@ -210,9 +214,53 @@ impl AppSettings {
         Self::update_with(cx, f, false);
     }
 
+    /// Show the theme settings `f` makes of the ones in use when the
+    /// preview started (every call starts from those again), without
+    /// saving. Other edits meanwhile save the theme from before the
+    /// preview; [`end_theme_preview`](Self::end_theme_preview) confirms or
+    /// undoes it.
+    pub fn preview_theme(cx: &mut App, f: impl FnOnce(&mut ThemeSettings)) {
+        let s = cx.global::<Self>();
+        let mut theme = s.theme_base.clone().unwrap_or_else(|| s.file.value.theme.clone());
+        let base = theme.clone();
+        f(&mut theme);
+        cx.global_mut::<Self>().theme_base.get_or_insert(base);
+        Self::show_theme(cx, theme);
+    }
+
+    /// End a theme preview: `commit` edits the theme settings the preview
+    /// started from and saves them; `None` shows those again.
+    pub fn end_theme_preview(cx: &mut App, commit: Option<&dyn Fn(&mut ThemeSettings)>) {
+        let s = cx.global_mut::<Self>();
+        let Some(mut theme) = s.theme_base.take().or_else(|| commit.is_some().then(|| s.file.value.theme.clone())) else { return };
+        match commit {
+            Some(f) => {
+                f(&mut theme);
+                Self::update(cx, |c| c.theme = theme);
+            }
+            None => Self::show_theme(cx, theme),
+        }
+    }
+
+    /// Apply `theme` without saving.
+    fn show_theme(cx: &mut App, theme: ThemeSettings) {
+        let s = cx.global::<Self>();
+        let mut file = s.file.clone();
+        let save_error = s.save_error.clone();
+        file.value.theme = theme;
+        file.issues = file.value.validate();
+        Self::replace(cx, file, save_error);
+    }
+
     fn update_with(cx: &mut App, f: impl FnOnce(&mut ClientSettings), save: bool) {
         let mut file = cx.global::<Self>().file.clone();
+        // A theme preview isn't part of the settings yet: edit (and save)
+        // the theme it started from, and keep showing the preview.
+        let previewing = cx.global::<Self>().theme_base.clone().map(|base| std::mem::replace(&mut file.value.theme, base));
         f(&mut file.value);
+        if previewing.is_some() {
+            cx.global_mut::<Self>().theme_base = Some(file.value.theme.clone());
+        }
         file.issues = file.value.validate();
         let save_error = if !save {
             cx.global::<Self>().save_error.clone()
@@ -239,6 +287,9 @@ impl AppSettings {
                 }),
             )
         });
+        if let Some(shown) = previewing {
+            file.value.theme = shown;
+        }
         Self::replace(cx, file, save_error);
         if save_toast.is_some() {
             cx.global_mut::<Self>().save_toast = save_toast;

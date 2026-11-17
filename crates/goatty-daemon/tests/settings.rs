@@ -372,6 +372,20 @@ strict = true
 [snippet.input.source]
 run = ["printf", '%s\t%s\n', "alpha", "the first letter", "{first}", "what you typed"]
 split = "\t"
+[[command]]
+id = "echo-pick"
+title = "Echo a picked word"
+run = ["printf", "%s\n", "{word}"]
+[[command.input]]
+id = "first"
+label = "First"
+[[command.input]]
+id = "word"
+label = "Word"
+strict = true
+[command.input.source]
+run = ["printf", '%s\t%s\n', "beta", "from a command", "{first}", "typed"]
+split = "\t"
 [[expansion]]
 say = "| shout it"
 to = "| tr a-z A-Z"
@@ -422,6 +436,48 @@ snippet-sources = "lists alpha and what you typed first, to test suggestions"
     for bad in [
         Request::Suggest { owner: "picks".into(), snippet: "nope".into(), input: "second".into(), values: Default::default(), cwd: None },
         Request::Suggest { owner: "picks".into(), snippet: "echo-two".into(), input: "nope".into(), values: Default::default(), cwd: None },
+    ] {
+        let request = serde_json::to_string(&bad).unwrap();
+        assert!(matches!(request_msg(&d.sock, |req| ClientMsg::Plugin { req, request }), ServerMsg::Error { .. }));
+    }
+
+    // A palette command's input lists what to pick the same way.
+    let values = [("first".to_string(), "a b".to_string())].into();
+    let suggest = Request::CommandSuggest { plugin: "picks".into(), command: "echo-pick".into(), input: "word".into(), values, cwd: None };
+    let Reply::Suggestions(sg) = call(suggest) else { panic!() };
+    let got: Vec<(&str, Option<&str>)> = sg.items.iter().map(|i| (i.value.as_str(), i.detail.as_deref())).collect();
+    assert_eq!(got, [("beta", Some("from a command")), ("a b", Some("typed"))]);
+    let early = Request::CommandSuggest {
+        plugin: "picks".into(),
+        command: "echo-pick".into(),
+        input: "word".into(),
+        values: Default::default(),
+        cwd: None,
+    };
+    let Reply::Suggestions(sg) = call(early) else { panic!() };
+    assert_eq!((sg.items.len(), sg.note.as_deref()), (0, Some("Fill in First first")));
+    for bad in [
+        Request::CommandSuggest {
+            plugin: "picks".into(),
+            command: "nope".into(),
+            input: "word".into(),
+            values: Default::default(),
+            cwd: None,
+        },
+        Request::CommandSuggest {
+            plugin: "picks".into(),
+            command: "echo-pick".into(),
+            input: "first".into(),
+            values: Default::default(),
+            cwd: None,
+        },
+        Request::CommandSuggest {
+            plugin: "nope".into(),
+            command: "echo-pick".into(),
+            input: "word".into(),
+            values: Default::default(),
+            cwd: None,
+        },
     ] {
         let request = serde_json::to_string(&bad).unwrap();
         assert!(matches!(request_msg(&d.sock, |req| ClientMsg::Plugin { req, request }), ServerMsg::Error { .. }));

@@ -431,7 +431,7 @@ fn plugin_entries(view: &Entity<TerminalView>, cx: &gpui::App) -> Vec<Entry> {
         let (cmd, sel) = (c.clone(), selection.clone());
         out.push(
             Item::new(c.command.title.clone(), move |window, cx| {
-                start(&cmd.plugin, &cmd.command, &cmd.origin, sel.as_deref(), window, cx);
+                start(&cmd.plugin_id, &cmd.plugin, &cmd.command, &cmd.origin, sel.as_deref(), window, cx);
             })
             .icon(c.icon())
             .into(),
