@@ -119,6 +119,36 @@ fn op_lock(dirs: &Dirs) -> Result<std::fs::File> {
     Ok(f)
 }
 
+/// [`op_lock`] for an install: waits without blocking, so a cancel of a
+/// queued install takes effect while another one holds the lock.
+fn op_lock_for(dirs: &Dirs, job: &Job) -> Result<std::fs::File> {
+    std::fs::create_dir_all(dirs.installed_dir())?;
+    let f = std::fs::File::create(dirs.installed_dir().join(".lock"))?;
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                job.check()?;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+}
+
+/// Downloads waiting for activation, kept on disk (a plugin's packages
+/// can add up to more than goattyd should hold in memory). Removed when
+/// dropped, whatever happens to the install.
+struct Spool(Vec<PathBuf>);
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        for f in &self.0 {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
 impl Plugins<'_> {
     pub fn sources(&self) -> (Vec<Source>, Vec<String>) {
         registry::sources(self.dirs, self.builtin)
@@ -397,7 +427,7 @@ impl Plugins<'_> {
     /// download is in. Leaves `job` at [`Step::Activating`].
     pub fn install_with(&self, c: &Candidate, approved: &str, settings: &HostSettings, job: &Job) -> Result<Plan> {
         job.step(Step::Waiting)?;
-        let _guard = op_lock(self.dirs)?;
+        let _guard = op_lock_for(self.dirs, job)?;
         job.check()?;
         let plan = self.plan(c, settings)?;
         if plan.digest != approved {
@@ -413,17 +443,21 @@ impl Plugins<'_> {
         // Everything is downloaded before anything changes, so a cancel
         // (or a failed download) leaves the host as it was.
         let count = plan.downloads.iter().filter(|d| d.fetches()).count();
-        let mut fetched: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut spool = Spool(Vec::new());
+        let mut fetched: Vec<Option<PathBuf>> = Vec::new();
         for (p, d) in m.packages.iter().zip(&plan.downloads) {
             if !d.fetches() {
                 fetched.push(None);
                 continue;
             }
             let a = p.asset_for(&target).context("no build for this host")?;
-            let index = fetched.iter().flatten().count() + 1;
+            let index = spool.0.len() + 1;
             job.step(Step::Downloading { package: p.id.clone(), index, count, bytes: 0, total: a.size })?;
             let bytes = self.fetch.fetch_progress(&a.url, &mut |n| job.downloaded(n)).with_context(|| format!("download {}", a.url))?;
-            fetched.push(Some(bytes));
+            let file = self.dirs.installed_dir().join(format!(".{}.download-{}-{index}", m.id, std::process::id()));
+            spool.0.push(file.clone());
+            std::fs::write(&file, &bytes).with_context(|| format!("keep the download of {} in {}", p.id, file.display()))?;
+            fetched.push(Some(file));
         }
         if c.builtin.is_none() {
             // Stage the plugin's files too: the last step that can fail on its own.
@@ -449,7 +483,8 @@ impl Plugins<'_> {
                     });
                     continue;
                 }
-                if let Some(bytes) = bytes {
+                if let Some(file) = bytes {
+                    let bytes = std::fs::read(&file).with_context(|| format!("read the download of {}", p.id))?;
                     let a = p.asset_for(&target).context("no build for this host")?;
                     let pi = PackageInstall {
                         id: &p.id,

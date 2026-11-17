@@ -80,6 +80,10 @@ fn check(cx: &mut App) {
             }
         };
         cx.update(|cx| {
+            // Turned off while the host was asked.
+            if !cx.global::<AppSettings>().file.value.plugins.notify_updates {
+                return;
+            }
             let state = cx.default_global::<State>();
             let new: Vec<Update> =
                 updates.into_iter().filter(|u| state.told.insert((key.clone(), u.id.clone(), u.version.clone()))).collect();
@@ -92,10 +96,13 @@ fn check(cx: &mut App) {
 }
 
 fn updates_toast(updates: &[Update], link: &HostLink) -> Toast {
+    let label = link.label();
+    let remote = link.remote_key().is_some();
+    let link = link.clone();
     let n = updates.len();
     let mut title = if n == 1 { format!("{} {} is out", updates[0].name, updates[0].version) } else { format!("{n} plugin updates") };
-    if link.remote_key().is_some() {
-        title.push_str(&format!(" on {}", link.label()));
+    if remote {
+        title.push_str(&format!(" on {label}"));
     }
     let mut lines: Vec<String> = updates.iter().map(|u| format!("{}: {} → {}", u.name, u.installed, u.version)).collect();
     if updates.iter().any(|u| !u.new_permissions.is_empty()) {
@@ -105,7 +112,7 @@ fn updates_toast(updates: &[Update], link: &HostLink) -> Toast {
         .body(lines.join("\n"))
         .key("plugins.updates")
         .duration(Duration::from_secs(20))
-        .action("Review", |_, cx| settings_window::open_plugin_updates(cx))
+        .action("Review", move |_, cx| settings_window::open_plugin_updates(cx, link.clone()))
 }
 
 #[cfg(test)]

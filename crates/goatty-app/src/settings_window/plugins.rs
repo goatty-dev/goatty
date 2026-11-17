@@ -108,6 +108,13 @@ impl PluginsPage {
         Some(back)
     }
 
+    /// Empty the search field (so the whole list shows).
+    pub(super) fn clear_filter<V: 'static>(&self, cx: &mut Context<'_, V>) {
+        if let Some(f) = &self.filter {
+            f.update(cx, |f, cx| f.set_text("", cx));
+        }
+    }
+
     pub(super) fn clear_review(&mut self) {
         self.plan = None;
         self.plan_return = None;
@@ -133,11 +140,13 @@ pub struct Follow {
     pub return_id: Option<u64>,
     /// When the host last answered a progress request.
     last_heard: std::time::Instant,
+    /// The host can't report progress or cancel (a goattyd from before #102).
+    pub no_progress: bool,
 }
 
 impl Follow {
     fn new(id: String, verb: &'static str, awaiting_reply: bool, return_id: Option<u64>) -> Follow {
-        Follow { id, verb, progress: None, awaiting_reply, return_id, last_heard: std::time::Instant::now() }
+        Follow { id, verb, progress: None, awaiting_reply, return_id, last_heard: std::time::Instant::now(), no_progress: false }
     }
 
     fn name(&self) -> String {
@@ -165,6 +174,9 @@ fn connection_lost(link: &HostLink, e: &anyhow::Error) -> bool {
 fn step_text(f: &Follow, connected: bool) -> String {
     if !connected {
         return "Connection lost: waiting for it to come back…".into();
+    }
+    if f.no_progress {
+        return "This host's goattyd can't report progress or cancel; waiting for it to finish".into();
     }
     if f.cancelling() {
         return "Cancelling…".into();
@@ -275,12 +287,14 @@ impl SettingsWindow {
             return;
         }
         let Some(link) = self.link.clone() else { return };
+        let asked = link.clone();
         cx.spawn(async move |this, cx| {
             let reply = cx.background_executor().spawn(async move { link.plugin(api::Request::Installs) }).await;
             let Ok(api::Reply::Installs { installs: list }) = reply else { return };
             let Some(running) = list.into_iter().find(|p| !p.step.finished()) else { return };
             let _ = this.update(cx, |view, cx| {
-                if view.plugins.follow.is_none() {
+                // The window may have moved to another host meanwhile.
+                if view.plugins.follow.is_none() && view.link.as_ref().is_some_and(|l| l.same(&asked)) {
                     let mut f = Follow::new(running.id.clone(), "Installing", false, None);
                     f.progress = Some(running);
                     view.plugins.follow = Some(f);
@@ -334,7 +348,9 @@ impl SettingsWindow {
             // A goattyd from before #102 can't report progress: only the
             // install's reply will tell. Lost that too: show what's there now.
             _ => {
-                if !f.awaiting_reply {
+                if f.awaiting_reply {
+                    f.no_progress = true;
+                } else {
                     self.plugins.follow = None;
                     self.load_host(cx);
                     self.load_plugins(false, cx);
@@ -625,7 +641,11 @@ impl SettingsWindow {
         if let Some(inst) =
             self.plugins.detail.as_ref().and_then(|id| self.plugins.catalog.as_ref()?.installed.iter().find(|i| &i.id == id))
         {
-            return self.plugin_detail(ui, inst, cx);
+            let detail = self.plugin_detail(ui, inst, cx);
+            return match &self.plugins.follow {
+                Some(f) => div().flex().flex_col().gap(px(20.)).child(self.install_progress(ui, f, cx)).child(detail).into_any_element(),
+                None => detail,
+            };
         }
         let mut page = div().flex().flex_col().gap(px(20.));
         if let Some(e) = &self.plugins.error {
@@ -776,14 +796,29 @@ impl SettingsWindow {
     /// The followed install: what it's doing, how far, and Cancel.
     fn install_progress(&self, ui: Ui, f: &Follow, cx: &Context<'_, Self>) -> AnyElement {
         let connected = self.link.as_ref().is_some_and(HostLink::is_connected);
-        let cancellable = f.progress.as_ref().is_none_or(|p| p.step.cancellable()) && !f.cancelling();
+        let cancellable = connected && !f.no_progress && !f.cancelling() && f.progress.as_ref().is_none_or(|p| p.step.cancellable());
         let title = format!("{} {}", f.verb, f.name());
-        let cancel = button("plugin-install-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.cancel_install(cx)));
+        // Unavailable, not hidden (and focus stays on it): the
+        // description (step_text) and the tooltip say why it's off.
+        let cancel = if cancellable {
+            button("plugin-install-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.cancel_install(cx)))
+        } else {
+            let why = if !connected {
+                "Not connected to the host"
+            } else if f.no_progress {
+                "This host's goattyd can't cancel installs"
+            } else if f.cancelling() {
+                "Already cancelling"
+            } else {
+                "It's being set up: too late to cancel"
+            };
+            button("plugin-install-cancel", "Cancel", ButtonKind::Ghost, ui, |_, _| {}).opacity(0.45).cursor_default().tooltip(tooltip(why))
+        };
         let r = row(ui, title.clone())
             .icon(Icon::Download)
             .desc(step_text(f, connected))
-            .below(progress_bar("plugin-install-progress", step_fraction(f), title, ui).mt(px(4.)));
-        let r = if cancellable && connected { r.control(cancel) } else { r };
+            .below(progress_bar("plugin-install-progress", step_fraction(f), title, ui).mt(px(4.)))
+            .control(cancel);
         kit::group(ui).child(r).into_any_element()
     }
 

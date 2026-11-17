@@ -266,7 +266,10 @@ fn update_replaces_version_and_packages() {
     let leftovers: Vec<_> = std::fs::read_dir(w.dirs.installed_dir())
         .unwrap()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().contains("partial"))
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.contains("partial") || n.contains("download")
+        })
         .collect();
     assert!(leftovers.is_empty(), "no staging left behind: {leftovers:?}");
 
@@ -393,4 +396,29 @@ fn builtins_are_active_unless_turned_off_and_ordered() {
         }
     }
     assert_eq!(load_order(list).len(), 6);
+}
+
+#[test]
+fn a_queued_install_is_cancelled_while_another_holds_the_lock() {
+    let w = world();
+    let p = w.plugins();
+    let settings = HostSettings::default();
+    let c = p.find("demo", None).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    let held = op_lock(&w.dirs).unwrap();
+    let jobs = jobs::Jobs::default();
+    std::thread::scope(|s| {
+        let queued = s.spawn(|| {
+            jobs.run("demo", "Demo", "1.0.0", |job| p.install_with(&c, &plan.digest, &settings, job).map(|_| Default::default()))
+        });
+        while jobs.list().is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(jobs.list()[0].step, goatty_plugin::api::Step::Waiting);
+        jobs.cancel("demo").unwrap();
+        let r = queued.join().unwrap();
+        assert!(goatty_plugin::fetch::Cancelled::is(&r.unwrap_err()), "cancelled without the lock being released");
+    });
+    drop(held);
+    assert!(Lock::load(&w.dirs).unwrap().plugins.is_empty());
 }
