@@ -38,6 +38,19 @@ pub mod transport;
 pub use connection::{Connection, HostSettingsApplied, HostSettingsReply};
 pub use control::Control;
 pub use goatty_proto::{RemotePathInfo, TopLineCause};
+
+/// This computer's host name (`gethostname`, else `/etc/hostname`); empty
+/// when neither works.
+pub fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of the length passed.
+    let from_libc = (unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0)
+        .then(|| String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(buf.len())]).trim().to_string());
+    from_libc
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+        .unwrap_or_default()
+}
 pub use handshake::VersionMismatch;
 pub use local::LocalProblem;
 pub use remote::RemoteProblem;

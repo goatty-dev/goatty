@@ -229,11 +229,5 @@ pub fn port_of(paths: &Paths, dns: &str) -> u16 {
 
 /// This computer's name to introduce itself with when pairing.
 pub fn my_name() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "goatty".into())
+    Some(crate::hostname()).filter(|s| !s.is_empty()).or_else(|| std::env::var("HOSTNAME").ok()).unwrap_or_else(|| "goatty".into())
 }

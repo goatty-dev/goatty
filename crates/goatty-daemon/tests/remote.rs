@@ -11,7 +11,6 @@
 //! * systemd socket activation (when `systemd-socket-activate` exists).
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -117,6 +116,9 @@ impl Collect {
     }
 }
 
+// The fake host is this machine, and goatty installs goattyd only on Linux
+// hosts so far.
+#[cfg(target_os = "linux")]
 #[test]
 fn ssh_host_without_goattyd_gets_it_installed() {
     let host = Host::new();
@@ -129,7 +131,7 @@ fn ssh_host_without_goattyd_gets_it_installed() {
 
     remote::install(&host.target(), Path::new(env!("CARGO_BIN_EXE_goattyd"))).unwrap();
     assert!(host.installed().is_file());
-    let mode = std::fs::metadata(host.installed()).unwrap().permissions().mode();
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(host.installed()).unwrap().permissions());
     assert_eq!(mode & 0o777, 0o755);
     // Installing again replaces it in place.
     remote::install(&host.target(), Path::new(env!("CARGO_BIN_EXE_goattyd"))).unwrap();

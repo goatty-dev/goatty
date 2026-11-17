@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -121,11 +121,7 @@ impl Pty {
     /// terminal's session leader) is `pid`. The fd is set close-on-exec.
     pub fn adopt(master: OwnedFd, pid: u32) -> Result<(Self, File)> {
         set_cloexec(master.as_raw_fd(), true)?;
-        // SAFETY: plain syscall; a failure (old kernel, gone process) is handled.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-        // SAFETY: on success the syscall returned a new fd that nothing else owns.
-        let pidfd = (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw as RawFd) });
-        Self::from_parts(master, Process::Adopted { pid, pidfd, exited: None })
+        Self::from_parts(master, Process::Adopted { pid, pidfd: pidfd_open(pid), exited: None })
     }
 
     fn from_parts(master: OwnedFd, process: Process) -> Result<(Self, File)> {
@@ -219,24 +215,39 @@ impl Pty {
     }
 
     /// Foreground process group's working directory is a later feature;
-    /// for now report the shell's cwd via /proc (Linux).
+    /// for now report the shell's cwd.
     pub fn cwd(&self) -> Option<PathBuf> {
-        let pid = self.pid()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        crate::process::cwd(self.pid()?)
     }
 }
 
 /// Send `sig` through the pidfd when there is one (no pid reuse), else to
 /// the pid. False when the process is gone.
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain syscall; a failure (old kernel, gone process) is handled.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    // SAFETY: on success the syscall returned a new fd that nothing else owns.
+    (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw as RawFd) })
+}
+
+/// Other systems have no pidfds: signals go to the pid.
+#[cfg(not(target_os = "linux"))]
+fn pidfd_open(_pid: u32) -> Option<OwnedFd> {
+    None
+}
+
 fn signal(pid: u32, pidfd: Option<RawFd>, sig: libc::c_int) -> bool {
-    // SAFETY: plain syscalls; a null siginfo is allowed for pidfd_send_signal.
-    let r = unsafe {
-        match pidfd {
-            Some(fd) => libc::syscall(libc::SYS_pidfd_send_signal, fd, sig, std::ptr::null::<libc::siginfo_t>(), 0) as libc::c_int,
-            None => libc::kill(pid as libc::pid_t, sig),
-        }
-    };
-    r == 0
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = pidfd {
+        // SAFETY: plain syscall; a null siginfo is allowed for pidfd_send_signal.
+        return unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd, sig, std::ptr::null::<libc::siginfo_t>(), 0) } == 0;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pidfd;
+    // SAFETY: plain syscall.
+    unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
 }
 
 fn alive(pid: u32, pidfd: Option<RawFd>) -> bool {
@@ -260,12 +271,11 @@ pub fn set_cloexec(fd: RawFd, on: bool) -> std::io::Result<()> {
 }
 
 /// The session leader of the terminal whose master is `master`: the shell
-/// goatty started in it (`TIOCGSID`).
+/// goatty started in it (`tcgetsid`, the `TIOCGSID` ioctl on Linux).
 pub fn session_leader(master: BorrowedFd<'_>) -> Option<u32> {
-    let mut sid: libc::pid_t = 0;
-    // SAFETY: `sid` is valid for writes and the fd is open.
-    let r = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGSID, &raw mut sid) };
-    (r == 0 && sid > 0).then_some(sid as u32)
+    // SAFETY: plain call on an open fd; a failure returns -1.
+    let sid = unsafe { libc::tcgetsid(master.as_raw_fd()) };
+    (sid > 0).then_some(sid as u32)
 }
 
 /// The size of the terminal behind `master` (`TIOCGWINSZ`), cell pixels

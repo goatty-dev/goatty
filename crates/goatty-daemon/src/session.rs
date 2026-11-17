@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -284,13 +284,18 @@ pub(crate) struct Pause {
 
 impl Pause {
     pub(crate) fn new() -> std::io::Result<Self> {
-        let mut fds = [0; 2];
-        // SAFETY: `fds` has room for the two fds pipe2 writes.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(std::io::Error::last_os_error());
+        let (wake_rx, wake_tx) = std::io::pipe()?;
+        let (wake_rx, wake_tx) = (OwnedFd::from(wake_rx), OwnedFd::from(wake_tx));
+        for fd in [&wake_rx, &wake_tx] {
+            // SAFETY: plain fcntl calls on an open fd.
+            let ok = unsafe {
+                let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+                flags >= 0 && libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+            };
+            if !ok {
+                return Err(std::io::Error::last_os_error());
+            }
         }
-        // SAFETY: pipe2 returned two new fds that nothing else owns.
-        let (wake_rx, wake_tx) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         Ok(Self { requested: AtomicBool::new(false), parked: Mutex::new(false), changed: Condvar::new(), wake_rx, wake_tx })
     }
 
@@ -386,8 +391,7 @@ impl Session {
     }
 
     fn proc_cwd(&self) -> Option<PathBuf> {
-        let pid = self.pid?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        goatty_term::process::cwd(self.pid?)
     }
 
     pub(crate) fn current_cwd(&self) -> Option<String> {
