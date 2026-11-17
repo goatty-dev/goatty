@@ -5,8 +5,8 @@
 //! Callers check the download's sha256 before anything here runs. Entries
 //! never land outside the destination: `tar` and `zip` both refuse `..` and
 //! absolute paths, and zip symlinks are only created when they stay inside.
-//! Permissions from the archive are not kept (the installer marks the
-//! package's executables itself).
+//! Tar permissions are not kept; zip entries keep their Unix modes. Either
+//! way the installer marks the package's executables itself.
 
 use std::io::{Cursor, Read};
 use std::path::Path;
