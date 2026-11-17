@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -226,6 +226,7 @@ impl Pty {
 /// the pid. False when the process is gone.
 #[cfg(target_os = "linux")]
 fn pidfd_open(pid: u32) -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
     // SAFETY: plain syscall; a failure (old kernel, gone process) is handled.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     // SAFETY: on success the syscall returned a new fd that nothing else owns.
