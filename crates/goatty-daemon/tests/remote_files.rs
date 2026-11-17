@@ -22,7 +22,10 @@ use parking_lot::Mutex;
 const SIZE: WinSize = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
 
 struct TestDaemon {
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
+    /// The temp dir's real path (macOS's is behind /var → /private/var, and
+    /// the cwd the daemon reports is the real one).
+    root: PathBuf,
     sock: PathBuf,
     child: Child,
 }
@@ -36,12 +39,13 @@ impl Drop for TestDaemon {
 
 fn start_daemon() -> TestDaemon {
     let dir = tempfile::Builder::new().prefix("goatty-remote-files-").tempdir().unwrap();
-    let sock = dir.path().join("d.sock");
+    let root = dir.path().canonicalize().unwrap();
+    let sock = root.join("d.sock");
     let child = Command::new(env!("CARGO_BIN_EXE_goattyd"))
         .env("GOATTY_SOCKET", &sock)
         .env("GOATTY_SHELL", "/bin/sh")
         .env("RUST_LOG", "warn,rio_vt=error")
-        .env("HOME", dir.path())
+        .env("HOME", &root)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .spawn()
@@ -51,7 +55,7 @@ fn start_daemon() -> TestDaemon {
         assert!(Instant::now() < deadline, "daemon did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    TestDaemon { dir, sock, child }
+    TestDaemon { _dir: dir, root, sock, child }
 }
 
 fn proxy_endpoint(d: &TestDaemon) -> Endpoint {
@@ -59,7 +63,7 @@ fn proxy_endpoint(d: &TestDaemon) -> Endpoint {
         label: "test-proxy".into(),
         program: "env".into(),
         args: vec![
-            format!("HOME={}", d.dir.path().display()),
+            format!("HOME={}", d.root.as_path().display()),
             format!("GOATTY_SOCKET={}", d.sock.display()),
             env!("CARGO_BIN_EXE_goattyd").into(),
             "proxy".into(),
@@ -115,7 +119,7 @@ fn eventually(what: &str, mut f: impl FnMut() -> bool) {
 #[test]
 fn cwd_stat_and_read_work_over_proxy() {
     let d = start_daemon();
-    let root = d.dir.path();
+    let root = d.root.as_path();
     let repo = root.join("repo");
     let sub = repo.join("src");
     std::fs::create_dir_all(&sub).unwrap();
@@ -245,7 +249,7 @@ fn older_v12_clients_do_not_receive_cwd_messages() {
 #[test]
 fn remote_files_edge_cases() {
     let d = start_daemon();
-    let root = d.dir.path();
+    let root = d.root.as_path();
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join("a")).unwrap();
     std::fs::write(repo.join("both.txt"), "root-both").unwrap();
