@@ -446,7 +446,12 @@ impl Node {
     fn min_len(&self, axis: Axis, min: MinSize) -> f32 {
         match self {
             Node::Leaf(_) => min.along(axis),
-            Node::Split { axis: a, children, .. } if *a == axis => children.iter().map(|c| c.min_len(axis, min)).sum(),
+            // The parts keep their shares, so the split needs room for
+            // the part that is smallest for its minimum.
+            Node::Split { axis: a, children, sizes } if *a == axis => {
+                let total: f32 = sizes.iter().sum::<f32>().max(EPS);
+                children.iter().zip(sizes).map(|(c, s)| c.min_len(axis, min) * total / s.max(EPS)).fold(0.0, f32::max)
+            }
             Node::Split { children, .. } => children.iter().map(|c| c.min_len(axis, min)).fold(0.0, f32::max),
         }
     }
@@ -736,6 +741,20 @@ mod tests {
         t.set_divider(&[], 0, 0.0, MinSize { w: 0.15, h: 0.0 });
         let Node::Split { sizes, .. } = &t else { panic!() };
         assert!(close(sizes[0], 0.3), "{sizes:?}");
+    }
+
+    #[test]
+    fn a_part_with_unequal_panes_side_by_side_keeps_the_small_one_usable() {
+        // (1 / (2 | 3)) | 4 with 2 | 3 at 0.8 / 0.2: 3 is 0.1 wide only when
+        // the left part is 0.5 wide.
+        let mut t = Node::Leaf(1);
+        t.split(1, 4, Direction::Right);
+        t.split(1, 2, Direction::Down);
+        t.split(2, 3, Direction::Right);
+        t.set_divider(&[0, 1], 0, 0.8, MinSize::NONE);
+        t.set_divider(&[], 0, 0.0, MinSize { w: 0.1, h: 0.0 });
+        let Node::Split { sizes, .. } = &t else { panic!() };
+        assert!(close(sizes[0], 0.5), "{sizes:?}");
     }
 
     #[test]

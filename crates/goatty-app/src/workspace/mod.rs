@@ -731,12 +731,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let min = self.min_pane_size(cx);
         let pane = self.make_pane(session, window, cx);
         let id = pane.id;
 
-        // A split whose pane went away while the shell started opens a tab.
+        // A split whose pane went away, or no longer has room (another split
+        // finished first), while the shell started opens a tab.
         let target = match placement {
-            Placement::Split { tab, of, dir } => self.tab_index(tab).filter(|&i| self.tabs[i].tree.contains(of)).map(|i| (i, of, dir)),
+            Placement::Split { tab, of, dir } => {
+                let found = self.tab_index(tab).filter(|&i| self.tabs[i].tree.contains(of));
+                let fits = found.filter(|&i| self.tabs[i].tree.can_split(of, dir, min));
+                if found.is_some() && fits.is_none() {
+                    let toast = Toast::info("Opened in a new tab").body("There was no longer room for another pane there.");
+                    toast::show_in(window, cx, toast.key("pane.split"));
+                }
+                fits.map(|i| (i, of, dir))
+            }
             Placement::NewTab => None,
         };
         let index = match target {
@@ -774,10 +784,10 @@ impl Workspace {
     /// with its last pane, the window with its last tab.
     fn remove_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some((index, _)) = self.find_pane(id) else { return };
-        // Its menu's items would act on whatever pane has focus next.
-        if self.menu.as_ref().is_some_and(|m| m.owner == menu::MenuOwner::Pane(id)) {
-            self.close_menu(window, cx);
-        }
+        // The tab's menus would act on a changed tree: a pane's items on
+        // whatever pane has focus next, a divider's on a shifted split.
+        let tab_id = self.tabs[index].id;
+        self.close_menu_of_tab(tab_id, window, cx);
         let tab = &mut self.tabs[index];
         if tab.tree == Node::Leaf(id) {
             self.remove_tab(index, window, cx);
@@ -1433,13 +1443,14 @@ impl Workspace {
             PaletteEvent::Answered(then, answers) => {
                 let (then, answers) = (then.clone(), answers.clone());
                 this.close_palette(window, cx);
-                then(&answers, window, cx);
+                // After this update: answers may update the workspace.
+                window.defer(cx, move |window, cx| then(&answers, window, cx));
             }
             PaletteEvent::Dismissed => this.close_palette(window, cx),
             PaletteEvent::Back(back) => {
                 let back = back.clone();
                 this.close_palette(window, cx);
-                back(window, cx);
+                window.defer(cx, move |window, cx| back(window, cx));
             }
             PaletteEvent::Run(command) => {
                 let command = command.clone();

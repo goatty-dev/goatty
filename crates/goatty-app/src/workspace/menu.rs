@@ -23,7 +23,7 @@ use super::{PaneId, Workspace};
 use crate::plugin_commands::{MenuCommands, start};
 use crate::settings::AppSettings;
 use crate::terminal::TerminalView;
-use crate::ui::context_menu::{ContextMenu, Entry, Item, MenuEvent};
+use crate::ui::context_menu::{self, ContextMenu, Entry, Item, MenuEvent};
 use crate::ui::icons::Icon;
 
 /// What the open menu is about: it closes when that goes away.
@@ -125,18 +125,18 @@ impl Workspace {
         if self.tabs.len() > 1 {
             let (back, on_back) = if vertical { ("Move up", "This is the first tab") } else { ("Move left", "This is the first tab") };
             let (fwd, on_fwd) = if vertical { ("Move down", "This is the last tab") } else { ("Move right", "This is the last tab") };
-            entries.push(
-                Item::new(back, on(|this, i, w, cx| this.move_tab_to(this.tabs[i].id, i.saturating_sub(1), w, cx)))
-                    .icon(if vertical { Icon::ArrowUp } else { Icon::ArrowLeft })
-                    .disabled((index == 0).then_some(on_back))
-                    .into(),
-            );
-            entries.push(
-                Item::new(fwd, on(|this, i, w, cx| this.move_tab_to(this.tabs[i].id, i + 1, w, cx)))
-                    .icon(if vertical { Icon::ArrowDown } else { Icon::ArrowRight })
-                    .disabled(last.then_some(on_fwd))
-                    .into(),
-            );
+            // The keys move the active tab, so they're shown on its menu only.
+            let keys = |name| (index == self.active).then(|| context_menu::shortcut(name, cx)).flatten();
+            let mut item = Item::new(back, on(|this, i, w, cx| this.move_tab_to(this.tabs[i].id, i.saturating_sub(1), w, cx)))
+                .icon(if vertical { Icon::ArrowUp } else { Icon::ArrowLeft })
+                .disabled((index == 0).then_some(on_back));
+            item.shortcut = keys("move_tab_left");
+            entries.push(item.into());
+            let mut item = Item::new(fwd, on(|this, i, w, cx| this.move_tab_to(this.tabs[i].id, i + 1, w, cx)))
+                .icon(if vertical { Icon::ArrowDown } else { Icon::ArrowRight })
+                .disabled(last.then_some(on_fwd));
+            item.shortcut = keys("move_tab_right");
+            entries.push(item.into());
             // Its panes into another tab, side by side with that tab's.
             let mut targets: Vec<Entry> = vec![Entry::Header("Put its panes beside those of".into())];
             for i in (0..self.tabs.len()).filter(|&i| i != index) {

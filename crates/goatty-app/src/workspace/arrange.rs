@@ -29,12 +29,15 @@ const RESIZE_FALLBACK: f32 = 0.05;
 impl Workspace {
     // ---- sizes in cells ---------------------------------------------------------
 
-    /// The cell size and padding of the focused pane (every pane of a window
-    /// has the same font), and the panes' area, when they're known.
+    /// The largest cell size among the active tab's panes (each pane can
+    /// zoom its own text), the padding, and the panes' area, when they're
+    /// known. The largest cell keeps every pane at least the minimum.
     fn cell_metrics(&self, cx: &gpui::App) -> Option<(gpui::Size<gpui::Pixels>, gpui::Edges<gpui::Pixels>, gpui::Size<gpui::Pixels>)> {
-        let view = self.focused_view()?.read(cx);
+        let tab = self.active_tab()?;
+        let cell = tab.panes.iter().filter_map(|p| p.view.read(cx).cell_size()).reduce(|a, b| a.max(&b))?;
+        let pad = tab.focused_view()?.read(cx).padding();
         let area = self.panes_bounds.get().size;
-        (area.width > gpui::px(0.) && area.height > gpui::px(0.)).then_some((view.cell_size()?, view.padding(), area))
+        (area.width > gpui::px(0.) && area.height > gpui::px(0.)).then_some((cell, pad, area))
     }
 
     /// The smallest a pane may be, as a share of the panes' area.
