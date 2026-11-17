@@ -32,7 +32,7 @@ use goatty_term::input::{
     Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
 };
 use goatty_term::paste::{self, PasteRisk};
-use goatty_term::{CursorKind, Frame, Link, SelectKind, TermMode, UiEvent};
+use goatty_term::{CursorKind, Frame, Link, PromptJump, SelectKind, TermMode, UiEvent};
 use gpui::{
     App, AppContext, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, Font,
     InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as GMouseButton,
@@ -46,8 +46,9 @@ use super::keys::{mods, terminal_key};
 use super::links::{self, Place, Target};
 use super::stats::Stats;
 use crate::actions::{
-    ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, OpenContextMenu,
-    Paste, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo, ViewLastOutput,
+    ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, NextPrompt,
+    OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo,
+    ViewLastOutput,
 };
 use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::Session;
@@ -965,6 +966,24 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn previous_prompt(&mut self, _: &PreviousPrompt, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.jump_to_prompt(PromptJump::Previous, cx);
+    }
+
+    fn next_prompt(&mut self, _: &NextPrompt, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.jump_to_prompt(PromptJump::Next, cx);
+    }
+
+    /// Without prompts to jump between (a full-screen program, a shell
+    /// without integration) the key goes to the program instead.
+    fn jump_to_prompt(&mut self, dir: PromptJump, cx: &mut Context<'_, Self>) {
+        match self.session.terminal.scroll_to_prompt(dir) {
+            None => cx.propagate(),
+            Some(true) => cx.notify(),
+            Some(false) => {}
+        }
+    }
+
     /// Zoom this pane (0 resets) and show the new size in a toast that
     /// replaces itself while zooming.
     fn zoom_by(&mut self, delta: f32, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1305,6 +1324,8 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::scroll_page_up))
             .on_action(cx.listener(Self::scroll_page_down))
+            .on_action(cx.listener(Self::previous_prompt))
+            .on_action(cx.listener(Self::next_prompt))
             .on_action(cx.listener(Self::increase_font_size))
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
