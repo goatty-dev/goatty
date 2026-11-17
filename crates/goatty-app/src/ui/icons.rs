@@ -76,6 +76,7 @@ icons! {
     ListFilter => "list-filter.svg",
     Maximize2 => "maximize-2.svg",
     Menu => "menu.svg",
+    Monitor => "monitor.svg",
     MousePointerClick => "mouse-pointer-click.svg",
     Package => "package.svg",
     PanelLeftClose => "panel-left-close.svg",

@@ -109,6 +109,13 @@ actions!(
         ToggleTabSidebar,
         /// Switch `tabs.style` between vertical and horizontal.
         ToggleVerticalTabs,
+        /// The next host's tabs (the one last active there).
+        NextHost,
+        PreviousHost,
+        /// Fold every other host's group of tabs.
+        ShowOnlyThisHost,
+        /// Unfold every host's group of tabs.
+        ShowAllHosts,
         SplitRight,
         SplitDown,
         SplitLeft,
@@ -191,6 +198,10 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "close_other_tabs" => Box::new(CloseOtherTabs),
         "toggle_tab_sidebar" => Box::new(ToggleTabSidebar),
         "toggle_vertical_tabs" => Box::new(ToggleVerticalTabs),
+        "next_host" => Box::new(NextHost),
+        "previous_host" => Box::new(PreviousHost),
+        "show_only_this_host" => Box::new(ShowOnlyThisHost),
+        "show_all_hosts" => Box::new(ShowAllHosts),
         "split_right" => Box::new(SplitRight),
         "split_down" => Box::new(SplitDown),
         "split_left" => Box::new(SplitLeft),

@@ -397,6 +397,14 @@ pub fn builtins() -> Vec<Command> {
             .keywords(&["vertical", "collapse", "expand", "rail", "hide", "panel"]),
         Command::action("tab.toggle_vertical", "Tabs", "Switch between vertical and horizontal tabs", "toggle_vertical_tabs")
             .keywords(&["sidebar", "side", "arc", "zen", "layout", "style"]),
+        Command::action("tab.next_host", "Tabs", "Go to the next host's tabs", "next_host")
+            .keywords(&["group", "server", "remote", "switch", "machine"]),
+        Command::action("tab.previous_host", "Tabs", "Go to the previous host's tabs", "previous_host")
+            .keywords(&["group", "server", "remote", "switch", "machine", "back"]),
+        Command::action("tab.only_this_host", "Tabs", "Show only this host's tabs", "show_only_this_host")
+            .keywords(&["group", "fold", "collapse", "hide", "focus", "server", "filter"]),
+        Command::action("tab.all_hosts", "Tabs", "Show every host's tabs", "show_all_hosts")
+            .keywords(&["group", "unfold", "expand", "show", "server"]),
         Command::action("tab.select_1", "Tabs", "Go to tab 1", "select_tab_1").keywords(&["first"]),
         Command::action("tab.select_2", "Tabs", "Go to tab 2", "select_tab_2"),
         Command::action("tab.select_3", "Tabs", "Go to tab 3", "select_tab_3"),

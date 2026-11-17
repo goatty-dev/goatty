@@ -10,7 +10,10 @@
 //!   host's plugin commands that asked to be here, and the command palette
 //!   and settings. In a program that uses the mouse, a note says how the
 //!   click reaches it,
-//! * a divider's: even out that split, or every split.
+//! * a divider's: even out that split, or every split,
+//! * a host group's label (`groups`): a new tab on that host, fold or
+//!   unfold, show only this host, every host, the host's settings, close
+//!   its tabs.
 //!
 //! One menu is open at a time. Items run after it closed and focus is
 //! back on the terminal, so the actions they dispatch reach that pane.
@@ -39,6 +42,9 @@ pub(super) struct OpenMenu {
     pub owner: MenuOwner,
     _subscription: gpui::Subscription,
 }
+
+/// What a host group's menu item does to the group.
+type GroupAction = dyn Fn(&mut Workspace, &super::groups::HostKey, &mut Window, &mut Context<'_, Workspace>);
 
 /// More plugin entries than this go into a submenu.
 const INLINE_PLUGIN_ITEMS: usize = 3;
@@ -281,6 +287,93 @@ impl Workspace {
 }
 
 impl Workspace {
+    // ---- a host group's menu ------------------------------------------------------
+
+    pub(super) fn open_group_menu(
+        &mut self,
+        key: super::groups::HostKey,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let groups = self.groups(cx);
+        let Some(g) = groups.iter().find(|g| g.key == key) else { return };
+        let me = cx.entity().downgrade();
+        let on = |f: Box<GroupAction>| {
+            let (me, key) = (me.clone(), key.clone());
+            move |window: &mut Window, cx: &mut gpui::App| {
+                let _ = me.update(cx, |this, cx| f(this, &key, window, cx));
+            }
+        };
+        let alone = groups.len() < 2;
+        let mut heading = g.label.to_string();
+        if let Some(d) = &g.detail {
+            heading.push_str(&format!(" · {d}"));
+        }
+        let n = g.tabs.len();
+        let mut entries = vec![
+            Entry::Header(heading.into()),
+            Item::new(format!("New tab on {}", g.label), on(Box::new(|this, k, w, cx| this.new_tab_in_group(k, w, cx))))
+                .icon(Icon::Plus)
+                .into(),
+            Entry::Separator,
+        ];
+        if g.folded {
+            entries.push(
+                Item::new("Show its tabs", on(Box::new(|this, k, w, cx| this.fold_group(k, false, w, cx)))).icon(Icon::ChevronDown).into(),
+            );
+        } else {
+            entries.push(
+                Item::new("Fold its tabs", on(Box::new(|this, k, w, cx| this.fold_group(k, true, w, cx))))
+                    .icon(Icon::ChevronRight)
+                    .disabled(alone.then_some("The only host in this window"))
+                    .into(),
+            );
+        }
+        let mut only = Item::new(format!("Show only {}", g.label), on(Box::new(|this, k, w, cx| this.show_only_group(k, w, cx))))
+            .disabled(alone.then_some("The only host in this window"));
+        only.shortcut = crate::ui::context_menu::shortcut("show_only_this_host", cx);
+        entries.push(only.into());
+        if groups.iter().any(|g| g.folded) {
+            entries.push(Item::action("Show every host", "show_all_hosts", cx).into());
+        }
+        entries.push(Entry::Separator);
+        entries.push(
+            Item::new(
+                "Settings for this host",
+                on(Box::new(|this, k, w, cx| {
+                    // The settings window follows the active tab's host.
+                    if let Some(g) = this.groups(cx).into_iter().find(|g| g.key == *k)
+                        && !g.active
+                    {
+                        this.activate(g.tabs[0], w, cx);
+                    }
+                    w.dispatch_action(Box::new(crate::actions::OpenSettings), cx);
+                })),
+            )
+            .icon(Icon::Sliders)
+            .disabled(matches!(key, super::groups::HostKey::Connecting(_)).then_some("Still connecting"))
+            .into(),
+        );
+        entries.push(Entry::Separator);
+        let ids = g.ids.clone();
+        let close_label = if n == 1 { "Close its tab".to_string() } else { format!("Close its {n} tabs") };
+        entries.push(
+            Item::new(close_label, {
+                let me = me.clone();
+                move |window: &mut Window, cx: &mut gpui::App| {
+                    let ids = ids.clone();
+                    let _ = me.update(cx, |this, cx| this.close_tabs(ids, window, cx));
+                }
+            })
+            .icon(Icon::Close)
+            .danger()
+            .into(),
+        );
+        let owner = MenuOwner::Tab(g.ids[0]);
+        self.open_menu(owner, entries, at, false, window, cx);
+    }
+
     // ---- a divider's menu -------------------------------------------------------
 
     /// The menu of the divider between the parts of the split at `path` in
