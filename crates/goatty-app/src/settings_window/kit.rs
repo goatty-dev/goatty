@@ -387,7 +387,36 @@ impl RenderOnce for Row {
                     .child(canvas(|_, _, _| (), |bounds, _, window, _| scroll_to_focus_row(bounds.top(), window)).absolute().size_full())
             })
             .child(line)
-            .when_some(self.below, |d, b| d.child(div().px(px(16.)).pb(px(14.)).child(b)));
+            .when_some(self.below, |d, b| {
+                let wrap = div().px(px(16.)).pb(px(14.));
+                if disabled {
+                    let allow = |k: &gpui::Keystroke| {
+                        let m = &k.modifiers;
+                        (matches!(k.key.as_str(), "tab" | "escape") && !m.control && !m.platform && !m.alt)
+                            || ((m.control || m.platform || m.alt) && !matches!(k.key.as_str(), "v" | "x" | "backspace" | "delete"))
+                    };
+                    d.child(
+                        wrap.relative()
+                            .opacity(0.45)
+                            .capture_key_down(move |ev, window, cx| {
+                                if !allow(&ev.keystroke) {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .capture_key_up(move |ev, window, cx| {
+                                if !allow(&ev.keystroke) {
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .child(b)
+                            .child(div().absolute().inset_0().occlude()),
+                    )
+                } else {
+                    d.child(wrap.child(b))
+                }
+            });
         match self.click {
             Some((id, f)) => {
                 let el = body

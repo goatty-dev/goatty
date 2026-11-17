@@ -132,6 +132,27 @@ impl Endpoint {
         }
     }
 
+    /// Stable identifier distinguishing this endpoint from others that might
+    /// report the same `user@hostname` label (used to namespace cached remote files).
+    pub fn cache_key(&self) -> String {
+        use std::fmt::Write;
+        match self {
+            Endpoint::Local => "local".into(),
+            Endpoint::Ssh(t) => {
+                let daemon = t.remote_daemon.as_deref().unwrap_or("");
+                format!("ssh:{}:{}:{}:{}:{}:{}", t.program.len(), t.program, t.host.len(), t.host, daemon.len(), daemon)
+            }
+            Endpoint::Command { program, args, .. } => {
+                let mut key = format!("cmd:{}:{}:{}", program.len(), program, args.len());
+                for arg in args {
+                    let _ = write!(key, ":{}:{}", arg.len(), arg);
+                }
+                key
+            }
+            Endpoint::Tailnet(t) => format!("tailnet:{}:{}:{}:{}", t.dns.len(), t.dns, t.name.len(), t.name),
+        }
+    }
+
     /// Stream parameters suited to this kind of link.
     pub fn default_opts(&self) -> StreamOpts {
         if self.is_local() { StreamOpts::LOCAL } else { StreamOpts::REMOTE }
@@ -393,5 +414,20 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(lines.len(), TAIL_LINES);
         assert_eq!(lines.last().unwrap(), "line49");
+    }
+
+    #[test]
+    fn endpoint_cache_keys_distinguish_targets() {
+        let ssh_a = Endpoint::ssh("prod-a", None);
+        let ssh_b = Endpoint::ssh("prod-b", None);
+        let ssh_a_custom = Endpoint::ssh("prod-a", Some("/opt/goattyd"));
+        assert_ne!(ssh_a.cache_key(), ssh_b.cache_key());
+        assert_ne!(ssh_a.cache_key(), ssh_a_custom.cache_key());
+
+        let cmd_a = Endpoint::command_line("docker exec -i box-a goattyd proxy").unwrap();
+        let cmd_b = Endpoint::command_line("docker exec -i box-b goattyd proxy").unwrap();
+        assert_ne!(cmd_a.cache_key(), cmd_b.cache_key());
+        assert_ne!(cmd_a.cache_key(), ssh_a.cache_key());
+        assert_ne!(Endpoint::Local.cache_key(), ssh_a.cache_key());
     }
 }

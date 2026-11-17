@@ -85,6 +85,8 @@ pub struct TextInput {
     /// Draw no border, background or padding: the caller wraps the field
     /// (search fields with an icon, inline editors).
     bare: bool,
+    /// Disabled fields do not accept focus, clicks, or edits.
+    disabled: bool,
     /// What the field is for, for screen readers (default: the placeholder).
     label: Option<SharedString>,
 }
@@ -106,6 +108,7 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             bare: false,
+            disabled: false,
             label: None,
         }
     }
@@ -128,8 +131,20 @@ impl TextInput {
         self
     }
 
+    /// Enable or disable editing, focus, and IME input on this field.
+    pub fn set_disabled(&mut self, disabled: bool, cx: &mut Context<'_, Self>) {
+        if self.disabled != disabled {
+            self.disabled = disabled;
+            if disabled {
+                self.is_selecting = false;
+                self.marked_range = None;
+            }
+            cx.notify();
+        }
+    }
+
     pub fn is_focused(&self, window: &Window) -> bool {
-        self.focus_handle.is_focused(window)
+        !self.disabled && self.focus_handle.is_focused(window)
     }
 
     pub fn text(&self) -> &str {
@@ -199,6 +214,9 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -210,6 +228,9 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -221,6 +242,9 @@ impl TextInput {
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let start = word_start_before(&self.content, self.cursor_offset());
             if start == self.cursor_offset() {
@@ -232,6 +256,9 @@ impl TextInput {
     }
 
     fn delete_word_right(&mut self, _: &DeleteWordRight, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if self.selected_range.is_empty() {
             let end = word_end_after(&self.content, self.cursor_offset());
             if end == self.cursor_offset() {
@@ -259,10 +286,16 @@ impl TextInput {
     }
 
     fn submit(&mut self, _: &Submit, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         cx.emit(TextInputEvent::Submitted(self.content.to_string()));
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         self.is_selecting = true;
         window.focus(&self.focus_handle, cx);
         if event.modifiers.shift {
@@ -277,12 +310,18 @@ impl TextInput {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), window, cx);
         }
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
         }
@@ -295,6 +334,9 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
             self.replace_text_in_range(None, "", window, cx)
@@ -443,6 +485,9 @@ impl EntityInputHandler for TextInput {
     }
 
     fn set_selected_text_range(&mut self, range_utf16: Range<usize>, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         self.selected_range = self.range_from_utf16(&range_utf16);
         self.selection_reversed = false;
         window.notify_text_selection_changed(&self.focus_handle);
@@ -458,6 +503,9 @@ impl EntityInputHandler for TextInput {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.disabled {
+            return;
+        }
         self.marked_range = None;
         window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
@@ -470,6 +518,9 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -492,6 +543,9 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.disabled {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -676,14 +730,20 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.input.read(cx).focus_handle.clone();
-        window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
+        let (focus_handle, disabled) = {
+            let input = self.input.read(cx);
+            (input.focus_handle.clone(), input.disabled)
+        };
+        if !disabled {
+            window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.input.clone()), cx);
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
         }
         let Some(line) = prepaint.line.take() else { return };
         let _ = line.paint(bounds.origin, window.line_height(), gpui::TextAlign::Left, None, window, cx);
-        if focus_handle.is_focused(window)
+        if !disabled
+            && focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -698,7 +758,7 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
-        let focused = self.focus_handle.is_focused(window);
+        let focused = !self.disabled && self.focus_handle.is_focused(window);
         let label = self.label.clone().unwrap_or_else(|| self.placeholder.clone());
         div()
             .id(ElementId::from(("text-input", cx.entity_id().as_u64() as usize)))
@@ -707,9 +767,8 @@ impl Render for TextInput {
             .aria_label(label)
             .aria_value(self.content.clone())
             .aria_placeholder(self.placeholder.clone())
-            .key_context(CONTEXT)
-            .track_focus(&self.focus_handle(cx))
-            .cursor(CursorStyle::IBeam)
+            .when(!self.disabled, |d| d.key_context(CONTEXT).track_focus(&self.focus_handle))
+            .cursor(if self.disabled { CursorStyle::Arrow } else { CursorStyle::IBeam })
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::delete_word_left))
@@ -744,7 +803,7 @@ impl Render for TextInput {
                     .border_1()
                     .border_color(if focused { ui.accent } else { ui.border })
                     .bg(ui.input_bg)
-                    .when(!focused, |d| d.hover(|s| s.border_color(ui.muted)))
+                    .when(!self.disabled && !focused, |d| d.hover(|s| s.border_color(ui.muted)))
             })
             .child(TextElement {
                 input: cx.entity(),

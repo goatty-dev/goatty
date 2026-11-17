@@ -5,39 +5,107 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-use goatty_proto::{ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, ServerMsg, SessionId, encode, encode_server, read_msg};
+use goatty_proto::{
+    ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, ServerMsg, SessionId, encode, encode_server, read_msg,
+};
 use goatty_term::Palette;
 
 use crate::server::Daemon;
 use crate::session::{Session, SubFeatures, Subscriber};
 
+/// Max concurrent `StatPath` worker threads per connection (bounds thread
+/// leaks if a remote mount stalls `stat`).
+const MAX_STAT_WORKERS: usize = 4;
+/// Max concurrent `ReadFile` worker threads per connection (bounds memory and
+/// stream head-of-line delay).
+const MAX_FILE_WORKERS: usize = 2;
+/// Max queued `FileData` bytes per connection waiting in the writer queue.
+const MAX_QUEUED_FILE_BYTES: usize = goatty_proto::MAX_FRAME;
+
+pub(crate) struct Outbound {
+    pub(crate) frame: Frame,
+    _file_bytes: Option<FileByteGuard>,
+}
+
+impl From<Frame> for Outbound {
+    fn from(frame: Frame) -> Self {
+        Self { frame, _file_bytes: None }
+    }
+}
+
+pub(crate) struct WorkerGuard(Arc<AtomicUsize>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct FileByteGuard {
+    counter: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for FileByteGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_worker(counter: &Arc<AtomicUsize>, limit: usize) -> Option<WorkerGuard> {
+    let mut cur = counter.load(Ordering::Acquire);
+    while cur < limit {
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(WorkerGuard(counter.clone())),
+            Err(next) => cur = next,
+        }
+    }
+    None
+}
+
+fn try_reserve_file_bytes(counter: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Option<FileByteGuard> {
+    let mut cur = counter.load(Ordering::Acquire);
+    // Always admit a single valid frame when nothing else is queued so a
+    // HARD_MAX_FILE_BYTES reply cannot be starved by metadata overhead.
+    while cur == 0 || cur.saturating_add(bytes) <= limit {
+        match counter.compare_exchange_weak(cur, cur.saturating_add(bytes), Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(FileByteGuard { counter: counter.clone(), bytes }),
+            Err(next) => cur = next,
+        }
+    }
+    None
+}
+
 /// Serve one client connection until it closes. Its subscriptions end with
 /// it; the sessions keep running.
 pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let conn = daemon.next_conn.fetch_add(1, Ordering::Relaxed);
-    // Unbounded, but bounded in practice: stream frames are limited by each
-    // subscriber's window, control replies are tiny.
-    let (tx, rx) = flume::unbounded::<Frame>();
+    // Unbounded for stream/control: stream frames are limited by each
+    // subscriber's window, control replies are tiny, and `FileData` frames
+    // carry a `FileByteGuard` bounded by `MAX_QUEUED_FILE_BYTES`.
+    let (tx, rx) = flume::unbounded::<Outbound>();
     // An empty frame (real ones never are) asks the writer to flush and say
     // so here: everything queued before it has been sent.
     let (flushed_tx, flushed_rx) = flume::bounded::<()>(1);
     let wstream = stream.try_clone()?;
     let writer = std::thread::Builder::new().name(format!("c{conn}-writer")).spawn(move || {
         let mut w = BufWriter::with_capacity(128 << 10, &wstream);
-        while let Ok(f) = rx.recv() {
-            if f.is_empty() {
+        while let Ok(out) = rx.recv() {
+            if out.frame.is_empty() {
                 if w.flush().is_err() {
                     break;
                 }
                 let _ = flushed_tx.try_send(());
                 continue;
             }
-            if w.write_all(&f).is_err() {
+            if w.write_all(&out.frame).is_err() {
                 break;
             }
+            // Drop `out` (and any `FileByteGuard`) as soon as it is written.
+            drop(out);
             // Batch under load; flush the moment the queue is idle.
             if rx.is_empty() && w.flush().is_err() {
                 break;
@@ -47,7 +115,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     })?;
     let reply = |msg: ServerMsg| {
         if let Ok(f) = encode(&msg) {
-            let _ = tx.send(f);
+            let _ = tx.send(Outbound::from(f));
         }
     };
 
@@ -55,6 +123,9 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // The protocol version agreed in the handshake.
     let mut agreed_version = 0;
     let mut features = SubFeatures::default();
+    let stat_workers = Arc::new(AtomicUsize::new(0));
+    let file_workers = Arc::new(AtomicUsize::new(0));
+    let file_queued_bytes = Arc::new(AtomicUsize::new(0));
     let mut rstream = BufReader::with_capacity(64 << 10, stream);
     let result = (|| -> Result<()> {
         loop {
@@ -76,6 +147,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     log::debug!("connection {conn}: {client} (protocol v{agreed})");
                     agreed_version = agreed;
                     features.lines = agreed >= HISTORY_SINCE;
+                    features.cwd = agreed >= REMOTE_FILES_SINCE;
                     reply(ServerMsg::Hello { version: agreed, daemon_pid, host });
                 }
                 ClientMsg::ListSessions { req } => reply(ServerMsg::Sessions { req, list: daemon.list() }),
@@ -148,7 +220,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     Ok(exe) => {
                         reply(ServerMsg::Ok { req });
                         // The exec closes the connection: let the reply out first.
-                        let _ = tx.send(Frame::from(&[][..]));
+                        let _ = tx.send(Outbound::from(Frame::from(&[][..])));
                         if flushed_rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
                             log::warn!("connection {conn}: the restart reply may not have gone out");
                         }
@@ -172,7 +244,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let spawned = std::thread::Builder::new().name(format!("c{conn}-plugin")).spawn(move || {
                         let msg = crate::settings::plugin(&daemon, req, &request);
                         if let Ok(f) = encode(&msg) {
-                            let _ = tx.send(f);
+                            let _ = tx.send(Outbound::from(f));
                         }
                     });
                     if let Err(e) = spawned {
@@ -185,7 +257,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let spawned = std::thread::Builder::new().name(format!("c{conn}-shell")).spawn(move || {
                         let msg = crate::settings::shell(&daemon, req, &request);
                         if let Ok(f) = encode(&msg) {
-                            let _ = tx.send(f);
+                            let _ = tx.send(Outbound::from(f));
                         }
                     });
                     if let Err(e) = spawned {
@@ -198,7 +270,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let spawned = std::thread::Builder::new().name(format!("c{conn}-net")).spawn(move || {
                         let msg = crate::net::request(&daemon, req, &request);
                         if let Ok(f) = encode(&msg) {
-                            let _ = tx.send(f);
+                            let _ = tx.send(Outbound::from(f));
                         }
                     });
                     if let Err(e) = spawned {
@@ -215,7 +287,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let rows = s.term.history_rows(before, count as usize);
                         let msg = ServerMsg::History { req, session, before, first: rows.first, oldest: rows.oldest, data: rows.data };
                         if let Ok(f) = encode_server(&msg, features.zstd) {
-                            let _ = tx.send(f);
+                            let _ = tx.send(Outbound::from(f));
                         }
                     }
                     None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
@@ -235,6 +307,57 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         (None, _) => {}
                     }
                 }
+                ClientMsg::StatPath { req, session, cwd, candidates } => {
+                    // Stat off the reader thread in case the host has a slow/hung mount.
+                    let Some(guard) = try_acquire_worker(&stat_workers, MAX_STAT_WORKERS) else {
+                        reply(ServerMsg::PathStat { req, info: None });
+                        continue;
+                    };
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-stat")).spawn(move || {
+                        let _guard = guard;
+                        let info = crate::files::stat_path(&daemon, session, cwd.as_deref(), &candidates);
+                        if let Ok(f) = encode(&ServerMsg::PathStat { req, info }) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't stat path: {e}") });
+                    }
+                }
+                ClientMsg::ReadFile { req, path, max_bytes } => {
+                    if file_queued_bytes.load(Ordering::Acquire) >= MAX_QUEUED_FILE_BYTES {
+                        reply(ServerMsg::Error { req: Some(req), message: "file transfer queue is full; try again shortly".into() });
+                        continue;
+                    }
+                    let Some(guard) = try_acquire_worker(&file_workers, MAX_FILE_WORKERS) else {
+                        reply(ServerMsg::Error { req: Some(req), message: "too many concurrent file reads".into() });
+                        continue;
+                    };
+                    let (tx, zstd, file_queued_bytes) = (tx.clone(), features.zstd, file_queued_bytes.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-file")).spawn(move || {
+                        let _guard = guard;
+                        let msg = crate::files::read_file(req, &path, max_bytes);
+                        let is_data = matches!(msg, ServerMsg::FileData { .. });
+                        if let Ok(f) = encode_server(&msg, zstd) {
+                            if is_data {
+                                if let Some(byte_guard) = try_reserve_file_bytes(&file_queued_bytes, f.len(), MAX_QUEUED_FILE_BYTES) {
+                                    let _ = tx.send(Outbound { frame: f, _file_bytes: Some(byte_guard) });
+                                } else if let Ok(err) = encode(&ServerMsg::Error {
+                                    req: Some(req),
+                                    message: "file transfer queue is full; try again shortly".into(),
+                                }) {
+                                    let _ = tx.send(Outbound::from(err));
+                                }
+                            } else {
+                                let _ = tx.send(Outbound::from(f));
+                            }
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't read file: {e}") });
+                    }
+                }
             }
         }
     })();
@@ -247,4 +370,31 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     drop(tx);
     let _ = writer.join();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_file_byte_budget_bounds_and_releases() {
+        let queued = Arc::new(AtomicUsize::new(0));
+        let limit = 100;
+        let g1 = try_reserve_file_bytes(&queued, 60, limit).expect("first fits");
+        assert_eq!(queued.load(Ordering::Acquire), 60);
+        assert!(try_reserve_file_bytes(&queued, 50, limit).is_none(), "second exceeds remaining budget");
+        let g2 = try_reserve_file_bytes(&queued, 40, limit).expect("exact remaining fits");
+        assert_eq!(queued.load(Ordering::Acquire), 100);
+        drop(g1);
+        assert_eq!(queued.load(Ordering::Acquire), 40);
+        drop(g2);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+
+        // Single oversized frame is still admitted when the queue is empty.
+        let big = try_reserve_file_bytes(&queued, 120, limit).expect("single frame when empty");
+        assert_eq!(queued.load(Ordering::Acquire), 120);
+        assert!(try_reserve_file_bytes(&queued, 1, limit).is_none(), "blocks while oversized frame queued");
+        drop(big);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+    }
 }

@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
-    ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE, PROTOCOL_VERSION, RUN_SINCE,
-    ReqId, SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
+    ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE, PROTOCOL_VERSION,
+    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode,
+    read_msg,
 };
 use parking_lot::Mutex;
 
@@ -518,6 +519,61 @@ impl Connection {
     pub fn force_disconnect(&self) {
         self.shared.close_transport();
     }
+
+    /// Connectable SSH host destination for this endpoint (`SshTarget::host`, or
+    /// the Tailnet MagicDNS name without a trailing dot), or `None` for local
+    /// and custom `--via` command endpoints.
+    pub fn ssh_host(&self) -> Option<String> {
+        match self.endpoint() {
+            Endpoint::Ssh(t) => Some(t.host.clone()),
+            Endpoint::Tailnet(t) => {
+                let dns = t.dns.trim_end_matches('.');
+                if dns.is_empty() { Some(t.name.clone()) } else { Some(dns.to_string()) }
+            }
+            Endpoint::Local | Endpoint::Command { .. } => None,
+        }
+    }
+
+    /// Whether the daemon on this link speaks protocol v13 (`Cwd`, `StatPath`,
+    /// `ReadFile`).
+    pub fn supports_remote_files(&self) -> bool {
+        self.protocol_version() >= REMOTE_FILES_SINCE
+    }
+
+    /// Resolve and stat the first existing regular file or directory among
+    /// `candidates` on the daemon's host. When `cwd` is `Some`, relative
+    /// candidates resolve against that directory rather than the session's
+    /// latest working directory. Blocks: call off the UI thread.
+    pub fn stat_path(&self, session: Option<SessionId>, cwd: Option<String>, candidates: Vec<String>) -> Result<Option<RemotePathInfo>> {
+        let version = self.protocol_version();
+        if version < REMOTE_FILES_SINCE {
+            bail!(
+                "goattyd via {} is too old for remote file resolution (protocol v{version}); restart it to use the new version",
+                self.endpoint().label()
+            );
+        }
+        match self.request(Pending::Reply, |req| ClientMsg::StatPath { req, session, cwd, candidates })? {
+            ServerMsg::PathStat { info, .. } => Ok(info),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
+    /// Fetch up to `max_bytes` from regular file `path` on the daemon's host.
+    /// Blocks: call off the UI thread.
+    pub fn read_file(&self, path: &str, max_bytes: u64) -> Result<(String, Vec<u8>)> {
+        let version = self.protocol_version();
+        if version < REMOTE_FILES_SINCE {
+            bail!(
+                "goattyd via {} is too old to read remote files (protocol v{version}); restart it to use the new version",
+                self.endpoint().label()
+            );
+        }
+        let timeout = Duration::from_secs(60 + (max_bytes / (256 * 1024)));
+        match self.request_within(timeout, Pending::Reply, |req| ClientMsg::ReadFile { req, path: path.to_string(), max_bytes })? {
+            ServerMsg::FileData { path, data, .. } => Ok((path, data)),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
 }
 
 impl Drop for Connection {
@@ -752,6 +808,12 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 sink.event(PaneEvent::Process(name));
             }
         }
+        ServerMsg::Cwd { session, cwd } => {
+            let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+            if let Some(sink) = sink {
+                sink.event(PaneEvent::Cwd(cwd));
+            }
+        }
         ServerMsg::TopLine { session, line, cause } => {
             let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
             if let Some(sink) = sink {
@@ -778,7 +840,9 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::Plugin { req, .. }
         | ServerMsg::Layout { req, .. }
         | ServerMsg::Shell { req, .. }
-        | ServerMsg::Net { req, .. } => {
+        | ServerMsg::Net { req, .. }
+        | ServerMsg::PathStat { req, .. }
+        | ServerMsg::FileData { req, .. } => {
             if let Some(Pending::Reply(tx) | Pending::Attach { tx, .. }) = s.pending.lock().remove(&req) {
                 let _ = tx.send(msg);
             }

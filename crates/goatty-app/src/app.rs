@@ -33,6 +33,7 @@ pub fn run(initial: Initial, open_settings: Option<String>) {
         crate::hosts::refresh(cx);
 
         crate::welcome::check_first_run(cx);
+        cx.background_executor().spawn(async { crate::terminal::cleanup_stale_remote_cache() }).detach();
         open_terminal_window(cx, initial, open_settings);
         crate::welcome::open_if_first_run(cx);
         // Quit with the last window (the settings window may outlive the
@@ -45,6 +46,7 @@ pub fn run(initial: Initial, open_settings: Option<String>) {
         .detach();
         cx.activate(true);
     });
+    crate::terminal::cleanup_remote_cache();
 }
 
 /// Open a terminal window starting with `initial`. `open_settings`

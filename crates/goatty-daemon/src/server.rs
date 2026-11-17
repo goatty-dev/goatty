@@ -19,7 +19,7 @@ use goatty_term::{Palette, Terminal, TerminalChannels};
 use parking_lot::{Mutex, RwLock};
 
 use crate::layouts::Layouts;
-use crate::session::{Pause, Session, pump_output, to_size};
+use crate::session::{CwdCoordinator, Pause, Session, pump_output, to_size};
 
 /// The session registry shared by every connection.
 pub(crate) struct Daemon {
@@ -146,18 +146,28 @@ impl Daemon {
     pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
         let NewSession { id, pty, reader, term, chans, created_unix, managed } = n;
         let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
+        let proc_cwd = pty.cwd();
+        let init_cwd = term
+            .current_directory()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
+        for _ in chans.ui.try_iter() {}
+        let subs = Arc::new(Mutex::new(Vec::new()));
+        let cwd = Arc::new(CwdCoordinator::new(id, subs.clone(), init_cwd, proc_cwd));
         let session = Arc::new(Session {
             id,
             term,
             pty: Mutex::new(pty),
-            subs: Mutex::new(Vec::new()),
+            subs,
             created_unix,
             process: Mutex::new(None),
+            cwd,
             fg: OnceLock::new(),
             managed,
             pause: Pause::new()?,
             pid,
             master_fd,
+            ui_events: chans.ui.clone(),
             replies: chans.replies.clone(),
             replies_taken: AtomicU64::new(0),
             replies_written: AtomicU64::new(0),

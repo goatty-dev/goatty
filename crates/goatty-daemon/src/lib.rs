@@ -18,6 +18,7 @@
 //! The `goattyd` binary is a thin CLI over this crate.
 
 mod client;
+mod files;
 mod layouts;
 mod net;
 pub mod proxy;

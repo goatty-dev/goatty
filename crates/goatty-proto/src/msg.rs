@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -55,6 +55,15 @@ pub const HISTORY_SINCE: u32 = 11;
 
 /// v12: `Net` (the host's availability on the user's tailnet).
 pub const NET_SINCE: u32 = 12;
+
+/// v13: remote working directory updates (`ServerMsg::Cwd`), path resolution
+/// and stat (`StatPath` / `PathStat`), and reading remote files
+/// (`ReadFile` / `FileData`).
+pub const REMOTE_FILES_SINCE: u32 = 13;
+
+/// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
+/// for postcard headers and path metadata).
+pub const HARD_MAX_FILE_BYTES: u64 = (crate::MAX_FRAME - 65_536) as u64;
 
 /// The version to use with a peer whose newest version is `peer`, or
 /// `None` when the ranges don't overlap.
@@ -271,6 +280,24 @@ pub enum ClientMsg {
         req: ReqId,
         request: String,
     },
+    /// v13: resolve and stat the first existing path among `candidates` on
+    /// the daemon's host (`cwd` pins relative resolution to the caller's
+    /// working directory; when `None`, falls back to `session`'s current cwd;
+    /// `~/` resolves against `$HOME`). Reply: `PathStat`.
+    StatPath {
+        req: ReqId,
+        session: Option<SessionId>,
+        cwd: Option<String>,
+        candidates: Vec<String>,
+    },
+    /// v13: read up to `max_bytes` from regular file `path` on the daemon's
+    /// host. Reply: `FileData` (or `Error` if missing, non-regular, or over
+    /// the limit).
+    ReadFile {
+        req: ReqId,
+        path: String,
+        max_bytes: u64,
+    },
 }
 
 /// Why the daemon sent `ServerMsg::TopLine`.
@@ -331,6 +358,14 @@ pub struct HostInfo {
     pub user: String,
     pub os: String,
     pub daemon_version: String,
+}
+
+/// v13: metadata for a resolved path on the daemon's host (`ServerMsg::PathStat`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemotePathInfo {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,8 +492,8 @@ pub enum ServerMsg {
         data: Vec<u8>,
     },
     /// v11: another `ServerMsg` (postcard), zstd-compressed. Only after the
-    /// client sent `Compress`, and only for `Attached`, `Resync` and
-    /// `History`. Flow control counts the inner message's stream bytes.
+    /// client sent `Compress`, and only for `Attached`, `Resync`, `History`,
+    /// and `FileData`. Flow control counts the inner message's stream bytes.
     Zstd {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
@@ -467,6 +502,24 @@ pub enum ServerMsg {
     Net {
         req: ReqId,
         reply: String,
+    },
+    /// v13: the session's working directory changed (also sent right after
+    /// `Attached`).
+    Cwd {
+        session: SessionId,
+        cwd: Option<String>,
+    },
+    /// v13: reply to `StatPath`.
+    PathStat {
+        req: ReqId,
+        info: Option<RemotePathInfo>,
+    },
+    /// v13: reply to `ReadFile`.
+    FileData {
+        req: ReqId,
+        path: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
     },
 }
 
@@ -485,7 +538,9 @@ impl ServerMsg {
             | ServerMsg::Layout { req, .. }
             | ServerMsg::Shell { req, .. }
             | ServerMsg::Net { req, .. }
-            | ServerMsg::History { req, .. } => Some(*req),
+            | ServerMsg::History { req, .. }
+            | ServerMsg::PathStat { req, .. }
+            | ServerMsg::FileData { req, .. } => Some(*req),
             ServerMsg::Error { req, .. } => *req,
             _ => None,
         }
@@ -502,10 +557,10 @@ impl ServerMsg {
         }
     }
 
-    /// Bytes of snapshot or history it carries (what compression is for).
+    /// Bytes of snapshot, history, or file data it carries (what compression is for).
     pub fn payload_len(&self) -> usize {
         match self {
-            ServerMsg::History { data, .. } => data.len(),
+            ServerMsg::History { data, .. } | ServerMsg::FileData { data, .. } => data.len(),
             m => m.stream_len(),
         }
     }
@@ -557,5 +612,11 @@ mod tests {
         // v12 additions come after v11's.
         assert_eq!(postcard::to_allocvec(&ClientMsg::Net { req: 1, request: String::new() }).unwrap()[0], 26);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Net { req: 1, reply: String::new() }).unwrap()[0], 20);
+        // v13 additions come after v12's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::StatPath { req: 1, session: None, cwd: None, candidates: vec![] }).unwrap()[0], 27);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ReadFile { req: 1, path: String::new(), max_bytes: 1 }).unwrap()[0], 28);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Cwd { session: 1, cwd: None }).unwrap()[0], 21);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::PathStat { req: 1, info: None }).unwrap()[0], 22);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::FileData { req: 1, path: String::new(), data: vec![] }).unwrap()[0], 23);
     }
 }
