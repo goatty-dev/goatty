@@ -396,18 +396,17 @@ fn looks_like_path(p: &str) -> bool {
     if p.starts_with('-') || p.starts_with('$') || p.contains("//") {
         return false;
     }
-    // A path with spaces can't have spaces right next to a slash (`"a / b"`).
-    if p.contains(" /") || p.contains("/ ") {
-        return false;
-    }
     if is_windows_drive_path(p) {
-        return !(p.contains(" \\") || p.contains("\\ "));
+        return true;
     }
     if p.starts_with('/') || p.starts_with("~/") || p.starts_with("./") || p.starts_with("../") {
         return true;
     }
     if p.contains('/') {
-        // `src/main.rs`, `docs/`; not `1/2` or `and/or`-style prose.
+        // `src/main.rs`, `docs/`; not `1/2`, `and/or`, or `"hello / world"` prose.
+        if p.contains(" /") || p.contains("/ ") {
+            return false;
+        }
         return p.chars().any(|c| c.is_ascii_alphabetic()) && (p.contains('.') || p.ends_with('/') || p.matches('/').count() >= 2);
     }
     if p.contains('\\') {
@@ -616,6 +615,8 @@ mod tests {
         assert_eq!(found("cd ~/My\\ Documents/notes"), [(Path, "~/My Documents/notes".into(), None, None)]);
         assert_eq!(found(r"'/tmp/a\ b.rs'"), [(Path, r"/tmp/a\ b.rs".into(), None, None)]);
         assert_eq!(found(r"/tmp/a\\b.rs"), [(Path, r"/tmp/a\\b.rs".into(), None, None)]);
+        assert_eq!(found("\"/tmp/ report.txt\""), [(Path, "/tmp/ report.txt".into(), None, None)]);
+        assert_eq!(found("/tmp/\\ report.txt"), [(Path, "/tmp/ report.txt".into(), None, None)]);
     }
 
     #[test]
