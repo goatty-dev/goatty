@@ -28,7 +28,7 @@ use std::sync::Arc;
 use rio_vt::crosswords::grid::{Dimensions, Grid, Scroll};
 
 use crate::snapshot::write_rows;
-use crate::terminal::Term;
+use crate::terminal::{Term, with_primary};
 use crate::{DEFAULT_SCROLLBACK, Palette, TermMode, TermSize, Terminal};
 
 /// Why the daemon sent the screen's top line (mirrors the wire's reasons).
@@ -131,45 +131,40 @@ fn own_rows(t: &Term) -> (u64, u64) {
 impl Terminal {
     // ---- daemon side ------------------------------------------------------
 
-    /// The host line of the primary screen's top row, or `None` while the
-    /// alternate screen is active (its rows have no history).
+    /// The host line of the primary screen's top row (also while the
+    /// alternate screen is active, via the hidden primary grid).
     pub fn top_line(&self) -> Option<u64> {
-        self.with_term(|t| (!TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN)).then(|| own_rows(t).1))
+        self.with_term(|t| Some(with_primary(t, |t| own_rows(t).1)))
     }
 
     /// Up to `count` (at most [`MAX_FETCH`]) rows just before host line
     /// `before`, as VT bytes for [`Terminal::insert_history`]. Empty when
-    /// the daemon has none of them any more, or while the alternate screen
-    /// is active.
+    /// the daemon has none of them any more.
     pub fn history_rows(&self, before: u64, count: usize) -> HistoryRows {
         self.with_term(|t| {
-            let (oldest, top) = own_rows(t);
-            if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
-                return HistoryRows { first: before, oldest, data: Vec::new() };
-            }
-            let end = before.min(top + t.screen_lines() as u64);
-            let first = end.saturating_sub(count.min(MAX_FETCH) as u64).max(oldest);
-            if first >= end {
-                return HistoryRows { first: before, oldest, data: Vec::new() };
-            }
-            let line = |h: u64| (h as i64 - top as i64) as i32;
-            let mut out = String::new();
-            write_rows(t, line(first)..line(end), true, &mut out);
-            HistoryRows { first, oldest, data: out.into_bytes() }
+            with_primary(t, |t| {
+                let (oldest, top) = own_rows(t);
+                let end = before.min(top + t.screen_lines() as u64);
+                let first = end.saturating_sub(count.min(MAX_FETCH) as u64).max(oldest);
+                if first >= end {
+                    return HistoryRows { first: before, oldest, data: Vec::new() };
+                }
+                let line = |h: u64| (h as i64 - top as i64) as i32;
+                let mut out = String::new();
+                write_rows(t, line(first)..line(end), true, &mut out);
+                HistoryRows { first, oldest, data: out.into_bytes() }
+            })
         })
     }
 
     // ---- client side ------------------------------------------------------
 
-    /// The daemon says its screen's top row is host line `line`, right after
-    /// the bytes fed so far (see the module docs).
+    /// The daemon says its primary screen's top row is host line `line`,
+    /// right after the bytes fed so far (see the module docs).
     pub fn set_top_line(&self, line: u64, cause: TopLineCause) {
-        let t = self.inner.term.lock();
-        if TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
-            // The primary screen's rows aren't where this applies.
-            return;
-        }
-        let (evicted, top) = own_rows(&t);
+        let mut t = self.inner.term.lock();
+        let alt = TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN);
+        let (evicted, top) = with_primary(&mut t, |t| own_rows(t));
         let mut map = self.inner.lines.lock();
         let to_oldest = (evicted, line.saturating_sub(top - evicted));
         match (cause, map.resized.take()) {
@@ -180,6 +175,16 @@ impl Terminal {
             }
             // Rows reflowed the same on both sides: one run again.
             (TopLineCause::Resize, Some(false)) => map.anchors = vec![to_oldest],
+            // Resync never replays the primary screen while the alternate
+            // screen is active: if primary lines were skipped before
+            // switching, the mirror's primary grid no longer matches;
+            // otherwise the existing map still holds.
+            (TopLineCause::Resync, resized) if alt => {
+                let matches = resized.is_none() && map.anchors.last().is_some_and(|&(c, h)| top >= c && h + (top - c) == line);
+                if !matches {
+                    map.anchors.clear();
+                }
+            }
             // A reflow lost where the gap was (or a resync came first): only
             // the screen is known, and the rows above it can't take older
             // lines in the right place.
@@ -562,5 +567,66 @@ mod tests {
             row.and_then(|r| t.cell_hyperlink(Line(r), Column(0))).map(|l| l.uri().to_string())
         });
         assert_eq!(link.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn trimmed_attach_in_alt_screen_fetches_older_history_after_exit() {
+        let size = TermSize::new(30, 5);
+        let a = term(size, true);
+        a.feed(&numbered(0..3000));
+        a.feed(b"$ vim\r\n\x1b[?1049h\x1b[2;2HALT");
+        let b = term(size, false);
+        b.feed(&a.reattach_snapshot_with_history(100));
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Attach);
+        // Nothing is fetched while the alt screen is showing.
+        assert_eq!(b.wanted_history(10), None);
+        // A resize in the alt screen keeps the primary line map valid.
+        for t in [&a, &b] {
+            t.resize(TermSize::new(20, 6));
+        }
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Resize);
+
+        // Exit the alt screen on both: primary screen and lazy scrollback work.
+        a.feed(b"\x1b[?1049l");
+        b.feed(b"\x1b[?1049l");
+        assert_eq!(screen(&b), screen(&a));
+        fill(&a, &b);
+        assert_eq!(lines(&b), lines(&a));
+        assert_eq!(b.history_size(), a.history_size());
+    }
+
+    #[test]
+    fn resync_in_alt_screen_keeps_valid_map_and_clears_stale_one() {
+        let size = TermSize::new(30, 5);
+        let a = term(size, true);
+        let b = term(size, false);
+        a.feed(&numbered(0..1500));
+        b.feed(&a.reattach_snapshot_with_history(50));
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Attach);
+
+        // Lag happens *inside* the alt screen: primary lines didn't move, so
+        // the existing map remains valid after exiting.
+        a.feed(b"\x1b[?1049hframe1\x1b[Hframe2");
+        b.feed(b"\x1b[?1049h");
+        b.feed(&a.resync_snapshot());
+        b.set_top_line(a.top_line().unwrap(), TopLineCause::Resync);
+        a.feed(b"\x1b[?1049l");
+        b.feed(b"\x1b[?1049l");
+        fill(&a, &b);
+        assert_eq!(lines(&b), lines(&a));
+
+        // Lag skips primary output before entering the alt screen: resync
+        // doesn't update the mirror's primary grid, so the stale map clears
+        // rather than splicing rows into the wrong place.
+        let c = term(size, false);
+        c.feed(&a.reattach_snapshot_with_history(50));
+        c.set_top_line(a.top_line().unwrap(), TopLineCause::Attach);
+        a.feed(&numbered(1500..1600));
+        a.feed(b"\x1b[?1049hIN-ALT");
+        c.feed(&a.resync_snapshot());
+        c.set_top_line(a.top_line().unwrap(), TopLineCause::Resync);
+        c.feed(b"\x1b[?1049l");
+        c.scroll(1000);
+        assert_eq!(c.wanted_history(10), None);
     }
 }

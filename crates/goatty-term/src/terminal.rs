@@ -368,6 +368,24 @@ pub(crate) fn pack(s: TermSize) -> u32 {
     ((s.cols as u32) << 16) | s.rows as u32
 }
 
+/// Run `f` with the primary screen in `t.grid`, even while the alternate
+/// screen is active (rio-vt keeps the inactive grid private). Switching back
+/// to the alternate screen clears it, so its grid and selection are saved and
+/// restored around `f`.
+pub(crate) fn with_primary<R>(t: &mut Term, f: impl FnOnce(&mut Term) -> R) -> R {
+    if !TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
+        return f(t);
+    }
+    let alt = t.grid.clone();
+    let selection = t.selection.take();
+    t.swap_alt();
+    let r = f(t);
+    t.swap_alt();
+    t.grid = alt;
+    t.selection = selection;
+    r
+}
+
 fn viewport_to_grid(t: &Term, col: usize, row: usize) -> Pos {
     let offset = t.display_offset() as i32;
     let row = row.min(t.screen_lines().saturating_sub(1));

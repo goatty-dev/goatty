@@ -3,9 +3,8 @@
 //!
 //! What has to carry over is each session's PTY master (the shell keeps
 //! running as long as one is open) and what the daemon knows about it: the
-//! screens and scrollback (`Terminal::restore_snapshot`: the attach
-//! snapshot plus the primary screen behind a full-screen program), size,
-//! ids, and the saved window layouts.
+//! screens and scrollback (`Terminal::restore_snapshot`), size, ids, and the
+//! saved window layouts.
 //!
 //! * **Restart** (protocol `Restart`, `goattyd restart`): every output pump
 //!   pauses between two reads, the state goes to `<socket>.restore/`, the
