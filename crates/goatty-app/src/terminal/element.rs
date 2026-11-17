@@ -18,12 +18,15 @@ use std::time::Instant;
 
 use goatty_term::{CellFlags, CursorKind, Frame, LinkSpan, Rgb, TermSize};
 use gpui::{
-    App, Bounds, Element, ElementId, Font, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Pixels,
-    Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point, px, relative, size,
+    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun,
+    UnderlineStyle, Window, fill, point, px, relative, size,
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::glyphs::{Glyph, GlyphCache};
 use super::stats::Stats;
+use super::view::TerminalView;
 use crate::session::Session;
 
 pub fn hsla(c: Rgb) -> Hsla {
@@ -37,6 +40,9 @@ pub struct Geom {
     pub cell: Size<Pixels>,
     pub cols: usize,
     pub rows: usize,
+    /// The cursor cell (col, row), kept while the cursor is hidden: where
+    /// IME composition shows and the input method puts its popup.
+    pub caret: (usize, usize),
 }
 
 impl Geom {
@@ -47,6 +53,14 @@ impl Geom {
         let col = (x as usize).min(self.cols.saturating_sub(1));
         let row = (y as usize).min(self.rows.saturating_sub(1));
         (col, row, x.fract() > 0.5)
+    }
+
+    /// Where IME composition text `cells` wide starts: at the caret, moved
+    /// left so it stays inside the grid when it's too long for the line.
+    pub fn preedit_origin(&self, cells: usize) -> Point<Pixels> {
+        let (col, row) = self.caret;
+        let col = col.min(self.cols.saturating_sub(cells));
+        point(self.origin.x + self.cell.width * col as f32, self.origin.y + self.cell.height * row as f32)
     }
 
     /// Selection auto-scroll: lines to scroll per tick for a drag at height
@@ -86,6 +100,13 @@ pub struct TerminalElement {
     pub cursor_visible: bool,
     /// The hovered link, underlined.
     pub link_spans: Vec<LinkSpan>,
+    /// The pane, which takes text from the input method (IME, compose).
+    pub view: Entity<TerminalView>,
+    pub focus: FocusHandle,
+    /// Text the input method is composing, drawn over the cursor until
+    /// it's committed (empty: none).
+    pub preedit: SharedString,
+    pub preedit_fg: Rgb,
 }
 
 struct GlyphDraw {
@@ -108,6 +129,8 @@ pub struct Layout {
     glyphs: Vec<GlyphDraw>,
     decos: Vec<Deco>,
     cursor: Option<CursorLayout>,
+    /// IME composition: its background and the shaped, underlined text.
+    preedit: Option<(Bounds<Pixels>, Hsla, ShapedLine)>,
     cursor_color: Hsla,
     line_height: Pixels,
     started: Instant,
@@ -226,7 +249,10 @@ impl Element for TerminalElement {
             // Scrolled up: get what the daemon has above (or in between).
             self.session.fill_history();
         }
-        self.geom.set(Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows });
+        let caret = frame.caret.unwrap_or(self.geom.get().caret);
+        let caret = (caret.0.min(frame.cols.saturating_sub(1)), caret.1.min(frame.rows.saturating_sub(1)));
+        let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret };
+        self.geom.set(geom);
 
         let default_bg = frame.background;
         let mut cache = self.glyphs.borrow_mut();
@@ -438,21 +464,35 @@ impl Element for TerminalElement {
             (b, cur.shape, glyph, cursor_glyphs)
         });
 
+        let preedit = (!self.preedit.is_empty()).then(|| {
+            let color = hsla(self.preedit_fg);
+            let underline = Some(UnderlineStyle { thickness: px(1.0), color: Some(color), wavy: false });
+            let run =
+                TextRun { len: self.preedit.len(), font: self.font.clone(), color, background_color: None, underline, strikethrough: None };
+            let line = ts.shape_line(self.preedit.clone(), self.font_size, &[run], None);
+            let cells = self.preedit.width().max(1);
+            let at = geom.preedit_origin(cells);
+            // A composition longer than the line is cut off at the grid's edge.
+            let width = line.width.max(cell_w * cells as f32).min(origin.x + cell_w * frame.cols as f32 - at.x);
+            (Bounds::new(at, size(width, line_height)), hsla(frame.background), line)
+        });
+
         self.stats.borrow_mut().shaped_segments += if self.glyph_mode { glyph_draws.len() } else { lines.len() } as u64;
-        Layout { rects, lines, glyphs: glyph_draws, decos, cursor, cursor_color: hsla(frame.cursor_color), line_height, started }
+        Layout { rects, lines, glyphs: glyph_draws, decos, cursor, preedit, cursor_color: hsla(frame.cursor_color), line_height, started }
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut (),
         layout: &mut Layout,
         window: &mut Window,
         cx: &mut App,
     ) {
         let paint_start = Instant::now();
+        window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
         for (b, color) in layout.rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
@@ -476,7 +516,8 @@ impl Element for TerminalElement {
                 Deco::Strike(o, w, st) => window.paint_strikethrough(o, w, &st),
             }
         }
-        let cursor = layout.cursor.take().filter(|_| self.cursor_visible || !self.focused);
+        // While composing, the composition stands where the cursor is.
+        let cursor = layout.cursor.take().filter(|_| (self.cursor_visible || !self.focused) && layout.preedit.is_none());
         if let Some((b, shape, glyph, cursor_glyphs)) = cursor {
             let c = layout.cursor_color;
             let t = px(2.0);
@@ -503,6 +544,12 @@ impl Element for TerminalElement {
                     window.paint_quad(fill(Bounds::new(point(o.x + s.width - px(1.), o.y), size(px(1.), s.height)), c));
                 }
             }
+        }
+        if let Some((bg, bg_color, line)) = layout.preedit.take() {
+            window.with_content_mask(Some(ContentMask { bounds: bg }), |window| {
+                window.paint_quad(fill(bg, bg_color));
+                let _ = line.paint(bg.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
+            });
         }
         let mut st = self.stats.borrow_mut();
         let pre = paint_start.duration_since(layout.started).as_micros() as u64;
@@ -554,7 +601,7 @@ mod tests {
 
     #[test]
     fn edge_scroll_grows_past_the_edges() {
-        let g = Geom { origin: point(px(5.0), px(10.0)), cell: size(px(8.0), px(20.0)), cols: 80, rows: 10 };
+        let g = Geom { origin: point(px(5.0), px(10.0)), cell: size(px(8.0), px(20.0)), cols: 80, rows: 10, caret: (0, 0) };
         assert_eq!(g.edge_scroll(px(10.0)), 0);
         assert_eq!(g.edge_scroll(px(209.0)), 0);
         assert_eq!(g.edge_scroll(px(9.0)), 1);
@@ -563,5 +610,14 @@ mod tests {
         assert_eq!(g.edge_scroll(px(250.0)), -3);
         assert_eq!(g.edge_scroll(px(-10_000.0)), 10);
         assert_eq!(g.edge_scroll(px(10_000.0)), -10);
+    }
+
+    #[test]
+    fn preedit_stays_inside_the_grid() {
+        let g = Geom { origin: point(px(0.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (5, 2) };
+        assert_eq!(g.preedit_origin(3), point(px(50.0), px(40.0)));
+        let g = Geom { caret: (78, 2), ..g };
+        assert_eq!(g.preedit_origin(6), point(px(740.0), px(40.0)));
+        assert_eq!(g.preedit_origin(200), point(px(0.0), px(40.0)));
     }
 }
