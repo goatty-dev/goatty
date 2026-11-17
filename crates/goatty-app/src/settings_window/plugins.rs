@@ -127,6 +127,8 @@ impl PluginsPage {
 #[derive(Debug, Clone)]
 pub struct Follow {
     pub id: String,
+    /// The plugins it needs that are installed along with it.
+    pub deps: Vec<String>,
     /// "Installing" or "Updating".
     pub verb: &'static str,
     /// The host's latest report (`None` until the first one, or from a
@@ -146,7 +148,16 @@ pub struct Follow {
 
 impl Follow {
     fn new(id: String, verb: &'static str, awaiting_reply: bool, return_id: Option<u64>) -> Follow {
-        Follow { id, verb, progress: None, awaiting_reply, return_id, last_heard: std::time::Instant::now(), no_progress: false }
+        Follow {
+            id,
+            deps: Vec::new(),
+            verb,
+            progress: None,
+            awaiting_reply,
+            return_id,
+            last_heard: std::time::Instant::now(),
+            no_progress: false,
+        }
     }
 
     fn name(&self) -> String {
@@ -384,7 +395,8 @@ impl SettingsWindow {
             api::Step::Failed { error } => Err(anyhow::anyhow!(error)),
             _ => Err(fetch::Cancelled.into()),
         };
-        self.after_change(result, Some(f.id), true, f.return_id, cx);
+        let ids = [f.id].into_iter().chain(f.deps).collect();
+        self.after_change(result, ids, true, f.return_id, cx);
         false
     }
 
@@ -466,6 +478,9 @@ impl SettingsWindow {
         let id = plan.id.clone();
         let verb = if plan.replaces.is_some() { "Updating" } else { "Installing" };
         let mut follow = Follow::new(id.clone(), verb, true, return_id);
+        let deps: Vec<String> = plan.dependencies.iter().map(|d| d.id.clone()).collect();
+        follow.deps = deps.clone();
+        let ids: Vec<String> = [id.clone()].into_iter().chain(deps).collect();
         follow.progress = Some(api::InstallProgress {
             id: id.clone(),
             name: plan.name.clone(),
@@ -482,7 +497,7 @@ impl SettingsWindow {
             Box::new(move |view, result, cx| {
                 let Some(f) = view.plugins.follow.as_mut().filter(|f| f.id == id) else {
                     // Not followed any more (another host): just report it.
-                    view.after_change(result, Some(id), true, return_id, cx);
+                    view.after_change(result, ids, true, return_id, cx);
                     return;
                 };
                 if let (Err(e), Some(link)) = (&result, &link)
@@ -500,7 +515,7 @@ impl SettingsWindow {
                     Err(_) if cancelled => Err(fetch::Cancelled.into()),
                     r => r,
                 };
-                view.after_change(result, Some(id), true, return_id, cx);
+                view.after_change(result, ids, true, return_id, cx);
             }),
             cx,
         );
@@ -508,24 +523,78 @@ impl SettingsWindow {
     }
 
     pub fn uninstall_plugin(&mut self, id: String, cx: &mut Context<'_, Self>) {
+        self.uninstall_plugins(vec![id], cx);
+    }
+
+    /// Uninstall `ids` one after the other (each before the ones it
+    /// needs), stopping at the first that fails. When the last one leaves
+    /// plugins that were only installed for it, offers to remove those too.
+    fn uninstall_plugins(&mut self, mut ids: Vec<String>, cx: &mut Context<'_, Self>) {
         self.plugins.confirm_uninstall = None;
+        if ids.is_empty() {
+            return;
+        }
+        let id = ids.remove(0);
         let req = api::Request::Uninstall { id: id.clone() };
-        self.plugin_call(req, changed, Box::new(move |view, result, cx| view.after_change(result, Some(id), false, None, cx)), cx);
+        self.plugin_call(
+            req,
+            changed,
+            Box::new(move |view, result, cx| {
+                let next = match &result {
+                    Ok(_) if !ids.is_empty() => Some(ids),
+                    _ => None,
+                };
+                let unneeded = result.as_ref().map(|c| c.unneeded.clone()).unwrap_or_default();
+                view.after_change(result, vec![id.clone()], false, None, cx);
+                if let Some(rest) = next {
+                    view.uninstall_plugins(rest, cx);
+                } else if !unneeded.is_empty() {
+                    view.offer_unneeded(&id, unneeded, cx);
+                }
+            }),
+            cx,
+        );
+    }
+
+    /// A toast offering to uninstall the plugins `id` needed that nothing
+    /// needs now.
+    fn offer_unneeded(&self, id: &str, unneeded: Vec<String>, cx: &mut Context<'_, Self>) {
+        let name = |i: &str| {
+            self.plugins
+                .catalog
+                .as_ref()
+                .and_then(|c| c.installed.iter().find(|x| x.id == i))
+                .map_or_else(|| i.to_owned(), |x| x.manifest.name.clone())
+        };
+        let names: Vec<String> = unneeded.iter().map(|i| name(i)).collect();
+        let this = cx.entity().downgrade();
+        let one = unneeded.len() == 1;
+        let t = Toast::info(format!("{} {} no longer needed", names.join(", "), if one { "is" } else { "are" }))
+            .body(format!("goatty installed {} for {} (or another removed plugin).", if one { "it" } else { "them" }, name(id)))
+            .key("plugins.unneeded")
+            .duration(std::time::Duration::from_secs(20))
+            .action("Uninstall", move |_, cx| {
+                let _ = this.update(cx, |v, cx| v.uninstall_plugins(unneeded.clone(), cx));
+            });
+        toast::show(cx, t);
     }
 
     /// An install or uninstall finished: report it, keep an unapplied
-    /// draft in step with the host (which changed `plugins.<id>`), reload.
+    /// draft in step with the host (which changed `plugins.<id>` for each
+    /// of `ids`), reload.
     fn after_change(
         &mut self,
         result: anyhow::Result<api::Changed>,
-        id: Option<String>,
+        ids: Vec<String>,
         installed: bool,
         return_id: Option<u64>,
         cx: &mut Context<'_, Self>,
     ) {
+        let first = ids.first().cloned();
         match result {
             Ok(c) => {
-                if let (Some(draft), Some(id)) = (self.draft.as_mut(), id) {
+                for id in ids {
+                    let Some(draft) = self.draft.as_mut() else { break };
                     if installed {
                         if goatty_shell::builtins::get(&id).is_some() {
                             draft.edit_plugin(&id, |p| p.enabled = true);
@@ -541,7 +610,7 @@ impl SettingsWindow {
                 self.outcome = Some(Outcome { ok: true, lines: c.lines, diff: Vec::new(), reload: c.reload });
             }
             Err(e) if fetch::Cancelled::is(&e) => {
-                let what = id.as_deref().unwrap_or("the plugin");
+                let what = first.as_deref().unwrap_or("the plugin");
                 toast::show(cx, Toast::info(format!("Cancelled installing {what}")).body("Nothing on the host changed."));
             }
             Err(e) => self.outcome = Some(Outcome { ok: false, lines: vec![format!("{e:#}")], diff: Vec::new(), reload: false }),
@@ -1297,9 +1366,46 @@ impl SettingsWindow {
 
     // ---- The install review -------------------------------------------------
 
-    /// Everything the plugin will do, before it does it.
+    /// Everything the plugin (and each plugin it needs that comes along)
+    /// will do, before it does it.
     fn plan_view(&self, ui: Ui, plan: &Plan, cx: &Context<'_, Self>) -> AnyElement {
-        let mono = kit::mono(cx);
+        let mut page = div().flex().flex_col().gap(px(28.)).child(Self::plan_hero(ui, plan));
+        if !plan.dependencies.is_empty() {
+            let names: Vec<String> = plan.dependencies.iter().map(|d| d.name.clone()).collect();
+            page = page.child(banner(
+                ui,
+                Tone::Accent,
+                format!("Also installs {}", names.join(", ")),
+                vec![format!("{} needs {}: installed first, with one approval. What each does is below.", plan.name, names.join(", "))],
+            ));
+        }
+        page = page.children(self.plan_sections(ui, plan, cx));
+        for d in &plan.dependencies {
+            page = page.child(Self::plan_hero(ui, d)).children(self.plan_sections(ui, d, cx));
+        }
+        let verb = if plan.replaces.is_some() { "Update" } else { "Install" };
+        page.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(8.))
+                .when(self.plugins.follow.is_some(), |d| d.child(kit::hint(ui, "Another plugin is being installed")))
+                .child(button("plan-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.back(cx))))
+                .child(button_with(
+                    "plan-install",
+                    Some(Icon::Download),
+                    verb,
+                    ButtonKind::Primary,
+                    ui,
+                    self.act(cx, |v, cx| v.install_reviewed(cx)),
+                )),
+        )
+        .into_any_element()
+    }
+
+    /// A planned plugin's name, version, origin and description.
+    fn plan_hero(ui: Ui, plan: &Plan) -> AnyElement {
         let source = if plan.builtin {
             "Comes with goatty: this installs the tool it needs into goatty's own directory".to_string()
         } else if plan.verified {
@@ -1341,25 +1447,35 @@ impl SettingsWindow {
                     div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(plan.description.trim().to_string())),
                 )
             });
-        let mut page = div().flex().flex_col().gap(px(28.)).child(hero);
+        hero.into_any_element()
+    }
+
+    /// A planned plugin's warnings, permissions, downloads, shell additions and code.
+    fn plan_sections(&self, ui: Ui, plan: &Plan, cx: &Context<'_, Self>) -> Vec<AnyElement> {
+        let mono = kit::mono(cx);
+        let mut page: Vec<AnyElement> = Vec::new();
         if !plan.warnings.is_empty() {
-            page = page.child(banner(ui, Tone::Warning, "Read this first", plan.warnings.clone()));
+            page.push(banner(ui, Tone::Warning, "Read this first", plan.warnings.clone()).into_any_element());
         }
-        page = page.child(section(ui, "What it may do").children(plan.permissions.iter().map(|g| {
-            let mut desc = String::new();
-            if !g.details.is_empty() {
-                desc.push_str(&g.details.join(", "));
-                desc.push_str(". ");
-            }
-            if !g.reason.is_empty() {
-                desc.push_str(&g.reason);
-                desc.push(' ');
-            }
-            desc.push_str(&g.meaning);
-            row(ui, g.title.clone()).icon(perm_icon(g.permission)).desc(desc)
-        })));
+        page.push(
+            section(ui, "What it may do")
+                .children(plan.permissions.iter().map(|g| {
+                    let mut desc = String::new();
+                    if !g.details.is_empty() {
+                        desc.push_str(&g.details.join(", "));
+                        desc.push_str(". ");
+                    }
+                    if !g.reason.is_empty() {
+                        desc.push_str(&g.reason);
+                        desc.push(' ');
+                    }
+                    desc.push_str(&g.meaning);
+                    row(ui, g.title.clone()).icon(perm_icon(g.permission)).desc(desc)
+                }))
+                .into_any_element(),
+        );
         if !plan.downloads.is_empty() {
-            page = page.child(
+            page.push(
                 section(ui, "Downloads")
                     .children(plan.downloads.iter().map(|d| {
                         let (desc, control) = match &d.system {
@@ -1369,7 +1485,8 @@ impl SettingsWindow {
                         };
                         row(ui, format!("{} {}", d.package, d.version)).icon(Icon::Download).desc(desc).control(control)
                     }))
-                    .footer("Into goatty's own directory, no sudo. Each download is checked against the checksum in the signed manifest before it's unpacked."),
+                    .footer("Into goatty's own directory, no sudo. Each download is checked against the checksum in the signed manifest before it's unpacked.")
+                    .into_any_element(),
             );
         }
         // Short items as chips; long ones (alias definitions) as wrapped lines.
@@ -1405,7 +1522,9 @@ impl SettingsWindow {
             .filter(|(_, v)| !v.is_empty())
             .collect();
         if !adds.is_empty() {
-            page = page.child(section(ui, "Adds to your shell").children(adds.into_iter().map(|(t, v)| row(ui, t).below(chips(v)))));
+            page.push(
+                section(ui, "Adds to your shell").children(adds.into_iter().map(|(t, v)| row(ui, t).below(chips(v)))).into_any_element(),
+            );
         }
         if let Some((file, code)) = &plan.shell_code {
             let open = self.plugins.show_code;
@@ -1414,7 +1533,7 @@ impl SettingsWindow {
                     .icon(Icon::Code)
                     .desc(format!("{file} runs when every goatty shell starts · {} lines", code.lines().count()))
                     .on_click(
-                        "plan-code",
+                        SharedString::from(format!("plan-code-{}", plan.id)),
                         cx.listener(|v, _, _, cx| {
                             v.plugins.show_code = !v.plugins.show_code;
                             cx.notify();
@@ -1424,7 +1543,7 @@ impl SettingsWindow {
             if open {
                 s = s.child(
                     div()
-                        .id("plan-code-text")
+                        .id(SharedString::from(format!("plan-code-text-{}", plan.id)))
                         .max_h(px(320.))
                         .overflow_y_scroll()
                         .mx(px(16.))
@@ -1441,27 +1560,9 @@ impl SettingsWindow {
                         })),
                 );
             }
-            page = page.child(s);
+            page.push(s.into_any_element());
         }
-        let verb = if plan.replaces.is_some() { "Update" } else { "Install" };
-        page.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap(px(8.))
-                .when(self.plugins.follow.is_some(), |d| d.child(kit::hint(ui, "Another plugin is being installed")))
-                .child(button("plan-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.back(cx))))
-                .child(button_with(
-                    "plan-install",
-                    Some(Icon::Download),
-                    verb,
-                    ButtonKind::Primary,
-                    ui,
-                    self.act(cx, |v, cx| v.install_reviewed(cx)),
-                )),
-        )
-        .into_any_element()
+        page
     }
 }
 
@@ -1518,6 +1619,7 @@ mod tests {
             shell_code: None,
             requires: Vec::new(),
             warnings: Vec::new(),
+            dependencies: Vec::new(),
             digest: "sha256:test".into(),
         })
     }

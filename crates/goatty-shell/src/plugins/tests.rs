@@ -422,3 +422,93 @@ fn a_queued_install_is_cancelled_while_another_holds_the_lock() {
     drop(held);
     assert!(Lock::load(&w.dirs).unwrap().plugins.is_empty());
 }
+
+/// Publish `mid` (needs `demo`), `top` (needs `mid`) and `lost` (needs a
+/// plugin no registry has) next to the world's plugins.
+pub(crate) fn publish_dependents(w: &World) {
+    let reg = w.tmp.path().join("registry");
+    let plugin = |id: &str, requires: &str| {
+        format!(
+            "schema = 1\nid = \"{id}\"\nname = \"{}\"\nversion = \"1.0.0\"\nsummary = \"Needs {requires}\"\npublisher = \"tests\"\n\n[requires]\nplugins = [\"{requires}\"]\n",
+            id.to_uppercase()
+        )
+    };
+    for (id, requires) in [("mid", "demo"), ("top", "mid"), ("lost", "nowhere")] {
+        let dir = reg.join("plugins").join(id).join("1.0.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.toml"), plugin(id, requires)).unwrap();
+    }
+    super::registry::tests::publish(&reg, &ed25519_dalek::SigningKey::from_bytes(&[42; 32]));
+    w.plugins().snapshots(true, false);
+}
+
+#[test]
+fn required_plugins_are_planned_installed_and_offered_for_removal() {
+    let w = world();
+    publish_dependents(&w);
+    let p = w.plugins();
+    let settings = HostSettings::default();
+
+    // Dependencies first, each with its own plan; one digest covers them all.
+    let c = p.find("top", None).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    let ids: Vec<&str> = plan.all().map(|x| x.id.as_str()).collect();
+    assert_eq!(ids, ["demo", "mid", "top"]);
+    assert!(plan.dependencies.iter().all(|d| d.dependencies.is_empty() && !d.digest.is_empty()));
+    assert_eq!(plan.download_size(), plan.dependencies[0].downloads[0].size);
+    assert!(plan.runs_code(), "demo installs a program");
+    let alone = p.plan_one(&c, &settings, &Lock::load(&w.dirs).unwrap()).unwrap();
+    assert_ne!(plan.digest, alone.digest, "the dependencies are part of the approval");
+    assert!(p.install(&c, &alone.digest, &settings).unwrap_err().to_string().contains("changed since you reviewed it"));
+
+    let err = p.plan(&p.find("lost", None).unwrap(), &settings).unwrap_err();
+    assert!(format!("{err:#}").contains("LOST needs the nowhere plugin"), "{err:#}");
+
+    let done = p.install(&c, &plan.digest, &settings).unwrap();
+    assert_eq!(done.dependencies.len(), 2);
+    assert!(w.dirs.bin_dir().join("demo").is_file());
+    let lock = Lock::load(&w.dirs).unwrap();
+    let dep = |id: &str| lock.plugins[id].dependency;
+    assert!(dep("demo") && dep("mid") && !dep("top"), "{lock:?}");
+
+    // Planned again: everything it needs is there.
+    assert!(p.plan(&c, &settings).unwrap().dependencies.is_empty());
+
+    // A plugin another one needs stays; the last one that needed them
+    // goes, and they're offered for removal (each before what it needs).
+    assert!(p.uninstall("mid").unwrap_err().to_string().contains("the top plugin needs mid"));
+    let (_, unneeded) = p.uninstall("top").unwrap();
+    assert_eq!(unneeded, ["mid", "demo"]);
+    assert_eq!(p.uninstall("mid").unwrap().1, ["demo"], "still unneeded");
+    assert!(p.uninstall("demo").unwrap().1.is_empty());
+    assert!(Lock::load(&w.dirs).unwrap().plugins.is_empty());
+    assert!(!w.dirs.bin_dir().join("demo").exists());
+
+    // Installed on its own, demo is the user's: never offered for removal.
+    let demo = p.find("demo", None).unwrap();
+    p.install(&demo, &p.plan(&demo, &settings).unwrap().digest, &settings).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    assert_eq!(plan.dependencies.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["mid"]);
+    p.install(&c, &plan.digest, &settings).unwrap();
+    assert_eq!(p.uninstall("top").unwrap().1, ["mid"]);
+}
+
+#[test]
+fn a_cancelled_install_leaves_its_dependencies_out_too() {
+    let w = world();
+    publish_dependents(&w);
+    let p = w.plugins();
+    let settings = HostSettings::default();
+    let c = p.find("mid", None).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    let jobs = jobs::Jobs::default();
+    // CancelOnFetch cancels the job called "demo" during its download.
+    let cancelling = CancelOnFetch { inner: w.fetch.clone(), jobs: jobs.clone() };
+    let pc = Plugins { dirs: &w.dirs, fetch: &cancelling, builtin: &w.sources };
+    let r = jobs.run("demo", "Mid", "1.0.0", |job| pc.install_with(&c, &plan.digest, &settings, job).map(|_| Default::default()));
+    assert!(goatty_plugin::fetch::Cancelled::is(&r.unwrap_err()));
+    assert!(Lock::load(&w.dirs).unwrap().plugins.is_empty());
+    assert!(!w.dirs.bin_dir().join("demo").exists());
+    let leftovers: Vec<_> = std::fs::read_dir(w.dirs.installed_dir()).unwrap().flatten().filter(|e| e.file_name() != ".lock").collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}

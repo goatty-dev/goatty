@@ -339,6 +339,12 @@ pub struct Plan {
     /// Commands the plugin needs that goatty won't install.
     pub requires: Vec<String>,
     pub warnings: Vec<String>,
+    /// Plugins this one needs (`requires.plugins`, and theirs) that aren't
+    /// on the host yet, each with its own plan, in the order they're
+    /// installed (before this one). The one approval covers them all: their
+    /// digests are part of [`Plan::digest`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<Plan>,
     /// Over everything security-relevant; [`Request::Install`] sends it back.
     pub digest: String,
 }
@@ -369,15 +375,22 @@ impl Download {
 }
 
 impl Plan {
-    /// Bytes to download.
+    /// Bytes to download, dependencies included.
     pub fn download_size(&self) -> u64 {
-        self.downloads.iter().filter(|d| d.fetches()).map(|d| d.size).sum()
+        self.downloads.iter().filter(|d| d.fetches()).map(|d| d.size).sum::<u64>()
+            + self.dependencies.iter().map(Plan::download_size).sum::<u64>()
+    }
+
+    /// This plan and its dependencies' (which come first), in install order.
+    pub fn all(&self) -> impl Iterator<Item = &Plan> {
+        self.dependencies.iter().chain(std::iter::once(self))
     }
 }
 
 impl Plan {
     /// The digest over what the user approves: identity, source, every
-    /// download and file checksum, permissions, shell code.
+    /// download and file checksum, permissions, shell code, and the
+    /// dependencies' digests (computed first).
     pub fn compute_digest(&self, files: &std::collections::BTreeMap<String, String>) -> String {
         #[derive(Serialize)]
         struct Approved<'a> {
@@ -389,6 +402,8 @@ impl Plan {
             downloads: Vec<(&'a str, &'a str, &'a str, bool)>,
             permissions: Vec<Permission>,
             shell_code: Option<&'a (String, String)>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            dependencies: Vec<&'a str>,
         }
         let a = Approved {
             id: &self.id,
@@ -399,14 +414,15 @@ impl Plan {
             downloads: self.downloads.iter().map(|d| (d.package.as_str(), d.url.as_str(), d.sha256.as_str(), d.system.is_some())).collect(),
             permissions: self.permissions.iter().map(|g| g.permission).collect(),
             shell_code: self.shell_code.as_ref(),
+            dependencies: self.dependencies.iter().map(|d| d.digest.as_str()).collect(),
         };
         let json = serde_json::to_vec(&a).expect("serializes");
         Sha256::digest(&json).iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Runs code as the user (programs or shell code).
+    /// Runs code as the user (programs or shell code), itself or through a dependency.
     pub fn runs_code(&self) -> bool {
-        self.permissions.iter().any(|g| g.permission.runs_code())
+        self.all().any(|p| p.permissions.iter().any(|g| g.permission.runs_code()))
     }
 }
 
@@ -418,6 +434,11 @@ pub struct Changed {
     pub generation: Option<u32>,
     /// The shell configuration changed: running shells can reload.
     pub reload: bool,
+    /// After an uninstall: plugins that were installed only because
+    /// another plugin needed them, and that nothing needs now. In an order
+    /// they can be uninstalled in (a plugin before the ones it needs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unneeded: Vec<String>,
 }
 
 #[cfg(test)]
@@ -430,7 +451,7 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(json, r#"{"op":"install","id":"eza","version":null,"approved":"ab"}"#);
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), r);
-        let c = Reply::Changed(Changed { lines: vec!["ok".into()], generation: Some(3), reload: true });
+        let c = Reply::Changed(Changed { lines: vec!["ok".into()], generation: Some(3), reload: true, unneeded: vec!["base".into()] });
         let back: Reply = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
     }
