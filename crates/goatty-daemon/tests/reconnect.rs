@@ -214,7 +214,7 @@ fn reattach_in_alt_screen_restores_primary_screen_on_exit() {
     assert!(!tb.mode().contains(goatty_term::TermMode::ALT_SCREEN));
     assert!(screen_text(&tb).contains("BEFORE-42"), "primary screen lost:\n{}", screen_text(&tb));
     assert!(tb.history_size() > 0, "primary scrollback should be restored");
-    assert!(tb.transcript().lines.iter().any(|l| l.text.contains("hist-1")), "oldest scrollback missing");
+    assert!(tb.transcript().lines.iter().any(|l| l.text.trim() == "hist-1"), "oldest scrollback missing");
 }
 
 #[test]

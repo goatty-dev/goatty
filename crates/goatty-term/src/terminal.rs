@@ -371,7 +371,9 @@ pub(crate) fn pack(s: TermSize) -> u32 {
 /// Run `f` with the primary screen in `t.grid`, even while the alternate
 /// screen is active (rio-vt keeps the inactive grid private). Switching back
 /// to the alternate screen clears it, so its grid and selection are saved and
-/// restored around `f`.
+/// restored around `f`. (`swap_alt` also resets the primary grid's
+/// `saved_cursor` to `cursor`, which `1049h` already did on entry; `inactive_grid`
+/// cannot be accessed without it.)
 pub(crate) fn with_primary<R>(t: &mut Term, f: impl FnOnce(&mut Term) -> R) -> R {
     if !TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
         return f(t);

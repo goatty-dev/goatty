@@ -83,6 +83,10 @@ pub(crate) struct LineMap {
     /// daemon's next top line. `true` if the history had a gap, which a
     /// reflow loses track of.
     resized: Option<bool>,
+    /// A resync in the alternate screen left the primary grid stale, so no
+    /// primary rows may be mapped until an `Attach` or non-alt `Resync`
+    /// redraws the primary screen.
+    stale: bool,
 }
 
 impl LineMap {
@@ -172,7 +176,11 @@ impl Terminal {
             (TopLineCause::Attach, _) => {
                 map.anchors = vec![to_oldest];
                 map.oldest = 0;
+                map.stale = false;
             }
+            // A stale primary grid stays unmapped across resizes until a
+            // snapshot actually redraws it.
+            (TopLineCause::Resize, _) if map.stale => {}
             // Rows reflowed the same on both sides: one run again.
             (TopLineCause::Resize, Some(false)) => map.anchors = vec![to_oldest],
             // Resync never replays the primary screen while the alternate
@@ -180,16 +188,24 @@ impl Terminal {
             // switching, the mirror's primary grid no longer matches;
             // otherwise the existing map still holds.
             (TopLineCause::Resync, resized) if alt => {
-                let matches = resized.is_none() && map.anchors.last().is_some_and(|&(c, h)| top >= c && h + (top - c) == line);
+                let matches =
+                    !map.stale && resized.is_none() && map.anchors.last().is_some_and(|&(c, h)| top >= c && h + (top - c) == line);
                 if !matches {
                     map.anchors.clear();
+                    map.stale = true;
                 }
             }
             // A reflow lost where the gap was (or a resync came first): only
             // the screen is known, and the rows above it can't take older
             // lines in the right place.
-            (_, Some(_)) => map.anchors = vec![(top, line)],
-            (_, None) => map.anchors.push((top, line)),
+            (_, Some(_)) => {
+                map.anchors = vec![(top, line)];
+                map.stale = false;
+            }
+            (_, None) => {
+                map.anchors.push((top, line));
+                map.stale = false;
+            }
         }
         map.anchors.retain(|a| a.0 <= top);
         map.anchors.sort_unstable();
@@ -617,7 +633,8 @@ mod tests {
 
         // Lag skips primary output before entering the alt screen: resync
         // doesn't update the mirror's primary grid, so the stale map clears
-        // rather than splicing rows into the wrong place.
+        // (and stays invalid across a resize) rather than splicing rows into
+        // the wrong place.
         let c = term(size, false);
         c.feed(&a.reattach_snapshot_with_history(50));
         c.set_top_line(a.top_line().unwrap(), TopLineCause::Attach);
@@ -625,6 +642,10 @@ mod tests {
         a.feed(b"\x1b[?1049hIN-ALT");
         c.feed(&a.resync_snapshot());
         c.set_top_line(a.top_line().unwrap(), TopLineCause::Resync);
+        for t in [&a, &c] {
+            t.resize(TermSize::new(20, 6));
+        }
+        c.set_top_line(a.top_line().unwrap(), TopLineCause::Resize);
         c.feed(b"\x1b[?1049l");
         c.scroll(1000);
         assert_eq!(c.wanted_history(10), None);
