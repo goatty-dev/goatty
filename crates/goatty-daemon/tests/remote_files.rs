@@ -151,26 +151,26 @@ fn cwd_stat_and_read_work_over_proxy() {
     sink.wait_for_cwd(&repo);
 
     // Relative and git diff candidate resolution against the live remote CWD.
-    let stat = conn.stat_path(Some(id), vec!["src/main.rs".into()]).unwrap().expect("relative file");
+    let stat = conn.stat_path(Some(id), None, vec!["src/main.rs".into()]).unwrap().expect("relative file");
     assert_eq!(stat.path, file_rs.to_string_lossy());
     assert!(!stat.is_dir);
     assert_eq!(stat.size, 13);
 
-    let git_stat = conn.stat_path(Some(id), vec!["a/src/main.rs".into(), "src/main.rs".into()]).unwrap().expect("git diff candidate");
+    let git_stat = conn.stat_path(Some(id), None, vec!["a/src/main.rs".into(), "src/main.rs".into()]).unwrap().expect("git diff candidate");
     assert_eq!(git_stat.path, file_rs.to_string_lossy());
 
     // `~/` resolution against daemon `$HOME`.
-    let tilde = conn.stat_path(Some(id), vec!["~/note.txt".into()]).unwrap().expect("tilde file");
+    let tilde = conn.stat_path(Some(id), None, vec!["~/note.txt".into()]).unwrap().expect("tilde file");
     assert_eq!(tilde.path, home_note.to_string_lossy());
 
     // Directories are reported with `is_dir = true`.
-    let dir_stat = conn.stat_path(Some(id), vec!["src".into()]).unwrap().expect("directory");
+    let dir_stat = conn.stat_path(Some(id), None, vec!["src".into()]).unwrap().expect("directory");
     assert_eq!(dir_stat.path, sub.to_string_lossy());
     assert!(dir_stat.is_dir);
 
     // Non-existent paths and FIFOs resolve to `None`.
-    assert_eq!(conn.stat_path(Some(id), vec!["does/not/exist.rs".into()]).unwrap(), None);
-    assert_eq!(conn.stat_path(Some(id), vec!["pipe.fifo".into()]).unwrap(), None);
+    assert_eq!(conn.stat_path(Some(id), None, vec!["does/not/exist.rs".into()]).unwrap(), None);
+    assert_eq!(conn.stat_path(Some(id), None, vec!["pipe.fifo".into()]).unwrap(), None);
 
     // 2. Reading files (small, compressed large, over-limit, dir, FIFO).
     let (p, data) = conn.read_file(&file_rs.to_string_lossy(), 1024).unwrap();
@@ -197,8 +197,14 @@ fn cwd_stat_and_read_work_over_proxy() {
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(sink.cwds.lock().last().and_then(|c| c.as_deref()), Some(sym_dir.to_string_lossy().as_ref()));
 
-    let sym_stat = conn.stat_path(Some(id), vec!["inside.txt".into()]).unwrap().expect("inside symlinked cwd");
+    let sym_stat = conn.stat_path(Some(id), None, vec!["inside.txt".into()]).unwrap().expect("inside symlinked cwd");
     assert_eq!(sym_stat.path, sym_dir.join("inside.txt").to_string_lossy());
+
+    // Explicit `cwd` pins lookup to the captured directory even after the shell moved elsewhere.
+    let pinned =
+        conn.stat_path(Some(id), Some(repo.to_string_lossy().into_owned()), vec!["src/main.rs".into()]).unwrap().expect("pinned cwd");
+    assert_eq!(pinned.path, file_rs.to_string_lossy());
+    assert_eq!(conn.stat_path(Some(id), Some(repo.to_string_lossy().into_owned()), vec!["inside.txt".into()]).unwrap(), None);
 }
 
 #[test]
@@ -274,31 +280,31 @@ fn remote_files_edge_cases() {
     sink.wait_for_cwd(&repo);
 
     // Exact match `a/both.txt` wins over stripped `both.txt`.
-    let pref = conn.stat_path(Some(id), vec!["a/both.txt".into(), "both.txt".into()]).unwrap().unwrap();
+    let pref = conn.stat_path(Some(id), None, vec!["a/both.txt".into(), "both.txt".into()]).unwrap().unwrap();
     assert_eq!(pref.path, repo.join("a/both.txt").to_string_lossy());
 
     // 16-candidate cap ignores the 17th candidate.
     let mut cands = vec!["does-not-exist".to_string(); 16];
     cands.push("both.txt".into());
-    assert_eq!(conn.stat_path(Some(id), cands).unwrap(), None);
+    assert_eq!(conn.stat_path(Some(id), None, cands).unwrap(), None);
 
     // Unix sockets are ignored by StatPath and rejected by ReadFile.
-    assert_eq!(conn.stat_path(Some(id), vec!["domain.sock".into(), sock_path.to_string_lossy().into_owned()]).unwrap(), None);
+    assert_eq!(conn.stat_path(Some(id), None, vec!["domain.sock".into(), sock_path.to_string_lossy().into_owned()]).unwrap(), None);
     assert!(conn.read_file(&sock_path.to_string_lossy(), 1024).is_err());
 
     // Symlinks to files and dirs work.
-    let lf = conn.stat_path(Some(id), vec!["link_file.txt".into()]).unwrap().unwrap();
+    let lf = conn.stat_path(Some(id), None, vec!["link_file.txt".into()]).unwrap().unwrap();
     assert!(!lf.is_dir);
     let (_, lf_bytes) = conn.read_file(&lf.path, 1024).unwrap();
     assert_eq!(lf_bytes, b"symlink-body");
-    let ld = conn.stat_path(Some(id), vec!["link_dir".into()]).unwrap().unwrap();
+    let ld = conn.stat_path(Some(id), None, vec!["link_dir".into()]).unwrap().unwrap();
     assert!(ld.is_dir);
 
     // `session: None` and unknown session ID allow absolute/`~/` and reject relative paths.
-    assert!(conn.stat_path(None, vec![repo.join("both.txt").to_string_lossy().into_owned()]).unwrap().is_some());
-    assert_eq!(conn.stat_path(None, vec!["both.txt".into()]).unwrap(), None);
-    assert!(conn.stat_path(Some(999_999), vec![repo.join("both.txt").to_string_lossy().into_owned()]).unwrap().is_some());
-    assert_eq!(conn.stat_path(Some(999_999), vec!["both.txt".into()]).unwrap(), None);
+    assert!(conn.stat_path(None, None, vec![repo.join("both.txt").to_string_lossy().into_owned()]).unwrap().is_some());
+    assert_eq!(conn.stat_path(None, None, vec!["both.txt".into()]).unwrap(), None);
+    assert!(conn.stat_path(Some(999_999), None, vec![repo.join("both.txt").to_string_lossy().into_owned()]).unwrap().is_some());
+    assert_eq!(conn.stat_path(Some(999_999), None, vec!["both.txt".into()]).unwrap(), None);
 
     // Sparse file > HARD_MAX_FILE_BYTES fails cleanly.
     let err = conn.read_file(&sparse.to_string_lossy(), u64::MAX).unwrap_err();
@@ -317,7 +323,7 @@ fn remote_files_edge_cases() {
     );
     sink.wait_for_output("sym-ready");
     sink.wait_for_cwd(&cwd_sym);
-    let sib = conn.stat_path(Some(id), vec!["../sibling.txt".into()]).unwrap().unwrap();
+    let sib = conn.stat_path(Some(id), None, vec!["../sibling.txt".into()]).unwrap().unwrap();
     assert_eq!(sib.path, std::fs::canonicalize(srv_proj.join("sibling.txt")).unwrap().to_string_lossy());
     let (_, sib_data) = conn.read_file(&sib.path, 1024).unwrap();
     assert_eq!(sib_data, b"real-sibling");

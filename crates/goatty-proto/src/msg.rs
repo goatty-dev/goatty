@@ -281,12 +281,13 @@ pub enum ClientMsg {
         request: String,
     },
     /// v13: resolve and stat the first existing path among `candidates` on
-    /// the daemon's host (relative paths and `a/`/`b/` prefixes resolve
-    /// against `session`'s working directory; `~/` against `$HOME`).
-    /// Reply: `PathStat`.
+    /// the daemon's host (`cwd` pins relative resolution to the caller's
+    /// working directory; when `None`, falls back to `session`'s current cwd;
+    /// `~/` resolves against `$HOME`). Reply: `PathStat`.
     StatPath {
         req: ReqId,
         session: Option<SessionId>,
+        cwd: Option<String>,
         candidates: Vec<String>,
     },
     /// v13: read up to `max_bytes` from regular file `path` on the daemon's
@@ -612,7 +613,7 @@ mod tests {
         assert_eq!(postcard::to_allocvec(&ClientMsg::Net { req: 1, request: String::new() }).unwrap()[0], 26);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Net { req: 1, reply: String::new() }).unwrap()[0], 20);
         // v13 additions come after v12's.
-        assert_eq!(postcard::to_allocvec(&ClientMsg::StatPath { req: 1, session: None, candidates: vec![] }).unwrap()[0], 27);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::StatPath { req: 1, session: None, cwd: None, candidates: vec![] }).unwrap()[0], 27);
         assert_eq!(postcard::to_allocvec(&ClientMsg::ReadFile { req: 1, path: String::new(), max_bytes: 1 }).unwrap()[0], 28);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Cwd { session: 1, cwd: None }).unwrap()[0], 21);
         assert_eq!(postcard::to_allocvec(&ServerMsg::PathStat { req: 1, info: None }).unwrap()[0], 22);

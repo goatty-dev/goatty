@@ -30,7 +30,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use goatty_client::RemotePathInfo;
-use goatty_config::{ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, Renderer, RightClick};
+use goatty_config::{
+    ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, RemoteFileOpen, Renderer, RightClick,
+};
 use goatty_term::input::{
     Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
 };
@@ -137,11 +139,28 @@ pub fn needs_confirmation(confirm: PasteConfirm, risks: &[PasteRisk]) -> bool {
 /// The link under the mouse and what it resolved to (`None`: looks like a
 /// link but isn't one here, e.g. a path that doesn't exist). Kept so moving
 /// over the same link doesn't check the file system again unless a remote
-/// `StatPath` lookup is still pending.
+/// `StatPath` lookup is still pending or its cache entry expired.
+type RemoteStatKey = (Option<String>, String);
+
+struct ResolveOutcome {
+    target: Option<Target>,
+    pending: bool,
+    stat_key: Option<RemoteStatKey>,
+}
+
 struct HoveredLink {
     link: Link,
     target: Option<Target>,
     pending: bool,
+    remote_stat_key: Option<RemoteStatKey>,
+}
+
+/// An explicit link click waiting on an in-flight `StatPath` reply.
+#[derive(Clone)]
+struct PendingOpen {
+    link: Link,
+    stat_key: RemoteStatKey,
+    window: AnyWindowHandle,
 }
 
 #[derive(Clone)]
@@ -214,6 +233,10 @@ pub struct TerminalView {
     /// `open_on: click`: the link a plain press landed on; opened on release
     /// unless the press turned into a selection.
     pressed_link: Option<Target>,
+    /// `open_on: click`: a press on a link whose `StatPath` lookup was still pending.
+    pressed_pending_link: Option<(Link, (Option<String>, String))>,
+    /// Explicit click waiting for an in-flight `StatPath` response.
+    pending_open: Option<PendingOpen>,
     hostname: Option<String>,
     /// Cached remote `StatPath` results keyed by `(remote_cwd, raw_target)`.
     remote_stats: HashMap<(Option<String>, String), CachedStat>,
@@ -346,6 +369,8 @@ impl TerminalView {
             modifiers: Modifiers::default(),
             hover: None,
             pressed_link: None,
+            pressed_pending_link: None,
+            pending_open: None,
             hostname: links::hostname(),
             remote_stats: HashMap::new(),
             remote_stat_inflight: HashSet::new(),
@@ -389,6 +414,8 @@ impl TerminalView {
         if self.link_click != s.links.open_on {
             self.link_click = s.links.open_on;
             self.hover = None;
+            self.pending_open = None;
+            self.pressed_pending_link = None;
         }
     }
 
@@ -462,9 +489,16 @@ impl TerminalView {
         if clear_stats || process_changed {
             self.remote_stats.clear();
             self.hover = None;
+            self.pending_open = None;
         }
         if cwd_changed {
             self.hover = None;
+            self.pending_open = None;
+        }
+        if let Some(pending) = &self.pending_open
+            && self.mouse_cell.and_then(|(c, r)| self.session.terminal.link_at(c, r)).as_ref() != Some(&pending.link)
+        {
+            self.pending_open = None;
         }
         if title != self.title || process_changed || cwd_changed {
             self.title = title;
@@ -772,7 +806,7 @@ impl TerminalView {
             .menu_cell
             .take()
             .and_then(|(c, r)| self.session.terminal.link_at(c, r))
-            .and_then(|l| self.resolve_link(&l, false, cx).0.or_else(|| self.fallback_remote_menu_target(&l)));
+            .and_then(|l| self.resolve_link(&l, true, cx).target.or_else(|| self.fallback_remote_menu_target(&l)));
         if let Some(target) = link {
             match &target {
                 Target::Url(_) | Target::Other(_) => {
@@ -816,13 +850,23 @@ impl TerminalView {
                         .into(),
                     );
                 }
-                Target::Remote { path, host, line, column, size, can_fetch, .. } => {
+                Target::Remote { path, host, line, column, size, on_session_host, can_fetch, .. } => {
                     let action = self.plan_remote(&target, cx);
+                    let pending_opener = (size.is_none()
+                        && *on_session_host
+                        && !path.starts_with('/')
+                        && self.session.connection().is_some_and(|c| c.supports_remote_files()))
+                    .then(|| self.unresolved_remote_prefers_opener(cx))
+                    .flatten();
                     let (open, me2) = (target.clone(), me.clone());
-                    let (label, icon) = match &action {
-                        RemoteAction::OpenInEditor { host, .. } => (format!("Open on {host}"), Icon::ExternalLink),
-                        RemoteAction::Fetch { .. } => ("Open read-only copy".to_string(), Icon::FileText),
-                        RemoteAction::Copy => ("Copy the remote path".to_string(), Icon::Copy),
+                    let (label, icon) = if let Some(opener_host) = &pending_opener {
+                        (format!("Open on {opener_host}"), Icon::ExternalLink)
+                    } else {
+                        match &action {
+                            RemoteAction::OpenInEditor { host, .. } => (format!("Open on {host}"), Icon::ExternalLink),
+                            RemoteAction::Fetch { .. } => ("Open read-only copy".to_string(), Icon::FileText),
+                            RemoteAction::Copy => ("Copy the remote path".to_string(), Icon::Copy),
+                        }
                     };
                     out.push(
                         Item::new(label, move |window, cx| {
@@ -831,13 +875,35 @@ impl TerminalView {
                         .icon(icon)
                         .into(),
                     );
-                    if matches!(action, RemoteAction::OpenInEditor { .. }) && *can_fetch {
+                    if (matches!(action, RemoteAction::OpenInEditor { .. }) || pending_opener.is_some()) && *can_fetch {
                         let (p, h, l, c, sz, me3) = (path.clone(), host.clone(), *line, *column, *size, me.clone());
                         let max_bytes = cx.global::<AppSettings>().client.links.remote_max_bytes();
                         out.push(
                             Item::new("Open local copy (read-only)", move |window, cx| {
                                 let _ = me3.update(cx, |v, cx| {
-                                    v.open_remote_fetch(p.clone(), h.clone(), l, c, sz, max_bytes, true, window, cx);
+                                    let resolved = if sz.is_none() { v.cached_remote_stat(&p) } else { None };
+                                    if let Some(info) = resolved {
+                                        if info.is_dir {
+                                            let copy_path = info.path.clone();
+                                            toast::show_in(
+                                                window,
+                                                cx,
+                                                Toast::info(format!("{} is a folder", info.path))
+                                                    .body(format!(
+                                                        "{h}:{} is a folder; set \"Open remote files with\" under Settings → Terminal to open folders.",
+                                                        info.path
+                                                    ))
+                                                    .action("Copy path", move |_, cx| {
+                                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                                                    })
+                                                    .key("terminal.link"),
+                                            );
+                                        } else {
+                                            v.open_remote_fetch(info.path, h.clone(), l, c, Some(info.size), max_bytes, true, window, cx);
+                                        }
+                                    } else {
+                                        v.open_remote_fetch(p.clone(), h.clone(), l, c, sz, max_bytes, true, window, cx);
+                                    }
                                 });
                             })
                             .icon(Icon::FileText)
@@ -845,11 +911,16 @@ impl TerminalView {
                         );
                     }
                     if !matches!(action, RemoteAction::Copy) {
-                        let copy_text = path.clone();
+                        let (raw_path, me_copy) = (path.clone(), me.clone());
                         out.push(
                             Item::new("Copy the remote path", move |window, cx| {
+                                let copy_text = me_copy
+                                    .update(cx, |v, _| v.resolved_remote_path(&raw_path))
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| raw_path.clone());
                                 cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
-                                toast::show_in(window, cx, Toast::success("Copied").body(copy_text.clone()).key("terminal.link"));
+                                toast::show_in(window, cx, Toast::success("Copied").body(copy_text).key("terminal.link"));
                             })
                             .icon(Icon::Copy)
                             .into(),
@@ -920,6 +991,16 @@ impl TerminalView {
 
     // ---- links --------------------------------------------------------------
 
+    fn hover_is_fresh(&self, h: &HoveredLink) -> bool {
+        if h.pending {
+            return false;
+        }
+        if let Some(key) = &h.remote_stat_key {
+            return key.0 == self.session.remote_cwd_str() && self.remote_stats.get(key).is_some_and(|c| c.is_fresh(Instant::now()));
+        }
+        true
+    }
+
     /// Re-detect the link under the mouse. Returns whether what's shown
     /// (underline, hint) changed.
     fn refresh_hover(&mut self, cx: &mut Context<'_, Self>) -> bool {
@@ -934,10 +1015,10 @@ impl TerminalView {
         let before = self.hover_shown();
         self.hover = match (link, self.hover.take()) {
             (None, _) => None,
-            (Some(link), Some(h)) if h.link == link && !h.pending => Some(h),
+            (Some(link), Some(h)) if h.link == link && self.hover_is_fresh(&h) => Some(h),
             (Some(link), _) => {
-                let (target, pending) = self.resolve_link(&link, true, cx);
-                Some(HoveredLink { link, target, pending })
+                let resolved = self.resolve_link(&link, true, cx);
+                Some(HoveredLink { link, target: resolved.target, pending: resolved.pending, remote_stat_key: resolved.stat_key })
             }
         };
         self.hover_shown() != before
@@ -953,9 +1034,34 @@ impl TerminalView {
         self.hover.as_ref()?.target.as_ref()
     }
 
-    /// Resolve `link`, returning `(target, pending)` where `pending` is true if
-    /// an asynchronous remote `StatPath` lookup is still awaited for it.
-    fn resolve_link(&mut self, link: &Link, trigger_stat: bool, cx: &mut Context<'_, Self>) -> (Option<Target>, bool) {
+    fn cached_remote_stat(&self, target: &str) -> Option<RemotePathInfo> {
+        let key = (self.session.remote_cwd_str(), target.to_string());
+        match self.remote_stats.get(&key).filter(|c| c.is_fresh(Instant::now()))? {
+            CachedStat::Found { info, .. } => Some(info.clone()),
+            CachedStat::Missing(_) | CachedStat::Error(_) => None,
+        }
+    }
+
+    fn resolved_remote_path(&self, target: &str) -> Option<String> {
+        self.cached_remote_stat(target).map(|info| info.path)
+    }
+
+    fn unresolved_remote_prefers_opener(&self, cx: &App) -> Option<String> {
+        let links = &cx.global::<AppSettings>().client.links;
+        if matches!(links.remote_files, RemoteFileOpen::Fetch | RemoteFileOpen::Copy) {
+            return None;
+        }
+        let host = self.session.ssh_host.as_deref()?;
+        let host_info = self.session.connection().map(|c| c.host());
+        let remote_user = host_info.as_ref().map(|h| h.user.as_str()).unwrap_or("");
+        let remote_hostname = host_info.as_ref().map(|h| h.hostname.as_str()).unwrap_or("");
+        links.remote_file_command(host, remote_user, remote_hostname, "/_", None, None)?;
+        Some(host.to_string())
+    }
+
+    /// Resolve `link`, reporting whether an asynchronous remote `StatPath`
+    /// lookup is still awaited and which stat cache key was consulted.
+    fn resolve_link(&mut self, link: &Link, trigger_stat: bool, cx: &mut Context<'_, Self>) -> ResolveOutcome {
         let is_remote = self.session.is_remote();
         let conn = self.session.connection().cloned();
         let supports_remote = is_remote && conn.as_ref().is_some_and(|c| c.supports_remote_files());
@@ -964,12 +1070,14 @@ impl TerminalView {
         let home = if is_remote { None } else { std::env::var_os("HOME").map(PathBuf::from) };
         let exists = |p: &Path| p.exists();
 
-        let pending_stat_for: RefCell<Option<(Option<String>, String)>> = RefCell::new(None);
+        let pending_stat_for: RefCell<Option<RemoteStatKey>> = RefCell::new(None);
+        let consulted_stat_key: RefCell<Option<RemoteStatKey>> = RefCell::new(None);
         let saw_pending = StdCell::new(false);
         let cwd_key = supports_remote.then(|| self.session.remote_cwd_str()).flatten();
         let now = Instant::now();
         let remote_stat_fn = |text: &str| -> RemoteLookup {
             let key = (cwd_key.clone(), text.to_string());
+            *consulted_stat_key.borrow_mut() = Some(key.clone());
             if let Some(cached) = self.remote_stats.get(&key).filter(|c| c.is_fresh(now)) {
                 match cached {
                     CachedStat::Found { info, .. } => RemoteLookup::Found(info.clone()),
@@ -983,7 +1091,7 @@ impl TerminalView {
                 RemoteLookup::Pending
             }
         };
-        let result = {
+        let target = {
             let place = Place {
                 cwd: cwd.as_deref(),
                 home: home.as_deref(),
@@ -1000,16 +1108,17 @@ impl TerminalView {
         {
             self.request_remote_stat(conn, key, cx);
         }
-        (result, saw_pending.get())
+        ResolveOutcome { target, pending: saw_pending.get(), stat_key: consulted_stat_key.into_inner() }
     }
 
     /// Fallback for right-click context menus when the user didn't hover first
-    /// to warm `remote_stats` and the token is explicitly rooted (`/...` or `~/`).
+    /// to warm `remote_stats` (or `StatPath` is still in flight).
     fn fallback_remote_menu_target(&self, link: &Link) -> Option<Target> {
-        if !self.session.is_remote() || link.kind != LinkKind::Path {
+        if !self.session.is_remote() || link.kind != LinkKind::Path || links::is_windows_drive_path(&link.target) {
             return None;
         }
-        if !link.target.starts_with('/') && !link.target.starts_with("~/") {
+        let supports_remote = self.session.connection().is_some_and(|c| c.supports_remote_files());
+        if !supports_remote && !link.target.starts_with('/') && !link.target.starts_with("~/") {
             return None;
         }
         let key = (self.session.remote_cwd_str(), link.target.clone());
@@ -1024,19 +1133,20 @@ impl TerminalView {
             is_dir: false,
             size: None,
             on_session_host: true,
-            can_fetch: self.session.connection().is_some_and(|c| c.supports_remote_files()),
+            can_fetch: supports_remote,
         })
     }
 
-    fn request_remote_stat(&mut self, conn: Arc<goatty_client::Connection>, key: (Option<String>, String), cx: &mut Context<'_, Self>) {
+    fn request_remote_stat(&mut self, conn: Arc<goatty_client::Connection>, key: RemoteStatKey, cx: &mut Context<'_, Self>) {
         if *self.session.status.lock() != LinkStatus::Connected || !conn.is_connected() || !self.remote_stat_inflight.insert(key.clone()) {
             return;
         }
+        let stat_cwd = key.0.clone();
         let candidates = links::remote_candidates(&key.1);
         let session_id = self.session.daemon_id();
         let (tx, rx) = flume::bounded(1);
         if let Err(e) = std::thread::Builder::new().name("remote-stat".into()).spawn(move || {
-            let _ = tx.send(conn.stat_path(session_id, candidates));
+            let _ = tx.send(conn.stat_path(session_id, stat_cwd, candidates));
         }) {
             self.remote_stat_inflight.remove(&key);
             log::debug!("couldn't spawn remote-stat thread for {}: {e}", key.1);
@@ -1044,38 +1154,65 @@ impl TerminalView {
         }
         cx.spawn(async move |this, cx| {
             let res = rx.recv_async().await;
+            let mut pending_to_open: Option<(AnyWindowHandle, Target)> = None;
             let _ = this.update(cx, |view, cx| {
                 view.remote_stat_inflight.remove(&key);
                 let now = Instant::now();
-                if view.remote_stats.len() >= 256 {
-                    view.remote_stats.retain(|_, v| v.is_fresh(now));
+                // If `Cwd` arrived while a `cwd == None` query was in flight,
+                // the daemon may have resolved against the new directory; do not
+                // cache that reply under the `None` key.
+                let cwd_mismatch = key.0.is_none() && view.session.remote_cwd_str().is_some();
+                if !cwd_mismatch {
                     if view.remote_stats.len() >= 256 {
-                        view.remote_stats.clear();
+                        view.remote_stats.retain(|_, v| v.is_fresh(now));
+                        if view.remote_stats.len() >= 256 {
+                            view.remote_stats.clear();
+                        }
+                    }
+                    match res {
+                        Ok(Ok(info)) => {
+                            let entry = match info {
+                                Some(info) => CachedStat::Found { info, at: now },
+                                None => CachedStat::Missing(now),
+                            };
+                            view.remote_stats.insert(key.clone(), entry);
+                        }
+                        Ok(Err(e)) => {
+                            log::debug!("remote stat_path failed for {}: {e:#}", key.1);
+                            view.remote_stats.insert(key.clone(), CachedStat::Error(now));
+                        }
+                        Err(_) => {
+                            view.remote_stats.insert(key.clone(), CachedStat::Error(now));
+                        }
                     }
                 }
-                match res {
-                    Ok(Ok(info)) => {
-                        let entry = match info {
-                            Some(info) => CachedStat::Found { info, at: now },
-                            None => CachedStat::Missing(now),
-                        };
-                        view.remote_stats.insert(key.clone(), entry);
-                    }
-                    Ok(Err(e)) => {
-                        log::debug!("remote stat_path failed for {}: {e:#}", key.1);
-                        view.remote_stats.insert(key.clone(), CachedStat::Error(now));
-                    }
-                    Err(_) => {
-                        view.remote_stats.insert(key.clone(), CachedStat::Error(now));
+                if let Some(pending) = view.pending_open.as_ref().filter(|p| p.stat_key == key).cloned() {
+                    view.pending_open = None;
+                    let still_valid = view.viewer.is_none()
+                        && !view.selecting
+                        && view.link_click != LinkClick::Off
+                        && !view.mouse_mode_active(view.modifiers.shift)
+                        && view.mouse_cell.and_then(|(c, r)| view.session.terminal.link_at(c, r)).as_ref() == Some(&pending.link);
+                    if still_valid && let Some(target) = view.resolve_link(&pending.link, false, cx).target {
+                        pending_to_open = Some((pending.window, target));
                     }
                 }
-                if view.hover.as_ref().is_some_and(|h| h.link.target == key.1) {
+                if view.hover.as_ref().is_some_and(|h| h.remote_stat_key.as_ref() == Some(&key) || h.link.target == key.1) {
                     view.hover = None;
                 }
                 if view.refresh_hover(cx) {
                     cx.notify();
                 }
             });
+            if let Some((window, target)) = pending_to_open {
+                cx.update(|cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        if let Some(entity) = this.upgrade() {
+                            entity.update(cx, |view, cx| view.open_link(target, window, cx));
+                        }
+                    });
+                });
+            }
         })
         .detach();
     }
@@ -1142,6 +1279,40 @@ impl TerminalView {
                 }
             }
             Target::Remote { path, host, line, column, is_dir, size, on_session_host, can_fetch } => {
+                if size.is_none()
+                    && on_session_host
+                    && !path.starts_with('/')
+                    && self.session.connection().is_some_and(|c| c.supports_remote_files())
+                {
+                    if let Some(info) = self.cached_remote_stat(&path) {
+                        self.open_link(
+                            Target::Remote {
+                                path: info.path,
+                                host,
+                                line,
+                                column,
+                                is_dir: info.is_dir,
+                                size: Some(info.size),
+                                on_session_host,
+                                can_fetch: !info.is_dir && can_fetch,
+                            },
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    if cx.global::<AppSettings>().client.links.remote_files != RemoteFileOpen::Copy
+                        && self.unresolved_remote_prefers_opener(cx).is_some()
+                    {
+                        self.open_unresolved_remote(path, host, line, column, window, cx);
+                        return;
+                    }
+                }
+                let path = if size.is_none() && cx.global::<AppSettings>().client.links.remote_files == RemoteFileOpen::Copy {
+                    self.resolved_remote_path(&path).unwrap_or(path)
+                } else {
+                    path
+                };
                 match self.plan_remote_parts(&path, line, column, on_session_host, can_fetch, cx) {
                     RemoteAction::OpenInEditor { argv, .. } => {
                         if let Err(e) = links::spawn_opener(&argv) {
@@ -1172,6 +1343,108 @@ impl TerminalView {
                 }
             }
         }
+    }
+
+    fn open_unresolved_remote(
+        &mut self,
+        path: String,
+        host: String,
+        line: Option<u32>,
+        column: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(conn) = self.session.connection().cloned() else {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            toast::show_in(window, cx, Toast::info(format!("Copied {path}")).key("terminal.link"));
+            return;
+        };
+        let stat_cwd = self.session.remote_cwd_str();
+        let session_id = self.session.daemon_id();
+        let filename = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string();
+        let toast_id =
+            toast::show_in(window, cx, Toast::loading(format!("Checking {filename}…")).body(format!("{host}:{path}")).key("terminal.link"));
+        let window_handle = window.window_handle();
+        let req_path = path.clone();
+        let req_cwd = stat_cwd.clone();
+        let (tx, rx) = flume::bounded(1);
+        if let Err(e) = std::thread::Builder::new().name("remote-stat-open".into()).spawn(move || {
+            let _ = tx.send(conn.stat_path(session_id, req_cwd, links::remote_candidates(&req_path)));
+        }) {
+            let copy_path = path.clone();
+            toast::update(
+                cx,
+                toast_id,
+                Toast::error("Couldn't check remote path")
+                    .body(format!("{e}"))
+                    .action("Copy path", move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                    })
+                    .key("terminal.link"),
+            );
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let res = rx.recv_async().await.unwrap_or_else(|_| Err(anyhow::anyhow!("stat worker terminated")));
+            match res {
+                Ok(Some(info)) => {
+                    let target = Target::Remote {
+                        path: info.path.clone(),
+                        host,
+                        line,
+                        column,
+                        is_dir: info.is_dir,
+                        size: Some(info.size),
+                        on_session_host: true,
+                        can_fetch: !info.is_dir,
+                    };
+                    cx.update(|cx| {
+                        toast::dismiss(cx, toast_id);
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            if let Some(entity) = this.upgrade() {
+                                entity.update(cx, |view, cx| {
+                                    if !(stat_cwd.is_none() && view.session.remote_cwd_str().is_some()) {
+                                        view.remote_stats.insert((stat_cwd, path), CachedStat::Found { info, at: Instant::now() });
+                                    }
+                                    view.open_link(target, window, cx);
+                                });
+                            }
+                        });
+                    });
+                }
+                Ok(None) => {
+                    let copy_path = path.clone();
+                    cx.update(|cx| {
+                        toast::update(
+                            cx,
+                            toast_id,
+                            Toast::info(format!("Couldn't find {filename}"))
+                                .body(format!("{path} does not exist on {host}."))
+                                .action("Copy path", move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                                })
+                                .key("terminal.link"),
+                        );
+                    });
+                }
+                Err(e) => {
+                    let copy_path = path.clone();
+                    cx.update(|cx| {
+                        toast::update(
+                            cx,
+                            toast_id,
+                            Toast::error("Couldn't check remote path")
+                                .body(format!("{e:#}"))
+                                .action("Copy path", move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                                })
+                                .key("terminal.link"),
+                        );
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1232,12 +1505,14 @@ impl TerminalView {
         let toast_id =
             toast::show_in(window, cx, Toast::loading(format!("Fetching {filename}…")).body(format!("{host}:{path}")).key("terminal.link"));
         let req_path = path.clone();
-        let req_host = host.clone();
+        let stat_cwd = self.session.remote_cwd_str();
+        let cache_endpoint_key = conn.endpoint().cache_key();
         let session_id = self.session.daemon_id();
         let need_prestat = size.is_none();
 
         enum FetchOutcome {
             Opened { resolved_path: String, local_path: PathBuf },
+            NotFound,
             IsDir { resolved_path: String },
             TooLargeHard { resolved_path: String, size: u64 },
             ConfirmLarge { resolved_path: String, size: u64 },
@@ -1247,23 +1522,26 @@ impl TerminalView {
         if let Err(e) = std::thread::Builder::new().name("remote-fetch".into()).spawn(move || {
             let res = (|| -> anyhow::Result<FetchOutcome> {
                 let mut fetch_path = req_path.clone();
-                if need_prestat
-                    && conn.supports_remote_files()
-                    && let Ok(Some(info)) = conn.stat_path(session_id, links::remote_candidates(&req_path))
-                {
-                    if info.is_dir {
-                        return Ok(FetchOutcome::IsDir { resolved_path: info.path });
+                if need_prestat && conn.supports_remote_files() {
+                    match conn.stat_path(session_id, stat_cwd, links::remote_candidates(&req_path)) {
+                        Ok(Some(info)) => {
+                            if info.is_dir {
+                                return Ok(FetchOutcome::IsDir { resolved_path: info.path });
+                            }
+                            if info.size > goatty_proto::HARD_MAX_FILE_BYTES {
+                                return Ok(FetchOutcome::TooLargeHard { resolved_path: info.path, size: info.size });
+                            }
+                            if prompt_if_larger && info.size > max_bytes {
+                                return Ok(FetchOutcome::ConfirmLarge { resolved_path: info.path, size: info.size });
+                            }
+                            fetch_path = info.path;
+                        }
+                        Ok(None) => return Ok(FetchOutcome::NotFound),
+                        Err(_) => {}
                     }
-                    if info.size > goatty_proto::HARD_MAX_FILE_BYTES {
-                        return Ok(FetchOutcome::TooLargeHard { resolved_path: info.path, size: info.size });
-                    }
-                    if prompt_if_larger && info.size > max_bytes {
-                        return Ok(FetchOutcome::ConfirmLarge { resolved_path: info.path, size: info.size });
-                    }
-                    fetch_path = info.path;
                 }
                 let (resolved_path, data) = conn.read_file(&fetch_path, max_bytes)?;
-                let local_path = links::save_remote_copy(&req_host, &resolved_path, &data)?;
+                let local_path = links::save_remote_copy(&cache_endpoint_key, &resolved_path, &data)?;
                 Ok(FetchOutcome::Opened { resolved_path, local_path })
             })();
             let _ = tx.send(res);
@@ -1307,6 +1585,19 @@ impl TerminalView {
                         toast_id,
                         Toast::success(format!("Opened {filename}"))
                             .body(format!("Read-only copy from {host}:{resolved_path}"))
+                            .key("terminal.link"),
+                    );
+                }
+                Ok(FetchOutcome::NotFound) => {
+                    let copy_path = path.clone();
+                    toast::update(
+                        cx,
+                        toast_id,
+                        Toast::info(format!("Couldn't find {filename}"))
+                            .body(format!("{path} does not exist on {host}."))
+                            .action("Copy path", move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                            })
                             .key("terminal.link"),
                     );
                 }
@@ -1390,6 +1681,7 @@ impl TerminalView {
     fn on_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<'_, Self>) {
         if !*hovered {
             self.mouse_cell = None;
+            self.pending_open = None;
             if self.refresh_hover(cx) {
                 cx.notify();
             }
@@ -1416,6 +1708,8 @@ impl TerminalView {
         self.autoscroll = None;
         self.session.terminal.selection_clear();
         self.hover = None;
+        self.pending_open = None;
+        self.pressed_pending_link = None;
         let session = self.session.clone();
         let (font, size, lh) = (self.font.clone(), self.font_size, self.line_height);
         let viewer = cx.new(|cx| OutputView::new(session, source, font, size, lh, window, cx));
@@ -1552,6 +1846,7 @@ impl TerminalView {
                 pane.update(cx, |v, cx| v.end_composition(cx));
             }
             self.end_composition(cx);
+            self.pending_open = None;
             self.session.terminal.selection_clear();
             self.send(&bytes, cx);
             window.invalidate_character_coordinates();
@@ -1597,6 +1892,8 @@ impl TerminalView {
         window.focus(&self.focus, cx);
         let (col, row, right) = self.geom.get().cell_at(ev.position);
         self.pressed_link = None;
+        self.pressed_pending_link = None;
+        self.pending_open = None;
         if ev.button == GMouseButton::Left && ev.click_count == 1 {
             self.modifiers = ev.modifiers;
             self.mouse_cell = Some((col, row));
@@ -1608,6 +1905,14 @@ impl TerminalView {
                 }
                 // Plain click: open on release, unless it becomes a selection.
                 self.pressed_link = Some(target);
+            } else if let Some(h) = self.hover.as_ref().filter(|h| h.pending)
+                && let Some(stat_key) = h.remote_stat_key.clone()
+            {
+                if self.link_click == LinkClick::CtrlClick {
+                    self.pending_open = Some(PendingOpen { link: h.link.clone(), stat_key, window: window.window_handle() });
+                    return;
+                }
+                self.pressed_pending_link = Some((h.link.clone(), stat_key));
             }
         }
         if ev.button == GMouseButton::Right {
@@ -1653,14 +1958,25 @@ impl TerminalView {
             self.report_mouse(btn, MouseAction::Release, col, row, &ev.modifiers);
         }
         self.end_selection(cx);
-        if let Some(target) = self.pressed_link.take()
-            && ev.button == GMouseButton::Left
-            && !self.session.terminal.has_selection()
-        {
-            self.mouse_cell = Some((col, row));
-            self.refresh_hover(cx);
-            if self.hovered_target() == Some(&target) {
-                self.open_link(target, window, cx);
+        let pressed_link = self.pressed_link.take();
+        let pressed_pending = self.pressed_pending_link.take();
+        if ev.button == GMouseButton::Left && !self.session.terminal.has_selection() {
+            if let Some(target) = pressed_link {
+                self.mouse_cell = Some((col, row));
+                self.refresh_hover(cx);
+                if self.hovered_target() == Some(&target) {
+                    self.open_link(target, window, cx);
+                }
+            } else if let Some((link, stat_key)) = pressed_pending {
+                self.mouse_cell = Some((col, row));
+                self.refresh_hover(cx);
+                if self.hover.as_ref().is_some_and(|h| h.link == link) {
+                    if let Some(target) = self.hovered_target().cloned() {
+                        self.open_link(target, window, cx);
+                    } else if self.hover.as_ref().is_some_and(|h| h.pending) {
+                        self.pending_open = Some(PendingOpen { link, stat_key, window: window.window_handle() });
+                    }
+                }
             }
         }
     }
@@ -1669,6 +1985,11 @@ impl TerminalView {
         let (col, row, _) = self.geom.get().cell_at(ev.position);
         self.mouse_cell = Some((col, row));
         self.modifiers = ev.modifiers;
+        if let Some(pending) = &self.pending_open
+            && self.session.terminal.link_at(col, row).as_ref() != Some(&pending.link)
+        {
+            self.pending_open = None;
+        }
         if self.selecting {
             // The window-wide listener (see `render`) extends the selection,
             // also when the drag leaves the pane.
@@ -1692,6 +2013,8 @@ impl TerminalView {
         // A press that turns into a selection doesn't open its link
         // (checked on release), and no link shows while selecting.
         self.hover = None;
+        self.pending_open = None;
+        self.pressed_pending_link = None;
         self.drag_pos = Some(pos);
         if geom.edge_scroll(pos.y) != 0 && self.autoscroll.is_none() {
             self.autoscroll = Some(cx.spawn(async move |this, cx| {
@@ -1757,11 +2080,13 @@ impl TerminalView {
         let mode = self.session.terminal.mode();
         let (col, row, _) = geom.cell_at(ev.position);
         if self.mouse_mode_active(ev.modifiers.shift) {
+            self.pending_open = None;
             let btn = if whole > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
             for _ in 0..whole.unsigned_abs() {
                 self.report_mouse(btn, MouseAction::Press, col, row, &ev.modifiers);
             }
         } else if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
+            self.pending_open = None;
             // less/man/etc. in the alt screen: wheel → arrow keys.
             let key = if whole > 0 { Key::Up } else { Key::Down };
             if let Some(b) = encode_key(&key, Mods::default(), mode) {
@@ -1771,6 +2096,11 @@ impl TerminalView {
             }
         } else {
             self.session.terminal.scroll(whole);
+            if let Some(pending) = &self.pending_open
+                && self.mouse_cell.and_then(|(c, r)| self.session.terminal.link_at(c, r)).as_ref() != Some(&pending.link)
+            {
+                self.pending_open = None;
+            }
             self.refresh_hover(cx);
             cx.notify();
         }

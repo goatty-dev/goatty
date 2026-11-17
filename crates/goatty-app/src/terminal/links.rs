@@ -169,7 +169,7 @@ fn same_host(a: &str, b: &str) -> bool {
     }
 }
 
-fn is_windows_drive_path(p: &str) -> bool {
+pub(crate) fn is_windows_drive_path(p: &str) -> bool {
     let b = p.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
 }
@@ -376,6 +376,10 @@ fn session_cache_dir() -> PathBuf {
 fn fnv1a_64(parts: &[&[u8]]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for part in parts {
+        for b in (part.len() as u64).to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
         for &b in *part {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0100_0000_01b3);
@@ -420,15 +424,16 @@ fn set_file_readonly(path: &Path) -> std::io::Result<()> {
 
 /// Write `data` into a read-only (`0o444`) temporary file preserving the
 /// basename/extension of `remote_path`, under `<runtime>/goatty/remote/p<pid>/<hash16>/<basename>`.
-pub fn save_remote_copy(host: &str, remote_path: &str, data: &[u8]) -> std::io::Result<PathBuf> {
-    save_remote_copy_in(&session_cache_dir(), host, remote_path, data)
+/// `endpoint_key` must uniquely identify the endpoint (separate from the display host label).
+pub fn save_remote_copy(endpoint_key: &str, remote_path: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    save_remote_copy_in(&session_cache_dir(), endpoint_key, remote_path, data)
 }
 
-fn save_remote_copy_in(session_dir: &Path, host: &str, remote_path: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+fn save_remote_copy_in(session_dir: &Path, endpoint_key: &str, remote_path: &str, data: &[u8]) -> std::io::Result<PathBuf> {
     fs::create_dir_all(session_dir)?;
     set_dir_private(session_dir)?;
 
-    let hash = fnv1a_64(&[host.as_bytes(), b"\0", remote_path.as_bytes()]);
+    let hash = fnv1a_64(&[endpoint_key.as_bytes(), remote_path.as_bytes()]);
     let bucket = session_dir.join(format!("{hash:016x}"));
     fs::create_dir_all(&bucket)?;
     set_dir_private(&bucket)?;
@@ -799,6 +804,12 @@ mod tests {
         let updated = save_remote_copy_in(&sess, "prod-box", "/srv/repo/config.json", br#"{"ok":false}"#).unwrap();
         assert_eq!(updated, saved);
         assert_eq!(fs::read(&saved).unwrap(), br#"{"ok":false}"#);
+
+        // Distinct endpoint identities with the same remote path do not collide.
+        let other = save_remote_copy_in(&sess, "ssh:prod-box-2", "/srv/repo/config.json", br#"{"host":2}"#).unwrap();
+        assert_ne!(other, saved);
+        assert_eq!(fs::read(&saved).unwrap(), br#"{"ok":false}"#);
+        assert_eq!(fs::read(&other).unwrap(), br#"{"host":2}"#);
 
         // Live PID directory is kept even when `now` is far ahead and `current_pid` differs.
         let live = dir.path().join(format!("p{}", std::process::id()));

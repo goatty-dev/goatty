@@ -541,8 +541,10 @@ impl Connection {
     }
 
     /// Resolve and stat the first existing regular file or directory among
-    /// `candidates` on the daemon's host. Blocks: call off the UI thread.
-    pub fn stat_path(&self, session: Option<SessionId>, candidates: Vec<String>) -> Result<Option<RemotePathInfo>> {
+    /// `candidates` on the daemon's host. When `cwd` is `Some`, relative
+    /// candidates resolve against that directory rather than the session's
+    /// latest working directory. Blocks: call off the UI thread.
+    pub fn stat_path(&self, session: Option<SessionId>, cwd: Option<String>, candidates: Vec<String>) -> Result<Option<RemotePathInfo>> {
         let version = self.protocol_version();
         if version < REMOTE_FILES_SINCE {
             bail!(
@@ -550,7 +552,7 @@ impl Connection {
                 self.endpoint().label()
             );
         }
-        match self.request(Pending::Reply, |req| ClientMsg::StatPath { req, session, candidates })? {
+        match self.request(Pending::Reply, |req| ClientMsg::StatPath { req, session, cwd, candidates })? {
             ServerMsg::PathStat { info, .. } => Ok(info),
             other => bail!("unexpected reply {other:?}"),
         }

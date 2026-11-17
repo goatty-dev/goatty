@@ -11,7 +11,7 @@ use super::appearance::opts;
 use super::kit::{choice_card, row, section};
 use super::{Page, SettingsWindow, client};
 use crate::settings::AppSettings;
-use crate::ui::controls::{segmented, slider, toggle};
+use crate::ui::controls::{segmented, slider, stepper, toggle};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
 
@@ -25,8 +25,6 @@ impl SettingsWindow {
         let ctrl = if cfg!(target_os = "macos") { "Cmd+click" } else { "Ctrl+click" };
         let opener_off = matches!(s.links.remote_files, RemoteFileOpen::Fetch | RemoteFileOpen::Copy);
         let max_mb = s.links.remote_max_size_mb.clamp(LinkSettings::MIN_REMOTE_MAX_SIZE_MB, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
-        let min_mb = LinkSettings::MIN_REMOTE_MAX_SIZE_MB;
-        let max_limit = LinkSettings::MAX_REMOTE_MAX_SIZE_MB;
         let links = section(ui, "Links")
             .child(row(ui, "Open links").desc("Web addresses, file paths and links programs mark up").control(self.select(
                 "links-open-on",
@@ -76,33 +74,25 @@ impl SettingsWindow {
                         "Larger files ask first before fetching over the session link"
                     })
                     .disabled(s.links.remote_files == RemoteFileOpen::Copy)
-                    .control(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(12.))
-                            .child(slider(
-                                "links-remote-max-size",
-                                (max_mb - min_mb) as f32 / (max_limit - min_mb) as f32,
-                                ui,
-                                move |t, done, _, cx| {
-                                    let v = (min_mb as f32 + t * (max_limit - min_mb) as f32).round() as u32;
-                                    let v = v.clamp(min_mb, max_limit);
-                                    if done {
-                                        AppSettings::update(cx, |s| s.links.remote_max_size_mb = v);
-                                    } else if cx.global::<AppSettings>().file.value.links.remote_max_size_mb != v {
-                                        AppSettings::preview(cx, |s| s.links.remote_max_size_mb = v);
-                                    }
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .w(px(52.))
-                                    .text_size(px(text::LABEL))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(SharedString::from(format!("{max_mb} MiB"))),
-                            ),
-                    ),
+                    .control(stepper(
+                        "links-remote-max-size",
+                        format!("{max_mb} MiB"),
+                        ui,
+                        client(|s| {
+                            s.links.remote_max_size_mb = s
+                                .links
+                                .remote_max_size_mb
+                                .saturating_sub(1)
+                                .clamp(LinkSettings::MIN_REMOTE_MAX_SIZE_MB, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
+                        }),
+                        client(|s| {
+                            s.links.remote_max_size_mb = s
+                                .links
+                                .remote_max_size_mb
+                                .saturating_add(1)
+                                .clamp(LinkSettings::MIN_REMOTE_MAX_SIZE_MB, LinkSettings::MAX_REMOTE_MAX_SIZE_MB);
+                        }),
+                    )),
             )
             .footer("Paths count when the file or folder exists on that host. Right-click a link for all options.");
 

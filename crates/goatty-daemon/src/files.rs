@@ -80,8 +80,8 @@ fn resolve_for_io(raw: &str, cwd: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Stat the first existing regular file or directory among `candidates`.
-pub(crate) fn stat_path(daemon: &Daemon, session: Option<SessionId>, candidates: &[String]) -> Option<RemotePathInfo> {
-    let cwd = session.and_then(|id| daemon.get(id)).and_then(|s| s.current_cwd());
+pub(crate) fn stat_path(daemon: &Daemon, session: Option<SessionId>, cwd: Option<&str>, candidates: &[String]) -> Option<RemotePathInfo> {
+    let cwd = cwd.map(str::to_owned).or_else(|| session.and_then(|id| daemon.get(id)).and_then(|s| s.current_cwd()));
     for raw in candidates.iter().take(MAX_CANDIDATES) {
         let Some(resolved) = resolve_for_io(raw, cwd.as_deref()) else {
             continue;

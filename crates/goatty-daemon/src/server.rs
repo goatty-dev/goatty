@@ -19,7 +19,7 @@ use goatty_term::{Palette, Terminal, TerminalChannels};
 use parking_lot::{Mutex, RwLock};
 
 use crate::layouts::Layouts;
-use crate::session::{Pause, Session, pump_output, to_size};
+use crate::session::{CwdState, Pause, Session, pump_output, to_size};
 
 /// The session registry shared by every connection.
 pub(crate) struct Daemon {
@@ -159,8 +159,7 @@ impl Daemon {
             subs: Mutex::new(Vec::new()),
             created_unix,
             process: Mutex::new(None),
-            cwd: Mutex::new(init_cwd),
-            last_proc_cwd: Mutex::new(proc_cwd),
+            cwd: Mutex::new(CwdState { current: init_cwd, last_proc: proc_cwd }),
             fg: OnceLock::new(),
             managed,
             pause: Pause::new()?,

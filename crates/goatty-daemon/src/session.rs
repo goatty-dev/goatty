@@ -15,6 +15,7 @@ use goatty_term::pty::Pty;
 use goatty_term::{TermSize, Terminal, UiEvent};
 use parking_lot::{Condvar, Mutex};
 
+use crate::client::Outbound;
 use crate::systemd::StoredPty;
 
 /// One connection's subscription to one session.
@@ -26,7 +27,7 @@ use crate::systemd::StoredPty;
 /// gets one `Resync` snapshot of the current screen and streaming resumes.
 pub(crate) struct Subscriber {
     conn: u64,
-    tx: flume::Sender<Frame>,
+    tx: flume::Sender<Outbound>,
     window: u64,
     sent: AtomicU64,
     acked: AtomicU64,
@@ -51,7 +52,7 @@ pub(crate) struct SubFeatures {
 impl Subscriber {
     fn push(&self, frame: Frame, stream_len: usize) -> bool {
         self.sent.fetch_add(stream_len as u64, Ordering::AcqRel);
-        self.tx.send(frame).is_ok()
+        self.tx.send(Outbound::from(frame)).is_ok()
     }
 
     fn in_flight(&self) -> u64 {
@@ -66,23 +67,60 @@ impl Subscriber {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct CwdState {
+    /// The session's current working directory (OSC 7 preferred to preserve
+    /// symlinks, with `/proc/<pid>/cwd` fallback).
+    pub(crate) current: Option<String>,
+    /// Last `/proc/<pid>/cwd` reflected in `current` (directly or via the
+    /// canonical target of an OSC 7 path), so a subsequent foreground probe
+    /// doesn't clobber a symlinked OSC 7 path when `/proc` didn't change.
+    pub(crate) last_proc: Option<PathBuf>,
+}
+
+impl CwdState {
+    /// Record a `/proc/<pid>/cwd` observation. Returns `Some(new_cwd)` when
+    /// `current` changed and subscribers should be notified.
+    fn apply_proc(&mut self, proc_cwd: PathBuf) -> Option<Option<String>> {
+        if self.last_proc.as_ref() == Some(&proc_cwd) {
+            return None;
+        }
+        self.last_proc = Some(proc_cwd.clone());
+        let next = proc_cwd.to_string_lossy().into_owned();
+        if self.current.as_deref() == Some(next.as_str()) {
+            return None;
+        }
+        self.current = Some(next.clone());
+        Some(Some(next))
+    }
+
+    /// Record an OSC 7 report together with its canonical physical path.
+    /// Never marks an unrelated `/proc/<pid>/cwd` observed later as already
+    /// reflected by this OSC report. Returns `Some(new_cwd)` when `current`
+    /// changed and subscribers should be notified.
+    fn apply_osc(&mut self, osc_cwd: String, canonical_target: Option<PathBuf>) -> Option<Option<String>> {
+        self.last_proc = canonical_target;
+        if self.current.as_deref() == Some(osc_cwd.as_str()) {
+            return None;
+        }
+        self.current = Some(osc_cwd.clone());
+        Some(Some(osc_cwd))
+    }
+}
+
 pub(crate) struct Session {
     pub(crate) id: SessionId,
     pub(crate) term: Terminal,
     pub(crate) pty: Mutex<Pty>,
     /// Held while feeding + broadcasting, so taking a snapshot and
     /// (un)subscribing are atomic with respect to the output stream: no gap,
-    /// no overlap.
+    /// no overlap. Also acquired before `cwd` when notifying CWD changes.
     pub(crate) subs: Mutex<Vec<Arc<Subscriber>>>,
     pub(crate) created_unix: u64,
     /// The foreground program, kept current by `fg` (see [`Session::watch_foreground`]).
     pub(crate) process: Mutex<Option<String>>,
-    /// The session's current working directory (OSC 7 preferred to preserve
-    /// symlinks, with `/proc/<pid>/cwd` fallback).
-    pub(crate) cwd: Mutex<Option<String>>,
-    /// Last `/proc/<pid>/cwd` observed, so a subsequent foreground probe doesn't
-    /// clobber a symlinked OSC 7 path when `/proc` didn't change.
-    pub(crate) last_proc_cwd: Mutex<Option<PathBuf>>,
+    /// Serialized working directory state (`OSC 7` + `/proc/<pid>/cwd`).
+    pub(crate) cwd: Mutex<CwdState>,
     pub(crate) fg: OnceLock<ForegroundWatch>,
     /// goatty's managed zsh (it handles reload requests).
     pub(crate) managed: bool,
@@ -196,10 +234,8 @@ impl Session {
             let s: Weak<Self> = Arc::downgrade(self);
             move || {
                 let s = s.upgrade()?;
-                let (name, proc_cwd) = {
-                    let pty = s.pty.lock();
-                    (pty.foreground_name(), pty.cwd())
-                };
+                let name = s.pty.lock().foreground_name();
+                let proc_cwd = s.proc_cwd();
                 s.maybe_update_proc_cwd(proc_cwd);
                 name
             }
@@ -233,54 +269,53 @@ impl Session {
         }
     }
 
+    fn proc_cwd(&self) -> Option<PathBuf> {
+        let pid = self.pid?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
     pub(crate) fn current_cwd(&self) -> Option<String> {
-        self.cwd.lock().clone().or_else(|| self.pty.lock().cwd().map(|p| p.to_string_lossy().into_owned()))
+        self.cwd.lock().current.clone().or_else(|| self.proc_cwd().map(|p| p.to_string_lossy().into_owned()))
     }
 
-    fn maybe_update_proc_cwd(&self, proc_cwd: Option<PathBuf>) {
-        let Some(path) = proc_cwd else { return };
-        {
-            let mut last = self.last_proc_cwd.lock();
-            if last.as_ref() == Some(&path) {
-                return;
-            }
-            *last = Some(path.clone());
-        }
-        self.set_cwd(Some(path.to_string_lossy().into_owned()));
-    }
-
-    pub(crate) fn set_osc_cwd(&self, cwd: String, proc_cwd: Option<PathBuf>) {
-        if proc_cwd.is_some() {
-            *self.last_proc_cwd.lock() = proc_cwd;
-        }
-        self.set_cwd(Some(cwd));
-    }
-
-    fn set_cwd(&self, cwd: Option<String>) {
-        {
-            let mut cur = self.cwd.lock();
-            if *cur == cwd {
-                return;
-            }
-            *cur = cwd.clone();
-        }
+    fn update_cwd_and_notify(&self, update: impl FnOnce(&mut CwdState) -> Option<Option<String>>) {
+        // Lock order matches `subscribe`: `subs` before `cwd`, so updates and
+        // subscriber notifications cannot interleave out of order.
+        let subs = self.subs.lock();
+        let next = {
+            let mut state = self.cwd.lock();
+            update(&mut state)
+        };
+        let Some(cwd) = next else { return };
         let Ok(frame) = encode(&ServerMsg::Cwd { session: self.id, cwd }) else { return };
-        for sub in self.subs.lock().iter() {
+        for sub in subs.iter() {
             if sub.cwd {
                 sub.push(frame.clone(), 0);
             }
         }
     }
 
+    fn maybe_update_proc_cwd(&self, proc_cwd: Option<PathBuf>) {
+        let Some(path) = proc_cwd else { return };
+        self.update_cwd_and_notify(|state| state.apply_proc(path));
+    }
+
+    pub(crate) fn set_osc_cwd(&self, cwd: String) {
+        // Resolve the physical target outside the locks; only that target (not a
+        // later `/proc/<pid>/cwd` read) may match a future proc-cwd probe.
+        let canonical = std::fs::canonicalize(&cwd).ok();
+        self.update_cwd_and_notify(|state| state.apply_osc(cwd, canonical));
+    }
+
     pub(crate) fn info(&self) -> SessionInfo {
         let (cols, rows) = self.term.size();
-        let tracked_cwd = self.cwd.lock().clone();
-        let pty = self.pty.lock();
+        let tracked_cwd = self.cwd.lock().current.clone();
+        let proc_cwd = self.proc_cwd();
         SessionInfo {
             id: self.id,
-            pid: pty.pid(),
+            pid: self.pid,
             title: self.term.title(),
-            cwd: tracked_cwd.or_else(|| pty.cwd().map(|p| p.to_string_lossy().into_owned())),
+            cwd: tracked_cwd.or_else(|| proc_cwd.map(|p| p.to_string_lossy().into_owned())),
             cols,
             rows,
             attached: self.subs.lock().len() as u32,
@@ -342,7 +377,7 @@ impl Session {
         req: ReqId,
         opts: StreamOpts,
         features: SubFeatures,
-        tx: &flume::Sender<Frame>,
+        tx: &flume::Sender<Outbound>,
     ) -> Arc<Subscriber> {
         let mut subs = self.subs.lock();
         subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
@@ -368,7 +403,7 @@ impl Session {
             sub.push(f, 0);
         }
         if sub.cwd {
-            let cwd = self.cwd.lock().clone();
+            let cwd = self.cwd.lock().current.clone();
             if cwd.is_some()
                 && let Ok(f) = encode(&ServerMsg::Cwd { session: self.id, cwd })
             {
@@ -413,7 +448,7 @@ impl Session {
                 self.resync(&sub);
             }
             if let Some(f) = &exited {
-                let _ = sub.tx.send(f.clone());
+                let _ = sub.tx.send(Outbound::from(f.clone()));
             }
         }
     }
@@ -478,8 +513,7 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
                     if matches!(ev, UiEvent::CwdChanged)
                         && let Some(dir) = s.term.current_directory()
                     {
-                        let proc_cwd = s.pty.lock().cwd();
-                        s.set_osc_cwd(dir.to_string_lossy().into_owned(), proc_cwd);
+                        s.set_osc_cwd(dir.to_string_lossy().into_owned());
                     }
                 }
             }
@@ -488,4 +522,32 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
         }
     }
     s.pause.finished();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cwd_state_preserves_symlinks_without_masking_later_proc_changes() {
+        let mut state = CwdState::default();
+
+        // Symlinked OSC 7 directory records its canonical target so a matching
+        // `/proc/<pid>/cwd` probe does not clobber the logical symlink path.
+        let update = state.apply_osc("/home/u/sym".into(), Some(PathBuf::from("/srv/real")));
+        assert_eq!(update, Some(Some("/home/u/sym".into())));
+        assert_eq!(state.apply_proc(PathBuf::from("/srv/real")), None);
+        assert_eq!(state.current.as_deref(), Some("/home/u/sym"));
+
+        // If the shell later changes to `/srv/other` before/after an earlier OSC 7
+        // for `/srv/a` is processed, `/srv/other` is not masked as already reflected.
+        let update = state.apply_osc("/srv/a".into(), Some(PathBuf::from("/srv/a")));
+        assert_eq!(update, Some(Some("/srv/a".into())));
+        assert_eq!(state.apply_proc(PathBuf::from("/srv/other")), Some(Some("/srv/other".into())));
+        assert_eq!(state.current.as_deref(), Some("/srv/other"));
+
+        // When canonicalization fails (`None`), subsequent `/proc` probes still apply.
+        state.apply_osc("/missing/dir".into(), None);
+        assert_eq!(state.apply_proc(PathBuf::from("/srv/other")), Some(Some("/srv/other".into())));
+    }
 }
