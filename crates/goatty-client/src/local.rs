@@ -220,8 +220,7 @@ fn alive(pid: u32) -> bool {
     return unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size
-            && info.pbi_status != libc::SZOMB
+        libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size && info.pbi_status != libc::SZOMB
     };
     // Elsewhere: whether it can still be signalled.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
