@@ -3,7 +3,7 @@
 //! icon), `goattyd list` reports it.
 //!
 //! The foreground process group comes from the PTY (`tcgetpgrp`), the name
-//! from `/proc` (Linux only for now; other systems report nothing).
+//! from `/proc` on Linux and libproc on macOS (other systems report nothing).
 //!
 //! [`ForegroundWatch`] checks again a little after something happened on the
 //! PTY (output, input), so it costs nothing while the session is idle and at
@@ -24,11 +24,44 @@ pub fn process_name(pid: u32) -> Option<String> {
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         display_name(comm.as_deref().unwrap_or("").trim_end_matches('\n'), &cmdline)
     }
-    #[cfg(not(target_os = "linux"))]
+    // macOS: the kernel's name (`proc_name`, up to 32 bytes); no argv, so
+    // a coding agent under a runtime shows as the runtime.
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 64];
+        // SAFETY: `buf` is valid for writes of the size passed.
+        let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        display_name(&String::from_utf8_lossy(&buf[..n.max(0) as usize]), &[])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
     }
+}
+
+/// The working directory of process `pid` (`/proc/<pid>/cwd`; libproc on
+/// macOS).
+pub fn cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `info` is plain data valid for writes of the size passed.
+        let info = unsafe {
+            let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+            if libc::proc_pidinfo(pid as i32, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size) != size {
+                return None;
+            }
+            info
+        };
+        // SAFETY: vip_path is a NUL-terminated C string of MAXPATHLEN bytes.
+        let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()));
+        (!path.as_os_str().is_empty()).then(|| path.to_path_buf())
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 /// Pick a name from `/proc/<pid>/comm` and `/proc/<pid>/cmdline`.

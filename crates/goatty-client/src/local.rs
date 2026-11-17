@@ -322,6 +322,7 @@ mod tests {
         assert!(!is_newer(build(1, 20), build(2, 10)));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn this_process_is_not_outdated_against_itself() {
         // Our own exe vs itself: same file.

@@ -215,10 +215,9 @@ impl Pty {
     }
 
     /// Foreground process group's working directory is a later feature;
-    /// for now report the shell's cwd via /proc (Linux).
+    /// for now report the shell's cwd.
     pub fn cwd(&self) -> Option<PathBuf> {
-        let pid = self.pid()?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        crate::process::cwd(self.pid()?)
     }
 }
 

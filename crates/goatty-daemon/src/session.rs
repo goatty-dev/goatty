@@ -391,8 +391,7 @@ impl Session {
     }
 
     fn proc_cwd(&self) -> Option<PathBuf> {
-        let pid = self.pid?;
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        goatty_term::process::cwd(self.pid?)
     }
 
     pub(crate) fn current_cwd(&self) -> Option<String> {
