@@ -13,6 +13,10 @@
 //!     `line=<percent-encoded>` (the unsent command line, which the shell
 //!     reports when goatty asks for it). Only `line=` payloads are kept past
 //!     the first few bytes, up to [`MAX_LINE`].
+//!   * screen switches (`CSI ? 1049/1047/47 h|l`), reported *before* the
+//!     final byte: the primary screen's kitty keyboard flags are noted there,
+//!     since rio-vt keeps the inactive screen's flags private and snapshots
+//!     need them.
 //!
 //! The scanner keeps its state between chunks, so a mark split across two
 //! reads is still found. Outside escape sequences it only runs `memchr` for
@@ -45,6 +49,9 @@ pub(crate) enum Mark {
     /// `OSC 7337 ; line=<percent-encoded bytes>`: the command line typed at
     /// the prompt and not sent yet, reported on request.
     Line(String),
+    /// `CSI ? 1049` (or `1047`, `47`) before its `h` or `l`: the screen is
+    /// about to switch (or stay).
+    ScreenSwitch,
 }
 
 /// What the shell last said about its command.
@@ -92,6 +99,10 @@ enum State {
     Osc,
     /// ESC inside an OSC: `\` ends it (ST), anything else aborts it.
     OscEsc,
+    /// After `ESC [`.
+    Csi,
+    /// Inside `ESC [ ?`, with the parameter read so far.
+    DecPrivate(u16),
 }
 
 #[derive(Debug)]
@@ -134,11 +145,35 @@ impl MarkScanner {
                             self.overflow = false;
                             State::Osc
                         }
+                        b'[' => State::Csi,
                         ESC => State::Esc,
                         _ => State::Ground,
                     };
                     i += 1;
                 }
+                State::Csi => {
+                    // Anything but a DEC private mode: back to looking for ESC.
+                    if bytes[i] == b'?' {
+                        self.state = State::DecPrivate(0);
+                        i += 1;
+                    } else {
+                        self.state = State::Ground;
+                    }
+                }
+                State::DecPrivate(n) => match bytes[i] {
+                    d @ b'0'..=b'9' => {
+                        self.state = State::DecPrivate(n.saturating_mul(10).saturating_add(u16::from(d - b'0')));
+                        i += 1;
+                    }
+                    b @ (b';' | 0x40..=0x7e) => {
+                        if matches!(n, 47 | 1047 | 1049) {
+                            on(i, Mark::ScreenSwitch);
+                        }
+                        self.state = if b == b';' { State::DecPrivate(0) } else { State::Ground };
+                        i += 1;
+                    }
+                    _ => self.state = State::Ground,
+                },
                 State::Osc => {
                     let rest = &bytes[i..];
                     let end = memchr2(BEL, ESC, rest).unwrap_or(rest.len());
@@ -286,6 +321,19 @@ mod tests {
         let mut out = Vec::new();
         s.scan(bytes, |end, m| out.push((end, m)));
         out
+    }
+
+    #[test]
+    fn screen_switches_are_reported_before_their_final_byte() {
+        let stream: &[u8] = b"\x1b[?25;1049hx\x1b[?1047l\x1b[?47h\x1b[1049h\x1b[?10490h\x1b[?2004h\x1b]133;A\x07";
+        let found = all_marks(stream);
+        assert_eq!(found.iter().filter(|(_, m)| *m == Mark::ScreenSwitch).count(), 3);
+        for (at, m) in &found {
+            if *m == Mark::ScreenSwitch {
+                assert!(matches!(stream[*at], b'h' | b'l'), "{at}");
+            }
+        }
+        assert!(found.iter().any(|(_, m)| *m == Mark::PromptStart), "OSC after CSI still found");
     }
 
     #[test]

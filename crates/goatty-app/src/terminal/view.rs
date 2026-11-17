@@ -28,14 +28,16 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use goatty_config::{ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, Renderer, RightClick};
-use goatty_term::input::{Key, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_mouse, encode_paste};
+use goatty_term::input::{
+    Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
+};
 use goatty_term::paste::{self, PasteRisk};
 use goatty_term::{CursorKind, Frame, Link, SelectKind, TermMode, UiEvent};
 use gpui::{
     App, AppContext, ClipboardItem, Context, CursorStyle, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseButton as GMouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, canvas, div, point, prelude::FluentBuilder, px,
+    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton as GMouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 
 use super::element::{Geom, TerminalElement, hsla};
@@ -187,6 +189,10 @@ pub struct TerminalView {
     line_request: Option<(LineUse, Task<()>)>,
     /// The cell a right click opened the menu on (for its link).
     menu_cell: Option<(usize, usize)>,
+    /// Keys whose press went to the program while it asked for key
+    /// releases (kitty protocol): only their releases go there too, not
+    /// those of keys a shortcut took.
+    keys_down: Vec<String>,
     /// A right press went to the program: its release goes there too.
     right_to_program: bool,
 }
@@ -304,6 +310,7 @@ impl TerminalView {
             viewer: None,
             line_request: None,
             menu_cell: None,
+            keys_down: Vec::new(),
             right_to_program: false,
         };
         view.apply_settings(&app);
@@ -998,10 +1005,37 @@ impl TerminalView {
     fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
         self.poke_cursor();
         cx.notify();
-        let Some((key, mods)) = terminal_key(&ev.keystroke) else { return };
-        if let Some(bytes) = encode_key(&key, mods, self.session.terminal.mode()) {
+        let kind = if ev.is_held { KeyKind::Repeat } else { KeyKind::Press };
+        let Some(key) = terminal_key(&ev.keystroke, kind) else { return };
+        let mode = self.session.terminal.mode();
+        if let Some(bytes) = encode_key_event(&key, mode) {
             self.session.terminal.selection_clear();
             self.send(&bytes, cx);
+            if mode.contains(TermMode::KITTY_EVENT_TYPES) && !self.keys_down.contains(&ev.keystroke.key) {
+                // Bounded: a release can come under another name (Shift let
+                // go first turns `!` into `1`) and never match.
+                if self.keys_down.len() >= 16 {
+                    self.keys_down.clear();
+                }
+                self.keys_down.push(ev.keystroke.key.clone());
+            }
+        }
+    }
+
+    /// Key releases go to the program if it asked for them (kitty
+    /// protocol) and had the press.
+    fn on_key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(i) = self.keys_down.iter().position(|k| *k == ev.keystroke.key) else { return };
+        self.keys_down.swap_remove(i);
+        // The press went to the program, so the release does too, even
+        // with Super held now (`terminal_key` leaves Super combos alone).
+        let mut ks = ev.keystroke.clone();
+        let logo = std::mem::take(&mut ks.modifiers.platform);
+        let Some(mut key) = terminal_key(&ks, KeyKind::Release) else { return };
+        key.mods.logo = logo;
+        if let Some(bytes) = encode_key_event(&key, self.session.terminal.mode()) {
+            self.session.write(&bytes);
+            cx.notify();
         }
     }
 
@@ -1253,6 +1287,8 @@ impl Render for TerminalView {
                 .on_action(cx.listener(Self::increase_font_size))
                 .on_action(cx.listener(Self::decrease_font_size))
                 .on_action(cx.listener(Self::reset_font_size))
+                // Keys pressed before the viewer opened are let go here.
+                .on_key_up(cx.listener(Self::on_key_up))
                 .child(viewer.clone())
                 .into_any_element();
         }
@@ -1281,6 +1317,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::edit_command_line))
             .on_action(cx.listener(Self::clear_command_line))
             .on_key_down(cx.listener(Self::on_key))
+            .on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_down(GMouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(GMouseButton::Middle, cx.listener(Self::on_mouse_down))
             .on_mouse_down(GMouseButton::Right, cx.listener(Self::on_mouse_down))

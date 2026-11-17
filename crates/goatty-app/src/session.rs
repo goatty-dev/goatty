@@ -143,6 +143,17 @@ pub fn plain_ssh_argv(host: &str) -> Vec<String> {
     vec!["ssh".to_string(), "--".into(), host.to_string()]
 }
 
+/// Input that is an Enter press: a CR, or the kitty protocol's Enter
+/// (`CSI 13 u`, with modifiers or as a repeat, not a release) when the
+/// program asked for every key as an escape.
+fn is_enter(bytes: &[u8]) -> bool {
+    if bytes.contains(&b'\r') {
+        return true;
+    }
+    let Some(rest) = bytes.strip_prefix(b"\x1b[13").and_then(|r| r.strip_suffix(b"u")) else { return false };
+    rest.is_empty() || (rest.starts_with(b";") && !rest.ends_with(b":3"))
+}
+
 fn palette_list(p: &Palette) -> Vec<u32> {
     let mut v: Vec<u32> = p.ansi.iter().map(|c| c.to_u32()).collect();
     v.extend([p.foreground, p.background, p.cursor, p.selection_fg, p.selection_bg].map(|c| c.to_u32()));
@@ -402,7 +413,7 @@ impl Session {
                 if *self.status.lock() == LinkStatus::NeedsReconnect {
                     // The link is down: input has nowhere to go. Enter asks ssh
                     // to reconnect, with prompts.
-                    if bytes.contains(&b'\r') {
+                    if is_enter(bytes) {
                         *self.status.lock() = LinkStatus::Reconnecting;
                         conn.reconnect();
                     }
@@ -425,9 +436,12 @@ impl Session {
             _ => LocalEcho::Auto,
         };
         let mut p = self.predictor.lock();
+        // Programs in the alternate screen or speaking the kitty keyboard
+        // protocol (key releases, CSI u keys) aren't a prompt to echo at.
+        let mode = self.terminal.mode();
         let on = setting != LocalEcho::Never
             && *self.status.lock() == LinkStatus::Connected
-            && !self.terminal.mode().contains(TermMode::ALT_SCREEN);
+            && !mode.intersects(TermMode::ALT_SCREEN | TermMode::KITTY_KEYBOARD);
         if !on {
             if p.deadline().is_some() {
                 p.reset();
@@ -454,7 +468,9 @@ impl Session {
 
     /// Draw the predicted echo over a frame of the terminal.
     pub fn overlay_predictions(&self, frame: &mut Frame) {
-        if !frame.mode.contains(TermMode::ALT_SCREEN) {
+        // Where `predict` doesn't guess: guesses from before the program
+        // switched aren't drawn.
+        if !frame.mode.intersects(TermMode::ALT_SCREEN | TermMode::KITTY_KEYBOARD) {
             self.predictor.lock().overlay(frame);
         }
     }
@@ -539,5 +555,23 @@ impl Session {
             LinkStatus::NeedsReconnect => format!("{t} (disconnected — press Enter)"),
             LinkStatus::Lost(_) => format!("{t} (disconnected)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_enter;
+
+    #[test]
+    fn enter_in_any_encoding_reconnects() {
+        assert!(is_enter(b"\r"));
+        assert!(is_enter(b"\x1b\r"));
+        assert!(is_enter(b"\x1b[13u"));
+        assert!(is_enter(b"\x1b[13;5u"));
+        assert!(is_enter(b"\x1b[13;1:2u"));
+        assert!(!is_enter(b"\x1b[13;1:3u"), "a release");
+        assert!(!is_enter(b"\x1b[13~"), "F3");
+        assert!(!is_enter(b"\x1b[131u"));
+        assert!(!is_enter(b"a"));
     }
 }

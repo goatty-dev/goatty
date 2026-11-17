@@ -5,7 +5,8 @@
 //! what it leaves out and what reconnecting actually needs:
 //!   * scrollback (replayed as lines so they scroll into the client history),
 //!   * the alternate screen switch (so `vim` exiting restores correctly),
-//!   * input-affecting modes (DECCKM, keypad, bracketed paste, mouse, focus),
+//!   * input-affecting modes (DECCKM, keypad, bracketed paste, mouse, focus,
+//!     kitty keyboard flags),
 //!   * the window title,
 //!   * the OSC 133 prompt marks on rows and soft wraps in the scrollback,
 //!     so the client's [transcript](crate::transcript) finds the same
@@ -40,7 +41,7 @@ impl Terminal {
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
-        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info()))
+        self.with_term(|t| serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info(), self.primary_kitty()))
     }
 
     /// Everything another process needs to rebuild this terminal (goattyd
@@ -52,7 +53,7 @@ impl Terminal {
         self.with_term(|t| {
             let shell = self.shell_info();
             if !TermMode::from_rio(t.mode()).contains(TermMode::ALT_SCREEN) {
-                return serialize(t, MAX_REPLAY_HISTORY, shell);
+                return serialize(t, MAX_REPLAY_HISTORY, shell, 0);
             }
             // rio-vt keeps the primary grid private while the alternate one
             // is active. Switch to it, and back: switching to the alternate
@@ -61,9 +62,12 @@ impl Terminal {
             t.swap_alt();
             let mut out = String::from("\x1bc");
             write_primary(t, MAX_REPLAY_HISTORY, &mut out);
+            // Each screen has its own kitty keyboard flags: the primary's
+            // here, the alternate's in `write_modes`.
+            write_kitty_flags(TermMode::of(t).kitty_flags(), &mut out);
             t.swap_alt();
             t.grid = alt;
-            let mode = TermMode::from_rio(t.mode());
+            let mode = TermMode::of(t);
             out.push_str("\x1b[?1049h");
             write_screen(t, false, &mut out);
             write_shell_state(shell, &mut out);
@@ -79,19 +83,33 @@ impl Terminal {
     /// (rio's `ED 2` on the primary screen pushes the viewport up) and the
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
-        self.with_term(|t| resync(t, self.shell_info()))
+        self.with_term(|t| resync(t, self.shell_info(), self.primary_kitty()))
+    }
+
+    /// The primary screen's kitty keyboard flags as of its last switch to
+    /// the alternate screen (only meaningful while that is active).
+    fn primary_kitty(&self) -> u8 {
+        self.inner.primary_kitty.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
-    let mode = TermMode::from_rio(t.mode());
+/// `primary`: the primary screen's kitty keyboard flags, used while the
+/// alternate screen is active (each screen has its own).
+fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> Vec<u8> {
+    let mode = TermMode::of(t);
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
     // region, origin mode, and the alt-screen switch in whichever direction.
     // Autowrap on for the replay (soft-wrapped rows rely on it);
     // `write_modes` then sets the session's own state.
     out.push_str("\x1b[0m\x1b[r\x1b[?6l\x1b[?7h");
-    out.push_str(if mode.contains(TermMode::ALT_SCREEN) { "\x1b[?1049h" } else { "\x1b[?1049l" });
+    out.push_str("\x1b[?1049l");
+    if mode.contains(TermMode::ALT_SCREEN) {
+        // Through the primary screen to set its flags (the alternate screen
+        // is drawn again anyway).
+        write_kitty_flags(primary, &mut out);
+        out.push_str("\x1b[?1049h");
+    }
     write_screen(t, true, &mut out);
     write_shell_state(shell, &mut out);
     // Mouse protocols are one setting in rio: reset, then set what's active.
@@ -100,8 +118,9 @@ fn resync(t: &mut Term, shell: ShellInfo) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn serialize(t: &Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
-    let mode = TermMode::from_rio(t.mode());
+/// `primary`: as for [`resync`].
+fn serialize(t: &Term, max_history: usize, shell: ShellInfo, primary: u8) -> Vec<u8> {
+    let mode = TermMode::of(t);
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
     out.push_str("\x1bc");
@@ -113,6 +132,7 @@ fn serialize(t: &Term, max_history: usize, shell: ShellInfo) -> Vec<u8> {
     if !alt {
         write_primary(t, max_history, &mut out);
     } else {
+        write_kitty_flags(primary, &mut out);
         out.push_str("\x1b[?1049h");
         write_screen(t, false, &mut out);
     }
@@ -238,8 +258,21 @@ fn write_modes(t: &Term, mode: TermMode, out: &mut String) {
         set(out, true, 1006);
     }
     out.push_str(if mode.contains(TermMode::APP_KEYPAD) { "\x1b=" } else { "\x1b>" });
+    write_kitty_flags(mode.kitty_flags(), out);
     if !t.title.is_empty() {
         let _ = write!(out, "\x1b]2;{}\x07", t.title.replace(['\x07', '\x1b'], ""));
+    }
+}
+
+/// A screen's kitty keyboard flags (#22), for the screen the client is on:
+/// empty its stack (popping more than it holds clears it), then push the
+/// flags. The levels below the top aren't readable from rio-vt, so an
+/// application that pops later lands on no flags here; it pushed over the
+/// shell's, which are normally none.
+fn write_kitty_flags(flags: u8, out: &mut String) {
+    out.push_str("\x1b[<99u");
+    if flags != 0 {
+        let _ = write!(out, "\x1b[>{flags}u");
     }
 }
 
@@ -522,6 +555,59 @@ mod tests {
         assert!(!a.line_editing());
         b.feed(&a.resync_snapshot());
         assert!(!b.line_editing());
+    }
+
+    #[test]
+    fn snapshots_carry_kitty_keyboard_flags() {
+        let fresh = || Terminal::new(TermSize::new(20, 5), false, Arc::new(Palette::default())).0;
+        let a = fresh();
+        a.feed(b"\x1b[>1u\x1b[?1049h\x1b[>11u");
+        let b = fresh();
+        b.feed(&a.reattach_snapshot());
+        assert_eq!(b.mode().kitty_flags(), 11);
+        // The primary screen's flags come back with it.
+        b.feed(b"\x1b[?1049l");
+        assert_eq!(b.mode().kitty_flags(), 1);
+
+        // Resync replaces what the client had.
+        let c = fresh();
+        c.feed(b"\x1b[>31u\x1b[>31u");
+        c.feed(&a.resync_snapshot());
+        assert_eq!(c.mode().kitty_flags(), 11);
+        // A second resync while the client is already in the alternate
+        // screen gives the same.
+        c.feed(&a.resync_snapshot());
+        assert_eq!(c.mode().kitty_flags(), 11);
+
+        // A restore keeps each screen's flags.
+        let d = fresh();
+        d.feed(&a.restore_snapshot());
+        assert_eq!(d.mode().kitty_flags(), 11);
+        d.feed(b"\x1b[?1049l");
+        assert_eq!(d.mode().kitty_flags(), 1);
+        assert_eq!(a.mode().kitty_flags(), 11, "restoring left the source as it was");
+
+        let primary_of = |t: &Terminal| {
+            t.feed(b"\x1b[?1049l");
+            let f = t.mode().kitty_flags();
+            t.feed(b"\x1b[?1049h");
+            f
+        };
+        assert_eq!(primary_of(&c), 1);
+
+        // Flags off: the client's go too.
+        a.feed(b"\x1b[<99u");
+        c.feed(&a.resync_snapshot());
+        assert_eq!(c.mode().kitty_flags(), 0);
+
+        // The switch and the push in one chunk, split mid-sequence.
+        let e = fresh();
+        e.feed(b"\x1b[>5u\x1b[?10");
+        e.feed(b"49h\x1b[>2u");
+        let f = fresh();
+        f.feed(&e.reattach_snapshot());
+        assert_eq!(f.mode().kitty_flags(), 2);
+        assert_eq!(primary_of(&f), 5);
     }
 
     #[test]

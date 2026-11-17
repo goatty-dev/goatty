@@ -121,7 +121,7 @@ One reader thread per session and one per connection is simple and fast. tokio a
 | rio-vt `contents_formatted()` covers only the visible screen and drops combining marks | goatty's snapshot adds scrollback (up to 5,000 lines) and modes. The alt screen's hidden primary screen can't be restored (rio keeps it private) |
 
 ## Not done yet (Stage 1 backlog)
-- IME / compose (needs gpui `InputHandler`), kitty keyboard protocol, cursor blink
+- IME / compose (needs gpui `InputHandler`), cursor blink
 - Procedural box-drawing glyphs; ligature setting
 - Selection auto-scroll, URL/path detection, OSC 133/7 integration
 - Multiline paste confirmation (plan §9)
