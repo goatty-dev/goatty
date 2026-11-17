@@ -151,41 +151,64 @@ impl Terminal {
 
     /// Scroll so the previous (or next) prompt, counted from the top of the
     /// view, is the view's top row. Past the newest prompt it scrolls to
-    /// the bottom. Returns `None` when there are no prompts to jump between:
-    /// a full-screen program shows, or no prompt was marked (no shell
-    /// integration). Otherwise it returns `Some(moved)`.
+    /// the bottom.
     ///
     /// A client mirror holds only the history it has fetched so far
-    /// (`history`), so the oldest prompts may not be there yet. When the
-    /// view gets close to them, the client fetches more and the next jump
-    /// can reach them.
-    pub fn scroll_to_prompt(&self, dir: PromptJump) -> Option<bool> {
+    /// (`history`). When no prompt is above the view but the daemon has
+    /// older lines, `Previous` scrolls to the oldest row held, which makes
+    /// the client fetch more ([`Terminal::wanted_history`]), and returns
+    /// [`PromptJumped::Fetching`]: jump again once the rows are in.
+    pub fn scroll_to_prompt(&self, dir: PromptJump) -> PromptJumped {
         self.with_term(|t| {
             if TermMode::of(t).contains(TermMode::ALT_SCREEN) {
-                return None;
+                return PromptJumped::NoPrompts;
             }
             let history = t.history_size() as i32;
             let last = t.screen_lines() as i32 - 1;
             let prompts: Vec<i32> = (-history..=last).filter(|&r| t.grid[Line(r)].semantic_prompt == SemanticPrompt::Prompt).collect();
-            if prompts.is_empty() {
-                return None;
+            // A command started: the shell marks prompts, even if none is held.
+            if prompts.is_empty() && self.commands_started() == 0 {
+                return PromptJumped::NoPrompts;
             }
             let offset = t.display_offset() as i32;
             let view_top = -offset;
             let target = match dir {
-                PromptJump::Previous => prompts.iter().rev().find(|&&r| r < view_top).copied(),
+                PromptJump::Previous => match prompts.iter().rev().find(|&&r| r < view_top) {
+                    Some(&r) => r,
+                    None if self.older_history_missing(t) => {
+                        if offset != history {
+                            t.scroll_display(Scroll::Delta(history - offset));
+                        }
+                        return PromptJumped::Fetching;
+                    }
+                    None => return PromptJumped::Boundary,
+                },
                 // No prompt below: the bottom (offset 0).
-                PromptJump::Next => Some(prompts.iter().find(|&&r| r > view_top).copied().unwrap_or(0)),
+                PromptJump::Next => prompts.iter().find(|&&r| r > view_top).copied().unwrap_or(0),
             };
-            let Some(target) = target else { return Some(false) };
             let new_offset = (-target).clamp(0, history);
             if new_offset == offset {
-                return Some(false);
+                return PromptJumped::Boundary;
             }
             t.scroll_display(Scroll::Delta(new_offset - offset));
-            Some(true)
+            PromptJumped::Moved
         })
     }
+}
+
+/// What [`Terminal::scroll_to_prompt`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptJumped {
+    /// The view moved to the prompt (or to the bottom).
+    Moved,
+    /// No prompt above in what this mirror holds, but the daemon has older
+    /// lines: the view is at the oldest row held, which fetches more.
+    Fetching,
+    /// Already at the oldest prompt (`Previous`) or the bottom (`Next`).
+    Boundary,
+    /// Nothing to jump between: a full-screen program shows, or the shell
+    /// doesn't mark its prompts.
+    NoPrompts,
 }
 
 /// Which way [`Terminal::scroll_to_prompt`] jumps.
@@ -542,7 +565,7 @@ mod tests {
     fn jumps_between_prompts() {
         let t = term(20, 4);
         let offset = || t.with_term(|t| t.display_offset());
-        assert_eq!(t.scroll_to_prompt(PromptJump::Previous), None, "no marks yet");
+        assert_eq!(t.scroll_to_prompt(PromptJump::Previous), PromptJumped::NoPrompts, "no marks yet");
         // Three commands of five output lines each, then the current prompt:
         // 4 rows per screen, so the earlier prompts are in the scrollback.
         for cmd in ["one", "two", "three"] {
@@ -554,24 +577,24 @@ mod tests {
             t.with_term(|t| t.grid[Line(-o)].semantic_prompt)
         };
         let mut seen = Vec::new();
-        while t.scroll_to_prompt(PromptJump::Previous) == Some(true) {
+        while t.scroll_to_prompt(PromptJump::Previous) == PromptJumped::Moved {
             assert_eq!(top_row(&t), SemanticPrompt::Prompt);
             seen.push(offset());
         }
         assert_eq!(seen.len(), 3, "three prompts above the current one: {seen:?}");
         assert!(seen.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(offset(), t.history_size(), "the first prompt is the oldest row");
-        assert_eq!(t.scroll_to_prompt(PromptJump::Previous), Some(false));
+        assert_eq!(t.scroll_to_prompt(PromptJump::Previous), PromptJumped::Boundary);
 
         // Forward again: the same prompts, then the bottom.
         let mut back = Vec::new();
-        while t.scroll_to_prompt(PromptJump::Next) == Some(true) {
+        while t.scroll_to_prompt(PromptJump::Next) == PromptJumped::Moved {
             back.push(offset());
         }
         assert_eq!(back.last(), Some(&0));
         seen.reverse();
         assert_eq!(&back[..back.len() - 1], &seen[1..]);
-        assert_eq!(t.scroll_to_prompt(PromptJump::Next), Some(false));
+        assert_eq!(t.scroll_to_prompt(PromptJump::Next), PromptJumped::Boundary);
     }
 
     #[test]
@@ -579,8 +602,8 @@ mod tests {
         let t = term(20, 4);
         command(&t, "vim", "");
         t.feed(b"\x1b[?1049h");
-        assert_eq!(t.scroll_to_prompt(PromptJump::Previous), None);
+        assert_eq!(t.scroll_to_prompt(PromptJump::Previous), PromptJumped::NoPrompts);
         t.feed(b"\x1b[?1049l");
-        assert!(t.scroll_to_prompt(PromptJump::Previous).is_some());
+        assert_ne!(t.scroll_to_prompt(PromptJump::Previous), PromptJumped::NoPrompts);
     }
 }
