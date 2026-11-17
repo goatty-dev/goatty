@@ -315,6 +315,7 @@ impl Workspace {
             Entry::Header(heading.into()),
             Item::new(format!("New tab on {}", g.label), on(Box::new(|this, k, w, cx| this.new_tab_in_group(k, w, cx))))
                 .icon(Icon::Plus)
+                .disabled(matches!(key, super::groups::HostKey::Connecting(_)).then_some("Still connecting"))
                 .into(),
             Entry::Separator,
         ];

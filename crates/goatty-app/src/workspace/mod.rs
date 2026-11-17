@@ -1089,14 +1089,19 @@ impl Workspace {
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + 1) % self.tabs.len(), window, cx);
-        }
+        self.cycle_tab(true, window, cx);
     }
 
     fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + self.tabs.len() - 1) % self.tabs.len(), window, cx);
+        self.cycle_tab(false, window, cx);
+    }
+
+    /// The next (or previous) tab, coming round at the ends and skipping
+    /// folded host groups.
+    fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let hidden: Vec<bool> = (0..self.tabs.len()).map(|i| self.hidden(i, cx)).collect();
+        if let Some(to) = groups::cycle_visible(self.active, forward, &hidden) {
+            self.activate(to, window, cx);
         }
     }
 

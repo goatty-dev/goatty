@@ -310,6 +310,10 @@ impl Workspace {
 
     /// A new tab on the host of group `key`, at the end of its group.
     pub(super) fn new_tab_in_group(&mut self, key: &HostKey, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // A connecting tab has no host yet: the new tab would open elsewhere.
+        if matches!(key, HostKey::Connecting(_)) {
+            return;
+        }
         let Some(last) = self.tabs.iter().rposition(|t| self.host_key(t) == *key) else { return };
         self.activate(last, window, cx);
         self.spawn(super::Placement::NewTab, window, cx);
@@ -349,6 +353,13 @@ pub(super) fn color_slot(name: &str) -> usize {
     h = h.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
     h as usize % GROUP_COLORS.len()
+}
+
+/// The next (`forward`) or previous tab after `from` that isn't `hidden`,
+/// coming round at the ends; `None` when there is no other one.
+pub(super) fn cycle_visible(from: usize, forward: bool, hidden: &[bool]) -> Option<usize> {
+    let n = hidden.len();
+    (1..n).map(|k| if forward { (from + k) % n } else { (from + n - k) % n }).find(|&i| !hidden[i])
 }
 
 /// From tab `from`, `steps` tabs on (negative: back) counting only the
@@ -401,5 +412,15 @@ mod tests {
         assert_eq!(step_visible(0, -1, &hidden), 0);
         assert_eq!(step_visible(3, 0, &hidden), 3);
         assert_eq!(step_visible(0, 1, &[false, true]), 0, "nothing visible after");
+    }
+
+    #[test]
+    fn cycling_skips_hidden_tabs_and_comes_round() {
+        // A1 A2 | B1 folded.
+        let hidden = [false, false, true];
+        assert_eq!(cycle_visible(1, true, &hidden), Some(0));
+        assert_eq!(cycle_visible(0, false, &hidden), Some(1));
+        assert_eq!(cycle_visible(0, true, &[false, true]), None);
+        assert_eq!(cycle_visible(0, true, &[]), None);
     }
 }

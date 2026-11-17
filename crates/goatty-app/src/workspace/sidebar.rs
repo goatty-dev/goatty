@@ -351,7 +351,8 @@ impl Workspace {
             )
             .children(mark)
             .children(count)
-            .child(plus)
+            // A connecting tab has no host to open another tab on yet.
+            .when(!matches!(g.key, super::groups::HostKey::Connecting(_)), |d| d.child(plus))
             .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
             .on_mouse_down(
                 gpui::MouseButton::Right,
