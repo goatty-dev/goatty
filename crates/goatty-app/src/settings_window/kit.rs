@@ -196,6 +196,19 @@ fn scroll_to_focus_row(top: gpui::Pixels, window: &mut Window) {
     }
 }
 
+/// Make `el` the target of the search entry labelled `label` when it isn't
+/// a [`Row`] (a banner, a form): highlighted and scrolled to like one.
+pub fn focus_target(ui: Ui, label: &str, el: Div) -> Div {
+    if !is_focus_row(label) {
+        return el;
+    }
+    div()
+        .relative()
+        .child(div().absolute().inset(px(-4.)).rounded(px(radius::CARD)).bg(ui.accent_soft))
+        .child(canvas(|_, _, _| (), |bounds, _, window, _| scroll_to_focus_row(bounds.top(), window)).absolute().size_full())
+        .child(el)
+}
+
 /// What a page knows about one of its rows: problems reading the setting
 /// and the `GOATTY_*` variable overriding it (#53).
 #[derive(Debug, Clone, Default, PartialEq)]

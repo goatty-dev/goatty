@@ -289,11 +289,13 @@ impl SettingsWindow {
                     ),
             )
             .children(self.hosts.error.clone().map(|e| banner(ui, Tone::Danger, e, Vec::new())));
+        // "Show" on a problem with `ssh.hosts` lands on the banner (or the
+        // form, once it's gone).
         let mut yours = section(ui, "Your hosts").plain();
-        if let Some(b) = self.skipped_hosts_banner(ui, cx) {
-            yours = yours.child(b);
-        }
-        yours = yours.child(form);
+        yours = match self.skipped_hosts_banner(ui, cx) {
+            Some(b) => yours.child(kit::focus_target(ui, "Your hosts", b)).child(form),
+            None => yours.child(kit::focus_target(ui, "Your hosts", form)),
+        };
         if !added.is_empty() {
             yours = yours.child(self.host_list(ui, &added, cx));
         }
