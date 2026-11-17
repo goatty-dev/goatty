@@ -56,16 +56,29 @@ impl Tailscale {
         Self { program: program.into() }
     }
 
+    /// Start `tailscale args…`. Retries briefly on `ETXTBSY` ("text file
+    /// busy"): the program is open for writing somewhere, either an upgrade
+    /// replacing it or, in tests, a script just written while another
+    /// thread's `fork` still holds the descriptor until its `exec`.
+    fn spawn(&self, args: &[&str]) -> std::io::Result<std::process::Child> {
+        const ETXTBSY: i32 = 26;
+        let mut tries = 0;
+        loop {
+            let spawned = Command::new(&self.program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+            match spawned {
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Run `tailscale args…`: (success, stdout, stderr). Errors when it
     /// can't be run at all ([`is_not_installed`]) or takes too long.
     fn run(&self, args: &[&str]) -> Result<(bool, String, String)> {
-        let mut child = Command::new(&self.program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("couldn't run {}", self.program.display()))?;
+        let mut child = self.spawn(args).with_context(|| format!("couldn't run {}", self.program.display()))?;
         let mut out = child.stdout.take().context("stdout")?;
         let mut err = child.stderr.take().context("stderr")?;
         let out_reader = std::thread::spawn(move || {
@@ -483,6 +496,25 @@ pub(crate) mod tests {
       },
       "User": {"1": {"ID": 1, "LoginName": "me@github"}}
     }"#;
+
+    #[test]
+    fn a_program_busy_for_writing_is_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tailscale");
+        std::fs::write(&path, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Open for writing: exec fails with ETXTBSY until it is closed.
+        let writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        let (ok, stdout, _) = Tailscale::with_program(&path).run(&["status"]).unwrap();
+        closer.join().unwrap();
+        assert!(ok);
+        assert_eq!(stdout.trim(), "ok");
+    }
 
     #[test]
     fn status_is_parsed() {
