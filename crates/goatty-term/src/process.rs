@@ -31,7 +31,7 @@ pub fn process_name(pid: u32) -> Option<String> {
         let mut buf = [0u8; 64];
         // SAFETY: `buf` is valid for writes of the size passed.
         let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        display_name(&String::from_utf8_lossy(&buf[..n.max(0) as usize]), &[])
+        display_name(&String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(buf.len())]), &[])
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

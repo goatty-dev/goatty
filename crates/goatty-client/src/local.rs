@@ -236,7 +236,7 @@ fn process_name(pid: u32) -> String {
         let mut buf = [0u8; 256];
         // SAFETY: `buf` is valid for writes of the size passed.
         let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned()
+        String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(buf.len())]).into_owned()
     }
     #[cfg(not(target_os = "macos"))]
     std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
