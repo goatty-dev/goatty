@@ -85,7 +85,7 @@ commands.rs    `goatty settings …` / `goatty theme …` (headless)
 cli.rs         clap definition
 fonts.rs       the bundled JetBrainsMono Nerd Font (assets/fonts, `scripts/update-nerd-font.sh`): registered at start, the default terminal font when no installed Nerd Font comes first, the fallback of every terminal font, and the tab icons' font
 app.rs         GPUI bootstrap: settings, terminal windows (`Initial`: ready, or connecting in the window), OpenSettings handler
-settings.rs    AppSettings global: client settings file ⇄ live values, file polling, keybindings
+settings.rs    AppSettings global: client settings file ⇄ live values, file polling, keybindings; theme previews (`preview_theme`: shown, never saved, other edits save the theme from before it; `end_theme_preview` confirms or undoes)
 actions.rs     actions, name → action map, loading user keybindings (Terminal key context)
 command_palette/
   mod.rs       the Ctrl+Shift+P overlay: ranking (fuzzy + keywords + recently used), list, keys; hosts once something is typed; `Scope::Hosts` (Ctrl+Shift+H, the host switcher): this computer and the hosts with user@host/OS/RTT when connected, plus a typed user@host; `Scope::Sessions` ("Sessions on this host…", `list_sessions`): a host's sessions (fetched in the background) and a new one, opened per `ssh.open_in` (Shift+Enter: the other way), or ended without opening (Shift+Delete or the row's trash button, twice)
@@ -143,7 +143,7 @@ workspace/
   gestures.rs  the tabs' pointer maths (pure, unit-tested): where a dragged tab goes, wheel notches and touchpad distance → tab switches, the sidebar's width limits and fold thresholds
   icons.rs     process name → Nerd Font glyph + theme color, drawn with the bundled font (tests check every code point against it)
   saved.rs     the window's layout as goattyd keeps it (JSON: tabs, split trees with session ids, names, focus, zoom, window size and state); `restore` claims and reattaches it
-pickers.rs     goatty's own pick-from-a-list commands on `Ask::pick` (#79): "Themes: Switch theme…" (live preview, Esc restores; following the system it changes the dark or light theme in use), "Themes: Dark, light or follow the system…", "Shell: Install a built-in tool…" (the active host's missing or outdated tools, then `shell_setup::start_install`)
+pickers.rs     goatty's own pick-from-a-list commands on `Ask::pick` (#79): "Themes: Switch theme…" (live preview through `AppSettings::preview_theme`, Esc restores; following the system it changes the dark or light theme in use), "Themes: Dark, light or follow the system…", "Shell: Install a built-in tool…" (the active host's missing or outdated tools, then `shell_setup::start_install`)
 close_confirm.rs  "Close this pane?" dialog when a program other than the shell still runs (`panes.confirm_close`, "Don't ask again")
 connect.rs     ConnectView, the connect screen in a tab: connects off the UI thread (local daemon or remote), turns RemoteProblem into questions (install / update and restart / plain SSH) and LocalProblem too (a local goattyd that's incompatible or an older build than the installed one: restarted right away when that keeps its sessions or it has none, else asked), hands the tab its session or restored layout
 snippets/

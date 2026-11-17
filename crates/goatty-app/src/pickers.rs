@@ -82,18 +82,15 @@ pub fn switch_theme(window: &mut Window, cx: &mut App) {
         Slot::Dark => ("Switch the dark theme (following the system)", "Dark theme"),
         Slot::Light => ("Switch the light theme (following the system)", "Light theme"),
     };
-    // The file's own value (`client` has `GOATTY_*` overrides on top).
-    let restore = s.file.value.theme.clone();
+    // Previews start from the saved theme settings each time; Esc shows
+    // those again, Enter saves the pick on top of them.
     let a = Ask::pick(title, label, items, Some(&current), move |id, _, cx| {
-        AppSettings::update(cx, |c| slot.set(&mut c.theme, id));
+        AppSettings::end_theme_preview(cx, Some(&|t: &mut ThemeSettings| slot.set(t, id)));
         let name = cx.global::<AppSettings>().themes.get(id).map_or_else(|| id.to_string(), |t| t.name);
         toast::show(cx, Toast::success(format!("Theme: {name}")).key("themes.switch"));
     })
-    .on_select(move |id, cx| AppSettings::preview(cx, |c| slot.set(&mut c.theme, id)))
-    .on_cancel(move |cx| {
-        let t = restore.clone();
-        AppSettings::preview(cx, |c| c.theme = t);
-    });
+    .on_select(move |id, cx| AppSettings::preview_theme(cx, |t| slot.set(t, id)))
+    .on_cancel(|cx| AppSettings::end_theme_preview(cx, None));
     ask(window, cx, a);
 }
 
@@ -142,9 +139,8 @@ pub fn switch_appearance(window: &mut Window, cx: &mut App) {
         Suggestion { value: DARK.into(), label: "Always dark".into(), detail: Some(name(&original.dark)) },
         Suggestion { value: LIGHT.into(), label: "Always light".into(), detail: Some(name(&original.light)) },
     ];
-    let restore = s.file.value.theme.clone();
     let a = Ask::pick("Dark, light or follow the system", "Appearance", items, appearance_of(&original), move |choice, _, cx| {
-        AppSettings::update(cx, |c| set_appearance(&mut c.theme, choice));
+        AppSettings::end_theme_preview(cx, Some(&|t: &mut ThemeSettings| set_appearance(t, choice)));
         let what = match choice {
             FOLLOW => "Following the system's dark or light mode",
             DARK => "Always the dark theme",
@@ -152,11 +148,8 @@ pub fn switch_appearance(window: &mut Window, cx: &mut App) {
         };
         toast::show(cx, Toast::success(what).body("Pick the themes with “Themes: Switch theme…”").key("themes.appearance"));
     })
-    .on_select(|choice, cx| AppSettings::preview(cx, |c| set_appearance(&mut c.theme, choice)))
-    .on_cancel(move |cx| {
-        let t = restore.clone();
-        AppSettings::preview(cx, |c| c.theme = t);
-    });
+    .on_select(|choice, cx| AppSettings::preview_theme(cx, |t| set_appearance(t, choice)))
+    .on_cancel(|cx| AppSettings::end_theme_preview(cx, None));
     ask(window, cx, a);
 }
 
@@ -247,6 +240,14 @@ mod tests {
         assert_eq!(appearance_of(&t), Some(FOLLOW));
         set_appearance(&mut t, DARK);
         assert_eq!((t.name.as_str(), t.follow_system), ("night", false));
+        // Previews start from the saved settings each time: "Always dark",
+        // then back to "Follow the system", leaves the fixed theme alone.
+        let base = ThemeSettings { follow_system: true, name: "x".into(), dark: "night".into(), ..Default::default() };
+        let mut shown = base.clone();
+        set_appearance(&mut shown, DARK);
+        let mut shown = base.clone();
+        set_appearance(&mut shown, FOLLOW);
+        assert_eq!(shown, base);
     }
 
     #[test]

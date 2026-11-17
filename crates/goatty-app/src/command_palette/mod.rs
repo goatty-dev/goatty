@@ -224,6 +224,10 @@ struct Asking {
     ready: bool,
     /// The value the live preview shows now.
     previewed: Option<String>,
+    /// A pick-from-list step's starting value (its default, or the answer
+    /// when going back): selected whenever the list (re)appears, also
+    /// once a loader's items arrive, until the user moves or types.
+    want: Option<String>,
 }
 
 impl Asking {
@@ -475,6 +479,7 @@ impl CommandPalette {
             answered: false,
             ready: false,
             previewed: None,
+            want: None,
         });
         if let Some(a) = &mut this.asking {
             a.answers = ask.answers;
@@ -701,6 +706,7 @@ impl CommandPalette {
         if let Some(a) = &mut self.asking {
             a.picked = true;
             a.moved = true;
+            a.want = None;
         }
     }
 
@@ -735,6 +741,7 @@ impl CommandPalette {
         let (text, preselect) = if a.fields[step].strict() && !multiple { (String::new(), Some(text)) } else { (text, None) };
         let placeholder = if spec.placeholder.is_empty() { format!("{}…", spec.label) } else { spec.placeholder.clone() };
         let label = spec.label.clone();
+        a.want = preselect;
         self.input.update(cx, |input, cx| {
             input.set_text(text.clone(), cx);
             input.set_placeholder(placeholder, cx);
@@ -743,16 +750,10 @@ impl CommandPalette {
             input.select_all_text(cx);
         });
         self.ask_changed(&text, cx);
-        let mut current = false;
-        if let Some(value) = preselect
-            && let Some(ix) = self.hits.iter().position(|h| self.commands[h.index].id == value)
-        {
-            self.select(ix, cx);
-            current = true;
-        }
-        // The current value is what's shown already; anything else
-        // previews once selected.
-        let shown = if current { self.selected_value() } else { None };
+        // The current value (selected by `ask_changed`) is what's shown
+        // already; anything else previews once selected.
+        let selected = self.selected_value();
+        let shown = self.asking.as_ref().and_then(|a| a.want.clone()).filter(|w| selected.as_ref() == Some(w));
         if let Some(a) = &mut self.asking {
             a.ready = true;
             a.previewed = shown;
@@ -802,6 +803,9 @@ impl CommandPalette {
     fn ask_changed(&mut self, text: &str, cx: &mut Context<'_, Self>) {
         self.query = text.to_string();
         let Some(a) = &mut self.asking else { return };
+        if !text.trim().is_empty() {
+            a.want = None;
+        }
         a.picked = a.field().strict();
         let field = a.field().clone();
         a.message = message_for(&field, text, a.tried);
@@ -850,10 +854,12 @@ impl CommandPalette {
         self.show_suggestions(list, text, cx);
         // A default or earlier answer selects its own choice, not the
         // first fuzzy match (a label may look like another's value).
-        if field.strict()
-            && let Some(ix) = self.hits.iter().position(|h| self.commands[h.index].id == text)
-        {
-            self.select(ix, cx);
+        if field.strict() {
+            let want = self.asking.as_ref().and_then(|a| a.want.clone());
+            let at = |v: &str| self.hits.iter().position(|h| self.commands[h.index].id == v);
+            if let Some(ix) = at(text).or_else(|| want.as_deref().and_then(at)) {
+                self.select(ix, cx);
+            }
         }
     }
 

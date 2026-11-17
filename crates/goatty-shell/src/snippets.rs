@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use goatty_config::HostSettings;
 use goatty_plugin::api::{HostExpansion, HostSnippet, Origin, SnippetList, Suggestions};
+use goatty_plugin::commands::InputKind;
 use goatty_plugin::snippets::{self, Command, Compiled, Expansion, Owner, Snippet, SnippetInput};
 
 use crate::dirs::Dirs;
@@ -202,7 +203,8 @@ pub fn suggest(
 ) -> Result<Suggestions> {
     let (s, i, user) = find(dirs, settings, owner, snippet, input)?;
     let src = i.source.clone().ok_or_else(|| anyhow!("{} has no suggestions", i.label))?;
-    let cmd = match snippets::source_command(&s, &i, values) {
+    let values = expand_paths(values, |id| s.input(id).map(|i| i.kind));
+    let cmd = match snippets::source_command(&s, &i, &values) {
         Ok(c) => c,
         Err(why) => return Ok(Suggestions { items: Vec::new(), note: Some(why), truncated: false }),
     };
@@ -230,11 +232,31 @@ pub fn suggest_command(
     let c = a.manifest.commands.iter().find(|c| c.id == command).with_context(|| format!("{plugin} has no command {command:?}"))?;
     let i = c.inputs.iter().find(|i| i.id == input).with_context(|| format!("{} has no input {input:?}", c.title))?;
     let src = i.source.clone().ok_or_else(|| anyhow!("{} has no suggestions", i.label))?;
-    let argv = match goatty_plugin::commands::source_argv(c, i, values) {
+    let values = expand_paths(values, |id| c.inputs.iter().find(|i| i.id == id).map(|i| i.kind));
+    let argv = match goatty_plugin::commands::source_argv(c, i, &values) {
         Ok(argv) => argv,
         Err(why) => return Ok(Suggestions { items: Vec::new(), note: Some(why), truncated: false }),
     };
     run_source(dirs, settings, &src, &Command::Argv(argv), cwd)
+}
+
+/// The answers with a leading `~` of path and folder values (`kind_of`
+/// an input's type) made the home directory: a source runs without a
+/// shell, which would have expanded it. The stored answers keep their `~`.
+fn expand_paths(values: &snippets::Answers, kind_of: impl Fn(&str) -> Option<InputKind>) -> snippets::Answers {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    values
+        .iter()
+        .map(|(id, v)| {
+            let path = matches!(kind_of(id), Some(InputKind::Path | InputKind::Folder));
+            let v = if path {
+                v.split('\n').map(|p| crate::path_report::expand(p, home.as_deref())).collect::<Vec<_>>().join("\n")
+            } else {
+                v.clone()
+            };
+            (id.clone(), v)
+        })
+        .collect()
 }
 
 /// Run a source's `cmd` in `cwd` (the pane's directory; the home directory
@@ -359,6 +381,15 @@ mod tests {
 
     fn settings(snippets: serde_json::Value) -> HostSettings {
         HostSettings { snippets: serde_json::from_value(snippets).unwrap(), ..HostSettings::default() }
+    }
+
+    #[test]
+    fn sources_get_paths_with_the_home_directory() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+        let values: snippets::Answers = [("dir".to_string(), "~/src\n/opt".to_string()), ("text".to_string(), "~/src".to_string())].into();
+        let out = expand_paths(&values, |id| Some(if id == "dir" { InputKind::Folder } else { InputKind::Text }));
+        assert_eq!(out["dir"], format!("{}/src\n/opt", home.display()));
+        assert_eq!(out["text"], "~/src", "only paths");
     }
 
     #[test]

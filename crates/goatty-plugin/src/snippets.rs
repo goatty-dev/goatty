@@ -872,7 +872,9 @@ pub enum Command {
 /// an input that has no value yet.
 pub fn source_command(s: &Snippet, input: &SnippetInput, values: &Answers) -> Result<Command, String> {
     let src = input.source.as_ref().ok_or_else(|| format!("{} has no suggestions", input.id))?;
-    let missing = input.depends().into_iter().find(|d| values.get(d).is_none_or(String::is_empty));
+    // An optional input left empty is answered (and left out).
+    let optional = |d: &str| s.input(d).is_some_and(|i| i.optional);
+    let missing = input.depends().into_iter().find(|d| values.get(d).is_none_or(|v| v.is_empty() && !optional(d)));
     if let Some(d) = missing {
         let label = s.input(&d).map_or(d.clone(), |i| i.label.clone());
         return Err(format!("Fill in {label} first"));

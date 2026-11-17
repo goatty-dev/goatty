@@ -391,7 +391,11 @@ pub fn source_argv(c: &PaletteCommand, input: &CommandInput, values: &BTreeMap<S
     if src.sh.is_some() {
         return Err("plugins can't run a shell".into());
     }
-    let missing = crate::snippets::source_depends(&src.run).into_iter().find(|d| values.get(d).is_none_or(String::is_empty));
+    // Unanswered, or empty without being optional (an optional one left
+    // empty is simply left out of the arguments).
+    let optional = |d: &str| c.inputs.iter().any(|i| i.id == d && i.optional);
+    let missing =
+        crate::snippets::source_depends(&src.run).into_iter().find(|d| values.get(d).is_none_or(|v| v.is_empty() && !optional(d)));
     if let Some(d) = missing {
         let label = c.inputs.iter().find(|i| i.id == d).map_or(d.clone(), |i| i.label.clone());
         return Err(format!("Fill in {label} first"));
@@ -706,6 +710,12 @@ run = ["eza", "-1", "--only-files", "{dir}"]
         assert_eq!(source_argv(c, file, &v), Err("Fill in Folder first".into()));
         v.insert("dir".to_string(), "my dir".to_string());
         assert_eq!(source_argv(c, file, &v), Ok(vec!["eza".into(), "-1".into(), "--only-files".into(), "my dir".into()]));
+        // An optional earlier input left empty is left out, not missing.
+        let mut opt = c.clone();
+        opt.inputs[0].optional = true;
+        v.insert("dir".to_string(), String::new());
+        assert_eq!(source_argv(&opt, &opt.inputs[1], &v), Ok(vec!["eza".into(), "-1".into(), "--only-files".into()]));
+        assert_eq!(source_argv(c, file, &v), Err("Fill in Folder first".into()), "a required one is still missing");
         use crate::permissions::{Permission, derived, describe};
         assert!(derived(&m).contains(&Permission::SnippetSources));
         let g = describe(&m).into_iter().find(|g| g.permission == Permission::SnippetSources).unwrap();
