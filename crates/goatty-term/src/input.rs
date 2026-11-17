@@ -87,7 +87,7 @@ pub fn encode_key(key: &Key<'_>, mods: Mods, mode: TermMode) -> Option<Vec<u8>> 
 /// terminal handles, or a repeat/release the application didn't ask for.
 pub fn encode_key_event(ev: &KeyEvent<'_>, mode: TermMode) -> Option<Vec<u8>> {
     if mode.kitty_flags() != 0 {
-        return kitty::encode(ev, mode.kitty_flags());
+        return kitty::encode(ev, mode);
     }
     // Legacy: a repeat is another press; releases aren't reported.
     match ev.kind {
@@ -261,15 +261,20 @@ mod kitty {
         })
     }
 
-    pub(super) fn encode(ev: &KeyEvent<'_>, flags: u8) -> Option<Vec<u8>> {
+    pub(super) fn encode(ev: &KeyEvent<'_>, mode: TermMode) -> Option<Vec<u8>> {
+        let flags = mode.kitty_flags();
         let all_keys = flags & ALL_KEYS != 0;
         let disambiguate = flags & DISAMBIGUATE != 0 || all_keys;
         let events = flags & EVENT_TYPES != 0;
-        if ev.kind == KeyKind::Release && !events {
-            return None;
-        }
+        // Without event types a repeat is another press, and releases
+        // aren't reported.
+        let kind = match ev.kind {
+            KeyKind::Release if !events => return None,
+            KeyKind::Repeat if !events => KeyKind::Press,
+            k => k,
+        };
         let mods = ev.mods;
-        let release = ev.kind == KeyKind::Release;
+        let release = kind == KeyKind::Release;
         // Shift alone still types text: keys with ctrl, alt or super don't.
         let typing = !(mods.ctrl || mods.alt || mods.logo);
 
@@ -286,8 +291,9 @@ mod kitty {
                 if typing {
                     return Some(text.as_bytes().to_vec());
                 }
-                if !disambiguate {
-                    // Only event types asked for: presses stay legacy.
+                if !disambiguate && kind == KeyKind::Press {
+                    // No disambiguation: presses stay legacy (a repeat
+                    // carries its event type, so it can't).
                     return encode_legacy(&ev.key, mods, TermMode::empty());
                 }
             }
@@ -307,10 +313,18 @@ mod kitty {
             let assoc = (flags & ASSOCIATED_TEXT != 0 && all_keys && typing && !release)
                 .then_some(text)
                 .filter(|t| !t.chars().any(char::is_control));
-            return Some(csi(u32::from(base), shifted, 'u', mods, ev.kind, events, assoc));
+            return Some(csi(u32::from(base), shifted, 'u', mods, kind, events, assoc));
         }
 
         let (code, end) = functional(&ev.key)?;
+        if !disambiguate && !events {
+            // Only alternate keys or associated text, which change nothing
+            // here: the legacy forms (SS3 arrows in DECCKM, SS3 F1-F4).
+            // F13 and up have none.
+            if let Some(b) = encode_legacy(&ev.key, mods, mode & TermMode::APP_CURSOR) {
+                return Some(b);
+            }
+        }
         let legacy_ok = !all_keys && mods == Mods::default();
         match ev.key {
             // These keep their legacy bytes so a shell stays usable after a
@@ -323,11 +337,7 @@ mod kitty {
             }
             _ => {}
         }
-        if !disambiguate && !release && end == 'u' && !matches!(ev.key, Key::F(_)) {
-            // Event types only: modified Enter/Tab/Backspace/Escape stay legacy.
-            return encode_legacy(&ev.key, mods, TermMode::empty());
-        }
-        Some(csi(code, None, end, mods, ev.kind, events, None))
+        Some(csi(code, None, end, mods, kind, events, None))
     }
 
     fn single(s: &str) -> Option<char> {
@@ -587,12 +597,29 @@ mod tests {
         // Enter, Tab and Backspace stay legacy, release included.
         assert_eq!(run(Key::Enter, NONE, KeyKind::Release), "");
 
-        // Event types alone: presses keep their legacy bytes.
+        // Event types alone: text-key presses keep their legacy bytes, but
+        // repeats and releases need CSI u to say what they are; modified
+        // functional keys are CSI u as kitty sends them.
         let m = kitty(2);
         let run = |key, mods, kind| String::from_utf8(encode_key_event(&ev(key, mods, kind), m).unwrap_or_default()).unwrap();
         assert_eq!(run(Key::Text("c"), CTRL, KeyKind::Press), "\x03");
-        assert_eq!(run(Key::Escape, NONE, KeyKind::Press), "\x1b");
+        assert_eq!(run(Key::Text("c"), CTRL, KeyKind::Repeat), "\x1b[99;5:2u");
         assert_eq!(run(Key::Text("c"), CTRL, KeyKind::Release), "\x1b[99;5:3u");
+        assert_eq!(run(Key::Escape, NONE, KeyKind::Press), "\x1b");
+        assert_eq!(run(Key::Enter, CTRL, KeyKind::Press), "\x1b[13;5u");
+    }
+
+    #[test]
+    fn kitty_alternate_keys_alone_keep_legacy_forms() {
+        let (term, _ch) = crate::Terminal::new(crate::TermSize::new(20, 5), false, std::sync::Arc::new(crate::Palette::default()));
+        term.feed(b"\x1b[?1h\x1b[>4u");
+        let m = term.mode();
+        assert_eq!(enc(Key::Up, NONE, m), "\x1bOA");
+        assert_eq!(enc(Key::F(1), NONE, m), "\x1bOP");
+        assert_eq!(enc(Key::Text("c"), CTRL, m), "\x03");
+        // Repeats are presses without event types.
+        assert_eq!(encode_key_event(&ev(Key::Text("c"), CTRL, KeyKind::Repeat), m).unwrap(), b"\x03");
+        assert_eq!(enc(Key::F(13), NONE, m), "\x1b[57376u");
     }
 
     #[test]

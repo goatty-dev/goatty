@@ -64,6 +64,10 @@ pub(crate) struct Inner {
     pub(crate) prompts: AtomicU64,
     /// Which host line each row shows (clients; see `history`).
     pub(crate) lines: Mutex<crate::history::LineMap>,
+    /// The primary screen's kitty keyboard flags when it last switched to
+    /// the alternate screen: what a snapshot taken in the alternate screen
+    /// restores for it (rio-vt keeps the inactive screen's flags private).
+    pub(crate) primary_kitty: AtomicU8,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -117,6 +121,7 @@ impl Terminal {
             zle: AtomicBool::new(false),
             prompts: AtomicU64::new(0),
             lines: Mutex::new(Default::default()),
+            primary_kitty: AtomicU8::new(0),
         };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
@@ -227,6 +232,12 @@ impl Terminal {
             }
             Mark::Line(line) => {
                 let _ = self.inner.ui.send(UiEvent::CommandLine(line));
+            }
+            Mark::ScreenSwitch => {
+                let mode = TermMode::of(t);
+                if !mode.contains(TermMode::ALT_SCREEN) {
+                    self.inner.primary_kitty.store(mode.kitty_flags(), Ordering::Relaxed);
+                }
             }
         }
     }

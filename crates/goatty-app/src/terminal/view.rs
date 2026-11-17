@@ -1027,7 +1027,12 @@ impl TerminalView {
     fn on_key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(i) = self.keys_down.iter().position(|k| *k == ev.keystroke.key) else { return };
         self.keys_down.swap_remove(i);
-        let Some(key) = terminal_key(&ev.keystroke, KeyKind::Release) else { return };
+        // The press went to the program, so the release does too, even
+        // with Super held now (`terminal_key` leaves Super combos alone).
+        let mut ks = ev.keystroke.clone();
+        let logo = std::mem::take(&mut ks.modifiers.platform);
+        let Some(mut key) = terminal_key(&ks, KeyKind::Release) else { return };
+        key.mods.logo = logo;
         if let Some(bytes) = encode_key_event(&key, self.session.terminal.mode()) {
             self.session.write(&bytes);
             cx.notify();
@@ -1282,6 +1287,8 @@ impl Render for TerminalView {
                 .on_action(cx.listener(Self::increase_font_size))
                 .on_action(cx.listener(Self::decrease_font_size))
                 .on_action(cx.listener(Self::reset_font_size))
+                // Keys pressed before the viewer opened are let go here.
+                .on_key_up(cx.listener(Self::on_key_up))
                 .child(viewer.clone())
                 .into_any_element();
         }
