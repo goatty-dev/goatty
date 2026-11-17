@@ -313,8 +313,11 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
             problems.extend(lib.check(&loaded.value.theme).iter().map(ToString::to_string));
             problems.extend(ClientSettings::lossy_colors(&text).iter().map(ToString::to_string));
             problems.extend(lib.lossy_colors().iter().map(ToString::to_string));
-            // Without a window there's no font list: only programs are checked.
-            problems.extend(loaded.value.check_environment(&[], crate::settings::has_program).iter().map(ToString::to_string));
+            // The checks the settings window makes, with the installed fonts
+            // read from disk since there's no GPUI here (#150). The file's
+            // values, without `GOATTY_*` overrides: this checks the file.
+            let fonts = crate::fonts::installed_families();
+            problems.extend(loaded.value.check_environment(&fonts, crate::settings::has_program).iter().map(ToString::to_string));
             // Keystrokes goatty can't read are already in `issues`; this
             // catches what only GPUI rejects.
             for key in loaded.value.keybindings.keys().filter(|k| goatty_config::keys::canonical_keystroke(k).is_ok()) {

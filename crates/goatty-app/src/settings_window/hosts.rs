@@ -3,7 +3,7 @@
 //! `~/.ssh/config` are client settings (`ssh` in `settings.json`), saved
 //! right away.
 
-use goatty_config::{LocalEcho, OpenIn, SshHost, SyncMode, ssh_host_problem};
+use goatty_config::{Issue, LocalEcho, OpenIn, SshHost, SyncMode, ssh_host_problem};
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, div, prelude::*, px,
 };
@@ -13,6 +13,7 @@ use super::kit::{self, card, divider, field, opt, row, section};
 use crate::hosts::{self, HostEntry, HostList};
 use crate::settings::AppSettings;
 use crate::ui::controls::{ButtonKind, Tone, banner, button_with, icon_button, segmented, toggle, tooltip};
+use crate::ui::focus;
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
 use crate::ui::text_input::{TextInput, TextInputEvent};
@@ -199,6 +200,32 @@ impl SettingsWindow {
         c
     }
 
+    /// The banner for [`skipped_hosts`], with a button that saves the list
+    /// as it's used, which drops those entries from `settings.json`.
+    fn skipped_hosts_banner(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<gpui::Div> {
+        let lines = skipped_hosts(&cx.global::<AppSettings>().issues());
+        let title = match lines.len() {
+            0 => return None,
+            1 => "An entry in settings.json was skipped".to_string(),
+            n => format!("{n} entries in settings.json were skipped"),
+        };
+        let remove = button_with(
+            "hosts-drop-skipped",
+            Some(Icon::Trash),
+            "Remove from the file",
+            ButtonKind::Normal,
+            ui,
+            self.act_window(cx, |v, window, cx| {
+                // The banner is going: focus waits on the Add button.
+                focus::hand_over(&v.focus, focus::Handover::Control("host-add".into()), window, cx);
+                // The loaded list already lacks them: saving it writes them out.
+                AppSettings::update(cx, |_| {});
+            }),
+        )
+        .aria_label(SharedString::from("Remove the skipped hosts from settings.json"));
+        Some(banner(ui, Tone::Warning, title, lines).items_center().child(remove))
+    }
+
     pub(super) fn hosts_page(&self, ui: Ui, cx: &Context<'_, Self>) -> AnyElement {
         let settings = &cx.global::<AppSettings>().file.value.ssh;
         let (discover, open_in, sync, local_echo) = (settings.discover, settings.open_in, settings.sync, settings.local_echo);
@@ -262,7 +289,13 @@ impl SettingsWindow {
                     ),
             )
             .children(self.hosts.error.clone().map(|e| banner(ui, Tone::Danger, e, Vec::new())));
-        let mut yours = section(ui, "Your hosts").plain().child(form);
+        // "Show" on a problem with `ssh.hosts` lands on the banner (or the
+        // form, once it's gone).
+        let mut yours = section(ui, "Your hosts").plain();
+        yours = match self.skipped_hosts_banner(ui, cx) {
+            Some(b) => yours.child(kit::focus_target(ui, "Your hosts", b)).child(form),
+            None => yours.child(kit::focus_target(ui, "Your hosts", form)),
+        };
         if !added.is_empty() {
             yours = yours.child(self.host_list(ui, &added, cx));
         }
@@ -286,6 +319,13 @@ impl SettingsWindow {
     }
 }
 
+/// Problems with `ssh.hosts` entries, which loading dropped (a host ssh
+/// can't take, one listed twice): the list has no row for them, so they
+/// show over it (#149).
+fn skipped_hosts(issues: &[Issue]) -> Vec<String> {
+    issues.iter().filter(|i| i.concerns("ssh.hosts")).map(|i| i.message.clone()).collect()
+}
+
 /// A stable element id for a host.
 fn hash(s: &str) -> usize {
     use std::hash::{Hash, Hasher};
@@ -305,5 +345,16 @@ mod tests {
         assert!(check_new_host(&existing, "box").unwrap_err().contains("already"));
         assert!(check_new_host(&existing, "").is_err());
         assert!(check_new_host(&existing, "a b").is_err());
+    }
+
+    #[test]
+    fn skipped_hosts_come_from_ssh_hosts_problems() {
+        let issues = [
+            Issue::new("ssh.hosts.1", "box is listed twice; the first entry counts"),
+            Issue::new("ssh.hosts_extra", "not about the list"),
+            Issue::new("font.size", "400 is outside 6–48; using 48"),
+        ];
+        assert_eq!(skipped_hosts(&issues), ["box is listed twice; the first entry counts"]);
+        assert!(skipped_hosts(&issues[2..]).is_empty());
     }
 }

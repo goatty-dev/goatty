@@ -261,7 +261,7 @@ impl AppSettings {
         if previewing.is_some() {
             cx.global_mut::<Self>().theme_base = Some(file.value.theme.clone());
         }
-        file.issues = file.value.validate();
+        let before = std::mem::replace(&mut file.issues, file.value.validate());
         let save_error = if !save {
             cx.global::<Self>().save_error.clone()
         } else {
@@ -274,6 +274,11 @@ impl AppSettings {
             }
             e
         };
+        // Entries loading dropped from `ssh.hosts` are in the file until a
+        // save writes the list without them: until then, keep saying so.
+        if !save || save_error.is_some() {
+            file.issues.extend(before.into_iter().filter(|i| i.concerns("ssh.hosts")));
+        }
         // Every failed save says so, even with the same text as the last one:
         // the user may have dismissed that toast. A preview doesn't save, so
         // it stays quiet.

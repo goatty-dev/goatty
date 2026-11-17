@@ -5,7 +5,25 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+/// The only installed font in the sandbox: the bundled one, copied to
+/// `~/.local/share/fonts` and named by a fontconfig file of its own, so the
+/// font checks don't depend on the machine's fonts.
+const TEST_FONT: &str = "JetBrainsMono Nerd Font";
+
+fn sandbox_fonts(home: &Path) -> std::path::PathBuf {
+    let dir = home.join(".local/share/fonts");
+    let conf = home.join("fonts.conf");
+    if !conf.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+        let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
+        std::fs::copy(font, dir.join("test.ttf")).unwrap();
+        std::fs::write(&conf, format!("<?xml version=\"1.0\"?>\n<fontconfig><dir>{}</dir></fontconfig>\n", dir.display())).unwrap();
+    }
+    conf
+}
+
 fn goatty(home: &Path, args: &[&str]) -> Output {
+    let fonts_conf = sandbox_fonts(home);
     Command::new(env!("CARGO_BIN_EXE_goatty"))
         .args(args)
         .env("HOME", home)
@@ -18,6 +36,7 @@ fn goatty(home: &Path, args: &[&str]) -> Output {
         .env_remove("GOATTY_UI_FONT")
         .env_remove("GOATTY_FONT_SIZE")
         .env("GOATTY_SOCKET", home.join("none.sock"))
+        .env("FONTCONFIG_FILE", fonts_conf)
         .stdin(Stdio::null())
         .output()
         .unwrap()
@@ -44,16 +63,16 @@ fn settings_set_show_validate() {
     assert!(out(&ok(goatty(home, &["settings", "path"]))).contains(&file.display().to_string()));
 
     ok(goatty(home, &["settings", "set", "font.size", "16"]));
-    ok(goatty(home, &["settings", "set", "font.ui_family", "Cantarell"]));
+    ok(goatty(home, &["settings", "set", "font.ui_family", TEST_FONT]));
     ok(goatty(home, &["settings", "set", "theme.overrides.accent", "#98c379"]));
     ok(goatty(home, &["settings", "set", "keybindings.ctrl-k", "paste"]));
     assert_eq!(out(&ok(goatty(home, &["settings", "show", "font.size"]))).trim(), "16.0");
-    assert_eq!(out(&ok(goatty(home, &["settings", "show", "font.ui_family"]))).trim(), "\"Cantarell\"");
+    assert_eq!(out(&ok(goatty(home, &["settings", "show", "font.ui_family"]))).trim(), format!("{TEST_FONT:?}"));
     assert_eq!(out(&ok(goatty(home, &["settings", "show", "theme.overrides.accent"]))).trim(), "\"#98c379\"");
     let stored = out(&ok(goatty(home, &["settings", "show"])));
     assert!(
         stored.contains("\"size\": 16.0")
-            && stored.contains("\"ui_family\": \"Cantarell\"")
+            && stored.contains(&format!("\"ui_family\": {TEST_FONT:?}"))
             && stored.contains("\"#98c379\"")
             && stored.contains("ctrl-k"),
         "{stored}"
@@ -61,6 +80,14 @@ fn settings_set_show_validate() {
     assert!(!goatty(home, &["settings", "set", "font.size", "huge"]).status.success());
     assert!(!goatty(home, &["settings", "set", "keybindings.ctrl-j", "explode"]).status.success());
     ok(goatty(home, &["settings", "validate"]));
+
+    // Fonts are checked against the installed ones, as in the settings window (#150).
+    ok(goatty(home, &["settings", "set", "font.family", "No Such Mono"]));
+    let o = goatty(home, &["settings", "validate"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("font.family") && err(&o).contains("isn't installed"), "{}", err(&o));
+    assert!(!err(&o).contains("font.ui_family"), "{}", err(&o));
+    ok(goatty(home, &["settings", "unset", "font.family"]));
 
     std::fs::write(&file, r#"{"version": 1, "theme": {"name": "nope"}, "keybindings": {"ctrl-+-+": "paste"}}"#).unwrap();
     let o = goatty(home, &["settings", "validate"]);

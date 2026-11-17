@@ -90,6 +90,8 @@ pub const INDEX: &[Entry] = &[
         .keys(&["tabs.mark_activity"]),
     e(Page::Workspace, "Panes", "Fade inactive panes", "dim split focus").keys(&["panes.dim_inactive"]),
     e(Page::Workspace, "Panes", "Ask before closing a running program", "confirm close quit").keys(&["panes.confirm_close"]),
+    // Entries goatty dropped from `ssh.hosts` show in a banner over the list.
+    e(Page::Hosts, "Your hosts", "Your hosts", "ssh add host list user server").keys(&["ssh.hosts"]),
     e(Page::Hosts, "Connecting", "Open hosts in", "ssh window tab remote").keys(&["ssh.open_in"]),
     e(Page::Hosts, "Connecting", "Show typing before the host echoes it", "local echo prediction latency lag slow mosh remote")
         .keys(&["ssh.local_echo"]),
@@ -331,6 +333,7 @@ mod tests {
         assert_eq!(entry_for(false, "font.ui_family").map(|e| e.label), Some("Interface font"));
         assert_eq!(entry_for(true, "prompt.style").map(|e| (e.page, e.label)), Some((Page::Prompt, "Style")));
         assert_eq!(entry_for(false, "tabs.style").map(|e| (e.page, e.label)), Some((Page::Workspace, "Style")));
+        assert_eq!(entry_for(false, "ssh.hosts.2").map(|e| (e.page, e.label)), Some((Page::Hosts, "Your hosts")));
         assert!(entry_for(false, "keybindings.ctrl-k").is_none());
         assert!(entry_for(false, "").is_none());
     }
