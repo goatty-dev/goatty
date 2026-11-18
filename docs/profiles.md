@@ -168,8 +168,8 @@ goatty settings show [KEY] [--all]       # stored values, every value, or one do
 goatty settings validate [FILE]          # exit 1 on problems (values, themes, keystrokes)
 goatty settings set KEY VALUE            # e.g. font.size 15, theme.follow_system true
 goatty settings unset KEY
-goatty settings export FILE|-            # profile: these settings + the host's shell settings
-goatty settings import FILE|- [--yes]    # host part goes to the local goattyd (else this machine's host.json)
+goatty settings export FILE|- [--ssh HOST [--remote-daemon PATH] | --via CMD]         # profile: these settings + the host's shell settings
+goatty settings import FILE|- [--yes] [--ssh HOST [--remote-daemon PATH] | --via CMD]  # host part goes to that host (default: local goattyd / host.json)
 
 goatty theme list | import FILE… [--name N] | export ID [FILE] | set ID [--for light|dark] | delete ID
 

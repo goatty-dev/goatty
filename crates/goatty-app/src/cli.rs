@@ -8,6 +8,28 @@ use goatty_client::Endpoint;
 
 use crate::session::AttachMode;
 
+#[derive(Debug, Default, Clone, clap::Args)]
+pub struct RemoteArgs {
+    /// Use goattyd on HOST, via `ssh HOST goattyd proxy`.
+    #[arg(long, value_name = "HOST", conflicts_with = "via")]
+    pub ssh: Option<String>,
+
+    /// Path of goattyd on the SSH host, if it isn't in PATH (requires `--ssh`).
+    #[arg(long, value_name = "PATH")]
+    pub remote_daemon: Option<String>,
+
+    /// Use goattyd behind any stdio command, e.g. 'docker exec -i box goattyd proxy'.
+    /// It runs under `sh -c`, so quote arguments as in a shell.
+    #[arg(long, value_name = "CMD", conflicts_with = "ssh")]
+    pub via: Option<String>,
+}
+
+impl RemoteArgs {
+    pub fn is_empty(&self) -> bool {
+        self.ssh.is_none() && self.via.is_none() && self.remote_daemon.is_none()
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "goatty", version, about = "A fast, batteries-included terminal")]
 pub struct Cli {
@@ -23,23 +45,13 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["ssh", "via"])]
     pub local: bool,
 
-    /// Use goattyd on HOST, via `ssh HOST goattyd proxy`.
-    #[arg(long, value_name = "HOST", conflicts_with = "via")]
-    pub ssh: Option<String>,
-
-    /// Path of goattyd on the SSH host, if it isn't in PATH.
-    #[arg(long, value_name = "PATH", requires = "ssh", conflicts_with = "plain")]
-    pub remote_daemon: Option<String>,
+    #[command(flatten)]
+    pub remote: RemoteArgs,
 
     /// With --ssh: a plain `ssh HOST` in a local session instead of goattyd on HOST.
     /// Nothing is installed there, and goatty's shell setup doesn't reach it.
-    #[arg(long, requires = "ssh", conflicts_with_all = ["new", "attach"])]
+    #[arg(long, requires = "ssh", conflicts_with_all = ["new", "attach", "remote_daemon"])]
     pub plain: bool,
-
-    /// Use goattyd behind any stdio command, e.g. 'docker exec -i box goattyd proxy'.
-    /// It runs under `sh -c`, so quote arguments as in a shell.
-    #[arg(long, value_name = "CMD")]
-    pub via: Option<String>,
 
     /// Also open the settings window, optionally at a page (appearance,
     /// shell, path, prompt, history, aliases, plugins, shortcuts, workspace, profile).
@@ -83,13 +95,21 @@ pub enum SettingsCmd {
     /// Reset KEY to its default.
     Unset { key: String },
     /// Write a profile (these settings + the host's shell settings) to FILE, `-` for stdout.
-    Export { file: PathBuf },
-    /// Apply a profile from FILE (`-` for stdin). Host settings go to the local goattyd.
+    /// Use `--ssh` or `--via` for another host.
+    Export {
+        file: PathBuf,
+        #[command(flatten)]
+        remote: RemoteArgs,
+    },
+    /// Apply a profile from FILE (`-` for stdin). Host settings go to the local goattyd,
+    /// or to the host given with `--ssh` / `--via`.
     Import {
         file: PathBuf,
         /// Don't ask.
         #[arg(short, long)]
         yes: bool,
+        #[command(flatten)]
+        remote: RemoteArgs,
     },
 }
 
@@ -131,6 +151,14 @@ pub fn completion_script(shell: clap_complete::Shell) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn merge_opt<'a>(a: Option<&'a str>, b: Option<&'a str>, flag: &str) -> Result<Option<&'a str>> {
+    match (a, b) {
+        (Some(_), Some(_)) => anyhow::bail!("{flag} cannot be used more than once"),
+        (Some(v), None) | (None, Some(v)) => Ok(Some(v)),
+        (None, None) => Ok(None),
+    }
+}
+
 impl Cli {
     /// `prefer_new`: the workspace setting asks for a new session by default.
     pub fn attach_mode(&self, prefer_new: bool) -> AttachMode {
@@ -144,9 +172,25 @@ impl Cli {
 
     /// The daemon to use, or `None` for `--local`.
     pub fn endpoint(&self) -> Result<Option<Endpoint>> {
-        Ok(match (&self.ssh, &self.via) {
+        let sub_remote = match &self.cmd {
+            Some(Command::Settings(SettingsCmd::Export { remote, .. } | SettingsCmd::Import { remote, .. })) => Some(remote),
+            _ => None,
+        };
+        let ssh = merge_opt(self.remote.ssh.as_deref(), sub_remote.and_then(|r| r.ssh.as_deref()), "--ssh")?;
+        let via = merge_opt(self.remote.via.as_deref(), sub_remote.and_then(|r| r.via.as_deref()), "--via")?;
+        let remote_daemon =
+            merge_opt(self.remote.remote_daemon.as_deref(), sub_remote.and_then(|r| r.remote_daemon.as_deref()), "--remote-daemon")?;
+
+        if self.local && (ssh.is_some() || via.is_some() || remote_daemon.is_some()) {
+            anyhow::bail!("--local cannot be used with --ssh or --via");
+        }
+        if remote_daemon.is_some() && ssh.is_none() {
+            anyhow::bail!("--remote-daemon requires --ssh");
+        }
+        Ok(match (ssh, via) {
             _ if self.local => None,
-            (Some(host), _) => Some(Endpoint::ssh(host, self.remote_daemon.as_deref())),
+            (Some(_), Some(_)) => anyhow::bail!("--ssh and --via cannot be used together"),
+            (Some(host), None) => Some(Endpoint::ssh(host, remote_daemon)),
             (None, Some(cmd)) => Some(Endpoint::command_line(cmd)?),
             (None, None) => Some(Endpoint::Local),
         })
@@ -173,7 +217,7 @@ mod tests {
         assert!(matches!(cli.endpoint().unwrap(), Some(Endpoint::Local)));
         assert!(Cli::parse_from(["goatty", "--local"]).endpoint().unwrap().is_none());
         assert!(Cli::try_parse_from(["goatty", "--local", "--ssh", "h"]).is_err());
-        assert!(Cli::try_parse_from(["goatty", "--remote-daemon", "/x"]).is_err());
+        assert!(Cli::parse_from(["goatty", "--remote-daemon", "/x"]).endpoint().is_err());
         assert!(Cli::parse_from(["goatty", "--ssh", "box", "--plain"]).plain);
         assert!(Cli::try_parse_from(["goatty", "--plain"]).is_err());
         assert!(matches!(Cli::parse_from(["goatty", "--ssh", "box"]).endpoint().unwrap(), Some(Endpoint::Ssh(t)) if t.host == "box"));
@@ -181,6 +225,39 @@ mod tests {
         assert!(matches!(cli.cmd, Some(Command::Settings(SettingsCmd::Set { .. }))));
         let cli = Cli::parse_from(["goatty", "theme", "set", "nord", "--for", "dark"]);
         assert!(matches!(cli.cmd, Some(Command::Theme(ThemeCmd::Set { target: Some(ThemeFor::Dark), .. }))));
+
+        // Endpoint flags work before, after, or split across `settings export` / `settings import`.
+        let cli = Cli::parse_from(["goatty", "settings", "import", "p.json", "--ssh", "prod", "--remote-daemon", "/opt/goattyd", "--yes"]);
+        assert!(matches!(cli.cmd, Some(Command::Settings(SettingsCmd::Import { yes: true, .. }))));
+        assert!(matches!(
+            cli.endpoint().unwrap(),
+            Some(Endpoint::Ssh(t)) if t.host == "prod" && t.remote_daemon.as_deref() == Some("/opt/goattyd")
+        ));
+
+        let cli = Cli::parse_from(["goatty", "--ssh", "prod", "settings", "export", "-", "--remote-daemon", "/opt/goattyd"]);
+        assert!(matches!(cli.cmd, Some(Command::Settings(SettingsCmd::Export { .. }))));
+        assert!(matches!(
+            cli.endpoint().unwrap(),
+            Some(Endpoint::Ssh(t)) if t.host == "prod" && t.remote_daemon.as_deref() == Some("/opt/goattyd")
+        ));
+
+        let cli = Cli::parse_from(["goatty", "settings", "export", "-", "--via", "docker exec -i box goattyd proxy"]);
+        assert!(matches!(cli.cmd, Some(Command::Settings(SettingsCmd::Export { .. }))));
+        assert!(matches!(cli.endpoint().unwrap(), Some(Endpoint::Command { label, .. }) if label == "docker"));
+
+        assert!(Cli::try_parse_from(["goatty", "settings", "import", "p.json", "--ssh", "a", "--via", "b"]).is_err());
+        assert!(Cli::parse_from(["goatty", "--ssh", "a", "settings", "export", "-", "--via", "b"]).endpoint().is_err());
+        assert!(Cli::parse_from(["goatty", "--via", "b", "settings", "export", "-", "--ssh", "a"]).endpoint().is_err());
+        assert!(Cli::parse_from(["goatty", "--ssh", "staging", "settings", "import", "p.json", "--ssh", "prod"]).endpoint().is_err());
+        assert!(Cli::parse_from(["goatty", "--via", "a", "settings", "import", "p.json", "--via", "b"]).endpoint().is_err());
+        assert!(
+            Cli::parse_from(["goatty", "--ssh", "prod", "--remote-daemon", "/a", "settings", "export", "-", "--remote-daemon", "/b",])
+                .endpoint()
+                .is_err()
+        );
+        assert!(Cli::parse_from(["goatty", "--local", "settings", "import", "p.json", "--ssh", "a"]).endpoint().is_err());
+        assert!(Cli::parse_from(["goatty", "settings", "import", "p.json", "--remote-daemon", "/x"]).endpoint().is_err());
+        assert!(Cli::try_parse_from(["goatty", "settings", "import", "p.json", "--plain"]).is_err());
     }
 
     #[test]

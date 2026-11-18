@@ -1,6 +1,7 @@
 //! [`Connection`]: a reconnecting, multiplexed link to one goattyd.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -26,6 +27,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PLUGIN_TIMEOUT: Duration = Duration::from_secs(600);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(20);
+
+/// A request was sent to `goattyd`, but the link dropped or timed out before a
+/// reply arrived. For state-changing requests, the daemon may still have applied
+/// the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyLost;
+
+impl fmt::Display for ReplyLost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("goattyd did not answer (connection lost?)")
+    }
+}
+
+impl std::error::Error for ReplyLost {}
 
 enum WriterCmd {
     Frame(Frame),
@@ -83,6 +98,7 @@ struct Shared {
     endpoint: Endpoint,
     opts: StreamOpts,
     client_name: String,
+    auto_reconnect: bool,
     out: flume::Sender<WriterCmd>,
     panes: Mutex<HashMap<SessionId, Pane>>,
     /// The window's last saved layout, saved again after a reconnect (the
@@ -141,6 +157,9 @@ impl Shared {
     /// `interactive: false` for automatic reconnects (ssh must not prompt).
     fn connect(&self, interactive: bool) -> Result<(Reader, HostInfo, u32)> {
         for _ in 0..2 {
+            if self.closed.load(Ordering::Acquire) {
+                bail!("connection closed");
+            }
             if let Some(ok) = self.handshake(self.endpoint.connect(interactive)?)? {
                 return Ok(ok);
             }
@@ -154,7 +173,15 @@ impl Shared {
         let stderr = t.stderr.clone();
         // A transport that never answers (hung ssh) is torn down by the caller
         // via the stored closer, which unblocks the read.
-        *self.closer.lock() = Some(t.closer.clone());
+        {
+            let mut closer = self.closer.lock();
+            if self.closed.load(Ordering::Acquire) {
+                drop(closer);
+                t.closer.close();
+                bail!("connection closed");
+            }
+            *closer = Some(t.closer.clone());
+        }
         let greeting = t
             .writer
             .write_all(&handshake::hello(&self.client_name, announced)?)
@@ -202,6 +229,16 @@ pub struct Connection {
 
 impl Connection {
     pub fn open(endpoint: Endpoint, client_name: &str) -> Result<Arc<Self>> {
+        Self::open_inner(endpoint, client_name, true, None)
+    }
+
+    /// One-shot link that does not automatically reconnect if it drops, and
+    /// optionally bounds the initial `Hello` handshake with `handshake_timeout`.
+    pub fn open_once(endpoint: Endpoint, client_name: &str, handshake_timeout: Option<Duration>) -> Result<Arc<Self>> {
+        Self::open_inner(endpoint, client_name, false, handshake_timeout)
+    }
+
+    fn open_inner(endpoint: Endpoint, client_name: &str, auto_reconnect: bool, handshake_timeout: Option<Duration>) -> Result<Arc<Self>> {
         let opts = endpoint.default_opts();
         let (out, out_rx) = flume::unbounded();
         let (reconnect_tx, reconnect_rx) = flume::bounded(1);
@@ -209,6 +246,7 @@ impl Connection {
             endpoint,
             opts,
             client_name: client_name.into(),
+            auto_reconnect,
             out,
             panes: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
@@ -231,7 +269,27 @@ impl Connection {
 
         std::thread::Builder::new().name("goatty-writer".into()).spawn(move || writer_loop(out_rx))?;
 
-        let (reader, host, pid) = shared.connect(true)?;
+        let (reader, host, pid) = if let Some(limit) = handshake_timeout {
+            let (tx, rx) = flume::bounded(1);
+            let shared_bg = shared.clone();
+            std::thread::Builder::new().name("goatty-handshake".into()).spawn(move || {
+                let _ = tx.send(shared_bg.connect(true));
+            })?;
+            match rx.recv_timeout(limit) {
+                Ok(res) => res?,
+                Err(_) => {
+                    shared.closed.store(true, Ordering::Release);
+                    let cleanup = shared.clone();
+                    if std::thread::Builder::new().name("goatty-handshake-cleanup".into()).spawn(move || cleanup.close_transport()).is_err()
+                    {
+                        shared.close_transport();
+                    }
+                    bail!("timed out waiting for goattyd greeting via {}", shared.endpoint.label());
+                }
+            }
+        } else {
+            shared.connect(true)?
+        };
         log::info!(
             "connected to goattyd {} on {}@{} (pid {pid}, via {}, protocol v{})",
             host.daemon_version,
@@ -244,7 +302,7 @@ impl Connection {
 
         let s = shared.clone();
         std::thread::Builder::new().name("goatty-reader".into()).spawn(move || reader_main(s, reader))?;
-        if !shared.endpoint.is_local() {
+        if auto_reconnect && !shared.endpoint.is_local() {
             let weak = Arc::downgrade(&shared);
             std::thread::Builder::new().name("goatty-heartbeat".into()).spawn(move || heartbeat(weak))?;
         }
@@ -295,19 +353,24 @@ impl Connection {
         pending: impl FnOnce(flume::Sender<ServerMsg>) -> Pending,
         msg: impl FnOnce(ReqId) -> ClientMsg,
     ) -> Result<ServerMsg> {
-        if !self.is_connected() {
-            bail!("not connected to goattyd");
-        }
         let req = self.shared.req_id();
         let (tx, rx) = flume::bounded(1);
-        self.shared.pending.lock().insert(req, pending(tx));
+        {
+            // Checked under the lock the disconnect drain takes: a request
+            // registered here is either drained (waking `rx`) or goes out on a live link.
+            let mut map = self.shared.pending.lock();
+            if !self.is_connected() {
+                bail!("not connected to goattyd");
+            }
+            map.insert(req, pending(tx));
+        }
         self.shared.send(&msg(req));
         let reply = rx.recv_timeout(timeout);
         self.shared.pending.lock().remove(&req);
         match reply {
             Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
             Ok(m) => Ok(m),
-            Err(_) => Err(anyhow!("goattyd did not answer (connection lost?)")),
+            Err(_) => Err(ReplyLost.into()),
         }
     }
 
@@ -455,7 +518,12 @@ impl Connection {
     /// Validate `json` and preview the generated-file changes; with `apply`,
     /// also activate and save. Blocks: call off the UI thread.
     pub fn set_host_settings(&self, json: String, apply: bool) -> Result<HostSettingsApplied> {
-        match self.request(Pending::Reply, |req| ClientMsg::SetHostSettings { req, json, apply })? {
+        self.set_host_settings_within(json, apply, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::set_host_settings`], waiting up to `timeout` for the reply.
+    pub fn set_host_settings_within(&self, json: String, apply: bool, timeout: Duration) -> Result<HostSettingsApplied> {
+        match self.request_within(timeout, Pending::Reply, |req| ClientMsg::SetHostSettings { req, json, apply })? {
             ServerMsg::HostSettingsApplied { issues, diff, applied, generation, .. } => {
                 Ok(HostSettingsApplied { issues, diff, applied, generation })
             }
@@ -713,6 +781,9 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
             .collect();
         for sink in &sinks {
             sink.event(PaneEvent::Disconnected(err.to_string()));
+        }
+        if !s.auto_reconnect {
+            return;
         }
         let mut needs_user = false;
         loop {
@@ -996,5 +1067,101 @@ mod tests {
         assert!(needs_user_input(&anyhow::Error::new(GatewayError::HostKeyChanged { name: "box".into() }).context("connecting")));
         let busy = anyhow::Error::new(GatewayError::Refused { code: Refusal::TooMany, reason: "later".into() });
         assert!(!needs_user_input(&busy));
+    }
+
+    #[test]
+    fn open_once_times_out_silent_handshake() {
+        let ep = Endpoint::command_line("exec sleep 5").unwrap();
+        let start = Instant::now();
+        let err = match Connection::open_once(ep, "test", Some(Duration::from_millis(50))) {
+            Ok(_) => panic!("silent endpoint should time out"),
+            Err(e) => e,
+        };
+        assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
+        assert!(err.to_string().contains("timed out waiting for goattyd greeting"), "{err:#}");
+    }
+
+    #[test]
+    fn open_once_times_out_when_descendant_keeps_pipe_open() {
+        // `; true` prevents shells from exec-replacing sh, so a child keeps stdout open if only sh is killed.
+        let ep = Endpoint::command_line("sleep 2; true").unwrap();
+        let start = Instant::now();
+        let err = match Connection::open_once(ep, "test", Some(Duration::from_millis(50))) {
+            Ok(_) => panic!("descendant keeping pipe open should still time out"),
+            Err(e) => e,
+        };
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(err.to_string().contains("timed out waiting for goattyd greeting"), "{err:#}");
+    }
+
+    #[test]
+    fn open_once_does_not_reconnect_and_reports_reply_lost() {
+        let (tx_req, rx_req) = flume::unbounded::<ClientMsg>();
+        let (client_w, server_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut server_w, client_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(server_r);
+            let hello = ServerMsg::Hello {
+                version: PROTOCOL_VERSION,
+                daemon_pid: 1,
+                host: HostInfo { hostname: "h".into(), user: "u".into(), os: "linux".into(), daemon_version: "0".into() },
+            };
+            server_w.write_all(&encode(&hello).unwrap()).unwrap();
+            // Read one request, record it, and drop the link without answering.
+            if let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                let _ = tx_req.send(msg);
+            }
+            drop(server_w);
+            drop(r);
+        });
+
+        let (out, out_rx) = flume::unbounded();
+        let _ = out.send(WriterCmd::Replace(Box::new(client_w.try_clone().unwrap())));
+        let (reconnect_tx, reconnect_rx) = flume::bounded(1);
+        let shared = Arc::new(Shared {
+            endpoint: Endpoint::command_line("false").unwrap(),
+            opts: StreamOpts::LOCAL,
+            client_name: "test".into(),
+            auto_reconnect: false,
+            out,
+            panes: Mutex::new(HashMap::new()),
+            layout: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            early_size: Mutex::new(HashMap::new()),
+            next_req: AtomicU32::new(1),
+            host: Mutex::new(HostInfo::default()),
+            announce: AtomicU32::new(PROTOCOL_VERSION),
+            version: AtomicU32::new(PROTOCOL_VERSION),
+            daemon_pid: AtomicU32::new(1),
+            connected: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            closer: Mutex::new(None),
+            epoch: Instant::now(),
+            last_rx_us: AtomicU64::new(0),
+            rtt_us: AtomicU64::new(0),
+            reconnect_tx,
+            reconnect_rx,
+        });
+        std::thread::spawn(move || writer_loop(out_rx));
+        let mut reader = std::io::BufReader::new(Box::new(client_r) as Box<dyn Read + Send>);
+        // Consume the server's Hello as handshake() would.
+        assert!(matches!(read_msg::<_, ServerMsg>(&mut reader).unwrap(), ServerMsg::Hello { .. }));
+        let s = shared.clone();
+        let (done_tx, done_rx) = flume::bounded(1);
+        let reader_handle = std::thread::spawn(move || {
+            reader_main(s, reader);
+            let _ = done_tx.send(());
+        });
+        let conn = Connection { shared };
+
+        let err = conn.set_host_settings_within("{}".into(), true, Duration::from_secs(5)).unwrap_err();
+        assert!(err.downcast_ref::<ReplyLost>().is_some(), "expected ReplyLost, got: {err:#}");
+        assert!(rx_req.recv_timeout(Duration::from_secs(1)).is_ok());
+        // `reader_main` must exit immediately rather than attempting to reconnect.
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "reader did not exit after one-shot disconnect");
+        reader_handle.join().unwrap();
+        assert!(!conn.is_connected());
+        drop(client_w);
+        server.join().unwrap();
     }
 }

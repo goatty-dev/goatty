@@ -45,12 +45,41 @@ fn approve(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
+/// Escape control characters in daemon-provided strings before writing to stdout.
+fn safe(s: &str) -> String {
+    if !s.chars().any(char::is_control) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            for e in c.escape_default() {
+                out.push(e);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn reload_hint(remote_host: Option<&str>) -> String {
+    match remote_host {
+        Some(host) => format!("Running shells ({}): run `goattyd shell reload` there (or `goatty-reload` in one shell).", safe(host)),
+        None => "Running shells: `goattyd shell reload` (or `goatty-reload` in one shell).".to_string(),
+    }
+}
+
 pub fn print_changed(c: &Changed) {
+    print_changed_for(c, None);
+}
+
+pub fn print_changed_for(c: &Changed, remote_host: Option<&str>) {
     for l in &c.lines {
-        println!("{l}");
+        println!("{}", safe(l));
     }
     if c.reload {
-        println!("Running shells: `goattyd shell reload` (or `goatty-reload` in one shell).");
+        println!("{}", reload_hint(remote_host));
     }
 }
 
@@ -165,10 +194,10 @@ fn local_installed(svc: &HostService, id: &str) -> Option<Candidate> {
 /// needs first, then the plugin.
 pub fn print_plan(plan: &Plan) {
     if !plan.dependencies.is_empty() {
-        let names: Vec<&str> = plan.dependencies.iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<String> = plan.dependencies.iter().map(|d| safe(&d.name)).collect();
         println!(
             "{} needs plugins that aren't installed here: {}. They're installed first, as planned below.\n",
-            plan.name,
+            safe(&plan.name),
             names.join(", ")
         );
     }
@@ -186,77 +215,81 @@ pub fn question(plan: &Plan) -> String {
 }
 
 fn print_one(plan: &Plan) {
+    let name = safe(&plan.name);
+    let version = safe(&plan.version);
     let verb = match &plan.replaces {
-        Some(old) if *old != plan.version => format!("Update {} {old} → {}", plan.name, plan.version),
-        Some(_) => format!("Reinstall {} {}", plan.name, plan.version),
-        None => format!("Install {} {}", plan.name, plan.version),
+        Some(old) if *old != plan.version => format!("Update {name} {} → {version}", safe(old)),
+        Some(_) => format!("Reinstall {name} {version}"),
+        None => format!("Install {name} {version}"),
     };
     let from = if plan.builtin {
         "goatty (built in)".to_string()
     } else if plan.verified {
-        format!("registry {:?} (signature checked)", plan.source)
+        format!("registry {:?} (signature checked)", safe(&plan.source))
     } else {
-        plan.source.clone()
+        safe(&plan.source)
     };
     println!("{verb} from {from}");
-    println!("  {}", plan.summary);
-    let mut who = vec![format!("by {}", plan.publisher)];
-    who.extend(plan.homepage.clone());
-    who.extend(plan.license.clone());
+    println!("  {}", safe(&plan.summary));
+    let mut who = vec![format!("by {}", safe(&plan.publisher))];
+    who.extend(plan.homepage.as_deref().map(safe));
+    who.extend(plan.license.as_deref().map(safe));
     println!("  {}", who.join(" · "));
 
     if !plan.downloads.is_empty() {
         println!("\nDownloads into goatty's own directory (no sudo; checked against the sha256 before anything is unpacked):");
         for d in &plan.downloads {
+            let pkg = safe(&d.package);
+            let ver = safe(&d.version);
             match &d.system {
-                Some(p) => println!("  {} {}: already installed at {p}; goatty uses that copy", d.package, d.version),
-                None if d.current => println!("  {} {}: goatty's copy is already installed", d.package, d.version),
+                Some(p) => println!("  {pkg} {ver}: already installed at {}; goatty uses that copy", safe(p)),
+                None if d.current => println!("  {pkg} {ver}: goatty's copy is already installed"),
                 None => {
-                    println!("  {} {}  {}  {}", d.package, d.version, size(d.size), d.url);
-                    println!("      sha256 {}", d.sha256);
+                    println!("  {pkg} {ver}  {}  {}", size(d.size), safe(&d.url));
+                    println!("      sha256 {}", safe(&d.sha256));
                 }
             }
         }
-        let bins: Vec<&str> = plan.downloads.iter().flat_map(|d| d.bins.iter().map(String::as_str)).collect();
+        let bins: Vec<String> = plan.downloads.iter().flat_map(|d| d.bins.iter().map(|b| safe(b))).collect();
         if !bins.is_empty() {
             println!("  On PATH in goatty shells: {}", bins.join(", "));
         }
-        let scripts: Vec<&str> = plan.downloads.iter().filter_map(|d| d.script.as_deref()).collect();
+        let scripts: Vec<String> = plan.downloads.iter().filter_map(|d| d.script.as_deref().map(safe)).collect();
         if !scripts.is_empty() {
             println!("  Sourced by goatty shells: {}", scripts.join(", "));
         }
     }
     println!("\nPermissions:");
     for g in &plan.permissions {
-        println!("  {} {}{}", if g.permission.runs_code() { "⚠" } else { "•" }, g.title, details(&g.details));
+        println!("  {} {}{}", if g.permission.runs_code() { "⚠" } else { "•" }, safe(&g.title), safe(&details(&g.details)));
         if !g.reason.is_empty() {
-            println!("      why: {}", g.reason);
+            println!("      why: {}", safe(&g.reason));
         }
-        println!("      {}", g.meaning);
+        println!("      {}", safe(&g.meaning));
     }
     if !plan.aliases.is_empty() {
         println!("\nAliases:");
         for a in &plan.aliases {
-            println!("  {a}");
+            println!("  {}", safe(a));
         }
     }
     if !plan.env.is_empty() {
         println!("\nEnvironment:");
         for e in &plan.env {
-            println!("  {e}");
+            println!("  {}", safe(e));
         }
     }
     if let Some((file, code)) = &plan.shell_code {
-        println!("\nShell code ({file}), run at the start of every goatty shell:");
+        println!("\nShell code ({}), run at the start of every goatty shell:", safe(file));
         for line in code.lines() {
-            println!("  │ {line}");
+            println!("  │ {}", safe(line));
         }
     }
     for r in &plan.requires {
-        println!("\nNeeds {r}");
+        println!("\nNeeds {}", safe(r));
     }
     for w in &plan.warnings {
-        println!("\n⚠ {w}");
+        println!("\n⚠ {}", safe(w));
     }
     println!();
 }
@@ -469,4 +502,25 @@ pub fn registry_remove(svc: &HostService, name: &str) -> Result<()> {
         bail!("no added registry called {name:?} (built-in registries can't be removed)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_escapes_control_sequences() {
+        assert_eq!(safe("Clean summary"), "Clean summary");
+        assert_eq!(safe("evil \x1b[31mred\x07\n"), "evil \\u{1b}[31mred\\u{7}\\n");
+    }
+
+    #[test]
+    fn reload_hint_names_remote_host_only_when_provided() {
+        assert_eq!(reload_hint(None), "Running shells: `goattyd shell reload` (or `goatty-reload` in one shell).");
+        assert_eq!(
+            reload_hint(Some("goattyd on deploy@box")),
+            "Running shells (goattyd on deploy@box): run `goattyd shell reload` there (or `goatty-reload` in one shell)."
+        );
+        assert!(reload_hint(Some("box\x1b[31m")).contains("box\\u{1b}[31m"));
+    }
 }
