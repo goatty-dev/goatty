@@ -1371,6 +1371,24 @@ fn command_line_widgets_report_and_change_the_line() {
     let _ = sh.pty.write(b"exit\r");
 }
 
+fn cached_entries(init_dir: &Path, prefix: &str, zwc: bool) -> Vec<PathBuf> {
+    let want_prefix = format!("{prefix}-");
+    let want_suffix = if zwc { ".zsh.zwc" } else { ".zsh" };
+    let Ok(rd) = std::fs::read_dir(init_dir) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_string_lossy();
+            let rest = s.strip_prefix(&want_prefix)?;
+            let tag = rest.strip_suffix(want_suffix)?;
+            (!tag.is_empty() && !tag.contains('-')).then(|| e.path())
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
 #[test]
 fn cached_tool_inits_hit_cache_and_preserve_global_scope() {
     let Some(zsh) = zsh() else { return };
@@ -1391,7 +1409,11 @@ PROMPT2=\"$(starship prompt --continuation)\"
 EOF
     ;;
   prompt)
-    printf 'cont-v1> '
+    if [ \"${STARSHIP_SHELL:-}\" = zsh ]; then
+      printf '%%{\\033[90m%%}cont-v1>%%{\\033[0m%%} '
+    else
+      printf '\\033[90mcont-v1>\\033[0m '
+    fi
     ;;
 esac
 ",
@@ -1414,25 +1436,41 @@ fi
     settings.edit_plugin("autosuggestions", |p| p.enabled = false);
     let launch = sb.launch_with(settings, None);
 
-    let first =
-        pty_session(&sb, &launch, &["print -r -- \"starship_scoped=$starship_scoped fzf_scoped=$fzf_scoped fzf_v=$fzf_v p2=[$PROMPT2]\""]);
-    assert!(first.contains("starship_scoped=1 fzf_scoped=1 fzf_v=1 p2=[cont-v1> ]"), "{first}");
+    let first = pty_session(
+        &sb,
+        &launch,
+        &["print -r -- \"starship_scoped=$starship_scoped fzf_scoped=$fzf_scoped fzf_v=$fzf_v p2=[${(V)PROMPT2}]\""],
+    );
+    assert!(
+        first.contains("starship_scoped=1 fzf_scoped=1 fzf_v=1 p2=[%{\\e[90m%}cont-v1>%{\\e[0m%} ]")
+            || first.contains("starship_scoped=1 fzf_scoped=1 fzf_v=1 p2=[%{^[[90m%}cont-v1>%{^[[0m%} ]"),
+        "{first}"
+    );
     let calls_after_first = std::fs::read_to_string(sb.home.join("init-calls")).unwrap_or_default();
     assert_eq!(calls_after_first.lines().filter(|l| l.starts_with("starship:init")).count(), 1, "{calls_after_first}");
     assert_eq!(calls_after_first.lines().filter(|l| l.starts_with("starship:prompt --continuation")).count(), 1, "{calls_after_first}");
     assert_eq!(calls_after_first.lines().filter(|l| l.starts_with("fzf:--zsh")).count(), 1, "{calls_after_first}");
 
     let init_dir = sb.dirs.init_cache_dir();
-    for f in ["starship.zsh", "starship.zsh.zwc", "fzf.zsh", "fzf.zsh.zwc"] {
-        let meta = std::fs::metadata(init_dir.join(f)).unwrap_or_else(|e| panic!("missing {f}: {e}"));
-        assert!(meta.len() > 0, "{f} is empty");
+    for (prefix, zwc) in [("starship", false), ("starship", true), ("fzf", false), ("fzf", true)] {
+        let files = cached_entries(&init_dir, prefix, zwc);
+        assert_eq!(files.len(), 1, "expected 1 {prefix} cache file (zwc={zwc}), got {files:?}");
+        let meta = std::fs::metadata(&files[0]).unwrap();
+        assert!(meta.len() > 0, "{} is empty", files[0].display());
     }
 
     // Second startup hits both caches without spawning starship or fzf.
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
-    let second =
-        pty_session(&sb, &launch, &["print -r -- \"starship_scoped=$starship_scoped fzf_scoped=$fzf_scoped fzf_v=$fzf_v p2=[$PROMPT2]\""]);
-    assert!(second.contains("starship_scoped=1 fzf_scoped=1 fzf_v=1 p2=[cont-v1> ]"), "{second}");
+    let second = pty_session(
+        &sb,
+        &launch,
+        &["print -r -- \"starship_scoped=$starship_scoped fzf_scoped=$fzf_scoped fzf_v=$fzf_v p2=[${(V)PROMPT2}]\""],
+    );
+    assert!(
+        second.contains("starship_scoped=1 fzf_scoped=1 fzf_v=1 p2=[%{\\e[90m%}cont-v1>%{\\e[0m%} ]")
+            || second.contains("starship_scoped=1 fzf_scoped=1 fzf_v=1 p2=[%{^[[90m%}cont-v1>%{^[[0m%} ]"),
+        "{second}"
+    );
     let calls_after_second = std::fs::read_to_string(sb.home.join("init-calls")).unwrap_or_default();
     assert!(calls_after_second.trim().is_empty(), "expected cache hit with no subprocess spawns, got:\n{calls_after_second}");
 }
@@ -1538,11 +1576,15 @@ esac
     let out4 = pty_session(&sb, &launch_cfg, &["print -r -- \"p=[$PROMPT] p2=[$PROMPT2]\""]);
     assert!(out4.contains("starship-shadow> ") && out4.contains("p2=[cont-shadow> ]"), "{out4}");
 
-    // 5) prefer_user_config=true with in-place edit to ~/.config/starship.toml invalidates cache.
+    // 5) prefer_user_config=true watches $HOME/.config/starship.toml (even when XDG_CONFIG_HOME points elsewhere)
+    //    and regenerates even on a same-size, same-second edit.
     let user_cfg_dir = sb.home.join(".config");
+    let xdg_cfg_dir = sb.home.join("other-xdg-config");
     std::fs::create_dir_all(&user_cfg_dir).unwrap();
+    std::fs::create_dir_all(&xdg_cfg_dir).unwrap();
     let user_toml = user_cfg_dir.join("starship.toml");
     std::fs::write(&user_toml, "continuation_prompt = 'u1> '\n").unwrap();
+    std::fs::write(xdg_cfg_dir.join("starship.toml"), "continuation_prompt = 'xdg> '\n").unwrap();
     exe(
         &shadow_dir.join("starship"),
         "#!/bin/sh
@@ -1558,11 +1600,12 @@ esac
         p.settings.insert("prefer_user_config".into(), true.into());
     });
     let mut launch_user = sb.launch_with(s_user, None);
-    launch_user.env.push(("XDG_CONFIG_HOME".into(), user_cfg_dir.to_string_lossy().into_owned()));
+    launch_user.env.push(("XDG_CONFIG_HOME".into(), xdg_cfg_dir.to_string_lossy().into_owned()));
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out5a = pty_session(&sb, &launch_user, &["print -r -- \"p2=[$PROMPT2]\""]);
     assert!(out5a.contains("p2=[u1> ]"), "{out5a}");
-    std::fs::write(&user_toml, "continuation_prompt = 'u2> longer'\n").unwrap();
+    // Same byte length as 'u1> ' to verify subsecond timestamps catch same-size edits too.
+    std::fs::write(&user_toml, "continuation_prompt = 'u2> '\n").unwrap();
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out5b = pty_session(&sb, &launch_user, &["print -r -- \"p2=[$PROMPT2]\""]);
     assert!(out5b.contains("p2=[u2> ]"), "{out5b}");
@@ -1575,8 +1618,9 @@ esac
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out_dumb = sb.run(&launch_dumb, "print -r -- \"p2=[$PROMPT2]\"");
     assert!(String::from_utf8_lossy(&out_dumb.stderr).trim().is_empty());
-    assert!(sb.dirs.init_cache_dir().join("starship-dumb.zsh").is_file());
-    assert!(sb.dirs.init_cache_dir().join("starship.zsh").is_file());
+    let init_dir = sb.dirs.init_cache_dir();
+    assert_eq!(cached_entries(&init_dir, "starship-dumb", false).len(), 1);
+    assert!(!cached_entries(&init_dir, "starship", false).is_empty());
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out_xterm = pty_session(&sb, &launch_user, &["print -r -- \"p2=[$PROMPT2]\""]);
     assert!(out_xterm.contains("p2=[u2> ]"), "{out_xterm}");
@@ -1586,13 +1630,14 @@ esac
     );
 
     // 7) ZSH_VERSION mismatch in cache header invalidates cache.
-    let star_cache = sb.dirs.init_cache_dir().join("starship.zsh");
-    let contents = std::fs::read_to_string(&star_cache).unwrap();
+    let star_caches = cached_entries(&init_dir, "starship", false);
+    let star_cache = star_caches.last().unwrap();
+    let contents = std::fs::read_to_string(star_cache).unwrap();
     let mut lines = contents.lines();
     let first_line = lines.next().unwrap();
     let rest: Vec<&str> = lines.collect();
-    let stale_hdr = first_line.replacen("v1|", "v1|0.0.0-stale|", 1);
-    std::fs::write(&star_cache, format!("{stale_hdr}\n{}\n", rest.join("\n"))).unwrap();
+    let stale_hdr = first_line.replacen("v2|", "v2|0.0.0-stale|", 1);
+    std::fs::write(star_cache, format!("{stale_hdr}\n{}\n", rest.join("\n"))).unwrap();
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out7 = pty_session(&sb, &launch_user, &["print -r -- \"p2=[$PROMPT2]\""]);
     assert!(out7.contains("p2=[u2> ]"), "{out7}");
@@ -1606,14 +1651,20 @@ esac
 fn cached_tool_init_fallbacks_and_hostile_shell_options() {
     use std::os::unix::fs::PermissionsExt;
     let Some(zsh) = zsh() else { return };
-    let sb = Sandbox::new(zsh);
+    let sb = Sandbox::new(zsh.clone());
     let _ = std::fs::remove_file(sb.home.join("userbin/starship"));
     let sysbin = sb.home.join("sysbin");
     exe(
         &sysbin.join("starship"),
         "#!/bin/sh
 case \"$1\" in
-  init) echo 'PROMPT=\"starship-ok> \"' ;;
+  init)
+    echo 'PROMPT=\"starship-ok> \"'
+    echo 'PROMPT2=\"$(starship prompt --continuation)\"'
+    ;;
+  prompt)
+    printf 'cont-strict> '
+    ;;
 esac
 ",
     );
@@ -1637,22 +1688,19 @@ esac
     settings.edit_plugin("autosuggestions", |p| p.enabled = false);
     let launch = sb.launch_with(settings, None);
 
-    // 1) Normal run populates cache even under hostile options, aliases, and function shadows.
-    let out1 = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
-    assert!(String::from_utf8_lossy(&out1.stderr).trim().is_empty(), "stderr: {}", String::from_utf8_lossy(&out1.stderr));
-    assert!(stdout(&out1).contains("starship-ok> "), "{}", stdout(&out1));
-    assert!(sb.dirs.init_cache_dir().join("starship.zsh").is_file());
-
-    // Also verify plugins/starship/zsh/init.zsh + _goatty_cached_init + _goatty_starship_post
-    // survive ksharrays + nounset + errexit with zero stderr.
+    // 1a) Verify cold-cache generation, zcompile, and _goatty_starship_post PROMPT2 rewriting
+    //     all succeed under ksharrays + nounset + errexit with zero stderr.
+    let init_dir = sb.dirs.init_cache_dir();
+    let _ = std::fs::remove_dir_all(&init_dir);
     let strict_out = sb.run(
         &launch,
-        "builtin eval \"$(command sed -n '/^_goatty_cached_init()/,/^}/p' \"$_goatty_dir/.zshrc\")\"\n\
+        "command rm -rf -- \"${_goatty_cache}/init\"\n\
+         builtin eval \"$(command sed -n '/^_goatty_cached_init()/,/^}/p' \"$_goatty_dir/.zshrc\")\"\n\
          setopt ksharrays nounset errexit\n\
          typeset -A goatty_settings=()\n\
-         builtin unset STARSHIP_CONFIG PROMPT\n\
+         builtin unset STARSHIP_CONFIG PROMPT PROMPT2\n\
          builtin source -- \"$_goatty_dir/plugins/starship/zsh/init.zsh\"\n\
-         print -r -- \"strict-ok:$PROMPT\"",
+         print -r -- \"strict-ok:$PROMPT|p2=$PROMPT2\"",
     );
     assert!(strict_out.status.success(), "strict opts failed: {}", String::from_utf8_lossy(&strict_out.stderr));
     assert!(
@@ -1660,29 +1708,57 @@ esac
         "strict stderr: {}",
         String::from_utf8_lossy(&strict_out.stderr)
     );
-    assert!(stdout(&strict_out).contains("strict-ok:starship-ok> "), "{}", stdout(&strict_out));
+    assert!(stdout(&strict_out).contains("strict-ok:starship-ok> |p2=cont-strict> "), "{}", stdout(&strict_out));
+    assert_eq!(cached_entries(&init_dir, "starship", false).len(), 1);
 
-    // 2) Broken/failing tool (exit 1) and empty stdout (exit 0) do not leave stale cache behind.
-    exe(&sysbin.join("starship"), "#!/bin/sh\nexit 1\n");
-    let out_broken = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
-    assert!(!stdout(&out_broken).contains("starship-ok> "), "stale cache used after failure: {}", stdout(&out_broken));
-    assert!(!sb.dirs.init_cache_dir().join("starship.zsh").exists(), "broken output should clear stale cache");
-
-    // Re-seed cache, then return empty stdout with exit 0.
+    // 1b) Normal run populates/hits cache cleanly under hostile options, aliases, and function shadows,
+    //     and zcompile -U does not bake builder aliases into compiled .zwc entries.
+    let _ = std::fs::remove_dir_all(&init_dir);
+    sb.file(
+        ".zshenv",
+        "setopt noclobber shwordsplit\n\
+         function read { return 1 }\n\
+         function zstat { return 1 }\n\
+         probe_cmd() { builtin print -r -- GOOD_FN }\n\
+         alias mv='mv -i' rm='rm -i' mkdir='false' eval='false' source='false' read='false' zstat='false' probe_cmd='echo BAD_ALIAS'\n",
+    );
     exe(
         &sysbin.join("starship"),
         "#!/bin/sh
-[ \"$1\" = init ] && echo 'PROMPT=\"starship-ok2> \"'
+[ \"$1\" = init ] && echo 'PROMPT=\"starship-ok:$(probe_cmd)> \"'
 ",
     );
-    let _ = sb.run(&launch, "true");
-    assert!(sb.dirs.init_cache_dir().join("starship.zsh").is_file());
+    let out1 = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(String::from_utf8_lossy(&out1.stderr).trim().is_empty(), "stderr: {}", String::from_utf8_lossy(&out1.stderr));
+    assert_eq!(cached_entries(&init_dir, "starship", false).len(), 1);
+    // Drop the alias for the second (cached .zwc) run: compiled code must resolve probe_cmd to GOOD_FN, not BAD_ALIAS.
+    sb.file(
+        ".zshenv",
+        "setopt noclobber shwordsplit\n\
+         function read { return 1 }\n\
+         function zstat { return 1 }\n\
+         alias mv='mv -i' rm='rm -i' mkdir='false' eval='false' source='false' read='false' zstat='false'\n\
+         probe_cmd() { builtin print -r -- GOOD_FN }\n",
+    );
+    let out1_cached = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(stdout(&out1_cached).contains("p=[starship-ok:GOOD_FN> ]"), "{}", stdout(&out1_cached));
+
+    // 2) Failing tool (exit 1) and empty stdout (exit 0) do not cache broken state or delete valid entries.
+    let valid_before = cached_entries(&init_dir, "starship", false);
+    assert_eq!(valid_before.len(), 1);
+    exe(&sysbin.join("starship"), "#!/bin/sh\nexit 1\n");
+    let out_broken = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(!stdout(&out_broken).contains("starship-ok:"), "stale cache used after failure: {}", stdout(&out_broken));
+    assert!(valid_before[0].exists(), "failing run must not remove an earlier valid cache entry");
+    assert_eq!(cached_entries(&init_dir, "starship", false).len(), 1, "failing run must not write a new entry");
+
     exe(&sysbin.join("starship"), "#!/bin/sh\nexit 0\n");
     let out_empty = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
-    assert!(!stdout(&out_empty).contains("starship-ok2> "), "stale cache used after empty exit 0: {}", stdout(&out_empty));
-    assert!(!sb.dirs.init_cache_dir().join("starship.zsh").exists(), "empty output should clear stale cache");
+    assert!(!stdout(&out_empty).contains("starship-ok:"), "stale cache used after empty exit 0: {}", stdout(&out_empty));
+    assert_eq!(cached_entries(&init_dir, "starship", false).len(), 1, "empty output must not write a new entry");
 
     // 3) Syntactically invalid tool output (fails zcompile) is never promoted into the cache file.
+    let _ = std::fs::remove_dir_all(&init_dir);
     exe(
         &sysbin.join("starship"),
         "#!/bin/sh
@@ -1690,42 +1766,82 @@ esac
 ",
     );
     let _ = sb.run(&launch, "true");
-    assert!(!sb.dirs.init_cache_dir().join("starship.zsh").exists(), "syntax-broken output must not be cached");
+    assert!(cached_entries(&init_dir, "starship", false).is_empty(), "syntax-broken output must not be cached");
 
-    // 4) Read-only parent cache dir (before init/ exists) falls back cleanly with zero stderr.
+    // 4) Non-directory at init/ pathname forces cache creation to fail regardless of runner privileges,
+    //    and falls back cleanly to in-memory eval with zero stderr.
     exe(
         &sysbin.join("starship"),
         "#!/bin/sh
 [ \"$1\" = init ] && echo 'PROMPT=\"starship-ro> \"'
 ",
     );
-    let init_dir = sb.dirs.init_cache_dir();
     let _ = std::fs::remove_dir_all(&init_dir);
-    std::fs::set_permissions(&sb.dirs.cache, std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::fs::write(&init_dir, b"not a directory").unwrap();
     let out_ro_parent = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
     let out_ro_pty = pty_session(&sb, &launch, &["print -r -- \"p=[$PROMPT] fzf=$fzf_ok\""]);
-    std::fs::set_permissions(&sb.dirs.cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_file(&init_dir).unwrap();
     assert!(
         String::from_utf8_lossy(&out_ro_parent.stderr).trim().is_empty(),
-        "read-only parent cache dir leaked stderr: {}",
+        "unwritable cache path leaked stderr: {}",
         String::from_utf8_lossy(&out_ro_parent.stderr)
     );
     assert!(stdout(&out_ro_parent).contains("starship-ro> "), "{}", stdout(&out_ro_parent));
     assert!(out_ro_pty.contains("starship-ro> ") && out_ro_pty.contains("fzf=1"), "{out_ro_pty}");
 
-    // 5) Active lock dir falls back to eval without hanging or failing; stale lock (>30s) is reclaimed.
+    // 5) Active advisory zsystem flock falls back to eval without hanging or failing;
+    //    killing the lock holder releases the kernel lock cleanly for subsequent runs.
+    use std::io::BufRead;
     std::fs::create_dir_all(&init_dir).unwrap();
-    let lock_dir = init_dir.join(".lock-starship");
-    std::fs::create_dir_all(&lock_dir).unwrap();
+    std::fs::set_permissions(&init_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let lock_path = init_dir.join(".lock-starship");
+    let mut holder = Command::new(&zsh)
+        .args([
+            "-fc",
+            "zmodload -F zsh/system b:zsystem && { : >>! \"$1\"; } && zsystem flock -t 0 -f fd -- \"$1\" && printf 'locked\\n' && IFS= read -r _",
+            "_",
+            lock_path.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(holder.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "locked");
+
     let out_locked = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
     assert!(String::from_utf8_lossy(&out_locked.stderr).trim().is_empty());
     assert!(stdout(&out_locked).contains("starship-ro> "));
-    assert!(!init_dir.join("starship.zsh").exists(), "active lock prevented write");
+    assert!(cached_entries(&init_dir, "starship", false).is_empty(), "active lock prevented write");
 
-    let status = Command::new("touch").args(["-d", "60 seconds ago"]).arg(&lock_dir).status().unwrap();
-    assert!(status.success());
-    let out_stale_lock = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
-    assert!(String::from_utf8_lossy(&out_stale_lock.stderr).trim().is_empty());
-    assert!(stdout(&out_stale_lock).contains("starship-ro> "));
-    assert!(init_dir.join("starship.zsh").is_file(), "stale lock (>30s) should be reclaimed and cache populated");
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let out_unlocked = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(String::from_utf8_lossy(&out_unlocked.stderr).trim().is_empty());
+    assert!(stdout(&out_unlocked).contains("starship-ro> "));
+    assert_eq!(cached_entries(&init_dir, "starship", false).len(), 1, "cache populated once lock released");
+
+    // 6) Security: group/other-writable init dir or .zwc is never written to or sourced.
+    let _ = std::fs::remove_dir_all(&init_dir);
+    std::fs::create_dir_all(&init_dir).unwrap();
+    std::fs::set_permissions(&init_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let out_unsafe_dir = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(String::from_utf8_lossy(&out_unsafe_dir.stderr).trim().is_empty());
+    assert!(stdout(&out_unsafe_dir).contains("starship-ro> "));
+    assert!(cached_entries(&init_dir, "starship", false).is_empty(), "group/other-writable dir must not be used");
+
+    std::fs::set_permissions(&init_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = sb.run(&launch, "true");
+    let zwc = cached_entries(&init_dir, "starship", true);
+    assert_eq!(zwc.len(), 1);
+    std::fs::set_permissions(&zwc[0], std::fs::Permissions::from_mode(0o664)).unwrap();
+    // Overwrite the .zsh body with a sentinel (making it newer than .zwc too): if the
+    // unsafe .zwc were ignored on cache hit, zsh would source the sentinel instead of regenerating.
+    let zsh_cache = cached_entries(&init_dir, "starship", false);
+    let mut lines: Vec<String> = std::fs::read_to_string(&zsh_cache[0]).unwrap().lines().map(str::to_string).collect();
+    lines[1] = "PROMPT=\"from-stale-body> \"".into();
+    std::fs::write(&zsh_cache[0], format!("{}\n", lines.join("\n"))).unwrap();
+    let out_unsafe_zwc = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(stdout(&out_unsafe_zwc).contains("starship-ro> "), "unsafe .zwc mode must reject cache hit: {}", stdout(&out_unsafe_zwc));
 }
