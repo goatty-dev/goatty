@@ -222,7 +222,20 @@ mod tests {
             completions: &[],
         };
         assert_eq!(install_package(&p, &archive, &dirs).unwrap(), [dirs.bin_dir().join("fzf")]);
-        let out = std::process::Command::new(dirs.bin_dir().join("fzf")).output().unwrap();
+        // Another test thread forking while the binary was open for writing
+        // holds that fd until its exec: retry ETXTBSY ("text file busy").
+        let run = || std::process::Command::new(dirs.bin_dir().join("fzf")).output();
+        let mut out = run();
+        for _ in 0..100 {
+            match &out {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    out = run();
+                }
+                _ => break,
+            }
+        }
+        let out = out.unwrap();
         assert_eq!(out.stdout, b"fzf\n");
 
         // The wrong format fails without touching the installed version.
