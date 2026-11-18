@@ -500,6 +500,12 @@ impl SettingsWindow {
             cx.observe_global::<AppSettings>(|this, cx| {
                 this.sync_picker(cx);
                 this.sync_remote_opener(cx);
+                if let Some(id) = this.recording.as_deref()
+                    && !shortcuts::has_row(id, cx)
+                {
+                    this.recording = None;
+                    cx.notify();
+                }
             }),
             cx.subscribe(&font_filter, |_, _, _: &TextInputEvent, cx| cx.notify()),
             cx.subscribe(&ui_font_filter, |_, _, _: &TextInputEvent, cx| cx.notify()),

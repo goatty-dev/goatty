@@ -101,7 +101,7 @@ fn matches(query: &str, line: &Line) -> bool {
 }
 
 pub(super) fn has_row(action: &str, cx: &App) -> bool {
-    let overrides = &cx.global::<AppSettings>().client.keybindings;
+    let overrides = &cx.global::<AppSettings>().file.value.keybindings;
     has_row_in(action, overrides, cx.try_global::<CommandRegistry>())
 }
 
@@ -720,7 +720,7 @@ mod tests {
         assert!(matches("plugin.git.status", git));
 
         assert!(has_row_in("new_tab", &overrides, Some(&reg)));
-        assert!(has_row_in("plugin.docker.exec", &overrides, Some(&reg)));
+        assert!(has_row_in("plugin.docker.exec", &BTreeMap::new(), Some(&reg)));
         assert!(has_row_in("plugin.git.status", &overrides, Some(&reg)));
         assert!(!has_row_in("plugin.git.status", &BTreeMap::new(), Some(&reg)));
         assert!(!has_row_in("plugin.missing.cmd", &overrides, Some(&reg)));

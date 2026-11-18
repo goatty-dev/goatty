@@ -1804,8 +1804,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ShowAllHosts, _, cx| this.show_all_groups(cx)))
             .on_action(cx.listener(|this, act: &crate::actions::RunPluginCommand, w, cx| {
+                let id = act.id.clone();
                 let sel = this.focused_view().and_then(|v| v.read(cx).session().terminal.selection_text()).filter(|t| !t.trim().is_empty());
-                crate::plugin_commands::run_by_id(&act.id, sel.as_deref(), w, cx);
+                w.defer(cx, move |window, cx| {
+                    crate::plugin_commands::run_by_id(&id, sel.as_deref(), window, cx);
+                });
             }))
             .children(self.render_menu())
             .child(self.toasts.clone())

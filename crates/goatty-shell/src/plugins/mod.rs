@@ -756,6 +756,14 @@ impl Plugins<'_> {
         install::uninstall_package(package, &bins, self.dirs).map(Some)
     }
 
+    /// Installed plugins (built-ins and lock entries), without reading or
+    /// refreshing any registry snapshot.
+    pub fn installed(&self, settings: &HostSettings) -> Vec<Installed> {
+        let path = std::env::var("PATH").ok();
+        let mut issues = Vec::new();
+        self.installed_entries(settings, path.as_deref(), &[], &mut issues)
+    }
+
     /// Installed plugins and what the registries offer.
     pub fn catalog(&self, refresh: bool, settings: &HostSettings) -> Catalog {
         let path = std::env::var("PATH").ok();
@@ -763,16 +771,64 @@ impl Plugins<'_> {
     }
 
     pub(crate) fn catalog_with_env_path(&self, refresh: bool, settings: &HostSettings, env_path: Option<&str>) -> Catalog {
+        let (snaps, registries, mut issues) = self.snapshots(refresh, true);
+        let installed = self.installed_entries(settings, env_path, &snaps, &mut issues);
+        let lock = Lock::load(self.dirs).unwrap_or_default();
+        let target = current_target();
+        let mut available: Vec<Available> = Vec::new();
+        for s in &snaps {
+            for (id, entry) in &s.index.plugins {
+                if available.iter().any(|a| a.id == *id) || builtins::get(id).is_some() {
+                    continue;
+                }
+                let Some((v, ver)) = s.index.latest(id) else { continue };
+                let incompatible = if !ver.targets.is_empty() && !ver.targets.iter().any(|t| *t == target || t == "any") {
+                    Some(format!("no build for {target}"))
+                } else if !ver.goatty.is_empty()
+                    && semver::VersionReq::parse(&ver.goatty)
+                        .is_ok_and(|r| !r.matches(&semver::Version::parse(GOATTY_VERSION).expect("semver")))
+                {
+                    Some(format!("needs goatty {}", ver.goatty))
+                } else {
+                    None
+                };
+                available.push(Available {
+                    id: id.clone(),
+                    name: entry.name.clone(),
+                    summary: entry.summary.clone(),
+                    publisher: entry.publisher.clone(),
+                    category: entry.category,
+                    keywords: entry.keywords.clone(),
+                    homepage: entry.homepage.clone(),
+                    registry: s.source.name.clone(),
+                    version: v.to_owned(),
+                    permissions: ver.permissions.clone(),
+                    incompatible,
+                    installed: lock.plugins.get(id).map(|e| e.version.clone()),
+                });
+            }
+        }
+        available.sort_by_key(|a| a.name.to_lowercase());
+        issues.extend(active(self.dirs, settings).1);
+        Catalog { installed, available, registries, issues }
+    }
+
+    fn installed_entries(
+        &self,
+        settings: &HostSettings,
+        env_path: Option<&str>,
+        snaps: &[Snapshot],
+        issues: &mut Vec<String>,
+    ) -> Vec<Installed> {
         /// zsh builtins that run in the shell without an external binary on PATH.
         const ZSH_BUILTINS: &[&str] = &[
             "alias", "autoload", "bg", "bindkey", "break", "builtin", "cd", "command", "continue", "declare", "dirs", "echo", "emulate",
             "eval", "exec", "exit", "export", "false", "fc", "fg", "float", "getopts", "history", "integer", "jobs", "kill", "let",
             "local", "noglob", "popd", "print", "printf", "pushd", "pwd", "r", "read", "readonly", "return", "set", "setopt", "shift",
             "source", "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait",
-            "whence", "where", "which", "z", "zmodload", "zstyle",
+            "whence", "where", "which", "z", "zcompile", "zmodload", "zstyle",
         ];
 
-        let (snaps, registries, mut issues) = self.snapshots(refresh, true);
         let lock = match Lock::load(self.dirs) {
             Ok(l) => l,
             Err(e) => {
@@ -866,42 +922,7 @@ impl Plugins<'_> {
                 installed_unix: e.installed,
             });
         }
-        let mut available: Vec<Available> = Vec::new();
-        for s in &snaps {
-            for (id, entry) in &s.index.plugins {
-                if available.iter().any(|a| a.id == *id) || builtins::get(id).is_some() {
-                    continue;
-                }
-                let Some((v, ver)) = s.index.latest(id) else { continue };
-                let incompatible = if !ver.targets.is_empty() && !ver.targets.iter().any(|t| *t == target || t == "any") {
-                    Some(format!("no build for {target}"))
-                } else if !ver.goatty.is_empty()
-                    && semver::VersionReq::parse(&ver.goatty)
-                        .is_ok_and(|r| !r.matches(&semver::Version::parse(GOATTY_VERSION).expect("semver")))
-                {
-                    Some(format!("needs goatty {}", ver.goatty))
-                } else {
-                    None
-                };
-                available.push(Available {
-                    id: id.clone(),
-                    name: entry.name.clone(),
-                    summary: entry.summary.clone(),
-                    publisher: entry.publisher.clone(),
-                    category: entry.category,
-                    keywords: entry.keywords.clone(),
-                    homepage: entry.homepage.clone(),
-                    registry: s.source.name.clone(),
-                    version: v.to_owned(),
-                    permissions: ver.permissions.clone(),
-                    incompatible,
-                    installed: lock.plugins.get(id).map(|e| e.version.clone()),
-                });
-            }
-        }
-        available.sort_by_key(|a| a.name.to_lowercase());
-        issues.extend(active(self.dirs, settings).1);
-        Catalog { installed, available, registries, issues }
+        installed
     }
 }
 

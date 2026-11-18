@@ -135,8 +135,12 @@ fn is_executable(p: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a NUL-terminated path passed to POSIX `faccessat` for reading.
+        unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
     }
     #[cfg(not(unix))]
     true

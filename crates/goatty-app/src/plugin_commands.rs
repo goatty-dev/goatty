@@ -112,16 +112,25 @@ pub fn refresh(cx: &mut App) {
     };
     cx.spawn(async move |cx: &mut AsyncApp| {
         let l = link.clone();
-        let reply = cx.background_executor().spawn(async move { l.plugin(Request::Catalog { refresh: false }) }).await;
+        let reply = cx
+            .background_executor()
+            .spawn(async move {
+                match l.plugin(Request::Installed) {
+                    Err(e) if e.to_string().contains("unknown variant") => l.plugin(Request::Catalog { refresh: false }),
+                    other => other,
+                }
+            })
+            .await;
         cx.update(|cx| {
             if cx.default_global::<State>().generation != generation {
                 return;
             }
             match reply {
+                Ok(Reply::Installed(installed)) => replace(Some(link), installed, cx),
                 Ok(Reply::Catalog(c)) => replace(Some(link), c.installed, cx),
                 Ok(_) => {
                     cx.default_global::<State>().stale = false;
-                    log::warn!("plugin commands: unexpected reply to a catalog request");
+                    log::warn!("plugin commands: unexpected reply to an installed plugins request");
                 }
                 // An older goattyd, or a host without plugins: keep none.
                 Err(e) => {
@@ -197,33 +206,69 @@ pub(crate) fn lookup<'a>(reg: &'a CommandRegistry, stale: bool, id: &str) -> Opt
     (!stale).then(|| reg.get(id).filter(|c| matches!(c.source, Source::Plugin(_)))).flatten()
 }
 
+fn resolve_dispatch<'a>(
+    reg: &'a CommandRegistry,
+    state: &'a State,
+    id: &str,
+    expected: Option<(&PaletteCommand, &HostLink)>,
+) -> Option<&'a MenuCommand> {
+    if state.stale {
+        return None;
+    }
+    lookup(reg, state.stale, id)?;
+    let entry = state.active.get(id)?;
+    if let Some((cmd, origin)) = expected
+        && (entry.command.as_ref() != cmd || !entry.origin.same(origin))
+    {
+        return None;
+    }
+    Some(entry)
+}
+
 /// Run the active plugin command with id `id` (`plugin.<plugin>.<command>`),
 /// or tell the user why it isn't available on the current host.
 pub fn run_by_id(id: &str, selection: Option<&str>, window: &mut Window, cx: &mut App) {
-    let state = cx.try_global::<State>();
-    let stale = state.is_some_and(|s| s.stale);
-    let active = state.filter(|s| !s.stale).and_then(|s| s.active.get(id)).cloned();
-    let in_reg = cx.try_global::<CommandRegistry>().is_some_and(|reg| lookup(reg, stale, id).is_some());
-    if in_reg && let Some(entry) = active {
+    run_checked(id, None, selection, window, cx);
+}
+
+/// Run a menu item's plugin command only if the active host still offers the
+/// same definition that was displayed when the menu opened.
+pub fn run_menu_command(
+    id: &str,
+    expected: &PaletteCommand,
+    expected_origin: &HostLink,
+    selection: Option<&str>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    run_checked(id, Some((expected, expected_origin)), selection, window, cx);
+}
+
+fn run_checked(id: &str, expected: Option<(&PaletteCommand, &HostLink)>, selection: Option<&str>, window: &mut Window, cx: &mut App) {
+    let entry = cx
+        .try_global::<State>()
+        .zip(cx.try_global::<CommandRegistry>())
+        .and_then(|(state, reg)| resolve_dispatch(reg, state, id, expected).cloned());
+    if let Some(entry) = entry {
         start(&entry.plugin_id, &entry.plugin, &entry.command, &entry.origin, selection, window, cx);
     } else {
-        crate::toast::show_in(
-            window,
-            cx,
-            crate::toast::Toast::info("Plugin command isn't available")
-                .body(format!("{id} isn't available here (plugin not installed or enabled, a setting is off, or its program is missing)."))
-                .key("plugin.command.unavailable"),
-        );
+        let changed = expected.is_some() && cx.try_global::<State>().filter(|s| !s.stale).and_then(|s| s.active.get(id)).is_some();
+        let (title, body) = if changed {
+            ("Plugin command changed", format!("{id} changed since the menu opened. Open the menu again to run the updated command."))
+        } else {
+            (
+                "Plugin command isn't available",
+                format!("{id} isn't available here (plugin not installed or enabled, a setting is off, or its program is missing)."),
+            )
+        };
+        crate::toast::show_in(window, cx, crate::toast::Toast::info(title).body(body).key("plugin.command.unavailable"));
     }
 }
 
-fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
-    let cmd = Rc::new(c.clone());
-    let origin = link.clone();
-    let (plugin_id, plugin_name) = (plugin.to_string(), name.to_string());
+fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
     let id = command_id(plugin, &c.id);
-    let mut out = Command::handler(&id, name, &c.title, move |window, cx| start(&plugin_id, &plugin_name, &cmd, &origin, None, window, cx))
-        .with_key_action(id);
+    let run_id = id.clone();
+    let mut out = Command::handler(&id, name, &c.title, move |window, cx| run_by_id(&run_id, None, window, cx)).with_key_action(id);
     let mut words: Vec<&str> = c.keywords.iter().map(String::as_str).collect();
     words.push(plugin);
     out = out.keywords(&words);
@@ -407,5 +452,64 @@ icon = "search"
         assert!(lookup(&reg, true, "plugin.docker.ps").is_none());
         assert!(lookup(&reg, false, "plugin.docker.missing").is_none());
         assert!(lookup(&reg, false, "new_tab").is_none());
+    }
+
+    #[test]
+    fn resolve_dispatch_rejects_stale_and_changed_menu_commands() {
+        let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let other = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let m = goatty_plugin::manifest::parse(
+            r#"
+schema = 1
+id = "docker"
+name = "Docker"
+version = "1.0.0"
+summary = "Containers"
+publisher = "tests"
+
+[requires]
+commands = ["docker"]
+
+[[command]]
+id = "ps"
+title = "List containers"
+run = ["docker", "ps"]
+"#,
+            None,
+        )
+        .unwrap();
+        let orig_cmd = m.commands[0].clone();
+        let inst = Installed {
+            id: "docker".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec![],
+        };
+        let (cmds, active, _) = build_with_active(Some(&link), &[inst]);
+        let mut reg = CommandRegistry::default();
+        for c in cmds {
+            reg.register(c);
+        }
+        let mut state = State { link: Some(link.clone()), generation: 1, stale: false, active };
+
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_some());
+
+        let mut changed_cmd = orig_cmd.clone();
+        changed_cmd.run = vec!["docker".into(), "ps".into(), "-a".into()];
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&changed_cmd, &link))).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &other))).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", None).is_some());
+
+        state.stale = true;
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", None).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_none());
     }
 }

@@ -23,6 +23,9 @@ pub enum Request {
     Catalog {
         refresh: bool,
     },
+    /// What's installed on this host (no registry load or network fetch).
+    /// Reply: [`Reply::Installed`].
+    Installed,
     /// What installing (or updating to) `id` would do.
     Plan {
         id: String,
@@ -78,6 +81,7 @@ pub enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reply {
     Catalog(Catalog),
+    Installed(Vec<Installed>),
     Plan(Box<Plan>),
     Changed(Changed),
     Snippets(SnippetList),

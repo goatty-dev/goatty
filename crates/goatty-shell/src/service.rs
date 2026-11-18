@@ -154,6 +154,7 @@ impl HostService {
         let settings = self.settings().value;
         match req {
             api::Request::Catalog { refresh } => self.plugins(|p| Ok(api::Reply::Catalog(p.catalog(refresh, &settings)))),
+            api::Request::Installed => self.plugins(|p| Ok(api::Reply::Installed(p.installed(&settings)))),
             api::Request::Plan { id, version } => {
                 self.plugins(|p| Ok(api::Reply::Plan(Box::new(p.plan(&p.find(&id, version.as_deref())?, &settings)?))))
             }
