@@ -172,8 +172,9 @@ impl Host {
     fn plugin(&mut self, req: api::Request) -> Result<api::Reply> {
         match self {
             Host::Remote(c) => {
-                let raw =
-                    c.plugin(serde_json::to_string(&req)?).map_err(|e| anyhow::anyhow!("{}", sanitize_terminal(&format!("{e:#}"))))?;
+                let raw = c.plugin(serde_json::to_string(&req)?).map_err(|e| {
+                    if e.downcast_ref::<ReplyLost>().is_some() { e } else { anyhow::anyhow!("{}", sanitize_terminal(&format!("{e:#}"))) }
+                })?;
                 Ok(serde_json::from_str(&raw)?)
             }
             Host::Daemon(c) => Ok(serde_json::from_str(&c.plugin(serde_json::to_string(&req)?)?)?),
@@ -352,11 +353,19 @@ fn offer_imported_plugins_with(
             approved: plan.digest.clone(),
         }) {
             Ok(api::Reply::Changed(c)) => {
-                goatty_shell::plugins::cmd::print_changed(&c);
+                let remote_host = target.is_remote().then(|| target.label());
+                goatty_shell::plugins::cmd::print_changed_for(&c, remote_host.as_deref());
                 report.installed.extend(plan.all().map(|p| p.id.clone()));
             }
             Ok(other) => {
                 eprintln!("⚠ Couldn't install {safe_id}: unexpected reply {}", sanitize_terminal(&format!("{other:?}")));
+                report.failed.push(id);
+            }
+            Err(e) if e.downcast_ref::<ReplyLost>().is_some() => {
+                eprintln!(
+                    "⚠ Lost confirmation while installing {safe_id} ({}); it may still have been installed — check the host before retrying",
+                    target.label()
+                );
                 report.failed.push(id);
             }
             Err(e) => {

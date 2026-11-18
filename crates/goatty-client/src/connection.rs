@@ -1059,13 +1059,26 @@ mod tests {
 
     #[test]
     fn open_once_times_out_silent_handshake() {
-        let ep = Endpoint::command_line("sleep 5").unwrap();
+        let ep = Endpoint::command_line("exec sleep 5").unwrap();
         let start = Instant::now();
         let err = match Connection::open_once(ep, "test", Some(Duration::from_millis(50))) {
             Ok(_) => panic!("silent endpoint should time out"),
             Err(e) => e,
         };
         assert!(start.elapsed() < Duration::from_secs(3), "took {:?}", start.elapsed());
+        assert!(err.to_string().contains("timed out waiting for goattyd greeting"), "{err:#}");
+    }
+
+    #[test]
+    fn open_once_times_out_when_descendant_keeps_pipe_open() {
+        // `; true` prevents shells from exec-replacing sh, so a child keeps stdout open if only sh is killed.
+        let ep = Endpoint::command_line("sleep 2; true").unwrap();
+        let start = Instant::now();
+        let err = match Connection::open_once(ep, "test", Some(Duration::from_millis(50))) {
+            Ok(_) => panic!("descendant keeping pipe open should still time out"),
+            Err(e) => e,
+        };
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
         assert!(err.to_string().contains("timed out waiting for goattyd greeting"), "{err:#}");
     }
 
