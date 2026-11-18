@@ -7,9 +7,10 @@
 use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use goatty_client::Control;
+use goatty_client::{Connection, Control, Endpoint, RemoteProblem};
 use goatty_config::theme_import;
 use goatty_config::themes::ThemeFile;
 use goatty_config::{ClientSettings, Document, HostSettings, Loaded, ThemeLibrary, store};
@@ -38,25 +39,63 @@ fn print_issues(label: &str, issues: &[String]) {
     }
 }
 
-/// The host side: the running goattyd, or this machine's files.
+/// The host side: a connected goattyd (remote over `--ssh`/`--via`, or the
+/// running local one), else this machine's files.
 enum Host {
+    Remote(Arc<Connection>),
     Daemon(Control),
     Local(HostService),
 }
 
 impl Host {
-    fn open() -> Self {
-        match Control::connect_local(CLIENT) {
-            Ok(c) => Host::Daemon(c),
-            Err(_) => {
+    fn open(endpoint: Option<Endpoint>) -> Result<Self> {
+        match endpoint {
+            None => {
                 let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
-                Host::Local(HostService::from_env(daemon))
+                Ok(Host::Local(HostService::from_env(daemon)))
+            }
+            Some(Endpoint::Local) => Ok(match Control::connect_local(CLIENT) {
+                Ok(c) => Host::Daemon(c),
+                Err(_) => {
+                    let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
+                    Host::Local(HostService::from_env(daemon))
+                }
+            }),
+            Some(remote) => {
+                let conn = Connection::open(remote, CLIENT).map_err(|e| {
+                    let hint = match e.downcast_ref::<RemoteProblem>() {
+                        Some(RemoteProblem::NotInstalled { host, platform }) if platform.target().is_some() => {
+                            Some(format!("run `goatty --ssh {host}` once to install goattyd there"))
+                        }
+                        Some(RemoteProblem::Incompatible { host, mismatch, .. }) if !mismatch.daemon_is_newer => {
+                            Some(format!("run `goatty --ssh {host}` to update goattyd there"))
+                        }
+                        _ => None,
+                    };
+                    match hint {
+                        Some(msg) => e.context(msg),
+                        None => e,
+                    }
+                })?;
+                Ok(Host::Remote(conn))
             }
         }
     }
 
+    fn is_remote(&self) -> bool {
+        matches!(self, Host::Remote(_))
+    }
+
     fn label(&self) -> String {
         match self {
+            Host::Remote(c) => {
+                let h = c.host();
+                match (h.user.is_empty(), h.hostname.is_empty()) {
+                    (false, false) => format!("goattyd on {}@{}", h.user, h.hostname),
+                    (true, false) => format!("goattyd on {}", h.hostname),
+                    _ => format!("goattyd via {}", c.endpoint().label()),
+                }
+            }
             Host::Daemon(c) => format!("goattyd on {}", c.host().hostname),
             Host::Local(_) => "this machine (no goattyd running)".into(),
         }
@@ -64,6 +103,7 @@ impl Host {
 
     fn json(&mut self) -> Result<String> {
         match self {
+            Host::Remote(c) => Ok(c.host_settings()?.json),
             Host::Daemon(c) => c.host_settings_json(),
             Host::Local(s) => Ok(s.snapshot().json),
         }
@@ -72,6 +112,13 @@ impl Host {
     /// Validate, build the generation, save. Returns the issues.
     fn apply(&mut self, json: String) -> Result<Vec<String>> {
         match self {
+            Host::Remote(c) => {
+                let r = c.set_host_settings(json, true)?;
+                if !r.applied {
+                    bail!("host settings were not applied ({})", self.label());
+                }
+                Ok(r.issues)
+            }
             Host::Daemon(c) => c.apply_host_settings(json),
             Host::Local(s) => Ok(s.set(&json, true)?.issues),
         }
@@ -79,6 +126,7 @@ impl Host {
 
     fn plugin(&mut self, req: api::Request) -> Result<api::Reply> {
         match self {
+            Host::Remote(c) => Ok(serde_json::from_str(&c.plugin(serde_json::to_string(&req)?)?)?),
             Host::Daemon(c) => Ok(serde_json::from_str(&c.plugin(serde_json::to_string(&req)?)?)?),
             Host::Local(s) => s.plugin_request(req),
         }
@@ -131,6 +179,7 @@ fn offer_imported_plugins_with(
     mut ask: impl FnMut(&str) -> Result<bool>,
 ) -> Result<ImportPluginReport> {
     let mut report = ImportPluginReport::default();
+    let on_host = if target.is_remote() { " on that host" } else { "" };
     let cat = match target.plugin(api::Request::Catalog { refresh: false }) {
         Ok(api::Reply::Catalog(c)) => c,
         Ok(other) => {
@@ -144,7 +193,7 @@ fn offer_imported_plugins_with(
             println!("Host settings applied ({}).", target.label());
             eprintln!("⚠ Couldn't check plugins: {e:#}");
             let ids: Vec<&str> = profile_plugins.iter().map(|(id, _)| id.as_str()).collect();
-            println!("Review and install profile plugins with: goattyd plugin install {}", ids.join(" "));
+            println!("Review and install profile plugins{on_host} with: goattyd plugin install {}", ids.join(" "));
             return Ok(report);
         }
     };
@@ -165,7 +214,7 @@ fn offer_imported_plugins_with(
     let reg_errors = cat.registries.iter().any(|r| r.error.is_some());
     let mut installable = Vec::new();
     let mut unfound = false;
-    println!("\n{} plugin(s) in this profile are not installed on {}:", missing.len(), target.label());
+    println!("\n{} plugin(s) in this profile are not installed ({}):", missing.len(), target.label());
     for (id, enabled) in &missing {
         report.listed.push(id.clone());
         let disabled_note = if !enabled { " [disabled in profile]" } else { "" };
@@ -193,19 +242,21 @@ fn offer_imported_plugins_with(
 
     if installable.is_empty() {
         if unfound {
-            println!("Add a registry with `goattyd plugin registry add …` or install locally with `goattyd plugin install --path DIR`.");
+            println!(
+                "Add a registry{on_host} with `goattyd plugin registry add …` or install{on_host} from a directory with `goattyd plugin install --path DIR`."
+            );
         }
         return Ok(report);
     }
 
     let ids: Vec<&str> = installable.iter().map(|(id, _)| id.as_str()).collect();
     if yes || !is_terminal {
-        println!("Review and install with: goattyd plugin install {}", ids.join(" "));
+        println!("Review and install{on_host} with: goattyd plugin install {}", ids.join(" "));
         return Ok(report);
     }
 
     if !ask("Review and install them now?")? {
-        println!("Install later with: goattyd plugin install {}", ids.join(" "));
+        println!("Install later{on_host} with: goattyd plugin install {}", ids.join(" "));
         report.skipped.extend(installable.into_iter().map(|(id, _)| id));
         return Ok(report);
     }
@@ -273,7 +324,7 @@ fn show<T: Document + serde::Serialize>(loaded: &Loaded<T>, effective: &T, key: 
     Ok(())
 }
 
-pub fn settings(cmd: SettingsCmd) -> Result<()> {
+pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
     match cmd {
         SettingsCmd::Path => {
             let dir = goatty_config::config_dir().context("$HOME is not set")?;
@@ -347,7 +398,7 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
         }
         SettingsCmd::Export { file } => {
             let client = goatty_config::load_client().file.value;
-            let mut host = Host::open();
+            let mut host = Host::open(endpoint)?;
             let host_settings = store::parse::<HostSettings>(&host.json()?).value;
             let text = goatty_config::profile::export(&client, &host_settings);
             if file.as_os_str() == "-" {
@@ -367,13 +418,19 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
                 std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?
             };
             let (client, host) = goatty_config::profile::import(&text).map_err(anyhow::Error::msg)?;
-            let mut target = Host::open();
+            let remote_label = endpoint.as_ref().filter(|e| !e.is_local()).map(|e| e.label().to_owned());
+            let mut target = if host.is_some() { Some(Host::open(endpoint)?) } else { None };
+            if host.is_none()
+                && let Some(label) = remote_label
+            {
+                eprintln!("Note: this profile has no host settings; nothing will be sent to {label}.");
+            }
             println!("This profile replaces:");
             if client.is_some() {
                 println!("  appearance, shortcuts and workspace settings on this computer");
             }
-            if host.is_some() {
-                println!("  shell, prompt and history settings of {}", target.label());
+            if let Some(t) = &target {
+                println!("  shell, prompt and history settings of {}", t.label());
             }
             println!("(the current files are kept in backups/, and the shell configuration can be rolled back)");
             if !confirm("Import?", yes)? {
@@ -385,7 +442,7 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
                 store::save(&client_path()?, &c.value, &c.unknown)?;
                 println!("Client settings saved.");
             }
-            if let Some(h) = host {
+            if let (Some(h), Some(t)) = (host, target.as_mut()) {
                 let profile_plugins: Vec<(String, bool)> = h
                     .value
                     .plugins
@@ -394,12 +451,12 @@ pub fn settings(cmd: SettingsCmd) -> Result<()> {
                     .map(|(id, cfg)| (id.clone(), cfg.enabled))
                     .collect();
                 print_issues("host", &h.issues.iter().map(ToString::to_string).collect::<Vec<_>>());
-                let issues = target.apply(store::to_json(&h.value, &h.unknown))?;
+                let issues = t.apply(store::to_json(&h.value, &h.unknown))?;
                 if profile_plugins.is_empty() {
                     print_issues("host", &issues);
-                    println!("Host settings applied ({}).", target.label());
+                    println!("Host settings applied ({}).", t.label());
                 } else {
-                    offer_imported_plugins(&mut target, &profile_plugins, &issues, yes)?;
+                    offer_imported_plugins(t, &profile_plugins, &issues, yes)?;
                 }
             }
             Ok(())

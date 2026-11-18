@@ -59,14 +59,34 @@ fn main() -> Result<()> {
     }
     let mut cli = Cli::parse();
     // Subcommands work without a window (and without a display).
-    match cli.cmd.take() {
-        Some(cli::Command::Settings(c)) => return commands::settings(c),
-        Some(cli::Command::Theme(c)) => return commands::theme(c),
-        Some(cli::Command::Completions { shell }) => {
-            print!("{}", cli::completion_script(shell));
-            return Ok(());
+    if cli.cmd.is_some() {
+        if cli.plain {
+            anyhow::bail!("--plain only applies when opening a terminal window");
         }
-        None => {}
+        let remote = cli.ssh.is_some() || cli.via.is_some() || cli.remote_daemon.is_some();
+        match cli.cmd.take().expect("checked is_some") {
+            cli::Command::Settings(c) => {
+                if remote && !matches!(c, cli::SettingsCmd::Export { .. } | cli::SettingsCmd::Import { .. }) {
+                    anyhow::bail!(
+                        "--ssh and --via only apply to `settings export` and `settings import` (run `goattyd settings` on the host for its host.json)"
+                    );
+                }
+                return commands::settings(c, cli.endpoint()?);
+            }
+            cli::Command::Theme(c) => {
+                if remote {
+                    anyhow::bail!("--ssh and --via don't apply to `theme`");
+                }
+                return commands::theme(c);
+            }
+            cli::Command::Completions { shell } => {
+                if remote {
+                    anyhow::bail!("--ssh and --via don't apply to `completions`");
+                }
+                print!("{}", cli::completion_script(shell));
+                return Ok(());
+            }
+        }
     }
     // goatty's own crates at info; dependencies (wgpu, zbus, ...) only warn, and
     // rio_vt only logs errors so unhandled OSC sequences (e.g. systemd OSC 3008) stay quiet (#20).
