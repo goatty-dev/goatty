@@ -1689,7 +1689,7 @@ esac
     let mut settings = no_highlighting();
     settings.edit_plugin("fzf-tab", |p| p.enabled = false);
     settings.edit_plugin("autosuggestions", |p| p.enabled = false);
-    let launch = sb.launch_with(settings, None);
+    let launch = sb.launch_with(settings.clone(), None);
 
     // 1a) Verify cold-cache generation, zcompile, and _goatty_starship_post PROMPT2 rewriting
     //     all succeed under ksharrays + nounset + errexit with zero stderr.
@@ -1776,6 +1776,7 @@ esac
     exe(
         &sysbin.join("starship"),
         "#!/bin/sh
+echo \"ro:$*\" >> \"$HOME/init-calls\"
 [ \"$1\" = init ] && echo 'PROMPT=\"starship-ro> \"'
 ",
     );
@@ -1799,6 +1800,10 @@ esac
     std::fs::set_permissions(&init_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let lock_path = init_dir.join(".lock-starship");
     let mut holder = Command::new(&zsh)
+        .env_clear()
+        .envs(sb.base_env())
+        .envs(launch.env.iter().cloned())
+        .current_dir(&sb.home)
         .args([
             "-fc",
             "zmodload -F zsh/system b:zsystem && { : >>! \"$1\"; } && zsystem flock -t 0 -f fd -- \"$1\" && printf 'locked\\n' && IFS= read -r _",
@@ -1825,7 +1830,8 @@ esac
     assert!(stdout(&out_unlocked).contains("starship-ro> "));
     assert_eq!(cached_entries(&init_dir, "starship", false).len(), 1, "cache populated once lock released");
 
-    // 6) Security: group/other-writable init dir or .zwc is never written to or sourced.
+    // 6) Security: group/other-writable init dir, non-sticky 0o777 ancestor dir, or unsafe .zwc
+    //    is never written to or sourced.
     let _ = std::fs::remove_dir_all(&init_dir);
     std::fs::create_dir_all(&init_dir).unwrap();
     std::fs::set_permissions(&init_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1833,6 +1839,33 @@ esac
     assert!(String::from_utf8_lossy(&out_unsafe_dir.stderr).trim().is_empty());
     assert!(stdout(&out_unsafe_dir).contains("starship-ro> "));
     assert!(cached_entries(&init_dir, "starship", false).is_empty(), "group/other-writable dir must not be used");
+
+    let unsafe_parent = sb.home.join("shared-nonsticky");
+    std::fs::create_dir_all(&unsafe_parent).unwrap();
+    std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let unsafe_xdg = unsafe_parent.join("xdg");
+    let unsafe_dirs = goatty_shell::Dirs::under(&unsafe_xdg);
+    let mut unsafe_settings = settings.clone();
+    unsafe_settings.shell.import.enabled = false;
+    unsafe_settings.shell.program = Some(zsh.clone());
+    let unsafe_ctx = goatty_shell::import::Context::new(sb.home.clone(), Some(zsh.clone()), sb.base_env(), &unsafe_dirs.zsh_dir());
+    let unsafe_launch = Launcher::new(Some(unsafe_dirs.clone()), Some(sb.home.join("goattyd")))
+        .with_import_context(unsafe_ctx)
+        .launch(&Effective::plain(unsafe_settings));
+    let _ = std::fs::remove_file(sb.home.join("init-calls"));
+    let out_unsafe_parent = sb.run(&unsafe_launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(String::from_utf8_lossy(&out_unsafe_parent.stderr).trim().is_empty());
+    assert!(stdout(&out_unsafe_parent).contains("starship-ro> "));
+    assert!(!unsafe_dirs.init_cache_dir().exists(), "non-sticky 0777 ancestor must block cache dir creation");
+    // Even if init_cache_dir() itself is pre-created with 0700 under the 0777 non-sticky ancestor, reject it.
+    std::fs::create_dir_all(unsafe_dirs.init_cache_dir()).unwrap();
+    std::fs::set_permissions(unsafe_dirs.init_cache_dir(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = sb.run(&unsafe_launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(
+        cached_entries(&unsafe_dirs.init_cache_dir(), "starship", false).is_empty(),
+        "non-sticky 0777 ancestor must block cache writes even when init/ is 0700"
+    );
+    std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     std::fs::set_permissions(&init_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _ = sb.run(&launch, "true");
@@ -1845,6 +1878,46 @@ esac
     let mut lines: Vec<String> = std::fs::read_to_string(&zsh_cache[0]).unwrap().lines().map(str::to_string).collect();
     lines[1] = "PROMPT=\"from-stale-body> \"".into();
     std::fs::write(&zsh_cache[0], format!("{}\n", lines.join("\n"))).unwrap();
+    let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out_unsafe_zwc = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
     assert!(stdout(&out_unsafe_zwc).contains("starship-ro> "), "unsafe .zwc mode must reject cache hit: {}", stdout(&out_unsafe_zwc));
+    assert!(
+        std::fs::read_to_string(sb.home.join("init-calls")).unwrap_or_default().contains("ro:init"),
+        "unsafe .zwc must force starship regeneration"
+    );
+
+    // 7) Missing .zwc with a syntax-broken .zsh body (retaining a valid key header) is rejected and regenerated.
+    let zsh_cache2 = cached_entries(&init_dir, "starship", false);
+    let zwc2 = cached_entries(&init_dir, "starship", true);
+    assert_eq!(zsh_cache2.len(), 1);
+    assert_eq!(zwc2.len(), 1);
+    std::fs::remove_file(&zwc2[0]).unwrap();
+    let hdr_only = std::fs::read_to_string(&zsh_cache2[0]).unwrap().lines().next().unwrap().to_string();
+    std::fs::write(&zsh_cache2[0], format!("{hdr_only}\nif then broken\n")).unwrap();
+    let _ = std::fs::remove_file(sb.home.join("init-calls"));
+    let out_missing_zwc = sb.run(&launch, "print -r -- \"p=[$PROMPT]\"");
+    assert!(
+        String::from_utf8_lossy(&out_missing_zwc.stderr).trim().is_empty(),
+        "missing .zwc leaked stderr: {}",
+        String::from_utf8_lossy(&out_missing_zwc.stderr)
+    );
+    assert!(stdout(&out_missing_zwc).contains("starship-ro> "));
+    assert!(
+        std::fs::read_to_string(sb.home.join("init-calls")).unwrap_or_default().contains("ro:init"),
+        "missing .zwc must trigger regeneration instead of sourcing broken .zsh"
+    );
+    assert_eq!(cached_entries(&init_dir, "starship", true).len(), 1, "missing .zwc must be rebuilt");
+
+    // 8) fzf init warnings emitted at source time are preserved on cache hits.
+    let _ = std::fs::remove_dir_all(&init_dir);
+    exe(
+        &sysbin.join("fzf"),
+        "#!/bin/sh
+[ \"$1\" = --zsh ] && printf '%s\\n' 'fzf_ok=warn' 'builtin print -u2 -- \"fzf-setup-warning\"'
+",
+    );
+    let out_fzf_cold = pty_session(&sb, &launch, &["print -r -- \"fzf=$fzf_ok\""]);
+    assert!(out_fzf_cold.contains("fzf=warn") && out_fzf_cold.contains("fzf-setup-warning"), "{out_fzf_cold}");
+    let out_fzf_warm = pty_session(&sb, &launch, &["print -r -- \"fzf=$fzf_ok\""]);
+    assert!(out_fzf_warm.contains("fzf=warn") && out_fzf_warm.contains("fzf-setup-warning"), "{out_fzf_warm}");
 }

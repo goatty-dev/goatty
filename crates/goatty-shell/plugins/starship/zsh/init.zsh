@@ -41,7 +41,7 @@ _goatty_starship_post() {
 }
 _goatty_rc=0
 _goatty_cached_init -p _goatty_starship_post "$_goatty_starship_name" "$_goatty_starship_key" starship init zsh --print-full-init || _goatty_rc=$?
-if (( _goatty_rc == 0 )) && ! builtin source -- "$REPLY" 2>/dev/null && [[ ! -r $REPLY ]]; then
+if (( _goatty_rc == 0 )) && { [[ ! -r $REPLY ]] || { ! builtin source -- "$REPLY" && [[ ! -r $REPLY ]]; }; }; then
   _goatty_rc=0
   _goatty_cached_init -n -p _goatty_starship_post "$_goatty_starship_name" "$_goatty_starship_key" starship init zsh --print-full-init || _goatty_rc=$?
 fi

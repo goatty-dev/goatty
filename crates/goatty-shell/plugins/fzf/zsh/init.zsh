@@ -79,7 +79,7 @@ _goatty_fzf_helper() {
 if [[ -o zle && -t 0 ]]; then
   _goatty_rc=0
   _goatty_cached_init fzf "" fzf --zsh || _goatty_rc=$?
-  if (( _goatty_rc == 0 )) && ! builtin source -- "$REPLY" 2>/dev/null && [[ ! -r $REPLY ]]; then
+  if (( _goatty_rc == 0 )) && { [[ ! -r $REPLY ]] || { ! builtin source -- "$REPLY" && [[ ! -r $REPLY ]]; }; }; then
     _goatty_rc=0
     _goatty_cached_init -n fzf "" fzf --zsh || _goatty_rc=$?
   fi
