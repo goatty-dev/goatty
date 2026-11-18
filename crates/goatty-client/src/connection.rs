@@ -321,6 +321,7 @@ impl Connection {
     /// Spawn a shell on the host and attach `sink` to it. `cwd` is a path on
     /// the host; pass `None` for remote endpoints.
     pub fn create(&self, size: WinSize, cwd: Option<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
+        ensure_sane(size)?;
         let opts = self.shared.opts;
         match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Create { req, size, cwd, opts })? {
             ServerMsg::Attached { session, .. } => Ok(session),
@@ -331,6 +332,7 @@ impl Connection {
     /// Start `argv` in a new session on the host (not the user's shell) and
     /// attach `sink` to it. Needs a daemon with protocol v6.
     pub fn run(&self, size: WinSize, cwd: Option<String>, argv: Vec<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
+        ensure_sane(size)?;
         let version = self.protocol_version();
         if version < RUN_SINCE {
             bail!("goattyd via {} is too old to run commands in sessions (protocol v{version}); restart it", self.endpoint().label());
@@ -343,6 +345,9 @@ impl Connection {
     }
 
     pub fn attach(&self, session: SessionId, size: WinSize, sink: Arc<dyn PaneSink>) -> Result<()> {
+        // Refused here, not by goattyd: a refused replacement attach would
+        // leave the pane that stays with output decoded at the old size.
+        ensure_sane(size)?;
         let opts = self.shared.opts;
         match self.request(
             |tx| Pending::Attach { tx, sink, size, session: Some(session) },
@@ -622,6 +627,14 @@ impl Drop for Connection {
         self.shared.closed.store(true, Ordering::Release);
         self.shared.close_transport();
     }
+}
+
+/// goattyd refuses sizes no screen has (`WinSize::is_sane`).
+fn ensure_sane(size: WinSize) -> Result<()> {
+    if !size.is_sane() {
+        bail!("the pane is too large ({}×{} cells)", size.cols, size.rows);
+    }
+    Ok(())
 }
 
 fn writer_loop(rx: flume::Receiver<WriterCmd>) {

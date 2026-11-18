@@ -2138,7 +2138,9 @@ impl TerminalView {
         self.end_selection(cx);
         let pressed_link = self.pressed_link.take();
         let pressed_pending = self.pressed_pending_link.take();
-        if ev.button == GMouseButton::Left && !self.session.terminal.has_selection() {
+        // A release over the letterbox opens nothing (its cell is clamped).
+        let on_grid = self.geom.get().in_grid(ev.position);
+        if ev.button == GMouseButton::Left && on_grid && !self.session.terminal.has_selection() {
             if let Some(target) = pressed_link {
                 self.mouse_cell = Some((col, row));
                 self.refresh_hover(cx);
