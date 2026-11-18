@@ -1631,7 +1631,10 @@ esac
 
     // 7) ZSH_VERSION mismatch in cache header invalidates cache.
     let star_caches = cached_entries(&init_dir, "starship", false);
-    let star_cache = star_caches.last().unwrap();
+    let star_cache = star_caches
+        .iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|c| c.contains("PROMPT2='u2> '")))
+        .expect("missing active starship cache entry for u2");
     let contents = std::fs::read_to_string(star_cache).unwrap();
     let mut lines = contents.lines();
     let first_line = lines.next().unwrap();
