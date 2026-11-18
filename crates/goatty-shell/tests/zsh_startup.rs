@@ -38,6 +38,7 @@ const BASIC_UTILS: &[&str] = &[
     "head",
     "id",
     "ln",
+    "locale",
     "ls",
     "mkdir",
     "mktemp",
