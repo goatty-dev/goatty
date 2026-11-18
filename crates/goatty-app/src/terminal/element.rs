@@ -59,10 +59,19 @@ impl Geom {
     }
 
     /// Where IME composition text `cells` wide starts: at the caret, moved
-    /// left so it stays inside the grid when it's too long for the line.
+    /// left so it stays inside the shown part of the grid when it's too
+    /// long for the line.
     pub fn preedit_origin(&self, cells: usize) -> Point<Pixels> {
         let (col, row) = self.caret;
-        let col = col.min(self.cols.saturating_sub(cells));
+        let (first, end) = match self.visible {
+            Some(b) => {
+                let first = ((b.left() - self.origin.x) / self.cell.width).ceil().max(0.0) as usize;
+                let end = ((b.right() - self.origin.x) / self.cell.width).floor().max(0.0) as usize;
+                (first, end.min(self.cols))
+            }
+            None => (0, self.cols),
+        };
+        let col = col.min(end.saturating_sub(cells)).max(first);
         point(self.origin.x + self.cell.width * col as f32, self.origin.y + self.cell.height * row as f32)
     }
 
@@ -695,5 +704,14 @@ mod tests {
         let g = Geom { caret: (78, 2), ..g };
         assert_eq!(g.preedit_origin(6), point(px(740.0), px(40.0)));
         assert_eq!(g.preedit_origin(200), point(px(0.0), px(40.0)));
+    }
+
+    #[test]
+    fn preedit_stays_inside_what_the_pane_shows() {
+        // An 80-column grid panned left by 10 columns in a pane showing 40.
+        let visible = Some(Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(200.0))));
+        let g = Geom { origin: point(px(-100.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (48, 2), visible };
+        assert_eq!(g.preedit_origin(4), point(px(360.0), px(40.0)), "columns 46..50 end at the right edge");
+        assert_eq!(g.preedit_origin(200), point(px(0.0), px(40.0)), "never left of the first shown column");
     }
 }

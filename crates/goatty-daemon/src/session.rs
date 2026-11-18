@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -270,8 +270,6 @@ pub(crate) struct Session {
     /// gets control even when another client attached in between. `None`
     /// for restored sessions. Changed while `subs` is held.
     pub(crate) creator: Mutex<Option<u64>>,
-    /// The size the PTY gets next ([`Session::flush_pty`]).
-    pub(crate) pty_size: Mutex<Option<TermSize>>,
 }
 
 impl Session {
@@ -443,73 +441,60 @@ impl Session {
     /// when the size changed, else just `from`. Lagging ones don't: they lack
     /// output the line counts, and their `Resync` brings the line.
     pub(crate) fn resize(&self, ws: WinSize, from: u64) {
-        {
-            // The reflow and its top line are one point in the stream, like a
-            // snapshot and its top line in `subscribe`/`resync`.
-            let subs = self.subs.lock();
-            let Some(sub) = subs.iter().find(|s| s.conn == from) else { return };
-            *sub.wanted.lock() = ws;
-            let mut controller = self.controller.lock();
-            let took = *controller != Some(from) && !sub.size_ctl;
-            if took {
-                *controller = Some(from);
-            }
-            if *controller != Some(from) {
-                return; // watching at someone else's size
-            }
-            drop(controller);
-            let changed = self.apply_size(ws);
-            if changed || took {
-                self.push_size_control(&subs, None);
-            }
-            self.push_resized(&subs, changed, Some(from));
+        // The reflow and its top line are one point in the stream, like a
+        // snapshot and its top line in `subscribe`/`resync`.
+        let subs = self.subs.lock();
+        let Some(sub) = subs.iter().find(|s| s.conn == from) else { return };
+        *sub.wanted.lock() = ws;
+        let mut controller = self.controller.lock();
+        let took = *controller != Some(from) && !sub.size_ctl;
+        if took {
+            *controller = Some(from);
         }
-        self.flush_pty();
+        if *controller != Some(from) {
+            return; // watching at someone else's size
+        }
+        drop(controller);
+        let changed = self.apply_size(ws);
+        if changed || took {
+            self.push_size_control(&subs, None);
+        }
+        self.push_resized(&subs, changed, Some(from));
     }
 
     /// Connection `conn` takes control of the session's size (`TakeSize`):
     /// the session takes the size it last asked for.
     pub(crate) fn take_size(&self, conn: u64) {
-        {
-            let subs = self.subs.lock();
-            let Some(sub) = subs.iter().find(|s| s.conn == conn) else { return };
-            let ws = *sub.wanted.lock();
-            let mut controller = self.controller.lock();
-            if *controller == Some(conn) {
-                return;
-            }
-            *controller = Some(conn);
-            drop(controller);
-            let changed = self.apply_size(ws);
-            self.push_size_control(&subs, None);
-            self.push_resized(&subs, changed, Some(conn));
+        let subs = self.subs.lock();
+        let Some(sub) = subs.iter().find(|s| s.conn == conn) else { return };
+        let ws = *sub.wanted.lock();
+        let mut controller = self.controller.lock();
+        if *controller == Some(conn) {
+            return;
         }
-        self.flush_pty();
+        *controller = Some(conn);
+        drop(controller);
+        let changed = self.apply_size(ws);
+        self.push_size_control(&subs, None);
+        self.push_resized(&subs, changed, Some(conn));
     }
 
-    /// Resize the authoritative terminal to `ws` and queue the size for the
-    /// PTY. Caller holds `subs`, and calls [`Self::flush_pty`] after letting
-    /// go of it. True when the size changed.
+    /// Resize the PTY and the authoritative terminal to `ws`. Caller holds
+    /// `subs`, so the PTY has the size before any client hears of it, and
+    /// sizes apply in the order they were decided. True when the size
+    /// changed.
     fn apply_size(&self, ws: WinSize) -> bool {
         let size = to_size(ws);
-        *self.pty_size.lock() = Some(size);
+        // SAFETY: `master_fd` is open as long as `pty`, which `self` owns.
+        let master = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+        if let Err(e) = goatty_term::pty::set_window_size(master, size) {
+            log::warn!("session {}: resize failed: {e}", self.id);
+        }
         let changed = self.term.size() != (size.cols, size.rows);
         if changed {
             self.term.resize(size);
         }
         changed
-    }
-
-    /// Give the PTY the newest size queued by [`Self::apply_size`]. Taken
-    /// under the PTY's lock, so the size the PTY ends up with is the one
-    /// applied last under `subs`, whichever caller gets the lock first. Not
-    /// called under `subs`: an input write can hold the PTY's lock.
-    fn flush_pty(&self) {
-        let pty = self.pty.lock();
-        let Some(size) = self.pty_size.lock().take() else { return };
-        if let Err(e) = pty.resize(size) {
-            log::warn!("session {}: resize failed: {e}", self.id);
-        }
     }
 
     /// Tell v14 subscribers (all, or just `only`) the session's size and
@@ -584,20 +569,6 @@ impl Session {
         features: SubFeatures,
         tx: &flume::Sender<Outbound>,
     ) -> Arc<Subscriber> {
-        let sub = self.subscribe_locked(conn, req, size, opts, features, tx);
-        self.flush_pty();
-        sub
-    }
-
-    fn subscribe_locked(
-        &self,
-        conn: u64,
-        req: ReqId,
-        size: WinSize,
-        opts: StreamOpts,
-        features: SubFeatures,
-        tx: &flume::Sender<Outbound>,
-    ) -> Arc<Subscriber> {
         let mut subs = self.subs.lock();
         subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
         {
@@ -662,17 +633,14 @@ impl Session {
     }
 
     pub(crate) fn unsubscribe(&self, conn: u64) {
-        {
-            let mut subs = self.subs.lock();
-            subs.retain(|s| s.conn != conn);
-            let mut creator = self.creator.lock();
-            if *creator == Some(conn) {
-                *creator = None;
-            }
-            drop(creator);
-            self.hand_over(&subs, conn);
+        let mut subs = self.subs.lock();
+        subs.retain(|s| s.conn != conn);
+        let mut creator = self.creator.lock();
+        if *creator == Some(conn) {
+            *creator = None;
         }
-        self.flush_pty();
+        drop(creator);
+        self.hand_over(&subs, conn);
     }
 
     /// Client acknowledged `consumed` bytes. If it was lagging and has now

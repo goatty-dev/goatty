@@ -175,7 +175,6 @@ impl Daemon {
             replies_written: AtomicU64::new(0),
             controller: Mutex::new(None),
             creator: Mutex::new(creator),
-            pty_size: Mutex::new(None),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");

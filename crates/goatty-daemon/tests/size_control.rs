@@ -182,7 +182,8 @@ fn one_client_controls_the_size_and_others_watch_until_they_take_over() {
     assert_eq!(next_size_control(&mut a, id), (80, 24, true));
     wait_size(&d.sock, id, (80, 24));
 
-    // The PTY has the size too, not only the daemon's terminal.
+    // The PTY has the size too, not only the daemon's terminal, and had it
+    // before A heard it controls again.
     send(&mut a, &ClientMsg::Input { session: id, data: b"stty size\r".to_vec() });
     output_until(&mut a, id, "24 80");
 }
@@ -214,6 +215,15 @@ fn the_first_client_to_attach_to_an_unwatched_session_controls_it() {
         other => panic!("{other:?}"),
     }
     send(&mut b, &ClientMsg::Resize { session: id, size: ws(4000, 2000) });
-    round_trip(&mut b);
+    send(&mut b, &ClientMsg::Ping { nonce: 8 });
+    let mut refused = false;
+    loop {
+        match read_msg::<_, ServerMsg>(&mut b).unwrap() {
+            ServerMsg::Error { req: None, message } if message.contains("too large") => refused = true,
+            ServerMsg::Pong { nonce: 8 } => break,
+            _ => {}
+        }
+    }
+    assert!(refused, "the oversized resize got no error");
     assert_eq!(size_of(&d.sock, id), (100, 30));
 }

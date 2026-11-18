@@ -145,13 +145,7 @@ impl Pty {
     }
 
     pub fn resize(&self, size: TermSize) -> Result<()> {
-        let s = pty_size(size);
-        let ws = libc::winsize { ws_row: s.rows, ws_col: s.cols, ws_xpixel: s.pixel_width, ws_ypixel: s.pixel_height };
-        // SAFETY: `ws` is a valid winsize and the fd is open.
-        if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &raw const ws) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("TIOCSWINSZ");
-        }
-        Ok(())
+        set_window_size(self.master.as_fd(), size)
     }
 
     pub fn pid(&self) -> Option<u32> {
@@ -266,6 +260,18 @@ pub fn session_leader(master: BorrowedFd<'_>) -> Option<u32> {
     // SAFETY: `sid` is valid for writes and the fd is open.
     let r = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGSID, &raw mut sid) };
     (r == 0 && sid > 0).then_some(sid as u32)
+}
+
+/// Give the terminal behind `master` the size `size` (`TIOCSWINSZ`). Never
+/// blocks, so it needs no lock that an input write could hold.
+pub fn set_window_size(master: BorrowedFd<'_>, size: TermSize) -> Result<()> {
+    let s = pty_size(size);
+    let ws = libc::winsize { ws_row: s.rows, ws_col: s.cols, ws_xpixel: s.pixel_width, ws_ypixel: s.pixel_height };
+    // SAFETY: `ws` is a valid winsize and the fd is open.
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &raw const ws) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("TIOCSWINSZ");
+    }
+    Ok(())
 }
 
 /// The size of the terminal behind `master` (`TIOCGWINSZ`), cell pixels

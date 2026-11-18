@@ -1123,7 +1123,13 @@ impl TerminalView {
 
         out.push(Entry::Separator);
         if self.session.watching() {
-            out.push(Item::action("Size the session to this pane", "take_session_size", cx).icon(Icon::Maximize2).into());
+            let down = *self.session.status.lock() != LinkStatus::Connected;
+            out.push(
+                Item::action("Size the session to this pane", "take_session_size", cx)
+                    .icon(Icon::Maximize2)
+                    .disabled(down.then_some("Not connected to goattyd"))
+                    .into(),
+            );
         }
         out.push(Item::action("Find in the output…", "find", cx).icon(Icon::Search).into());
         out.push(Item::action("View the last command's output", "view_last_output", cx).icon(Icon::FileText).into());
@@ -2126,6 +2132,9 @@ impl TerminalView {
         {
             self.report_mouse(btn, MouseAction::Release, col, row, &ev.modifiers);
         }
+        if ev.button == GMouseButton::Middle {
+            return; // selections and links are the left button's
+        }
         self.end_selection(cx);
         let pressed_link = self.pressed_link.take();
         let pressed_pending = self.pressed_pending_link.take();
@@ -2151,11 +2160,15 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
-        let (col, row, _) = self.geom.get().cell_at(ev.position);
-        self.mouse_cell = Some((col, row));
+        let geom = self.geom.get();
+        // Over the letterbox there's no cell: no hover, no motion report
+        // (unless a button pressed on the grid drags out there).
+        let inside = geom.in_grid(ev.position);
+        let (col, row, _) = geom.cell_at(ev.position);
+        self.mouse_cell = inside.then_some((col, row));
         self.modifiers = ev.modifiers;
         if let Some(pending) = &self.pending_open
-            && self.session.terminal.link_at(col, row).as_ref() != Some(&pending.link)
+            && self.mouse_cell.and_then(|(c, r)| self.session.terminal.link_at(c, r)).as_ref() != Some(&pending.link)
         {
             self.pending_open = None;
         }
@@ -2167,7 +2180,7 @@ impl TerminalView {
         if self.refresh_hover(cx) {
             cx.notify();
         }
-        if self.mouse_mode_active(ev.modifiers.shift) {
+        if self.mouse_mode_active(ev.modifiers.shift) && (inside || self.buttons_to_program != 0) {
             let btn = mouse_button(ev.pressed_button).unwrap_or(MouseButton::None);
             self.report_mouse(btn, MouseAction::Motion, col, row, &ev.modifiers);
         }
@@ -2250,6 +2263,9 @@ impl TerminalView {
         let (col, row, _) = geom.cell_at(ev.position);
         if self.mouse_mode_active(ev.modifiers.shift) {
             self.pending_open = None;
+            if !geom.in_grid(ev.position) {
+                return; // the letterbox has no cell to report
+            }
             let btn = if whole > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
             for _ in 0..whole.unsigned_abs() {
                 self.report_mouse(btn, MouseAction::Press, col, row, &ev.modifiers);
@@ -2539,6 +2555,8 @@ impl Render for TerminalView {
             .on_mouse_up_out(GMouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(GMouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(GMouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(GMouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(GMouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_hover(cx.listener(Self::on_hover))
