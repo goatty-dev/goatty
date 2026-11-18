@@ -247,7 +247,8 @@ impl Workspace {
         };
         // With goatty's title bar, the empty space is the title bar's.
         let rest = self.tabs_rest("tab-bar-rest", !csd, cx).flex_1().h_full();
-        let rest = if csd { self.title_bar_area(rest, window, cx) } else { rest };
+        // Some room to grab even when the tabs overflow and scroll.
+        let rest = if csd { self.title_bar_area(rest.min_w(px(48.)), window, cx) } else { rest };
         let bar = div()
             .id("tab-bar")
             .flex_none()
