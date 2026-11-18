@@ -53,8 +53,8 @@ use super::links::{self, Place, RemoteAction, RemoteLookup, Target};
 use super::stats::Stats;
 use crate::actions::{
     ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, NextPrompt,
-    OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo,
-    ViewLastOutput,
+    OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT,
+    TakeSessionSize, ToggleSudo, ViewLastOutput,
 };
 use crate::agent::notify::Notice;
 use crate::agent::{AgentStatus, Identity};
@@ -338,6 +338,10 @@ pub struct TerminalView {
     keys_down: Vec<String>,
     /// A right press went to the program: its release goes there too.
     right_to_program: bool,
+    /// Left and middle presses that went to the program (bits 0 and 1):
+    /// only their releases go there, not the release of a press the pane
+    /// kept (the "Take over" chip, the letterbox).
+    buttons_to_program: u8,
     /// Text the input method (IME, dead keys, compose) is composing; it
     /// goes to the program only once committed (#21).
     preedit: String,
@@ -464,6 +468,7 @@ impl TerminalView {
             menu_cell: None,
             keys_down: Vec::new(),
             right_to_program: false,
+            buttons_to_program: 0,
             preedit: String::new(),
         };
         view.apply_settings(&app);
@@ -917,6 +922,24 @@ impl TerminalView {
         self.line_edit(LineEdit::Clear, window, cx);
     }
 
+    /// Another client sets the session's size: make it this pane's (#12).
+    fn take_session_size(&mut self, _: &TakeSessionSize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.session.watching() {
+            toast::show_in(window, cx, Toast::success("This pane already sets the session's size").key("terminal.size"));
+            return;
+        }
+        self.request_take_size(window, cx);
+    }
+
+    /// Ask the daemon to size the session to this pane, or say why it can't.
+    fn request_take_size(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.session.take_size() {
+            let why = "This pane isn't connected to the session right now. Try again once it's back.";
+            toast::show_in(window, cx, Toast::error("Can't take over the session's size").body(why).key("terminal.size"));
+        }
+        cx.notify();
+    }
+
     // ---- the menu (#186) ------------------------------------------------------
 
     /// Shift+F10 / the Menu key: the menu at the text cursor (or the
@@ -1099,6 +1122,15 @@ impl TerminalView {
         }
 
         out.push(Entry::Separator);
+        if self.session.watching() {
+            let down = *self.session.status.lock() != LinkStatus::Connected;
+            out.push(
+                Item::action("Size the session to this pane", "take_session_size", cx)
+                    .icon(Icon::Maximize2)
+                    .disabled(down.then_some("Not connected to goattyd"))
+                    .into(),
+            );
+        }
         out.push(Item::action("Find in the output…", "find", cx).icon(Icon::Search).into());
         out.push(Item::action("View the last command's output", "view_last_output", cx).icon(Icon::FileText).into());
         out
@@ -2020,6 +2052,15 @@ impl TerminalView {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.focus(&self.focus, cx);
+        if !self.geom.get().in_grid(ev.position) {
+            // The letterbox around a session another client sizes (#12): no
+            // cell is there. A right click still opens the pane's menu.
+            if ev.button == GMouseButton::Right {
+                self.menu_cell = None;
+                cx.emit(TerminalEvent::ContextMenu { at: ev.position, keyboard: false });
+            }
+            return;
+        }
         let (col, row, right) = self.geom.get().cell_at(ev.position);
         self.pressed_link = None;
         self.pressed_pending_link = None;
@@ -2051,6 +2092,7 @@ impl TerminalView {
         }
         if self.mouse_mode_active(ev.modifiers.shift) {
             if let Some(btn) = mouse_button(Some(ev.button)) {
+                self.buttons_to_program |= button_bit(ev.button);
                 self.report_mouse(btn, MouseAction::Press, col, row, &ev.modifiers);
             }
             return;
@@ -2082,15 +2124,23 @@ impl TerminalView {
             }
             return;
         }
-        if self.mouse_mode_active(ev.modifiers.shift)
+        let pressed_here = self.buttons_to_program & button_bit(ev.button) != 0;
+        self.buttons_to_program &= !button_bit(ev.button);
+        if pressed_here
+            && self.mouse_mode_active(ev.modifiers.shift)
             && let Some(btn) = mouse_button(Some(ev.button))
         {
             self.report_mouse(btn, MouseAction::Release, col, row, &ev.modifiers);
         }
+        if ev.button == GMouseButton::Middle {
+            return; // selections and links are the left button's
+        }
         self.end_selection(cx);
         let pressed_link = self.pressed_link.take();
         let pressed_pending = self.pressed_pending_link.take();
-        if ev.button == GMouseButton::Left && !self.session.terminal.has_selection() {
+        // A release over the letterbox opens nothing (its cell is clamped).
+        let on_grid = self.geom.get().in_grid(ev.position);
+        if ev.button == GMouseButton::Left && on_grid && !self.session.terminal.has_selection() {
             if let Some(target) = pressed_link {
                 self.mouse_cell = Some((col, row));
                 self.refresh_hover(cx);
@@ -2112,11 +2162,15 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
-        let (col, row, _) = self.geom.get().cell_at(ev.position);
-        self.mouse_cell = Some((col, row));
+        let geom = self.geom.get();
+        // Over the letterbox there's no cell: no hover, no motion report
+        // (unless a button pressed on the grid drags out there).
+        let inside = geom.in_grid(ev.position);
+        let (col, row, _) = geom.cell_at(ev.position);
+        self.mouse_cell = inside.then_some((col, row));
         self.modifiers = ev.modifiers;
         if let Some(pending) = &self.pending_open
-            && self.session.terminal.link_at(col, row).as_ref() != Some(&pending.link)
+            && self.mouse_cell.and_then(|(c, r)| self.session.terminal.link_at(c, r)).as_ref() != Some(&pending.link)
         {
             self.pending_open = None;
         }
@@ -2128,7 +2182,14 @@ impl TerminalView {
         if self.refresh_hover(cx) {
             cx.notify();
         }
-        if self.mouse_mode_active(ev.modifiers.shift) {
+        // Plain motion over the grid; a drag only when the program got its
+        // press (like the release), wherever it goes.
+        let report = match ev.pressed_button {
+            None => inside,
+            Some(GMouseButton::Right) => self.right_to_program,
+            Some(b) => self.buttons_to_program & button_bit(b) != 0,
+        };
+        if self.mouse_mode_active(ev.modifiers.shift) && report {
             let btn = mouse_button(ev.pressed_button).unwrap_or(MouseButton::None);
             self.report_mouse(btn, MouseAction::Motion, col, row, &ev.modifiers);
         }
@@ -2201,6 +2262,9 @@ impl TerminalView {
             ScrollDelta::Pixels(p) => p.y / geom.cell.height.max(px(1.0)),
         };
         self.prompt_jump_pending = false;
+        if self.mouse_mode_active(ev.modifiers.shift) && !geom.in_grid(ev.position) {
+            return; // the letterbox has no cell to report, and nothing to scroll
+        }
         self.scroll_accum += lines;
         let whole = self.scroll_accum.trunc() as i32;
         if whole == 0 {
@@ -2251,6 +2315,15 @@ fn write_primary(cx: &App, item: ClipboardItem) {
     cx.write_to_primary(item);
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let _ = (cx, item);
+}
+
+/// `buttons_to_program`'s bit for a left or middle press.
+fn button_bit(b: GMouseButton) -> u8 {
+    match b {
+        GMouseButton::Left => 1,
+        GMouseButton::Middle => 2,
+        _ => 0,
+    }
 }
 
 fn mouse_button(b: Option<GMouseButton>) -> Option<MouseButton> {
@@ -2481,6 +2554,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::toggle_sudo))
             .on_action(cx.listener(Self::edit_command_line))
             .on_action(cx.listener(Self::clear_command_line))
+            .on_action(cx.listener(Self::take_session_size))
             .on_key_down(cx.listener(Self::on_key))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_down(GMouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -2490,6 +2564,8 @@ impl Render for TerminalView {
             .on_mouse_up_out(GMouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(GMouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(GMouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(GMouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(GMouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_hover(cx.listener(Self::on_hover))
@@ -2537,6 +2613,38 @@ impl Render for TerminalView {
                         });
                     },
                 ))
+            })
+            .when(self.session.watching(), |d| {
+                // Another client sets the size: say so, and offer to take over.
+                let font = cx.global::<AppSettings>().ui_font.clone();
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .right(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .bg(ui.surface)
+                        .border_1()
+                        .border_color(ui.border)
+                        .text_xs()
+                        .font_family(font)
+                        .child(div().text_color(ui.muted).child("Sized by another window"))
+                        .child(
+                            div()
+                                .id("take-session-size")
+                                .cursor_pointer()
+                                .text_color(ui.text)
+                                .hover(|s| s.underline())
+                                .child("Take over")
+                                .on_mouse_down(GMouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, window, cx| this.request_take_size(window, cx))),
+                        ),
+                )
             })
             .when_some(hint, |d, (target, action)| {
                 // The target, since an OSC 8 link's text can say anything.

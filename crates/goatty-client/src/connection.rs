@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
     ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE, PROTOCOL_VERSION,
-    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode,
-    read_msg,
+    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts,
+    WinSize, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -39,6 +39,9 @@ struct Pane {
     acked: u64,
     /// Last `SetPalette` colors, re-sent after a reattach.
     palette: Option<Vec<u32>>,
+    /// Subscribed on the current link: false from a dropped link until the
+    /// reattach's `Attached`.
+    linked: bool,
 }
 
 /// The host's settings, as the daemon reports them.
@@ -66,6 +69,8 @@ enum Pending {
         tx: flume::Sender<ServerMsg>,
         sink: Arc<dyn PaneSink>,
         size: WinSize,
+        /// The session, for `Attach` (`Create` and `Run` learn it from the reply).
+        session: Option<SessionId>,
     },
     Reattach(SessionId),
     /// `fetch_history`: the answer goes to the pane's sink.
@@ -84,6 +89,9 @@ struct Shared {
     /// daemon frees a layout when its connection drops).
     layout: Mutex<Option<ClientMsg>>,
     pending: Mutex<HashMap<ReqId, Pending>>,
+    /// `SizeControl` that came before the `Attached` of a session we don't
+    /// have a pane for yet (v14 sends it first); delivered before its snapshot.
+    early_size: Mutex<HashMap<SessionId, PaneEvent>>,
     next_req: AtomicU32,
     host: Mutex<HostInfo>,
     /// The protocol version we announce: ours, or lower after an old
@@ -205,6 +213,7 @@ impl Connection {
             panes: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
             host: Mutex::new(HostInfo::default()),
             announce: AtomicU32::new(PROTOCOL_VERSION),
@@ -312,8 +321,9 @@ impl Connection {
     /// Spawn a shell on the host and attach `sink` to it. `cwd` is a path on
     /// the host; pass `None` for remote endpoints.
     pub fn create(&self, size: WinSize, cwd: Option<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
+        ensure_sane(size)?;
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size }, |req| ClientMsg::Create { req, size, cwd, opts })? {
+        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Create { req, size, cwd, opts })? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -322,20 +332,27 @@ impl Connection {
     /// Start `argv` in a new session on the host (not the user's shell) and
     /// attach `sink` to it. Needs a daemon with protocol v6.
     pub fn run(&self, size: WinSize, cwd: Option<String>, argv: Vec<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
+        ensure_sane(size)?;
         let version = self.protocol_version();
         if version < RUN_SINCE {
             bail!("goattyd via {} is too old to run commands in sessions (protocol v{version}); restart it", self.endpoint().label());
         }
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size }, |req| ClientMsg::Run { req, size, cwd, argv, opts })? {
+        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Run { req, size, cwd, argv, opts })? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
     }
 
     pub fn attach(&self, session: SessionId, size: WinSize, sink: Arc<dyn PaneSink>) -> Result<()> {
+        // Refused here, not by goattyd: a refused replacement attach would
+        // leave the pane that stays with output decoded at the old size.
+        ensure_sane(size)?;
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size }, |req| ClientMsg::Attach { req, session, size, opts })? {
+        match self.request(
+            |tx| Pending::Attach { tx, sink, size, session: Some(session) },
+            |req| ClientMsg::Attach { req, session, size, opts },
+        )? {
             ServerMsg::Attached { .. } => Ok(()),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -379,10 +396,39 @@ impl Connection {
     }
 
     pub fn resize(&self, session: SessionId, size: WinSize) {
-        if let Some(p) = self.shared.panes.lock().get_mut(&session) {
+        if !size.is_sane() {
+            // goattyd would refuse it, and a reattach with it would fail.
+            log::warn!("session {session}: not sending a {}×{} size", size.cols, size.rows);
+            return;
+        }
+        // Sent under the lock the reattach takes: either the reattach's
+        // `Attach` already has this size, or the `Resize` follows it.
+        let mut panes = self.shared.panes.lock();
+        if let Some(p) = panes.get_mut(&session) {
             p.size = size;
         }
         self.shared.send(&ClientMsg::Resize { session, size });
+    }
+
+    /// Take control of `session`'s size from the client that has it (v14):
+    /// the session takes the size this connection last sent. Never blocks.
+    /// False when nothing was sent: the link is down, or the daemon is older.
+    pub fn take_size(&self, session: SessionId) -> bool {
+        // Checked and sent under the lock a dropped link takes to unlink the
+        // panes, before a new link (maybe to an older daemon) gets the writer.
+        let panes = self.shared.panes.lock();
+        let linked = panes.get(&session).is_some_and(|p| p.linked);
+        let send = linked && self.is_connected() && self.supports_size_control();
+        if send {
+            self.shared.send(&ClientMsg::TakeSize { session });
+        }
+        send
+    }
+
+    /// Whether the daemon on this link speaks protocol v14 (one controlling
+    /// client per session sets its size; `take_size`).
+    pub fn supports_size_control(&self) -> bool {
+        self.protocol_version() >= SIZE_CONTROL_SINCE
     }
 
     /// Tell the daemon which colors this session is shown with, so color
@@ -583,6 +629,14 @@ impl Drop for Connection {
     }
 }
 
+/// goattyd refuses sizes no screen has (`WinSize::is_sane`).
+fn ensure_sane(size: WinSize) -> Result<()> {
+    if !size.is_sane() {
+        bail!("the pane is too large ({}×{} cells)", size.cols, size.rows);
+    }
+    Ok(())
+}
+
 fn writer_loop(rx: flume::Receiver<WriterCmd>) {
     let mut w: Option<BufWriter<Box<dyn Write + Send>>> = None;
     while let Ok(cmd) = rx.recv() {
@@ -639,6 +693,8 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
         log::warn!("link to goattyd lost: {err}");
         // Fail in-flight requests; keep panes for reattach.
         let failed: Vec<Pending> = s.pending.lock().drain().map(|(_, p)| p).collect();
+        // Geometry from the old link is no one's on the next.
+        s.early_size.lock().clear();
         for p in failed {
             if let Pending::History(session) = p
                 && let Some(sink) = s.panes.lock().get(&session).map(|p| p.sink.clone())
@@ -646,7 +702,15 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                 sink.history(None);
             }
         }
-        let sinks: Vec<_> = s.panes.lock().values().map(|p| p.sink.clone()).collect();
+        let sinks: Vec<_> = s
+            .panes
+            .lock()
+            .values_mut()
+            .map(|p| {
+                p.linked = false;
+                p.sink.clone()
+            })
+            .collect();
         for sink in &sinks {
             sink.event(PaneEvent::Disconnected(err.to_string()));
         }
@@ -679,12 +743,15 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                     *s.host.lock() = host;
                     reader = r;
                     backoff = [200u64, 500, 1000, 2000, 5000].iter().copied().chain(std::iter::repeat(5000));
-                    let panes: Vec<(SessionId, WinSize)> = s.panes.lock().iter().map(|(id, p)| (*id, p.size)).collect();
-                    for (session, size) in panes {
+                    // Under the panes lock, so a resize meanwhile is either in
+                    // the `Attach` or sent after it (see `Connection::resize`).
+                    let panes = s.panes.lock();
+                    for (&session, p) in panes.iter() {
                         let req = s.req_id();
                         s.pending.lock().insert(req, Pending::Reattach(session));
-                        s.send(&ClientMsg::Attach { req, session, size, opts: s.opts });
+                        s.send(&ClientMsg::Attach { req, session, size: p.size, opts: s.opts });
                     }
+                    drop(panes);
                     if let Some(layout) = &*s.layout.lock() {
                         s.send(layout);
                     }
@@ -773,10 +840,13 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         ServerMsg::Attached { req, session, snapshot } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, sink, size }) => {
+                Some(Pending::Attach { tx, sink, size, .. }) => {
+                    if let Some(ev) = s.early_size.lock().remove(&session) {
+                        sink.event(ev);
+                    }
                     sink.feed(&snapshot);
                     let n = snapshot.len() as u64;
-                    s.panes.lock().insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None });
+                    s.panes.lock().insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None, linked: true });
                     let _ = tx.send(ServerMsg::Attached { req, session, snapshot: Vec::new() });
                 }
                 Some(Pending::Reattach(_)) => {
@@ -784,6 +854,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                         // New subscription: stream offsets restart at zero.
                         p.consumed = snapshot.len() as u64;
                         p.acked = 0;
+                        p.linked = true;
                         (p.sink.clone(), p.palette.clone())
                     });
                     if let Some((sink, palette)) = pane {
@@ -812,6 +883,29 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
             if let Some(sink) = sink {
                 sink.event(PaneEvent::Cwd(cwd));
+            }
+        }
+        ServerMsg::SizeControl { session, size, controlling } => {
+            if !size.is_sane() {
+                log::warn!("session {session}: ignoring a {}×{} size from the daemon", size.cols, size.rows);
+                return;
+            }
+            let ev = PaneEvent::SizeControl { cols: size.cols, rows: size.rows, controlling };
+            // Before an `Attached` we're waiting for, it's for the sink that
+            // attach installs, not a pane the session may still have here.
+            let attaching = s.pending.lock().values().any(|p| matches!(p, Pending::Attach { session: Some(id), .. } if *id == session));
+            let sink = if attaching { None } else { s.panes.lock().get(&session).map(|p| p.sink.clone()) };
+            match sink {
+                Some(sink) => sink.event(ev),
+                // Comes before the `Attached` that adds the pane.
+                // Or after we detached: keep such leftovers bounded.
+                None => {
+                    let mut early = s.early_size.lock();
+                    if early.len() >= 64 {
+                        early.clear();
+                    }
+                    early.insert(session, ev);
+                }
             }
         }
         ServerMsg::TopLine { session, line, cause } => {
@@ -850,7 +944,20 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         ServerMsg::Error { req: Some(req), ref message } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Reply(tx) | Pending::Attach { tx, .. }) => {
+                Some(Pending::Attach { tx, session, .. }) => {
+                    // A refused replacement attach: a live size change held
+                    // for it belongs to the pane that stays.
+                    if let Some(session) = session {
+                        let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+                        if let Some(sink) = sink
+                            && let Some(ev) = s.early_size.lock().remove(&session)
+                        {
+                            sink.event(ev);
+                        }
+                    }
+                    let _ = tx.send(msg);
+                }
+                Some(Pending::Reply(tx)) => {
                     let _ = tx.send(msg);
                 }
                 Some(Pending::Reattach(session)) => {

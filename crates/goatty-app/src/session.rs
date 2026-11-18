@@ -88,11 +88,17 @@ pub struct Session {
     waker: Arc<Waker>,
     /// A `fetch_history` is on its way.
     fetching: AtomicBool,
-    /// Local echo prediction (#16). Lock order:
+    /// Local echo prediction (#16). Lock order: `view`, then
     /// `predictor`, then the terminal.
     predictor: Mutex<Predictor>,
     /// `ssh.local_echo` as `LocalEcho as u8`.
     local_echo: AtomicU8,
+    /// The pane's size in cells, as last given to [`Self::resize`]. The
+    /// terminal has it too unless another client controls the session's size.
+    view: Mutex<TermSize>,
+    /// Another client controls the session's size (#12, protocol v14): the
+    /// terminal stays at the session's size and the pane letterboxes it.
+    watching: AtomicBool,
 }
 
 /// Makes the sessions for new tabs and panes: on a goattyd connection, as
@@ -212,6 +218,23 @@ impl PaneSink for Sink {
             PaneEvent::Reconnected => {
                 s.predictor.lock().reset();
                 *s.status.lock() = LinkStatus::Connected;
+                // A daemon from before v14 says nothing about control: the
+                // pane sets the size again.
+                if s.connection().is_some_and(|c| !c.supports_size_control()) {
+                    s.set_controlling();
+                }
+            }
+            PaneEvent::SizeControl { cols, rows, controlling } => {
+                if controlling {
+                    s.set_controlling();
+                } else {
+                    let view = s.view.lock();
+                    s.watching.store(true, Ordering::Release);
+                    if s.terminal.size() != (cols, rows) {
+                        s.predictor.lock().reset();
+                        s.terminal.resize(TermSize { cols, rows, ..*view });
+                    }
+                }
             }
             PaneEvent::Lost(why) => {
                 s.terminal.feed(format!("\r\n\x1b[0;31m[goatty: session lost: {why}]\x1b[0m\r\n").as_bytes());
@@ -261,7 +284,10 @@ impl Session {
         ssh_host: Option<String>,
     ) -> Self {
         let (waker, wake_rx) = Waker::new();
+        let (cols, rows) = terminal.size();
         Self {
+            view: Mutex::new(TermSize { cols, rows, cell_width: 0, cell_height: 0 }),
+            watching: AtomicBool::new(false),
             terminal,
             wake_rx,
             backend,
@@ -378,6 +404,7 @@ impl Session {
         let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
         let s =
             Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, host_label, ssh_host));
+        *s.view.lock() = size;
         let sink = Arc::new(Sink(Arc::downgrade(&s)));
         let id = match target {
             Some(id) => {
@@ -404,6 +431,7 @@ impl Session {
     pub fn daemon_run(conn: Arc<Connection>, size: TermSize, argv: Vec<String>) -> Result<Arc<Self>> {
         let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
         let s = Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, None, None));
+        *s.view.lock() = size;
         let sink = Arc::new(Sink(Arc::downgrade(&s)));
         let cwd = conn.endpoint().is_local().then(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())).flatten();
         let id = conn.run(win(size), cwd, argv, sink)?;
@@ -534,9 +562,62 @@ impl Session {
         }
     }
 
+    /// The pane is `cols`×`rows` cells, unlike what [`Self::resize`] was
+    /// last told.
+    pub fn view_differs(&self, cols: u16, rows: u16) -> bool {
+        let v = self.view.lock();
+        (v.cols, v.rows) != (cols, rows)
+    }
+
+    /// Another client controls the session's size: the terminal has the
+    /// session's size, not the pane's (#12).
+    pub fn watching(&self) -> bool {
+        self.watching.load(Ordering::Acquire)
+    }
+
+    /// Take control of the session's size from the client that has it.
+    /// False when the request couldn't be sent (the link is down).
+    pub fn take_size(&self) -> bool {
+        match &self.backend {
+            Backend::Daemon { conn, id } => conn.take_size(id.load(Ordering::Relaxed)),
+            Backend::Local(_) => false,
+        }
+    }
+
+    /// This client sets the session's size (again): the terminal follows
+    /// the pane, and the daemon hears the pane's size.
+    fn set_controlling(&self) {
+        let view = self.view.lock();
+        if !self.watching.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let view = *view;
+        if self.terminal.size() != (view.cols, view.rows) {
+            self.predictor.lock().reset();
+            self.terminal.resize(view);
+        }
+        if let Backend::Daemon { conn, id } = &self.backend {
+            conn.resize(id.load(Ordering::Relaxed), win(view));
+        }
+    }
+
+    /// The pane is now `size`. The terminal follows unless another client
+    /// controls the session's size; the daemon always hears it (it's the
+    /// size the session takes when this client controls it).
     pub fn resize(&self, size: TermSize) {
-        self.predictor.lock().reset();
-        self.terminal.resize(size);
+        if matches!(self.backend, Backend::Daemon { .. }) && !win(size).is_sane() {
+            // goattyd would refuse it: keep the mirror at the session's size.
+            return;
+        }
+        // `view` is held while the terminal is resized, so a `SizeControl`
+        // on the reader thread can't interleave with it.
+        let mut view = self.view.lock();
+        *view = size;
+        if !self.watching() {
+            self.predictor.lock().reset();
+            self.terminal.resize(size);
+        }
+        drop(view);
         match &self.backend {
             Backend::Local(pty) => {
                 let _ = pty.lock().resize(size);

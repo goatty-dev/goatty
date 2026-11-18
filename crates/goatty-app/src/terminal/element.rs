@@ -43,6 +43,9 @@ pub struct Geom {
     /// The cursor cell (col, row), kept while the cursor is hidden: where
     /// IME composition shows and the input method puts its popup.
     pub caret: (usize, usize),
+    /// The part of the grid the pane shows, when another client sizes the
+    /// session (#12) and the grid doesn't fill the pane or overflows it.
+    pub visible: Option<Bounds<Pixels>>,
 }
 
 impl Geom {
@@ -56,21 +59,39 @@ impl Geom {
     }
 
     /// Where IME composition text `cells` wide starts: at the caret, moved
-    /// left so it stays inside the grid when it's too long for the line.
+    /// left so it stays inside the shown part of the grid when it's too
+    /// long for the line.
     pub fn preedit_origin(&self, cells: usize) -> Point<Pixels> {
         let (col, row) = self.caret;
-        let col = col.min(self.cols.saturating_sub(cells));
+        let (first, end) = match self.visible {
+            Some(b) => {
+                let first = ((b.left() - self.origin.x) / self.cell.width).ceil().max(0.0) as usize;
+                let end = ((b.right() - self.origin.x) / self.cell.width).floor().max(0.0) as usize;
+                (first, end.min(self.cols))
+            }
+            None => (0, self.cols),
+        };
+        let col = col.min(end.saturating_sub(cells)).max(first);
         point(self.origin.x + self.cell.width * col as f32, self.origin.y + self.cell.height * row as f32)
+    }
+
+    /// Whether `p` is on the part of the grid the pane shows (not in the
+    /// letterbox around it).
+    pub fn in_grid(&self, p: Point<Pixels>) -> bool {
+        self.visible.is_none_or(|b| b.contains(&p))
     }
 
     /// Selection auto-scroll: lines to scroll per tick for a drag at height
     /// `y`, positive towards history. 0 over the grid; past the top or
-    /// bottom edge it grows with the distance, one line per cell height.
+    /// bottom edge of what the pane shows it grows with the distance, one
+    /// line per cell height.
     pub fn edge_scroll(&self, y: Pixels) -> i32 {
         const MAX: f32 = 10.0;
         let h = self.cell.height.max(px(1.0));
-        let top = self.origin.y;
-        let bottom = top + h * self.rows as f32;
+        let (top, bottom) = match self.visible {
+            Some(b) => (b.top(), b.bottom()),
+            None => (self.origin.y, self.origin.y + h * self.rows as f32),
+        };
         if y < top {
             (1.0 + (top - y) / h).min(MAX) as i32
         } else if y >= bottom {
@@ -134,6 +155,10 @@ pub struct Layout {
     cursor_color: Hsla,
     line_height: Pixels,
     started: Instant,
+    /// Another client controls the session's size (#12): the grid's bounds,
+    /// which may be smaller or larger than the pane. Painting is clipped to
+    /// the pane and the space around the grid is shaded.
+    letterbox: Option<Bounds<Pixels>>,
 }
 
 impl IntoElement for TerminalElement {
@@ -228,9 +253,9 @@ impl Element for TerminalElement {
         let inner_h = bounds.size.height - pad.top - pad.bottom;
         let cols = ((inner_w / cell_w).floor() as u16).max(2);
         let rows = ((inner_h / line_height).floor() as u16).max(1);
-        let origin = bounds.origin + point(pad.left, pad.top);
+        let mut origin = bounds.origin + point(pad.left, pad.top);
 
-        if self.session.terminal.size() != (cols, rows) {
+        if self.session.view_differs(cols, rows) {
             let scale = window.scale_factor();
             self.session.resize(TermSize {
                 cols,
@@ -251,7 +276,15 @@ impl Element for TerminalElement {
         }
         let caret = frame.caret.unwrap_or(self.geom.get().caret);
         let caret = (caret.0.min(frame.cols.saturating_sub(1)), caret.1.min(frame.rows.saturating_sub(1)));
-        let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret };
+        let letterbox = self.session.watching().then(|| {
+            // A grid larger than the pane pans so the cursor's cell shows.
+            let pan = |cells: usize, fits: u16, at: usize| (at + 1).saturating_sub(fits as usize).min(cells.saturating_sub(fits as usize));
+            origin.x -= cell_w * pan(frame.cols, cols, caret.0) as f32;
+            origin.y -= line_height * pan(frame.rows, rows, caret.1) as f32;
+            Bounds::new(origin, size(cell_w * frame.cols as f32, line_height * frame.rows as f32))
+        });
+        let visible = letterbox.map(|grid| grid.intersect(&bounds));
+        let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret, visible };
         self.geom.set(geom);
 
         let default_bg = frame.background;
@@ -478,7 +511,18 @@ impl Element for TerminalElement {
         });
 
         self.stats.borrow_mut().shaped_segments += if self.glyph_mode { glyph_draws.len() } else { lines.len() } as u64;
-        Layout { rects, lines, glyphs: glyph_draws, decos, cursor, preedit, cursor_color: hsla(frame.cursor_color), line_height, started }
+        Layout {
+            rects,
+            lines,
+            glyphs: glyph_draws,
+            decos,
+            cursor,
+            preedit,
+            cursor_color: hsla(frame.cursor_color),
+            line_height,
+            started,
+            letterbox,
+        }
     }
 
     fn paint(
@@ -493,6 +537,39 @@ impl Element for TerminalElement {
     ) {
         let paint_start = Instant::now();
         window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
+        let mask = layout.letterbox.map(|_| ContentMask { bounds });
+        window.with_content_mask(mask, |window| self.paint_grid(layout, window, cx));
+        if let Some(grid) = layout.letterbox {
+            paint_letterbox(bounds, grid, window);
+        }
+        let mut st = self.stats.borrow_mut();
+        let pre = paint_start.duration_since(layout.started).as_micros() as u64;
+        let paint = paint_start.elapsed().as_micros() as u64;
+        st.frames += 1;
+        st.prepaint_us += pre;
+        st.paint_us += paint;
+        st.max_frame_us = st.max_frame_us.max(pre + paint);
+    }
+}
+
+/// Shade the pane outside the grid of a session another client sizes, and
+/// draw the grid's right and bottom edges where they fall inside the pane.
+fn paint_letterbox(pane: Bounds<Pixels>, grid: Bounds<Pixels>, window: &mut Window) {
+    let shade = gpui::hsla(0., 0., 0.5, 0.12);
+    let edge = gpui::hsla(0., 0., 0.5, 0.45);
+    let (right, bottom) = (grid.right().min(pane.right()), grid.bottom().min(pane.bottom()));
+    if grid.right() < pane.right() {
+        window.paint_quad(fill(Bounds::from_corners(point(right, pane.top()), pane.bottom_right()), shade));
+        window.paint_quad(fill(Bounds::new(point(right, pane.top()), size(px(1.), bottom - pane.top())), edge));
+    }
+    if grid.bottom() < pane.bottom() {
+        window.paint_quad(fill(Bounds::from_corners(point(pane.left(), bottom), point(right, pane.bottom())), shade));
+        window.paint_quad(fill(Bounds::new(point(pane.left(), bottom), size(right + px(1.) - pane.left(), px(1.))), edge));
+    }
+}
+
+impl TerminalElement {
+    fn paint_grid(&mut self, layout: &mut Layout, window: &mut Window, cx: &mut App) {
         for (b, color) in layout.rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
@@ -551,13 +628,6 @@ impl Element for TerminalElement {
                 let _ = line.paint(bg.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
             });
         }
-        let mut st = self.stats.borrow_mut();
-        let pre = paint_start.duration_since(layout.started).as_micros() as u64;
-        let paint = paint_start.elapsed().as_micros() as u64;
-        st.frames += 1;
-        st.prepaint_us += pre;
-        st.paint_us += paint;
-        st.max_frame_us = st.max_frame_us.max(pre + paint);
     }
 }
 
@@ -601,7 +671,7 @@ mod tests {
 
     #[test]
     fn edge_scroll_grows_past_the_edges() {
-        let g = Geom { origin: point(px(5.0), px(10.0)), cell: size(px(8.0), px(20.0)), cols: 80, rows: 10, caret: (0, 0) };
+        let g = Geom { origin: point(px(5.0), px(10.0)), cell: size(px(8.0), px(20.0)), cols: 80, rows: 10, caret: (0, 0), visible: None };
         assert_eq!(g.edge_scroll(px(10.0)), 0);
         assert_eq!(g.edge_scroll(px(209.0)), 0);
         assert_eq!(g.edge_scroll(px(9.0)), 1);
@@ -613,11 +683,35 @@ mod tests {
     }
 
     #[test]
+    fn a_letterboxed_grid_scrolls_and_clicks_by_what_the_pane_shows() {
+        // A 60-row grid panned up by 15 rows in a pane showing 24 of them.
+        let (cell, rows) = (size(px(8.0), px(20.0)), 60);
+        let origin = point(px(0.0), px(-300.0));
+        let visible = Some(Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(480.0))));
+        let g = Geom { origin, cell, cols: 40, rows, caret: (0, 44), visible };
+        assert_eq!(g.edge_scroll(px(479.0)), 0);
+        assert_eq!(g.edge_scroll(px(481.0)), -1);
+        assert_eq!(g.edge_scroll(px(-1.0)), 1);
+        assert!(g.in_grid(point(px(10.0), px(10.0))));
+        assert!(!g.in_grid(point(px(330.0), px(10.0))), "right of a 40-column grid");
+        assert!(Geom { visible: None, ..g }.in_grid(point(px(330.0), px(10.0))));
+    }
+
+    #[test]
     fn preedit_stays_inside_the_grid() {
-        let g = Geom { origin: point(px(0.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (5, 2) };
+        let g = Geom { origin: point(px(0.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (5, 2), visible: None };
         assert_eq!(g.preedit_origin(3), point(px(50.0), px(40.0)));
         let g = Geom { caret: (78, 2), ..g };
         assert_eq!(g.preedit_origin(6), point(px(740.0), px(40.0)));
         assert_eq!(g.preedit_origin(200), point(px(0.0), px(40.0)));
+    }
+
+    #[test]
+    fn preedit_stays_inside_what_the_pane_shows() {
+        // An 80-column grid panned left by 10 columns in a pane showing 40.
+        let visible = Some(Bounds::new(point(px(0.0), px(0.0)), size(px(400.0), px(200.0))));
+        let g = Geom { origin: point(px(-100.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (48, 2), visible };
+        assert_eq!(g.preedit_origin(4), point(px(360.0), px(40.0)), "columns 46..50 end at the right edge");
+        assert_eq!(g.preedit_origin(200), point(px(0.0), px(40.0)), "never left of the first shown column");
     }
 }

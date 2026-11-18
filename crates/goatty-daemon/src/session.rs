@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -41,6 +41,13 @@ pub(crate) struct Subscriber {
     lines: bool,
     /// The client speaks v13: it gets `Cwd` updates.
     cwd: bool,
+    /// The client speaks v14: it gets `SizeControl` and only sets the size
+    /// while it controls the session. Older clients take control with every
+    /// `Attach` and `Resize` (they can't watch at another client's size).
+    size_ctl: bool,
+    /// The size this client last asked for (`Attach`, `Resize`): the
+    /// session's size whenever it controls it.
+    wanted: Mutex<WinSize>,
     /// Compress snapshots (the connection sent `Compress`).
     pub(crate) zstd: AtomicBool,
 }
@@ -51,6 +58,7 @@ pub(crate) struct SubFeatures {
     pub(crate) lines: bool,
     pub(crate) zstd: bool,
     pub(crate) cwd: bool,
+    pub(crate) size_ctl: bool,
 }
 
 impl Subscriber {
@@ -255,6 +263,13 @@ pub(crate) struct Session {
     pub(crate) replies: flume::Receiver<Vec<u8>>,
     pub(crate) replies_taken: AtomicU64,
     pub(crate) replies_written: AtomicU64,
+    /// The connection that sets the session's size (#12). Guarded by
+    /// `subs`' order: only changed while `subs` is held.
+    pub(crate) controller: Mutex<Option<u64>>,
+    /// The connection that created the session, until it subscribes: it
+    /// gets control even when another client attached in between. `None`
+    /// for restored sessions. Changed while `subs` is held.
+    pub(crate) creator: Mutex<Option<u64>>,
 }
 
 impl Session {
@@ -423,25 +438,104 @@ impl Session {
         }
     }
 
-    /// Resize for connection `from` (`None`: before it subscribes). Rows
-    /// reflow, so subscribers that number lines hear the new top line: all
-    /// of them when the size changed, else just `from`. Lagging ones don't:
-    /// they lack output the line counts, and their `Resync` brings the line.
-    pub(crate) fn resize(&self, ws: WinSize, from: Option<u64>) {
-        let size = to_size(ws);
-        {
-            // The reflow and its top line are one point in the stream, like a
-            // snapshot and its top line in `subscribe`/`resync`.
-            let subs = self.subs.lock();
-            let changed = self.term.size() != (size.cols, size.rows);
-            if changed {
-                self.term.resize(size);
-            }
-            self.push_resized(&subs, changed, from);
+    /// Connection `from` asks for size `ws`. It's recorded as what `from`
+    /// wants; the session takes it when `from` controls the session (a
+    /// client older than v14 takes control here). Rows reflow, so
+    /// subscribers that number lines hear the new top line: all of them
+    /// when the size changed, else just `from`. Lagging ones don't: they lack
+    /// output the line counts, and their `Resync` brings the line.
+    pub(crate) fn resize(&self, ws: WinSize, from: u64) {
+        // The reflow and its top line are one point in the stream, like a
+        // snapshot and its top line in `subscribe`/`resync`.
+        let subs = self.subs.lock();
+        let Some(sub) = subs.iter().find(|s| s.conn == from) else { return };
+        *sub.wanted.lock() = ws;
+        let mut controller = self.controller.lock();
+        let took = *controller != Some(from) && !sub.size_ctl;
+        if took {
+            *controller = Some(from);
         }
-        if let Err(e) = self.pty.lock().resize(size) {
+        if *controller != Some(from) {
+            return; // watching at someone else's size
+        }
+        drop(controller);
+        let changed = self.apply_size(ws);
+        if changed || took {
+            self.push_size_control(&subs, None);
+        }
+        self.push_resized(&subs, changed, Some(from));
+    }
+
+    /// Connection `conn` takes control of the session's size (`TakeSize`):
+    /// the session takes the size it last asked for.
+    pub(crate) fn take_size(&self, conn: u64) {
+        let subs = self.subs.lock();
+        let Some(sub) = subs.iter().find(|s| s.conn == conn) else { return };
+        if self.creator.lock().is_some_and(|c| c != conn) {
+            return; // the creator gets it first (`subscribe`)
+        }
+        let ws = *sub.wanted.lock();
+        let mut controller = self.controller.lock();
+        if *controller == Some(conn) {
+            return;
+        }
+        *controller = Some(conn);
+        drop(controller);
+        let changed = self.apply_size(ws);
+        self.push_size_control(&subs, None);
+        self.push_resized(&subs, changed, Some(conn));
+    }
+
+    /// Resize the PTY and the authoritative terminal to `ws`. Caller holds
+    /// `subs`, so (when the ioctl succeeds) the PTY has the size before any
+    /// client hears of it, and sizes apply in the order they were decided.
+    /// True when the size changed.
+    fn apply_size(&self, ws: WinSize) -> bool {
+        let size = to_size(ws);
+        // SAFETY: `master_fd` is open as long as `pty`, which `self` owns.
+        let master = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+        if let Err(e) = goatty_term::pty::set_window_size(master, size) {
             log::warn!("session {}: resize failed: {e}", self.id);
         }
+        let changed = self.term.size() != (size.cols, size.rows);
+        if changed {
+            self.term.resize(size);
+        }
+        changed
+    }
+
+    /// Tell v14 subscribers (all, or just `only`) the session's size and
+    /// whether they control it. Caller holds `subs`.
+    fn push_size_control(&self, subs: &[Arc<Subscriber>], only: Option<u64>) {
+        let controller = *self.controller.lock();
+        let (cols, rows) = self.term.size();
+        let size = WinSize { cols, rows, cell_width: 0, cell_height: 0 };
+        let frame = |controlling| encode(&ServerMsg::SizeControl { session: self.id, size, controlling }).ok();
+        let (mut yes, mut no) = (None, None);
+        for sub in subs.iter().filter(|s| s.size_ctl && only.is_none_or(|c| c == s.conn)) {
+            let controlling = controller == Some(sub.conn);
+            let slot = if controlling { &mut yes } else { &mut no };
+            if let Some(f) = slot.get_or_insert_with(|| frame(controlling)) {
+                sub.push(f.clone(), 0);
+            }
+        }
+    }
+
+    /// The controller left: hand control to the newest remaining subscriber,
+    /// which brings its size. Caller holds `subs`.
+    fn hand_over(&self, subs: &[Arc<Subscriber>], gone: u64) {
+        let mut controller = self.controller.lock();
+        if controller.is_none_or(|c| c != gone && subs.iter().any(|s| s.conn == c)) {
+            return;
+        }
+        let next = subs.last();
+        *controller = next.map(|s| s.conn);
+        drop(controller);
+        let Some(next) = next else { return };
+        let ws = *next.wanted.lock();
+        let changed = self.apply_size(ws);
+        self.push_size_control(subs, None);
+        self.push_resized(subs, changed, None);
     }
 
     /// Caller holds `subs`.
@@ -469,18 +563,44 @@ impl Session {
         }
     }
 
-    /// Snapshot + subscribe under one lock. Returns the subscriber.
+    /// Snapshot + subscribe under one lock, asking for size `size`. The
+    /// subscriber takes control of the session's size when nobody has it
+    /// (or it had it already, or it predates v14); then the snapshot already
+    /// has its geometry (reflowed by the VT core). Returns the subscriber.
     pub(crate) fn subscribe(
         &self,
         conn: u64,
         req: ReqId,
+        size: WinSize,
         opts: StreamOpts,
         features: SubFeatures,
         tx: &flume::Sender<Outbound>,
     ) -> Arc<Subscriber> {
         let mut subs = self.subs.lock();
         subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
-        let snapshot = self.term.reattach_snapshot_with_history(opts.history as usize);
+        {
+            let mut controller = self.controller.lock();
+            // The connection that created the session gets it, even if
+            // someone else attached before its own subscription.
+            let mut creator = self.creator.lock();
+            let reserved = creator.is_some_and(|c| c != conn);
+            if *creator == Some(conn) {
+                *creator = None;
+            }
+            drop(creator);
+            let free = controller.is_none_or(|c| c == conn || !subs.iter().any(|s| s.conn == c));
+            if (free && !reserved) || !features.size_ctl {
+                let took = *controller != Some(conn);
+                *controller = Some(conn);
+                drop(controller);
+                let changed = self.apply_size(size);
+                if took || changed {
+                    // The others watch at the new size from here on.
+                    self.push_size_control(&subs, None);
+                }
+                self.push_resized(&subs, changed, None);
+            }
+        }
         let sub = Arc::new(Subscriber {
             conn,
             tx: tx.clone(),
@@ -491,8 +611,14 @@ impl Session {
             skipped: AtomicU64::new(0),
             lines: features.lines,
             cwd: features.cwd,
+            size_ctl: features.size_ctl,
+            wanted: Mutex::new(size),
             zstd: AtomicBool::new(features.zstd),
         });
+        // Before the snapshot: a watching client sizes its terminal first, so
+        // the snapshot lands in a grid of the session's size.
+        self.push_size_control(std::slice::from_ref(&sub), None);
+        let snapshot = self.term.reattach_snapshot_with_history(opts.history as usize);
         sub.push_snapshot(&ServerMsg::Attached { req, session: self.id, snapshot });
         self.push_top_line(&sub, TopLineCause::Attach);
         let name = self.process.lock().clone();
@@ -514,7 +640,14 @@ impl Session {
     }
 
     pub(crate) fn unsubscribe(&self, conn: u64) {
-        self.subs.lock().retain(|s| s.conn != conn);
+        let mut subs = self.subs.lock();
+        subs.retain(|s| s.conn != conn);
+        let mut creator = self.creator.lock();
+        if *creator == Some(conn) {
+            *creator = None;
+        }
+        drop(creator);
+        self.hand_over(&subs, conn);
     }
 
     /// Client acknowledged `consumed` bytes. If it was lagging and has now
@@ -642,6 +775,8 @@ mod tests {
             skipped: AtomicU64::new(0),
             lines: false,
             cwd: true,
+            size_ctl: false,
+            wanted: Mutex::new(WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 }),
             zstd: AtomicBool::new(false),
         });
         let subs = Arc::new(Mutex::new(vec![sub]));

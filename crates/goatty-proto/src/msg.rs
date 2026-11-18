@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -61,6 +61,11 @@ pub const NET_SINCE: u32 = 12;
 /// (`ReadFile` / `FileData`).
 pub const REMOTE_FILES_SINCE: u32 = 13;
 
+/// v14: one controlling client per session sets its size (`TakeSize` /
+/// `ServerMsg::SizeControl`). Other v14 clients watch at the session's size;
+/// clients older than v14 take control with every `Attach` and `Resize`.
+pub const SIZE_CONTROL_SINCE: u32 = 14;
+
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
 /// for postcard headers and path metadata).
 pub const HARD_MAX_FILE_BYTES: u64 = (crate::MAX_FRAME - 65_536) as u64;
@@ -85,6 +90,21 @@ pub struct WinSize {
     pub rows: u16,
     pub cell_width: u16,
     pub cell_height: u16,
+}
+
+impl WinSize {
+    /// The most columns a session may have.
+    pub const MAX_COLS: u16 = 4096;
+    /// The most rows a session may have.
+    pub const MAX_ROWS: u16 = 2048;
+    /// The most cells a session may have (a grid is allocated per size).
+    pub const MAX_CELLS: u32 = 1 << 21;
+
+    /// Within the limits above. A peer refuses (never clamps) a size outside
+    /// them: a snapshot made for one grid size can't be fed into another.
+    pub fn is_sane(&self) -> bool {
+        self.cols <= Self::MAX_COLS && self.rows <= Self::MAX_ROWS && u32::from(self.cols) * u32::from(self.rows) <= Self::MAX_CELLS
+    }
 }
 
 /// Per-subscription stream parameters, chosen by the client per connection
@@ -297,6 +317,13 @@ pub enum ClientMsg {
         req: ReqId,
         path: String,
         max_bytes: u64,
+    },
+    /// v14: make this connection the controlling client of `session` (it
+    /// must be subscribed). The session takes the size this connection last
+    /// asked for (`Attach`/`Resize`), and every v14 subscriber hears
+    /// `SizeControl`.
+    TakeSize {
+        session: SessionId,
     },
 }
 
@@ -521,6 +548,20 @@ pub enum ServerMsg {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    /// v14: the session's size and whether this connection controls it. In
+    /// stream order (sent under the subscriber lock): right *before*
+    /// `Attached` (so a watching client sizes its terminal before the
+    /// snapshot; it may precede the reply that tells a `Create` its session
+    /// id), and whenever the controller or the size changes, before the reflowed
+    /// output and its `TopLine`. A client that doesn't control the session
+    /// keeps its mirror at `size` (letterboxed in its pane); the controlling
+    /// client's mirror follows its own pane, whose sizes it sends as `Resize`.
+    SizeControl {
+        session: SessionId,
+        /// Only `cols` and `rows` are meaningful; the cell size is 0.
+        size: WinSize,
+        controlling: bool,
+    },
 }
 
 impl ServerMsg {
@@ -576,6 +617,17 @@ mod tests {
         assert_eq!(negotiate(PROTOCOL_VERSION + 3), Some(PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION), Some(MIN_PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION - 1), None);
+    }
+
+    #[test]
+    fn window_sizes_are_bounded() {
+        let ws = |cols, rows| WinSize { cols, rows, cell_width: 8, cell_height: 16 };
+        assert!(ws(80, 24).is_sane());
+        assert!(ws(1536, 600).is_sane());
+        assert!(!ws(WinSize::MAX_COLS + 1, 1).is_sane());
+        assert!(!ws(1, WinSize::MAX_ROWS + 1).is_sane());
+        assert!(!ws(4096, 2048).is_sane());
+        assert!(!ws(u16::MAX, u16::MAX).is_sane());
     }
 
     #[test]
