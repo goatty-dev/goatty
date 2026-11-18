@@ -10,7 +10,6 @@ Starship shows the directory, the git branch and status, how long the last comma
 publisher = "goatty"
 homepage = "https://starship.rs"
 license = "ISC"
-category = "prompt"
 keywords = ["prompt", "git"]
 
 [[package]]

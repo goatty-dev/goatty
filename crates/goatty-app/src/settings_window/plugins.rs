@@ -904,7 +904,6 @@ impl SettingsWindow {
     /// The round icon standing for a plugin.
     fn plugin_avatar(ui: Ui, category: Category, builtin: bool, size: f32) -> impl IntoElement {
         let icon = match category {
-            Category::Prompt => Icon::TextCursorInput,
             Category::Application => Icon::AppWindow,
             Category::Environment if builtin => Icon::Zap,
             Category::Environment => Icon::Package,
