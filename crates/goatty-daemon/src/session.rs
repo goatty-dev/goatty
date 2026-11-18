@@ -471,6 +471,9 @@ impl Session {
     pub(crate) fn take_size(&self, conn: u64) {
         let subs = self.subs.lock();
         let Some(sub) = subs.iter().find(|s| s.conn == conn) else { return };
+        if self.creator.lock().is_some_and(|c| c != conn) {
+            return; // the creator gets it first (`subscribe`)
+        }
         let ws = *sub.wanted.lock();
         let mut controller = self.controller.lock();
         if *controller == Some(conn) {
@@ -484,9 +487,9 @@ impl Session {
     }
 
     /// Resize the PTY and the authoritative terminal to `ws`. Caller holds
-    /// `subs`, so the PTY has the size before any client hears of it, and
-    /// sizes apply in the order they were decided. True when the size
-    /// changed.
+    /// `subs`, so (when the ioctl succeeds) the PTY has the size before any
+    /// client hears of it, and sizes apply in the order they were decided.
+    /// True when the size changed.
     fn apply_size(&self, ws: WinSize) -> bool {
         let size = to_size(ws);
         // SAFETY: `master_fd` is open as long as `pty`, which `self` owns.

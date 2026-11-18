@@ -2180,7 +2180,8 @@ impl TerminalView {
         if self.refresh_hover(cx) {
             cx.notify();
         }
-        if self.mouse_mode_active(ev.modifiers.shift) && (inside || self.buttons_to_program != 0) {
+        let held = self.buttons_to_program != 0 || self.right_to_program;
+        if self.mouse_mode_active(ev.modifiers.shift) && (inside || held) {
             let btn = mouse_button(ev.pressed_button).unwrap_or(MouseButton::None);
             self.report_mouse(btn, MouseAction::Motion, col, row, &ev.modifiers);
         }
@@ -2253,6 +2254,9 @@ impl TerminalView {
             ScrollDelta::Pixels(p) => p.y / geom.cell.height.max(px(1.0)),
         };
         self.prompt_jump_pending = false;
+        if self.mouse_mode_active(ev.modifiers.shift) && !geom.in_grid(ev.position) {
+            return; // the letterbox has no cell to report, and nothing to scroll
+        }
         self.scroll_accum += lines;
         let whole = self.scroll_accum.trunc() as i32;
         if whole == 0 {
@@ -2263,9 +2267,6 @@ impl TerminalView {
         let (col, row, _) = geom.cell_at(ev.position);
         if self.mouse_mode_active(ev.modifiers.shift) {
             self.pending_open = None;
-            if !geom.in_grid(ev.position) {
-                return; // the letterbox has no cell to report
-            }
             let btn = if whole > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
             for _ in 0..whole.unsigned_abs() {
                 self.report_mouse(btn, MouseAction::Press, col, row, &ev.modifiers);

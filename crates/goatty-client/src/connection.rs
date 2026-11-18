@@ -391,6 +391,11 @@ impl Connection {
     }
 
     pub fn resize(&self, session: SessionId, size: WinSize) {
+        if !size.is_sane() {
+            // goattyd would refuse it, and a reattach with it would fail.
+            log::warn!("session {session}: not sending a {}×{} size", size.cols, size.rows);
+            return;
+        }
         // Sent under the lock the reattach takes: either the reattach's
         // `Attach` already has this size, or the `Resize` follows it.
         let mut panes = self.shared.panes.lock();

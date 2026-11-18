@@ -272,8 +272,8 @@ pub fn session_leader(master: BorrowedFd<'_>) -> Option<u32> {
     (sid > 0).then_some(sid as u32)
 }
 
-/// Give the terminal behind `master` the size `size` (`TIOCSWINSZ`). Never
-/// blocks, so it needs no lock that an input write could hold.
+/// Give the terminal behind `master` the size `size` (`TIOCSWINSZ`). Needs
+/// no `Pty`, so no lock that a blocked input write could hold.
 pub fn set_window_size(master: BorrowedFd<'_>, size: TermSize) -> Result<()> {
     let s = pty_size(size);
     let ws = libc::winsize { ws_row: s.rows, ws_col: s.cols, ws_xpixel: s.pixel_width, ws_ypixel: s.pixel_height };
