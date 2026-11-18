@@ -680,6 +680,8 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
         log::warn!("link to goattyd lost: {err}");
         // Fail in-flight requests; keep panes for reattach.
         let failed: Vec<Pending> = s.pending.lock().drain().map(|(_, p)| p).collect();
+        // Geometry from the old link is no one's on the next.
+        s.early_size.lock().clear();
         for p in failed {
             if let Pending::History(session) = p
                 && let Some(sink) = s.panes.lock().get(&session).map(|p| p.sink.clone())
