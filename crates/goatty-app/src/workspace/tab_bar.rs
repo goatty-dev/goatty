@@ -10,7 +10,9 @@
 //!
 //! Every style: click to switch, middle-click to close, double-click to
 //! rename, right-click for the tab's menu (`menu`), double-click the
-//! empty space for a new tab. Dragging a tab moves it live: the others make
+//! empty space for a new tab (or, when goatty draws the title bar, to
+//! maximize: the bar is the title bar then, see `chrome`). A settings
+//! button sits at the end. Dragging a tab moves it live: the others make
 //! room as it passes their middle (`gestures::reorder_target`). With
 //! `tabs.scroll_to_switch` the mouse wheel over the tabs switches tabs;
 //! otherwise it scrolls tabs that don't fit. The active tab is always
@@ -41,11 +43,12 @@ use gpui::{
 
 use goatty_term::{ProgressState, StatusState};
 
+use super::chrome;
 use super::gestures::{Wheel, reorder_target};
 use super::groups::{Group, StripItem};
 use super::icons::{IconColor, icon_for};
 use super::{DraggedTab, Tab, Workspace, marks};
-use crate::actions::NewTab;
+use crate::actions::{NewTab, OpenSettings};
 use crate::agent::{self, AgentStatus, Identity};
 use crate::settings::AppSettings;
 use crate::terminal::Activity;
@@ -193,7 +196,13 @@ impl Workspace {
             StripItem::Group(_) => (l + 1, t),
             StripItem::Tab(_) => (l, t + 1),
         });
-        let room = f32::from(window.viewport_size().width) - labels as f32 * GROUP_LABEL_ROOM;
+        let csd = chrome::csd(window).is_some();
+        let control = if modern { 24.0 } else { 18.0 };
+        let left = chrome::window_buttons(chrome::Side::Left, control, c, window, cx);
+        let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
+        // The settings button, and the window buttons when goatty draws them.
+        let chrome_room = 32.0 + chrome::buttons_width(control, window, cx);
+        let room = f32::from(window.viewport_size().width) - labels as f32 * GROUP_LABEL_ROOM - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
         let items: Vec<AnyElement> = strip
@@ -220,7 +229,26 @@ impl Workspace {
         } else {
             new_tab.h_full().px(px(10.)).child("+")
         };
-        div()
+        let settings = div()
+            .id("tab-settings")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_color(c.ui.muted)
+            .hover(|s| s.bg(c.hover))
+            .tooltip(tooltip("Settings"))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx));
+        let settings = if modern {
+            settings.size(px(28.)).mb(px(2.)).rounded_md().child(Icon::Sliders.svg().size(px(15.)).text_color(c.ui.muted))
+        } else {
+            settings.h_full().px(px(8.)).child(Icon::Sliders.svg().size(px(13.)).text_color(c.ui.muted))
+        };
+        // With goatty's title bar, the empty space is the title bar's.
+        let rest = self.tabs_rest("tab-bar-rest", !csd, cx).flex_1().h_full();
+        let rest = if csd { self.title_bar_area(rest, window, cx) } else { rest };
+        let bar = div()
             .id("tab-bar")
             .flex_none()
             .h(px(height))
@@ -231,6 +259,7 @@ impl Workspace {
             .on_scroll(cx.listener(Self::on_tabs_scroll))
             .when(modern, |d| d.items_end().px(px(6.)).gap(px(2.)))
             .when(!modern, |d| d.items_stretch().text_size(px(12.)))
+            .children(left)
             .child(
                 // The tabs scroll sideways when they don't fit.
                 div()
@@ -245,19 +274,23 @@ impl Workspace {
                     .children(items),
             )
             .child(new_tab)
-            .child(self.tabs_rest("tab-bar-rest", cx).flex_1().h_full())
-            .into_any_element()
+            .child(rest)
+            .child(settings)
+            .children(right);
+        chrome::round_top(bar, window).into_any_element()
     }
 
-    /// The empty space after the tabs: double-click for a new tab, drag a
-    /// tab here to move it to the end.
-    pub(super) fn tabs_rest(&self, id: &'static str, cx: &mut Context<'_, Self>) -> gpui::Stateful<gpui::Div> {
+    /// The empty space after the tabs: double-click for a new tab (with
+    /// `new_tab`), drag a tab here to move it to the end.
+    pub(super) fn tabs_rest(&self, id: &'static str, new_tab: bool, cx: &mut Context<'_, Self>) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
-            .on_click(|ev, window, cx| {
-                if ev.click_count() == 2 {
-                    window.dispatch_action(Box::new(NewTab), cx);
-                }
+            .when(new_tab, |d| {
+                d.on_click(|ev, window, cx| {
+                    if ev.click_count() == 2 {
+                        window.dispatch_action(Box::new(NewTab), cx);
+                    }
+                })
             })
             .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<DraggedTab>, window, cx| {
                 if !this.moved_unpainted && ev.bounds.contains(&ev.event.position) {

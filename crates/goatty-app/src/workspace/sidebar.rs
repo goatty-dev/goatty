@@ -160,7 +160,7 @@ impl Workspace {
                         .track_scroll(&self.tab_scroll)
                         .children(tiles)
                         .child(new_tab)
-                        .child(self.tabs_rest("tab-rail-rest", cx).w_full().flex_1().min_h(px(TILE))),
+                        .child(self.tabs_rest("tab-rail-rest", true, cx).w_full().flex_1().min_h(px(TILE))),
                 )
                 .child(
                     div().flex_none().flex().justify_center().pt(px(6.)).child(
@@ -221,7 +221,7 @@ impl Workspace {
                         .track_scroll(&self.tab_scroll)
                         .children(rows)
                         .child(new_tab)
-                        .child(self.tabs_rest("tab-sidebar-rest", cx).flex_1().min_h(px(24.))),
+                        .child(self.tabs_rest("tab-sidebar-rest", true, cx).flex_1().min_h(px(24.))),
                 )
                 .child(footer)
                 .into_any_element()

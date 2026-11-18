@@ -1,7 +1,7 @@
 //! The Appearance page: a live preview, the theme gallery and color editor,
 //! text, cursor and window settings.
 
-use goatty_config::{ClientSettings, ColorSlot, CursorShape, FontSettings, Renderer, TerminalSettings, ThemeColors, ThemeEntry};
+use goatty_config::{ClientSettings, ColorSlot, CursorShape, FontSettings, Renderer, TerminalSettings, ThemeColors, ThemeEntry, TitleBar};
 use gpui::{
     AnyElement, Context, Entity, Focusable, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, div,
     prelude::*, px, rgb,
@@ -861,6 +861,17 @@ impl SettingsWindow {
                     .child(SharedString::from(format!("{:.0} %", opacity * 100.0))),
             );
         section(ui, "Window")
+            .child(row(ui, "Title bar").desc("Where the window buttons go").control(self.select(
+                "title-bar",
+                "Title bar",
+                opts(&[
+                    (TitleBar::System, "The desktop's", "Above the tabs. goatty draws one only where the desktop doesn't (GNOME)"),
+                    (TitleBar::Goatty, "goatty's, with the tabs", "Window buttons next to the tabs, where the desktop allows it"),
+                ]),
+                &s.window.title_bar,
+                cx,
+                |v, _, cx| AppSettings::update(cx, |s| s.window.title_bar = v),
+            )))
             .child(self.padding_row(ui, cx))
             .child(row(ui, "Background opacity").desc("Text and colored cells stay opaque. Needs a compositor").control(opacity_control))
             .child(

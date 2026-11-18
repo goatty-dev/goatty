@@ -49,7 +49,7 @@ pub use client::{
     ClientSettings, CopyOnSelect, CursorShape, DebugSettings, FontSettings, LinkClick, LinkSettings, LocalEcho, MiddleClick, MouseSettings,
     NotificationSettings, NotifyWhen, OnLaunch, OpenIn, Padding, PaneSettings, PasteConfirm, PasteSettings, PluginNotifySettings,
     RemoteFileOpen, Renderer, RightClick, SelectionSettings, SshHost, SshSettings, SyncMode, TabActivity, TabBarShow, TabSettings,
-    TabStyle, TailnetSettings, TerminalSettings, WorkspaceSettings, ssh_host_problem,
+    TabStyle, TailnetSettings, TerminalSettings, TitleBar, WindowSettings, WorkspaceSettings, ssh_host_problem,
 };
 pub use color_history::ColorHistory;
 pub use colorspace::ColorFormat;
