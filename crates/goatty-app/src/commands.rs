@@ -381,6 +381,13 @@ fn show<T: Document + serde::Serialize>(loaded: &Loaded<T>, effective: &T, key: 
     Ok(())
 }
 
+fn parse_host_settings_for_export(raw: &str, remote: bool, label: &str) -> Result<HostSettings> {
+    if remote && !matches!(serde_json::from_str::<serde_json::Value>(raw), Ok(serde_json::Value::Object(_))) {
+        bail!("unexpected host settings from {label}: expected a JSON object");
+    }
+    Ok(store::parse::<HostSettings>(raw).value)
+}
+
 pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
     match cmd {
         SettingsCmd::Path => {
@@ -456,7 +463,8 @@ pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
         SettingsCmd::Export { file, .. } => {
             let client = goatty_config::load_client().file.value;
             let mut host = Host::open(endpoint)?;
-            let host_settings = store::parse::<HostSettings>(&host.json()?).value;
+            let raw = host.json()?;
+            let host_settings = parse_host_settings_for_export(&raw, host.is_remote(), &host.label())?;
             let text = goatty_config::profile::export(&client, &host_settings);
             if file.as_os_str() == "-" {
                 print!("{text}");
@@ -789,5 +797,21 @@ shell-code = "uses greet"
         assert_eq!(sanitize_terminal("goattyd on deploy@box-1"), "goattyd on deploy@box-1");
         assert_eq!(sanitize_terminal("hello \x1b[31mred\x1b[0m\r\n"), "hello \\u{1b}[31mred\\u{1b}[0m\\r\\n");
         assert_eq!(sanitize_terminal("title\x1b]0;evil\x07\u{009b}K"), "title\\u{1b}]0;evil\\u{7}\\u{9b}K");
+    }
+
+    #[test]
+    fn remote_export_rejects_non_object_json_and_accepts_valid_objects() {
+        assert!(parse_host_settings_for_export("[]", true, "goattyd on box").is_err());
+        assert!(parse_host_settings_for_export("null", true, "goattyd on box").is_err());
+        assert!(parse_host_settings_for_export("not json", true, "goattyd on box").is_err());
+
+        assert_eq!(
+            parse_host_settings_for_export("{}", true, "goattyd on box").unwrap().history.size,
+            HostSettings::default().history.size
+        );
+        let with_unknown =
+            parse_host_settings_for_export(r#"{"version": 999, "future_key": true, "history": {"size": 2500}}"#, true, "goattyd on box")
+                .unwrap();
+        assert_eq!(with_unknown.history.size, 2500);
     }
 }

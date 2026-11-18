@@ -170,10 +170,14 @@ impl Shared {
         let stderr = t.stderr.clone();
         // A transport that never answers (hung ssh) is torn down by the caller
         // via the stored closer, which unblocks the read.
-        *self.closer.lock() = Some(t.closer.clone());
-        if self.closed.load(Ordering::Acquire) {
-            self.close_transport();
-            bail!("connection closed");
+        {
+            let mut closer = self.closer.lock();
+            if self.closed.load(Ordering::Acquire) {
+                drop(closer);
+                t.closer.close();
+                bail!("connection closed");
+            }
+            *closer = Some(t.closer.clone());
         }
         let greeting = t
             .writer
@@ -754,9 +758,6 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                 sink.history(None);
             }
         }
-        if !s.auto_reconnect {
-            return;
-        }
         let sinks: Vec<_> = s
             .panes
             .lock()
@@ -768,6 +769,9 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
             .collect();
         for sink in &sinks {
             sink.event(PaneEvent::Disconnected(err.to_string()));
+        }
+        if !s.auto_reconnect {
+            return;
         }
         let mut needs_user = false;
         loop {
@@ -1090,7 +1094,7 @@ mod tests {
         let _ = out.send(WriterCmd::Replace(Box::new(client_w.try_clone().unwrap())));
         let (reconnect_tx, reconnect_rx) = flume::bounded(1);
         let shared = Arc::new(Shared {
-            endpoint: Endpoint::Local,
+            endpoint: Endpoint::command_line("false").unwrap(),
             opts: StreamOpts::LOCAL,
             client_name: "test".into(),
             auto_reconnect: false,
@@ -1118,13 +1122,18 @@ mod tests {
         // Consume the server's Hello as handshake() would.
         assert!(matches!(read_msg::<_, ServerMsg>(&mut reader).unwrap(), ServerMsg::Hello { .. }));
         let s = shared.clone();
-        let reader_handle = std::thread::spawn(move || reader_main(s, reader));
+        let (done_tx, done_rx) = flume::bounded(1);
+        let reader_handle = std::thread::spawn(move || {
+            reader_main(s, reader);
+            let _ = done_tx.send(());
+        });
         let conn = Connection { shared };
 
         let err = conn.set_host_settings_within("{}".into(), true, Duration::from_secs(5)).unwrap_err();
         assert!(err.downcast_ref::<ReplyLost>().is_some(), "expected ReplyLost, got: {err:#}");
         assert!(rx_req.recv_timeout(Duration::from_secs(1)).is_ok());
         // `reader_main` must exit immediately rather than attempting to reconnect.
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "reader did not exit after one-shot disconnect");
         reader_handle.join().unwrap();
         assert!(!conn.is_connected());
         drop(client_w);
