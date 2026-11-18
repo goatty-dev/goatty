@@ -393,13 +393,8 @@ extern "C" fn on_sigterm(_: libc::c_int) {
 /// `stop`) save the screens and exit without ending the sessions. Their
 /// PTYs stay in the fd store for the next start; a stop empties it.
 pub(crate) fn save_on_sigterm(daemon: Arc<Daemon>) -> Result<()> {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` has room for the two fds pipe2 writes.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("pipe2");
-    }
-    // SAFETY: pipe2 returned two new fds that nothing else owns.
-    let (rx, tx) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (rx, tx) = std::io::pipe().context("pipe")?;
+    let (rx, tx) = (OwnedFd::from(rx), OwnedFd::from(tx));
     SIGTERM_PIPE.store(tx.as_raw_fd(), Ordering::SeqCst);
     std::mem::forget(tx); // the handler writes to it for the life of the process
     // SAFETY: installs a handler that only calls write(2); sigaction is

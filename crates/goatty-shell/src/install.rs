@@ -2,7 +2,7 @@
 //! and registry plugins' programs alike).
 //!
 //! An install checks the download against the manifest's sha256, unpacks
-//! it into `tools/<id>/<version>/` (staged, then renamed), and switches the
+//! it (any `AssetFormat`: tar.gz/xz/zst, zip, or a raw executable) into `tools/<id>/<version>/` (staged, then renamed), and switches the
 //! `bin/<exe>` and `plugins/<id>` symlinks atomically. No sudo, nothing
 //! outside goatty's data directory.
 //!
@@ -71,17 +71,12 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
     let result = (|| -> Result<()> {
-        match p.format {
-            AssetFormat::TarGz => {
-                let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-                ar.set_preserve_permissions(false);
-                ar.unpack(&staging).context("unpack the download")?;
-            }
-            AssetFormat::Binary => {
-                let dest = staging.join(p.root).join(&p.bins[0]);
-                std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-                std::fs::write(&dest, archive)?;
-            }
+        if p.format == AssetFormat::Binary {
+            let dest = staging.join(p.root).join(&p.bins[0]);
+            std::fs::create_dir_all(dest.parent().context("no parent")?)?;
+            std::fs::write(&dest, archive)?;
+        } else {
+            goatty_plugin::archive::unpack(p.format, archive, &staging).context("unpack the download")?;
         }
         for b in p.bins {
             let exe = staging.join(p.root).join(b);
@@ -201,6 +196,39 @@ mod tests {
             b.append_data(&mut h, path, *data).unwrap();
         }
         b.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn installs_zip_packages() {
+        // How macOS builds usually ship (fzf's darwin release): a .zip whose
+        // executable has no execute bit recorded.
+        use std::io::Write;
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file("fzf", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(b"#!/bin/sh\necho fzf\n").unwrap();
+        let archive = z.finish().unwrap().into_inner();
+        let sha = sha256_hex(&archive);
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let bins = vec!["fzf".to_string()];
+        let p = PackageInstall {
+            id: "fzf",
+            version: "1",
+            sha256: &sha,
+            format: AssetFormat::Zip,
+            root: "",
+            bins: &bins,
+            source: None,
+            completions: &[],
+        };
+        assert_eq!(install_package(&p, &archive, &dirs).unwrap(), [dirs.bin_dir().join("fzf")]);
+        let out = std::process::Command::new(dirs.bin_dir().join("fzf")).output().unwrap();
+        assert_eq!(out.stdout, b"fzf\n");
+
+        // The wrong format fails without touching the installed version.
+        let wrong = PackageInstall { format: AssetFormat::TarXz, version: "2", ..p };
+        assert!(install_package(&wrong, &archive, &dirs).is_err());
+        assert!(dirs.tools_dir().join("fzf/1/fzf").is_file());
     }
 
     #[test]

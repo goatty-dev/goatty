@@ -12,7 +12,9 @@
 //! The variables are read once, first thing ([`capture_env`]), and removed
 //! so the shells don't inherit them. A re-exec passes `NOTIFY_SOCKET` on.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 
 use goatty_proto::SessionId;
@@ -141,7 +143,14 @@ pub(crate) fn unstore(pty: &StoredPty) {
     }
 }
 
+/// systemd is Linux only.
+#[cfg(not(target_os = "linux"))]
+fn notify(_state: &str, _fds: &[RawFd]) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// `sd_notify` with `fds` attached (`SCM_RIGHTS`). Nothing without `NOTIFY_SOCKET`.
+#[cfg(target_os = "linux")]
 fn notify(state: &str, fds: &[RawFd]) -> std::io::Result<()> {
     let Some(path) = notify_socket() else { return Ok(()) };
     // SAFETY: plain syscall; the result is checked and owned right away.
@@ -218,6 +227,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn notify_sends_the_fds() {
         use std::io::IoSliceMut;
@@ -252,6 +262,7 @@ mod tests {
     }
 
     /// [`notify`] against an explicit socket path.
+    #[cfg(target_os = "linux")]
     fn send_to(path: &str, state: &str, fds: &[RawFd]) {
         let _ = ENV.set(Env { listen: Vec::new(), notify: Some(path.to_string()) });
         assert_eq!(notify_socket(), Some(path), "no other test sets the env");

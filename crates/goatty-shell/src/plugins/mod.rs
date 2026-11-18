@@ -7,8 +7,10 @@
 //! 1. [`Plugins::find`] a plugin in a verified registry snapshot (or a
 //!    local directory, [`Candidate::local`]),
 //! 2. [`Plugins::plan`] what installing it does (downloads, permissions,
-//!    shell code) and hand that to the user,
+//!    shell code; and the same for each plugin it needs that isn't
+//!    installed yet) and hand that to the user,
 //! 3. [`Plugins::install`] exactly that plan (its digest must match),
+//!    dependencies first,
 //!    packages into `tools/` + `bin/`, a verified copy of the plugin's files
 //!    into `installed/<id>/`, an entry in `installed/lock.json`,
 //! 4. the caller enables it in `host.json` and builds a new generation;
@@ -26,7 +28,7 @@ pub mod jobs;
 pub mod lock;
 pub mod registry;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -137,16 +139,35 @@ fn op_lock_for(dirs: &Dirs, job: &Job) -> Result<std::fs::File> {
 }
 
 /// Downloads waiting for activation, kept on disk (a plugin's packages
-/// can add up to more than goattyd should hold in memory). Removed when
-/// dropped, whatever happens to the install.
+/// can add up to more than goattyd should hold in memory), and the staged
+/// copy of the plugin's files. Removed when dropped, whatever happens to
+/// the install.
 struct Spool(Vec<PathBuf>);
 
 impl Drop for Spool {
     fn drop(&mut self) {
         for f in &self.0 {
-            let _ = std::fs::remove_file(f);
+            if f.is_dir() {
+                let _ = std::fs::remove_dir_all(f);
+            } else {
+                let _ = std::fs::remove_file(f);
+            }
         }
     }
+}
+
+/// One plugin of an install, everything downloaded and staged: what's
+/// left can't be cancelled ([`Plugins::commit`]).
+struct Staged<'c> {
+    c: &'c Candidate,
+    plan: &'c Plan,
+    /// Installed because another plugin of the install needs it.
+    dependency: bool,
+    /// Per package: the spooled download, if it fetches one.
+    fetched: Vec<Option<PathBuf>>,
+    /// The plugin's files, checked (not for a built-in plugin).
+    staging: PathBuf,
+    _spool: Spool,
 }
 
 impl Plugins<'_> {
@@ -233,21 +254,69 @@ impl Plugins<'_> {
         }
     }
 
-    /// What installing `c` would do. For a built-in plugin: downloading the
-    /// packages it's missing.
+    /// What installing `c` would do, including the plugins it needs that
+    /// aren't installed yet ([`Plan::dependencies`]). For a built-in
+    /// plugin: downloading the packages it's missing.
     pub fn plan(&self, c: &Candidate, settings: &HostSettings) -> Result<Plan> {
+        Ok(self.plan_all(c, settings)?.0)
+    }
+
+    /// [`plan`](Self::plan), and the dependencies' candidates (in the
+    /// order of [`Plan::dependencies`]).
+    fn plan_all(&self, c: &Candidate, settings: &HostSettings) -> Result<(Plan, Vec<Candidate>)> {
+        let lock = Lock::load(self.dirs)?;
+        let deps = self.dependencies(c, &lock)?;
+        // Plugins of one install can't clash with each other either.
+        let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+        for x in deps.iter().chain([c]) {
+            for exe in x.manifest.executables() {
+                if let Some(other) = owners.insert(exe, &x.manifest.id).filter(|o| *o != x.manifest.id) {
+                    bail!("{exe} would be provided by both the {other} and the {} plugin", x.manifest.id);
+                }
+            }
+        }
+        let dependencies = deps.iter().map(|d| self.plan_one(d, settings, &lock)).collect::<Result<Vec<_>>>()?;
+        let mut plan = self.plan_one(c, settings, &lock)?;
+        if !dependencies.is_empty() {
+            plan.dependencies = dependencies;
+            plan.digest = plan.compute_digest(&c.files);
+        }
+        Ok((plan, deps))
+    }
+
+    /// The plugins `c` needs (`requires.plugins`, and what those need)
+    /// that aren't on the host yet, each after the ones it needs.
+    fn dependencies(&self, c: &Candidate, lock: &Lock) -> Result<Vec<Candidate>> {
+        fn visit(p: &Plugins<'_>, m: &Manifest, lock: &Lock, path: &mut Vec<String>, out: &mut Vec<Candidate>) -> Result<()> {
+            for dep in &m.requires.plugins {
+                if lock.plugins.contains_key(dep) || builtins::get(dep).is_some() || out.iter().any(|c| c.manifest.id == *dep) {
+                    continue;
+                }
+                if path.contains(dep) {
+                    bail!("{} and {dep} need each other; neither can be installed first", m.name);
+                }
+                let c = p.find(dep, None).with_context(|| format!("{} needs the {dep} plugin", m.name))?;
+                path.push(dep.clone());
+                visit(p, &c.manifest, lock, path, out)?;
+                path.pop();
+                out.push(c);
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        visit(self, &c.manifest, lock, &mut vec![c.manifest.id.clone()], &mut out)?;
+        Ok(out)
+    }
+
+    /// The plan for `c` alone; the plugins it needs are installed, or
+    /// planned along with it.
+    fn plan_one(&self, c: &Candidate, settings: &HostSettings, lock: &Lock) -> Result<Plan> {
         let m = &c.manifest;
         let target = current_target();
         // A built-in plugin works with system copies anywhere; only a
         // download needs a build for this host (checked below).
         if c.builtin.is_none() {
             m.compatible(GOATTY_VERSION, &target).map_err(|why| anyhow!("{} can't be installed here: {why}", m.name))?;
-        }
-        let lock = Lock::load(self.dirs)?;
-        for dep in &m.requires.plugins {
-            if !lock.plugins.contains_key(dep) && builtins::get(dep).is_none() {
-                bail!("{} needs the {dep} plugin: install that first", m.name);
-            }
         }
         if c.builtin.is_none() {
             if builtins::get(&m.id).is_some() {
@@ -357,6 +426,11 @@ impl Plugins<'_> {
             .collect();
 
         let mut warnings = Vec::new();
+        // (One installed along with it gets turned on.)
+        let installed = |d: &str| lock.plugins.contains_key(d) || builtins::get(d).is_some();
+        for dep in m.requires.plugins.iter().filter(|d| installed(d) && settings.plugins.get(*d).is_some_and(|p| !p.enabled)) {
+            warnings.push(format!("{} needs the {dep} plugin, which is turned off here: turn it on for {} to work.", m.name, m.name));
+        }
         if c.is_local() {
             warnings.push(
                 "Not from a registry: nobody reviewed this plugin and nothing signed it. Install it only if you wrote it or trust whoever did."
@@ -408,6 +482,7 @@ impl Plugins<'_> {
             shell_code,
             requires,
             warnings,
+            dependencies: Vec::new(),
             digest: String::new(),
         };
         plan.digest = plan.compute_digest(&c.files);
@@ -424,26 +499,50 @@ impl Plugins<'_> {
     /// [`install`](Self::install), reporting its progress to `job` and
     /// stopping (with everything as it was) when `job` is cancelled while
     /// it waits or downloads: nothing on the host changes before every
-    /// download is in. Leaves `job` at [`Step::Activating`].
+    /// download (the dependencies' too) is in. Leaves `job` at
+    /// [`Step::Activating`].
     pub fn install_with(&self, c: &Candidate, approved: &str, settings: &HostSettings, job: &Job) -> Result<Plan> {
         job.step(Step::Waiting)?;
         let _guard = op_lock_for(self.dirs, job)?;
         job.check()?;
-        let plan = self.plan(c, settings)?;
+        let (plan, deps) = self.plan_all(c, settings)?;
         if plan.digest != approved {
             bail!("{} changed since you reviewed it (files, downloads or permissions); review the new plan before installing", plan.name);
         }
-        let m = &c.manifest;
-        let target = current_target();
-        let mut lock = Lock::load(self.dirs)?;
-        let previous = lock.plugins.get(&m.id).cloned();
-        let staging = self.dirs.installed_dir().join(format!(".{}.partial-{}", m.id, std::process::id()));
-        let _ = std::fs::remove_dir_all(&staging);
-
+        let todo = deps.iter().zip(&plan.dependencies).map(|(c, p)| (c, p, true)).chain([(c, &plan, false)]);
         // Everything is downloaded before anything changes, so a cancel
         // (or a failed download) leaves the host as it was.
-        let count = plan.downloads.iter().filter(|d| d.fetches()).count();
-        let mut spool = Spool(Vec::new());
+        let count = plan.all().flat_map(|p| &p.downloads).filter(|d| d.fetches()).count();
+        let mut index = 0;
+        let mut staged = Vec::new();
+        for (c, p, dependency) in todo {
+            staged.push(self.stage(c, p, dependency, job, &mut index, count)?);
+        }
+        job.activate()?;
+        // Dependencies first: if a later one fails, the ones before it
+        // are complete installs of their own.
+        for s in staged {
+            self.commit(s)?;
+        }
+        Ok(plan)
+    }
+
+    /// Download `c`'s packages (counting them in `index` of `count`) and
+    /// stage its files: everything of its install that can be cancelled.
+    fn stage<'c>(
+        &self,
+        c: &'c Candidate,
+        plan: &'c Plan,
+        dependency: bool,
+        job: &Job,
+        index: &mut usize,
+        count: usize,
+    ) -> Result<Staged<'c>> {
+        let m = &c.manifest;
+        let target = current_target();
+        let staging = self.dirs.installed_dir().join(format!(".{}.partial-{}", m.id, std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        let mut spool = Spool(vec![staging.clone()]);
         let mut fetched: Vec<Option<PathBuf>> = Vec::new();
         for (p, d) in m.packages.iter().zip(&plan.downloads) {
             if !d.fetches() {
@@ -451,8 +550,8 @@ impl Plugins<'_> {
                 continue;
             }
             let a = p.asset_for(&target).context("no build for this host")?;
-            let index = spool.0.len() + 1;
-            job.step(Step::Downloading { package: p.id.clone(), index, count, bytes: 0, total: a.size })?;
+            *index += 1;
+            job.step(Step::Downloading { package: p.id.clone(), index: *index, count, bytes: 0, total: a.size })?;
             let bytes = self.fetch.fetch_progress(&a.url, &mut |n| job.downloaded(n)).with_context(|| format!("download {}", a.url))?;
             let file = self.dirs.installed_dir().join(format!(".{}.download-{}-{index}", m.id, std::process::id()));
             spool.0.push(file.clone());
@@ -461,15 +560,18 @@ impl Plugins<'_> {
         }
         if c.builtin.is_none() {
             // Stage the plugin's files too: the last step that can fail on its own.
-            goatty_plugin::bundle::copy_verified(&c.dir, &staging, &c.files).inspect_err(|_| {
-                let _ = std::fs::remove_dir_all(&staging);
-            })?;
+            goatty_plugin::bundle::copy_verified(&c.dir, &staging, &c.files)?;
         }
-        if let Err(e) = job.activate() {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
-        }
+        Ok(Staged { c, plan, dependency, fetched, staging, _spool: spool })
+    }
 
+    /// Activate a staged plugin: its packages, its files, its lock entry.
+    fn commit(&self, s: Staged<'_>) -> Result<()> {
+        let Staged { c, plan, dependency, fetched, staging, _spool } = s;
+        let m = &c.manifest;
+        let target = current_target();
+        let mut lock = Lock::load(self.dirs)?;
+        let previous = lock.plugins.get(&m.id).cloned();
         let mut packages = Vec::new();
         let mut fresh: Vec<(String, Vec<String>)> = Vec::new();
         let result = (|| -> Result<()> {
@@ -506,7 +608,7 @@ impl Plugins<'_> {
                 return Ok(());
             }
 
-            // The plugin's files (staged and checked above) swapped in.
+            // The plugin's files (staged and checked) swapped in.
             let dest = lock::bundle_dir(self.dirs, &m.id);
             if dest.exists() {
                 std::fs::remove_dir_all(&dest)?;
@@ -515,7 +617,6 @@ impl Plugins<'_> {
             Ok(())
         })();
         if let Err(e) = result {
-            let _ = std::fs::remove_dir_all(&staging);
             // Undo packages this attempt added that the old version didn't have.
             let keep: Vec<&str> = previous.iter().flat_map(|p| p.packages.iter().map(|x| x.id.as_str())).collect();
             for (id, bins) in fresh.iter().filter(|(id, _)| !keep.contains(&id.as_str())) {
@@ -525,7 +626,7 @@ impl Plugins<'_> {
         }
         if c.builtin.is_some() {
             log::info!("installed the packages of built-in plugin {}", m.id);
-            return Ok(plan);
+            return Ok(());
         }
         // Packages the old version had and the new one doesn't.
         if let Some(old) = &previous {
@@ -545,16 +646,30 @@ impl Plugins<'_> {
                 permissions: permissions::all(m),
                 digest: plan.digest.clone(),
                 installed: now(),
+                // An update keeps what it was installed as; installing the
+                // same version again on purpose makes it the user's own.
+                dependency: match &previous {
+                    Some(p) if p.version != m.version => p.dependency,
+                    _ => dependency,
+                },
             },
         );
         lock.save(self.dirs)?;
-        log::info!("installed plugin {} {} from {}", m.id, m.version, c.source);
-        Ok(plan)
+        log::info!(
+            "installed plugin {} {} from {}{}",
+            m.id,
+            m.version,
+            c.source,
+            if dependency { " (needed by another plugin)" } else { "" }
+        );
+        Ok(())
     }
 
     /// Remove an installed plugin: its packages, files and lock entry.
-    /// The caller drops it from the host settings.
-    pub fn uninstall(&self, id: &str) -> Result<lock::Entry> {
+    /// The caller drops it from the host settings. Returns its entry and
+    /// the plugins nothing needs any more ([`Plugins::unneeded`]), to
+    /// offer removing them too.
+    pub fn uninstall(&self, id: &str) -> Result<(lock::Entry, Vec<String>)> {
         if let Some(b) = builtins::get(id) {
             bail!(
                 "{} comes with goatty: turn it off instead (goattyd plugin disable {id}); `goattyd shell uninstall {id}` removes goatty's download of it",
@@ -580,7 +695,37 @@ impl Plugins<'_> {
         }
         lock.save(self.dirs)?;
         log::info!("uninstalled plugin {id}");
-        Ok(entry)
+        Ok((entry, self.unneeded(&lock)))
+    }
+
+    /// The plugins that were installed only because another plugin needed
+    /// them, and that no other installed plugin needs now; ordered so each
+    /// comes before the ones it needs (the order they can be uninstalled in).
+    fn unneeded(&self, lock: &Lock) -> Vec<String> {
+        let needs: BTreeMap<&str, Vec<String>> = lock
+            .plugins
+            .iter()
+            .map(|(id, e)| (id.as_str(), lock::manifest_of(self.dirs, id, e).map(|m| m.requires.plugins).unwrap_or_default()))
+            .collect();
+        let needed_by = |dep: &str, from: &dyn Fn(&str) -> bool| needs.iter().any(|(o, reqs)| from(o) && reqs.iter().any(|r| r == dep));
+        let mut set: BTreeSet<&str> = lock.plugins.iter().filter(|(_, e)| e.dependency).map(|(id, _)| id.as_str()).collect();
+        // Drop the ones a plugin outside the set needs, until none is left.
+        loop {
+            let kept: Vec<&str> = set.iter().copied().filter(|d| needed_by(d, &|o| !set.contains(o))).collect();
+            if kept.is_empty() {
+                break;
+            }
+            for k in kept {
+                set.remove(k);
+            }
+        }
+        let mut out = Vec::new();
+        while let Some(&first) = set.iter().next() {
+            let next = set.iter().copied().find(|d| !needed_by(d, &|o| o != *d && set.contains(o))).unwrap_or(first);
+            set.remove(next);
+            out.push(next.to_owned());
+        }
+        out
     }
 
     /// Remove goatty's downloaded packages of a built-in plugin (the plugin

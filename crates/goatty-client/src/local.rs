@@ -66,7 +66,8 @@ pub fn outdated(pid: u32) -> Option<Outdated> {
     outdated_than(pid, installed_daemon()?)
 }
 
-/// [`outdated`] against a given `installed` goattyd.
+/// [`outdated`] against a given `installed` goattyd. Linux only (it stats
+/// the running file through `/proc/<pid>/exe`); `None` elsewhere.
 pub fn outdated_than(pid: u32, installed: PathBuf) -> Option<Outdated> {
     let exe = PathBuf::from(format!("/proc/{pid}/exe"));
     let running = std::fs::read_link(&exe).ok()?;
@@ -211,8 +212,34 @@ fn alive(pid: u32) -> bool {
     // SAFETY: plain syscall; for a pid that isn't our child it fails with
     // ECHILD and changes nothing.
     unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .is_ok_and(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) != Some('Z'))
+    #[cfg(target_os = "linux")]
+    return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) != Some('Z'));
+    #[cfg(target_os = "macos")]
+    // SAFETY: `info` is plain data valid for writes of the size passed.
+    return unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size && info.pbi_status != libc::SZOMB
+    };
+    // Elsewhere: whether it can still be signalled.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    // SAFETY: plain syscall; signal 0 only checks.
+    return unsafe { libc::kill(pid as i32, 0) } == 0;
+}
+
+/// The name of process `pid` (`/proc/<pid>/comm`; `proc_name` on macOS);
+/// empty when it can't be read.
+fn process_name(pid: u32) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is valid for writes of the size passed.
+        let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(buf.len())]).into_owned()
+    }
+    #[cfg(not(target_os = "macos"))]
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
 }
 
 fn wait_gone(pid: u32, timeout: Duration) -> bool {
@@ -260,7 +287,7 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
     }
     let pid = crate::control::socket_owner(&path)?;
     // Under socket activation the listener belongs to systemd, never kill that.
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let comm = process_name(pid);
     anyhow::ensure!(comm.starts_with("goattyd"), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
     log::info!("stopping goattyd (pid {pid}): {why}");
     // SAFETY: plain syscall on a pid we just checked is our goattyd.
@@ -295,6 +322,7 @@ mod tests {
         assert!(!is_newer(build(1, 20), build(2, 10)));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn this_process_is_not_outdated_against_itself() {
         // Our own exe vs itself: same file.

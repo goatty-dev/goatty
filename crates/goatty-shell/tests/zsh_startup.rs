@@ -64,7 +64,9 @@ struct Sandbox {
 impl Sandbox {
     fn new(zsh: String) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
+        // macOS's temp dir is behind a symlink (/var → /private/var); the
+        // shell sees the real path, so HOME must be it for `~` to show.
+        let home = tmp.path().canonicalize().unwrap().join("home");
         std::fs::create_dir_all(home.join("userbin")).unwrap();
         // PATH holds zsh and basic utilities (compinit needs mv, grep, ...)
         // but not the host's starship/fzf/fd, which would change the

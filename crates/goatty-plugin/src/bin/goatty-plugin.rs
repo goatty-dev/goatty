@@ -232,16 +232,12 @@ fn hash(sources: &[String]) -> Result<()> {
             std::fs::read(src).with_context(|| format!("read {src}"))?
         };
         println!("{src}\n  sha256 = \"{}\"\n  size = {}", bundle::sha256_hex(&bytes), bytes.len());
-        if src.ends_with(".tar.gz") || src.ends_with(".tgz") {
-            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
-            let mut shown = 0;
-            for entry in ar.entries()?.flatten() {
-                let path = entry.path().map(|p| p.display().to_string()).unwrap_or_default();
-                let exec = entry.header().mode().is_ok_and(|m| m & 0o111 != 0) && entry.header().entry_type().is_file();
-                if exec && shown < 10 {
-                    println!("  executable in archive: {path}");
-                    shown += 1;
-                }
+        if let Some(format) = manifest::AssetFormat::from_url(src) {
+            if format != manifest::AssetFormat::TarGz {
+                println!("  format = \"{}\"", format.name());
+            }
+            for path in goatty_plugin::archive::executables(format, &bytes, 10)? {
+                println!("  executable in archive: {path}");
             }
         }
     }

@@ -249,10 +249,7 @@ impl Daemon {
 }
 
 pub(crate) fn host_info() -> HostInfo {
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let hostname = goatty_client::hostname();
     HostInfo {
         hostname,
         user: std::env::var("USER").unwrap_or_default(),

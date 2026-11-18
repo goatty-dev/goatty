@@ -39,6 +39,10 @@ pub struct Entry {
     /// The plan digest the user approved.
     pub digest: String,
     pub installed: u64,
+    /// Installed only because another plugin needs it (`requires.plugins`):
+    /// uninstalling the last plugin that needs it offers to remove it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dependency: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

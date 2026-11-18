@@ -134,8 +134,10 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
 
     // An update replaces the file the daemon runs.
     install_goattyd(&exe);
-    let running = std::fs::read_link(format!("/proc/{}/exe", daemon.0.id())).unwrap();
-    assert!(running.to_string_lossy().ends_with(" (deleted)"));
+    if cfg!(target_os = "linux") {
+        let running = std::fs::read_link(format!("/proc/{}/exe", daemon.0.id())).unwrap();
+        assert!(running.to_string_lossy().ends_with(" (deleted)"));
+    }
 
     Control::connect(&sock, "test").unwrap().restart(None).unwrap();
     // The old connection went with the old process image.
@@ -144,8 +146,10 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
 
     let mut c = Control::connect(&sock, "test").unwrap();
     assert_eq!(c.pid(), daemon.0.id(), "same process");
-    let running = std::fs::read_link(format!("/proc/{}/exe", daemon.0.id())).unwrap();
-    assert!(!running.to_string_lossy().ends_with(" (deleted)"), "runs the new build: {}", running.display());
+    if cfg!(target_os = "linux") {
+        let running = std::fs::read_link(format!("/proc/{}/exe", daemon.0.id())).unwrap();
+        assert!(!running.to_string_lossy().ends_with(" (deleted)"), "runs the new build: {}", running.display());
+    }
     let list = c.list_sessions().unwrap();
     assert_eq!(list.iter().map(|s| (s.id, s.pid)).collect::<Vec<_>>(), [(id, pid_before)]);
 
@@ -198,7 +202,7 @@ fn a_program_that_cant_take_over_is_refused() {
         ServerMsg::Attached { session, .. } => session,
         other => panic!("{other:?}"),
     };
-    let err = Control::connect(&sock, "test").unwrap().restart(Some(Path::new("/bin/true"))).unwrap_err();
+    let err = Control::connect(&sock, "test").unwrap().restart(Some(&true_exe())).unwrap_err();
     assert!(format!("{err:#}").contains("can't take over"), "{err:#}");
     send(&mut s, &ClientMsg::Input { session: id, data: b"echo still-$((2+3))\r".to_vec() });
     read_until(&mut s, "still-5");
@@ -275,4 +279,9 @@ fn ptys_from_the_systemd_fd_store_come_back() {
     assert_eq!(wait_exited(&mut s, 7), None);
     assert!(!state.exists(), "the saved state is gone");
     drop(pty);
+}
+
+/// `true` from PATH (`/bin/true` on Linux, `/usr/bin/true` on macOS).
+fn true_exe() -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap()).map(|d| d.join("true")).find(|p| p.is_file()).expect("true on PATH")
 }

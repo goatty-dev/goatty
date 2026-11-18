@@ -161,8 +161,31 @@ fn local_installed(svc: &HostService, id: &str) -> Option<Candidate> {
     })
 }
 
-/// Print an install plan the way the user approves it.
+/// Print an install plan the way the user approves it: the plugins it
+/// needs first, then the plugin.
 pub fn print_plan(plan: &Plan) {
+    if !plan.dependencies.is_empty() {
+        let names: Vec<&str> = plan.dependencies.iter().map(|d| d.name.as_str()).collect();
+        println!(
+            "{} needs plugins that aren't installed here: {}. They're installed first, as planned below.\n",
+            plan.name,
+            names.join(", ")
+        );
+    }
+    for p in plan.all() {
+        print_one(p);
+    }
+}
+
+/// The approval question for `plan`: "Install Base and Addon?".
+pub fn question(plan: &Plan) -> String {
+    let verb = if plan.replaces.is_some() { "Update" } else { "Install" };
+    let mut names: Vec<&str> = plan.all().map(|p| p.name.as_str()).collect();
+    let last = names.pop().unwrap_or_default();
+    if names.is_empty() { format!("{verb} {last}?") } else { format!("{verb} {} and {last}?", names.join(", ")) }
+}
+
+fn print_one(plan: &Plan) {
     let verb = match &plan.replaces {
         Some(old) if *old != plan.version => format!("Update {} {old} → {}", plan.name, plan.version),
         Some(_) => format!("Reinstall {} {}", plan.name, plan.version),
@@ -258,7 +281,7 @@ pub fn install(svc: &HostService, targets: &[String], path: Option<&Path>, yes: 
     for c in candidates {
         let plan = svc.plugins(|p| p.plan(&c, &settings))?;
         print_plan(&plan);
-        if !yes && !approve(&format!("{} {}?", if plan.replaces.is_some() { "Update" } else { "Install" }, plan.name))? {
+        if !yes && !approve(&question(&plan))? {
             println!("Not installed.");
             continue;
         }
@@ -280,7 +303,7 @@ pub fn update(svc: &HostService, ids: &[String], yes: bool) -> Result<()> {
         let c = svc.plugins(|p| p.find(&i.id, i.update.as_deref()))?;
         let plan = svc.plugins(|p| p.plan(&c, &settings))?;
         print_plan(&plan);
-        if !yes && !approve(&format!("Update {}?", plan.name))? {
+        if !yes && !approve(&question(&plan))? {
             println!("Not updated.");
             continue;
         }
@@ -289,12 +312,33 @@ pub fn update(svc: &HostService, ids: &[String], yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// `goattyd plugin uninstall ID…`.
-pub fn uninstall(svc: &HostService, ids: &[String]) -> Result<()> {
+/// `goattyd plugin uninstall ID…`. Offers to remove the plugins that
+/// were installed only for these and that nothing needs now (`yes`:
+/// without asking).
+pub fn uninstall(svc: &HostService, ids: &[String], yes: bool) -> Result<()> {
     if ids.is_empty() {
         bail!("name the plugins to remove");
     }
+    let mut unneeded = Vec::new();
     for id in ids {
+        let c = svc.uninstall_plugin(id)?;
+        print_changed(&c);
+        unneeded = c.unneeded;
+    }
+    // Ones named on the command line are gone already.
+    unneeded.retain(|u| !ids.contains(u));
+    if unneeded.is_empty() {
+        return Ok(());
+    }
+    let ask = !yes && std::io::stdin().is_terminal();
+    if !yes && !ask {
+        println!("Remove them with: goattyd plugin uninstall {}", unneeded.join(" "));
+        return Ok(());
+    }
+    if ask && !approve(&format!("Also uninstall {}?", unneeded.join(", ")))? {
+        return Ok(());
+    }
+    for id in &unneeded {
         print_changed(&svc.uninstall_plugin(id)?);
     }
     Ok(())

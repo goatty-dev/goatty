@@ -23,6 +23,7 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+zip.workspace = true
 ed25519-dalek.workspace = true
 goatty-term.workspace = true
 

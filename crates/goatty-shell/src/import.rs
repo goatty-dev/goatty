@@ -563,7 +563,12 @@ local k
 {{
   builtin printf '%s\0' "{MAGIC}" 1
   for k in $(compgen -e); do builtin printf 'E%s=%s\0' "$k" "${{!k}}"; done
-  for k in "${{!BASH_ALIASES[@]}}"; do builtin printf 'A%s=%s\0' "$k" "${{BASH_ALIASES[$k]}}"; done
+  if (( BASH_VERSINFO[0] >= 4 )); then
+    for k in "${{!BASH_ALIASES[@]}}"; do builtin printf 'A%s=%s\0' "$k" "${{BASH_ALIASES[$k]}}"; done
+  else
+    # bash 3.2 (macOS) has no BASH_ALIASES: unquote what `alias NAME` prints.
+    for k in $(compgen -a); do v=$(builtin alias -- "$k"); v=${{v#alias }}; v=${{v#-- }}; builtin eval "v=${{v#"$k"=}}"; builtin printf 'A%s=%s\0' "$k" "$v"; done
+  fi
   builtin printf '%s\0' "{END}"
 }} >| {out}"#
             );

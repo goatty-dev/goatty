@@ -17,11 +17,16 @@ sha2.workspace = true
 ed25519-dalek.workspace = true
 flate2.workspace = true
 tar.workspace = true
+zip.workspace = true
+lzma-rust2.workspace = true
+zstd.workspace = true
 clap.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Tests pack .tar.xz archives.
+lzma-rust2 = { workspace = true, features = ["encoder"] }
 
 [lints]
 workspace = true
