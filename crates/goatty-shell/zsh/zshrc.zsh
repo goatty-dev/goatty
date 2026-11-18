@@ -31,6 +31,111 @@ _goatty_find() {
 }
 _goatty_ok() { _goatty_state[$1]="ok"$'\t'"$2" }
 
+# Cache a tool's init output under $_goatty_cache/init/<name>.zsh, keyed on the
+# zsh version, binary path + resolved path + stat, extra key, and arguments.
+# Sets REPLY to the cache file (return 0) or _goatty_init_code when the cache
+# isn't writable (return 2); returns 1 if the command is missing or empty.
+# Usage: _goatty_cached_init [-p POST_FN] NAME EXTRA CMD [ARGS...]
+builtin zmodload -F zsh/stat b:zstat 2>/dev/null
+builtin zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
+_goatty_cached_init() {
+  builtin emulate -L zsh
+  local post_fn=
+  if [[ $1 == -p ]]; then
+    post_fn=$2
+    builtin shift 2
+  fi
+  local name=$1 extra=$2 cmd=$3
+  builtin shift 3
+  local -a args=("$@")
+
+  if [[ -z $name || $name == */* || $name == .* || -z $cmd ]]; then
+    return 1
+  fi
+  local bin=${commands[$cmd]-}
+  [[ -n $bin ]] || return 1
+  local resolved=${bin:A}
+
+  local -A st
+  if ! (( $+builtins[zstat] )) || ! builtin zstat -H st -- "$resolved" 2>/dev/null; then
+    local out
+    out=$("$bin" "${(@)args}" 2>/dev/null) || return 1
+    [[ -n $out ]] || return 1
+    if [[ -n $post_fn ]]; then
+      "$post_fn" "$bin" "$out"
+      out=$REPLY
+      [[ -n $out ]] || return 1
+    fi
+    typeset -g _goatty_init_code=$out
+    return 2
+  fi
+
+  local key="# goatty-cache-key: v1|${(q+)ZSH_VERSION}|${(q+)bin}|${(q+)resolved}|${st[device]}:${st[inode]}:${st[size]}:${st[mtime]}:${st[ctime]}|${(q+)extra}|${(j: :)${(q+)args}}"
+  local cache_dir=${_goatty_cache:-${XDG_CACHE_HOME:-$HOME/.cache}/goatty}/init
+  local cache=$cache_dir/$name.zsh
+  local hdr
+  if [[ -f $cache && -r $cache && -s $cache ]] && { IFS= builtin read -r hdr < "$cache"; } 2>/dev/null && [[ $hdr == "$key" ]]; then
+    REPLY=$cache
+    return 0
+  fi
+
+  local out
+  if ! out=$("$bin" "${(@)args}" 2>/dev/null) || [[ -z $out ]]; then
+    [[ -e $cache.zwc || -e $cache ]] && command rm -f -- "$cache.zwc" "$cache" 2>/dev/null
+    return 1
+  fi
+  if [[ -n $post_fn ]]; then
+    "$post_fn" "$bin" "$out"
+    out=$REPLY
+    if [[ -z $out ]]; then
+      [[ -e $cache.zwc || -e $cache ]] && command rm -f -- "$cache.zwc" "$cache" 2>/dev/null
+      return 1
+    fi
+  fi
+
+  local lock_dir="$cache_dir/.lock-$name"
+  local got_lock=0
+  if [[ -d $cache_dir ]] || command mkdir -p -- "$cache_dir" 2>/dev/null; then
+    if command mkdir -- "$lock_dir" 2>/dev/null; then
+      got_lock=1
+    elif (( ${+EPOCHSECONDS} )); then
+      local -A lst
+      if builtin zstat -H lst -- "$lock_dir" 2>/dev/null && (( EPOCHSECONDS - lst[mtime] > 30 )); then
+        command rm -rf -- "$lock_dir" 2>/dev/null
+        command mkdir -- "$lock_dir" 2>/dev/null && got_lock=1
+      fi
+    fi
+  fi
+
+  if (( got_lock )); then
+    local tmp_dir="$cache_dir/.tmp-$name.$$"
+    local tmp="$tmp_dir/$name.zsh"
+    local zc_ok=1
+    if command mkdir -p -- "$tmp_dir" 2>/dev/null \
+       && { builtin print -rn -- "${key}"$'\n'"${out}"$'\n' >| "$tmp"; } 2>/dev/null; then
+      if (( $+builtins[zcompile] )) && ! builtin zcompile -- "$tmp" 2>/dev/null; then
+        command rm -f -- "$tmp.zwc" 2>/dev/null
+        zc_ok=0
+      fi
+      if (( zc_ok )); then
+        [[ -e $cache.zwc ]] && command rm -f -- "$cache.zwc" 2>/dev/null
+        if command mv -f -- "$tmp" "$cache" 2>/dev/null; then
+          if [[ -f $tmp.zwc ]]; then
+            command mv -f -- "$tmp.zwc" "$cache.zwc" 2>/dev/null || command rm -f -- "$tmp.zwc" "$cache.zwc" 2>/dev/null
+          fi
+          command rm -rf -- "$tmp_dir" "$lock_dir" 2>/dev/null
+          REPLY=$cache
+          return 0
+        fi
+      fi
+    fi
+    command rm -rf -- "$tmp_dir" "$lock_dir" 2>/dev/null
+  fi
+
+  typeset -g _goatty_init_code=$out
+  return 2
+}
+
 # --- What your own shell sets up (shell.import) -----------------------------
 # goatty ran your login shell with its startup files in a separate process
 # and noted the variables and PATH folders it added (import.zsh, written by
@@ -477,6 +582,6 @@ add-zsh-hook precmd _goatty_reload_requested
 }
 
 # --- Done --------------------------------------------------------------------
-builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file _goatty_on _goatty_find _goatty_ok
+builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file _goatty_on _goatty_find _goatty_ok _goatty_cached_init
 builtin unset _goatty_user_zdotdir _goatty_src _goatty_prompt GOATTY_GUI_SETUP _goatty_ps1_before
 builtin unset _goatty_imported_vars _goatty_imported_path _goatty_imported_from
