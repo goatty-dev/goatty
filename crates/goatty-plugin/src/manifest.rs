@@ -89,8 +89,6 @@ pub enum Category {
     /// Command-line tools, aliases, environment, completions.
     #[default]
     Environment,
-    /// Prompt modules and appearance.
-    Prompt,
     /// goatty commands and UI features (needs a runtime goatty doesn't have yet).
     Application,
 }
@@ -99,7 +97,6 @@ impl Category {
     pub fn label(self) -> &'static str {
         match self {
             Category::Environment => "environment",
-            Category::Prompt => "prompt",
             Category::Application => "application",
         }
     }

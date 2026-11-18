@@ -26,7 +26,7 @@ Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatt
 
 Everything goatty writes itself is quoted: a setting value can never become shell syntax (`tests: values_cannot_escape_quotes` runs real zsh). The only code a plugin brings is its `zsh.init` file, which is shown in full before installing and re-checked against its approved checksum every time a configuration is built.
 
-Not yet: application plugins (UI, commands that run code inside goatty) need a runtime goatty doesn't have (category `application` is rejected; WASM later, plan §7). Tracked: prompt modules (#96), other shells (#103), more first-party plugins (#99), index expiry (#100), installing an imported profile's plugins (#101), publishing the repos (#93).
+Not yet: application plugins (UI, commands that run code inside goatty) need a runtime goatty doesn't have (category `application` is rejected; WASM later, plan §7). Tracked: other shells (#103), more first-party plugins (#99), index expiry (#100), installing an imported profile's plugins (#101), publishing the repos (#93).
 
 ## The manifest (`plugin.toml`)
 
@@ -43,7 +43,7 @@ publisher = "goatty"
 homepage = "https://eza.rocks"
 license = "EUPL-1.2"            # the tool's
 keywords = ["ls", "files"]
-category = "environment"        # or "prompt"
+category = "environment"
 
 [compat]
 goatty = ">=0.0.1"              # semver requirement
