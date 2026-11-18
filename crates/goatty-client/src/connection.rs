@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -171,6 +171,10 @@ impl Shared {
         // A transport that never answers (hung ssh) is torn down by the caller
         // via the stored closer, which unblocks the read.
         *self.closer.lock() = Some(t.closer.clone());
+        if self.closed.load(Ordering::Acquire) {
+            self.close_transport();
+            bail!("connection closed");
+        }
         let greeting = t
             .writer
             .write_all(&handshake::hello(&self.client_name, announced)?)
@@ -259,48 +263,19 @@ impl Connection {
         std::thread::Builder::new().name("goatty-writer".into()).spawn(move || writer_loop(out_rx))?;
 
         let (reader, host, pid) = if let Some(limit) = handshake_timeout {
-            #[derive(Default)]
-            struct Watch {
-                done: bool,
-                timed_out: bool,
-            }
-            let watch = Arc::new((StdMutex::new(Watch::default()), Condvar::new()));
-            let watch_bg = watch.clone();
+            let (tx, rx) = flume::bounded(1);
             let shared_bg = shared.clone();
-            let handle = std::thread::Builder::new().name("goatty-handshake-timeout".into()).spawn(move || {
-                let (lock, cvar) = &*watch_bg;
-                let mut guard = lock.lock().unwrap();
-                let deadline = Instant::now() + limit;
-                while !guard.done {
-                    let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
-                        guard.timed_out = true;
-                        drop(guard);
-                        shared_bg.close_transport();
-                        return;
-                    };
-                    let (g, res) = cvar.wait_timeout(guard, rem).unwrap();
-                    guard = g;
-                    if res.timed_out() && !guard.done {
-                        guard.timed_out = true;
-                        drop(guard);
-                        shared_bg.close_transport();
-                        return;
-                    }
-                }
+            std::thread::Builder::new().name("goatty-handshake".into()).spawn(move || {
+                let _ = tx.send(shared_bg.connect(true));
             })?;
-            let res = shared.connect(true);
-            let timed_out = {
-                let (lock, cvar) = &*watch;
-                let mut guard = lock.lock().unwrap();
-                guard.done = true;
-                cvar.notify_all();
-                guard.timed_out
-            };
-            let _ = handle.join();
-            if timed_out {
-                bail!("timed out waiting for goattyd greeting via {}", shared.endpoint.label());
+            match rx.recv_timeout(limit) {
+                Ok(res) => res?,
+                Err(_) => {
+                    shared.closed.store(true, Ordering::Release);
+                    shared.close_transport();
+                    bail!("timed out waiting for goattyd greeting via {}", shared.endpoint.label());
+                }
             }
-            res?
         } else {
             shared.connect(true)?
         };
