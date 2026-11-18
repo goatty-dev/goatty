@@ -147,6 +147,10 @@ fn change(link: HostLink, change: Change, cx: &mut App) {
         cx.update(|cx| {
             let label = link.label();
             let reload = link.clone();
+            if cx.try_global::<crate::settings_window::HostLinkGlobal>().and_then(|g| g.0.as_ref()).is_some_and(|g| g.same(&link)) {
+                crate::plugin_commands::refresh(cx);
+                crate::snippets::refresh(cx);
+            }
             let settings = |t: Toast| t.action("PATH settings", |_, cx| settings_window::open_at(cx, Some(Page::Path))).key(KEY);
             let t = match (result, &change) {
                 (Ok(Done::Changed { active: false }), Change::Add(dir)) => {

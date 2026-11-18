@@ -522,3 +522,189 @@ fn a_cancelled_install_leaves_its_dependencies_out_too() {
     let leftovers: Vec<_> = std::fs::read_dir(w.dirs.installed_dir()).unwrap().flatten().filter(|e| e.file_name() != ".lock").collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+#[test]
+fn catalog_marks_unavailable_commands_from_when_and_missing_programs() {
+    let w = world();
+    let dir = w.tmp.path().join("cmd-plugin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let env_bin = w.tmp.path().join("env-bin");
+    std::fs::create_dir_all(&env_bin).unwrap();
+    let present = env_bin.join("present-tool");
+    std::fs::write(&present, "#!/bin/sh\n").unwrap();
+    let nonexec = env_bin.join("nonexec-tool");
+    std::fs::write(&nonexec, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&nonexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let env_path = env_bin.to_string_lossy().into_owned();
+
+    let manifest = r#"
+schema = 1
+id = "cmd-test"
+name = "Cmd Test"
+version = "1.0.0"
+summary = "Tests command availability"
+publisher = "tests"
+
+[requires]
+commands = ["present-tool", "nonexec-tool", "goatty-test-needed-tool-xyz", "setopt", "zcompile", "z", "sudo"]
+
+[[setting]]
+id = "extra"
+label = "Extra"
+type = "bool"
+default = false
+
+[[command]]
+id = "always"
+title = "Always"
+run = ["present-tool", "--version"]
+
+[[command]]
+id = "builtin"
+title = "Builtin"
+run = ["setopt", "nullglob"]
+
+[[command]]
+id = "builtin-zcompile"
+title = "Zcompile"
+run = ["zcompile", "foo.zsh"]
+
+[[command]]
+id = "fn-z"
+title = "Zoxide jump"
+run = ["z", "projects"]
+
+[[command]]
+id = "external-sudo"
+title = "Sudo"
+run = ["sudo", "-l"]
+
+[[command]]
+id = "nonexec"
+title = "Non-executable"
+run = ["nonexec-tool"]
+
+[[command]]
+id = "gated"
+title = "Gated"
+when = "extra"
+run = ["present-tool", "--extra"]
+
+[[command]]
+id = "missing-bin"
+title = "Missing bin"
+run = ["goatty-test-needed-tool-xyz", "--help"]
+"#;
+    std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+    let p = w.plugins();
+    let mut settings = HostSettings::default();
+    let c = Candidate::local(&dir).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    p.install(&c, &plan.digest, &settings).unwrap();
+
+    // `z` (not a builtin), `sudo` (external, absent in env_path), `nonexec-tool` (0644), `gated` (`when = "extra"`),
+    // and `missing-bin` are unavailable; `present-tool` (0755), `setopt`, and `zcompile` are available.
+    let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
+    let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
+    assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo", "nonexec", "gated", "missing-bin"]);
+
+    // `Plugins::installed` works locally without consulting registries.
+    let (local_only, local_issues) = p.installed(&settings);
+    assert!(local_issues.is_empty(), "{local_issues:?}");
+    assert!(local_only.iter().any(|i| i.id == "cmd-test"));
+
+    // Turning on `extra` makes `gated` available.
+    settings.edit_plugin("cmd-test", |pc| {
+        pc.settings.insert("extra".into(), true.into());
+    });
+    let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
+    let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
+    assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo", "nonexec", "missing-bin"]);
+
+    // Adding `goatty-test-needed-tool-xyz` (0755) and an executable `nonexec-tool` (0755) later
+    // in `shell.path` makes both available (earlier 0644 `nonexec-tool` in `env_bin` is skipped).
+    let custom_bin = w.tmp.path().join("custom-bin");
+    std::fs::create_dir_all(&custom_bin).unwrap();
+    let tool = custom_bin.join("goatty-test-needed-tool-xyz");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    let fallback_exec = custom_bin.join("nonexec-tool");
+    std::fs::write(&fallback_exec, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&fallback_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    settings.shell.path.push(custom_bin.to_string_lossy().into_owned());
+    let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
+    let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
+    assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo"]);
+    assert_eq!(
+        crate::snippets::find_in(&format!("{}:{}", env_bin.display(), custom_bin.display()), "nonexec-tool").as_deref(),
+        Some(fallback_exec.as_path())
+    );
+}
+
+#[test]
+fn installed_reports_lock_and_manifest_issues_without_hiding_valid_entries() {
+    let w = world();
+    let p = w.plugins();
+    let settings = HostSettings::default();
+
+    // Missing lock is a valid empty user-installed inventory with no issues.
+    let (entries, issues) = p.installed_with_env_path(&settings, Some(""));
+    assert!(issues.is_empty(), "{issues:?}");
+    assert!(entries.iter().all(|e| e.builtin));
+
+    // Install a valid local plugin, then add a broken manifest entry in a second plugin
+    // and verify valid entries survive alongside the reported manifest error.
+    let dir = w.tmp.path().join("good-plugin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "schema = 1\nid = \"good-plugin\"\nname = \"Good\"\nversion = \"1.0.0\"\nsummary = \"Good\"\npublisher = \"tests\"\n",
+    )
+    .unwrap();
+    let c = Candidate::local(&dir).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    p.install(&c, &plan.digest, &settings).unwrap();
+
+    let broken_dir = w.dirs.installed_dir().join("broken-plugin");
+    std::fs::create_dir_all(&broken_dir).unwrap();
+    std::fs::write(broken_dir.join("plugin.toml"), "not valid toml [").unwrap();
+    let lock_path = w.dirs.installed_dir().join("lock.json");
+    let mut lock: Lock = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    lock.plugins.insert(
+        "broken-plugin".into(),
+        crate::plugins::lock::Entry {
+            version: "1.0.0".into(),
+            source: "local".into(),
+            path: None,
+            verified: true,
+            files: BTreeMap::new(),
+            packages: vec![],
+            permissions: vec![],
+            digest: "sha256:0".into(),
+            installed: 0,
+            dependency: false,
+        },
+    );
+    lock.save(&w.dirs).unwrap();
+
+    let (entries, issues) = p.installed_with_env_path(&settings, Some(""));
+    assert!(entries.iter().any(|e| e.id == "good-plugin"));
+    assert!(entries.iter().all(|e| e.id != "broken-plugin"));
+    assert_eq!(issues.len(), 1, "{issues:?}");
+
+    // An unreadable/corrupt lock.json reports its error while still returning builtins.
+    std::fs::write(&lock_path, "{broken json").unwrap();
+    let (entries, issues) = p.installed_with_env_path(&settings, Some(""));
+    assert!(entries.iter().all(|e| e.builtin));
+    assert!(!entries.is_empty());
+    assert!(issues.iter().any(|i| i.contains("installed/lock.json")), "{issues:?}");
+}

@@ -23,7 +23,7 @@ use gpui::{AppContext, Context, Entity, Pixels, Point, Window};
 
 use super::layout::Direction;
 use super::{PaneId, Workspace};
-use crate::plugin_commands::{MenuCommands, start};
+use crate::plugin_commands::{MenuCommands, run_menu_command};
 use crate::settings::AppSettings;
 use crate::terminal::TerminalView;
 use crate::ui::context_menu::{self, ContextMenu, Entry, Item, MenuEvent};
@@ -428,14 +428,17 @@ fn plugin_entries(view: &Entity<TerminalView>, cx: &gpui::App) -> Vec<Entry> {
             out.push(Entry::Header(c.plugin.clone().into()));
             last_plugin = Some(c.plugin.as_str());
         }
-        let (cmd, sel) = (c.clone(), selection.clone());
-        out.push(
-            Item::new(c.command.title.clone(), move |window, cx| {
-                start(&cmd.plugin_id, &cmd.plugin, &cmd.command, &cmd.origin, sel.as_deref(), window, cx);
-            })
-            .icon(c.icon())
-            .into(),
-        );
+        let id = crate::plugin_commands::command_id(&c.plugin_id, &c.command.id);
+        let shortcut = context_menu::shortcut(&id, cx);
+        let sel = selection.clone();
+        let expected_cmd = c.command.clone();
+        let expected_origin = c.origin.clone();
+        let mut item = Item::new(c.command.title.clone(), move |window, cx| {
+            run_menu_command(&id, &expected_cmd, &expected_origin, sel.as_deref(), window, cx);
+        })
+        .icon(c.icon());
+        item.shortcut = shortcut;
+        out.push(item.into());
     }
     out
 }

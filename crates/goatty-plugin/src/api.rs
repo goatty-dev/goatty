@@ -23,6 +23,9 @@ pub enum Request {
     Catalog {
         refresh: bool,
     },
+    /// What's installed on this host (no registry load or network fetch).
+    /// Reply: [`Reply::Installed`].
+    Installed,
     /// What installing (or updating to) `id` would do.
     Plan {
         id: String,
@@ -78,12 +81,21 @@ pub enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reply {
     Catalog(Catalog),
+    Installed {
+        installed: Vec<Installed>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        issues: Vec<String>,
+    },
     Plan(Box<Plan>),
     Changed(Changed),
     Snippets(SnippetList),
     Suggestions(Suggestions),
-    Installs { installs: Vec<InstallProgress> },
-    Updates { updates: Vec<Update> },
+    Installs {
+        installs: Vec<InstallProgress>,
+    },
+    Updates {
+        updates: Vec<Update>,
+    },
 }
 
 /// One install on the host ([`Request::Installs`]).
@@ -236,6 +248,11 @@ pub struct Installed {
     /// Where each of its packages is on this host.
     #[serde(default)]
     pub packages: Vec<PackageStatus>,
+    /// Ids of this plugin's `[[command]]`s that don't apply here (a `when`
+    /// condition on settings is false, or the program `run` starts isn't
+    /// installed on this host).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_commands: Vec<String>,
 }
 
 /// One package of an installed plugin, as found on the host.
@@ -474,5 +491,57 @@ mod tests {
         let back: Reply = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
         assert_eq!(serde_json::to_string(&Request::CancelInstall { id: "eza".into() }).unwrap(), r#"{"op":"cancel_install","id":"eza"}"#);
+    }
+
+    #[test]
+    fn installed_unavailable_commands_defaults_and_round_trips() {
+        let m: Manifest = toml::from_str(
+            r#"
+schema = 1
+id = "demo"
+name = "Demo"
+version = "1.0.0"
+summary = "Test"
+publisher = "tests"
+"#,
+        )
+        .unwrap();
+        let inst = Installed {
+            id: "demo".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec![],
+        };
+        let empty_json = serde_json::to_string(&inst).unwrap();
+        assert!(!empty_json.contains("unavailable_commands"), "{empty_json}");
+        let mut with_unavail = inst.clone();
+        with_unavail.unavailable_commands = vec!["exec".into(), "logs".into()];
+        let full_json = serde_json::to_string(&with_unavail).unwrap();
+        assert!(full_json.contains("unavailable_commands"));
+        let back: Installed = serde_json::from_str(&full_json).unwrap();
+        assert_eq!(back.unavailable_commands, ["exec", "logs"]);
+        let back_empty: Installed = serde_json::from_str(&empty_json).unwrap();
+        assert!(back_empty.unavailable_commands.is_empty());
+
+        let req_json = serde_json::to_string(&Request::Installed).unwrap();
+        assert_eq!(req_json, r#"{"op":"installed"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&req_json).unwrap(), Request::Installed);
+
+        for (list, issues) in [(vec![], vec![]), (vec![with_unavail], vec!["installed/lock.json is unreadable".into()])] {
+            let reply = Reply::Installed { installed: list, issues };
+            let json = serde_json::to_string(&reply).unwrap();
+            let back: Reply = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, reply);
+        }
+        let legacy = r#"{"kind":"installed","installed":[]}"#;
+        assert_eq!(serde_json::from_str::<Reply>(legacy).unwrap(), Reply::Installed { installed: vec![], issues: vec![] });
     }
 }

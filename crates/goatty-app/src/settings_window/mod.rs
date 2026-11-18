@@ -428,10 +428,10 @@ pub struct SettingsWindow {
     color_save_gen: u64,
     theme_name: Entity<TextInput>,
     /// Shortcut being recorded: the next keystroke binds to this action.
-    recording: Option<&'static str>,
+    recording: Option<String>,
     /// What the last recorded shortcut replaced or takes from the shell:
     /// (action it was recorded for, message).
-    shortcut_note: Option<(&'static str, String)>,
+    shortcut_note: Option<(String, String)>,
     plugins: plugins::PluginsPage,
     diag: diagnostics::DiagPage,
     path: path::PathPage,
@@ -500,6 +500,9 @@ impl SettingsWindow {
             cx.observe_global::<AppSettings>(|this, cx| {
                 this.sync_picker(cx);
                 this.sync_remote_opener(cx);
+                if this.sync_recording(cx) {
+                    cx.notify();
+                }
             }),
             cx.subscribe(&font_filter, |_, _, _: &TextInputEvent, cx| cx.notify()),
             cx.subscribe(&ui_font_filter, |_, _, _: &TextInputEvent, cx| cx.notify()),
@@ -623,6 +626,12 @@ impl SettingsWindow {
             _subs: {
                 subs.push(net_sub);
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
+                subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
+                    let canceled = this.sync_recording(cx);
+                    if this.page == Page::Shortcuts || canceled {
+                        cx.notify();
+                    }
+                }));
                 subs
             },
         };

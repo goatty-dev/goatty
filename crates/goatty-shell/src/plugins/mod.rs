@@ -756,78 +756,32 @@ impl Plugins<'_> {
         install::uninstall_package(package, &bins, self.dirs).map(Some)
     }
 
+    /// Installed plugins (built-ins and lock entries) and any problems reading
+    /// the lock or installed manifests, without reading or refreshing any
+    /// registry snapshot.
+    pub fn installed(&self, settings: &HostSettings) -> (Vec<Installed>, Vec<String>) {
+        let path = std::env::var("PATH").ok();
+        self.installed_with_env_path(settings, path.as_deref())
+    }
+
+    pub(crate) fn installed_with_env_path(&self, settings: &HostSettings, env_path: Option<&str>) -> (Vec<Installed>, Vec<String>) {
+        let mut issues = Vec::new();
+        let lock = self.load_lock(&mut issues);
+        let installed = self.installed_entries(&lock, settings, env_path, &[], &mut issues);
+        (installed, issues)
+    }
+
     /// Installed plugins and what the registries offer.
     pub fn catalog(&self, refresh: bool, settings: &HostSettings) -> Catalog {
-        let (snaps, registries, mut issues) = self.snapshots(refresh, true);
-        let lock = match Lock::load(self.dirs) {
-            Ok(l) => l,
-            Err(e) => {
-                issues.push(format!("{e:#}"));
-                Lock::default()
-            }
-        };
-        let target = current_target();
         let path = std::env::var("PATH").ok();
-        let package_status = |m: &Manifest| -> Vec<PackageStatus> {
-            m.packages
-                .iter()
-                .map(|p| PackageStatus {
-                    id: p.id.clone(),
-                    version: p.version.clone(),
-                    state: match packages::locate(self.dirs, p, path.as_deref()) {
-                        Location::System(found) => PackageState::System { path: found.display().to_string() },
-                        Location::Managed { version, .. } => PackageState::Managed { version },
-                        Location::Missing => PackageState::Missing,
-                    },
-                    available: p.asset_for(&target).is_some(),
-                })
-                .collect()
-        };
-        let mut installed = Vec::new();
-        for b in builtins::BUILTINS {
-            let m = b.manifest().clone();
-            installed.push(Installed {
-                id: b.id.into(),
-                version: m.version.clone(),
-                source: builtins::SOURCE.into(),
-                verified: true,
-                enabled: settings.plugins.get(b.id).is_none_or(|c| c.enabled),
-                incompatible: None,
-                packages: package_status(&m),
-                builtin: true,
-                manifest: m,
-                update: None,
-                installed_unix: 0,
-            });
-        }
-        for (id, e) in lock.plugins.iter().filter(|(id, _)| builtins::get(id).is_none()) {
-            let m = match lock::manifest_of(self.dirs, id, e) {
-                Ok(m) => m,
-                Err(err) => {
-                    issues.push(format!("{err:#}"));
-                    continue;
-                }
-            };
-            let update = snaps
-                .iter()
-                .find(|s| s.source.name == e.source)
-                .and_then(|s| s.index.latest(id))
-                .filter(|(v, _)| newer(v, &e.version))
-                .map(|(v, _)| v.to_owned());
-            installed.push(Installed {
-                id: id.clone(),
-                version: e.version.clone(),
-                source: e.source.clone(),
-                verified: e.verified,
-                enabled: settings.plugins.get(id).is_none_or(|c| c.enabled),
-                incompatible: m.compatible(GOATTY_VERSION, &target).err(),
-                packages: package_status(&m),
-                builtin: false,
-                manifest: m,
-                update,
-                installed_unix: e.installed,
-            });
-        }
+        self.catalog_with_env_path(refresh, settings, path.as_deref())
+    }
+
+    pub(crate) fn catalog_with_env_path(&self, refresh: bool, settings: &HostSettings, env_path: Option<&str>) -> Catalog {
+        let (snaps, registries, mut issues) = self.snapshots(refresh, true);
+        let lock = self.load_lock(&mut issues);
+        let installed = self.installed_entries(&lock, settings, env_path, &snaps, &mut issues);
+        let target = current_target();
         let mut available: Vec<Available> = Vec::new();
         for s in &snaps {
             for (id, entry) in &s.index.plugins {
@@ -864,6 +818,122 @@ impl Plugins<'_> {
         available.sort_by_key(|a| a.name.to_lowercase());
         issues.extend(active(self.dirs, settings).1);
         Catalog { installed, available, registries, issues }
+    }
+
+    fn load_lock(&self, issues: &mut Vec<String>) -> Lock {
+        match Lock::load(self.dirs) {
+            Ok(l) => l,
+            Err(e) => {
+                issues.push(format!("{e:#}"));
+                Lock::default()
+            }
+        }
+    }
+
+    fn installed_entries(
+        &self,
+        lock: &Lock,
+        settings: &HostSettings,
+        env_path: Option<&str>,
+        snaps: &[Snapshot],
+        issues: &mut Vec<String>,
+    ) -> Vec<Installed> {
+        /// zsh builtins that run in the shell without an external binary on PATH.
+        const ZSH_BUILTINS: &[&str] = &[
+            "alias", "autoload", "bg", "bindkey", "break", "builtin", "cd", "command", "continue", "declare", "dirs", "echo", "emulate",
+            "eval", "exec", "exit", "export", "false", "fc", "fg", "float", "getopts", "history", "integer", "jobs", "kill", "let",
+            "local", "noglob", "popd", "print", "printf", "pushd", "pwd", "r", "read", "readonly", "return", "set", "setopt", "shift",
+            "source", "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait",
+            "whence", "where", "which", "zcompile", "zmodload", "zstyle",
+        ];
+
+        let target = current_target();
+        let managed_path = std::cell::OnceCell::new();
+        let mut found: BTreeMap<String, bool> = BTreeMap::new();
+        let mut unavailable_of = |m: &Manifest| -> Vec<String> {
+            if m.commands.is_empty() {
+                return Vec::new();
+            }
+            let stored = settings.plugins.get(&m.id).map(|c| c.settings.clone()).unwrap_or_default();
+            let (values, _) = schema::resolve(m, &stored);
+            m.commands
+                .iter()
+                .filter(|c| {
+                    !manifest::applies(&c.when, &values)
+                        || c.run.first().is_none_or(|prog| {
+                            !ZSH_BUILTINS.contains(&prog.as_str())
+                                && !*found.entry(prog.clone()).or_insert_with(|| {
+                                    let p = managed_path.get_or_init(|| crate::snippets::managed_path_with(self.dirs, settings, env_path));
+                                    crate::snippets::find_in(p, prog).is_some()
+                                })
+                        })
+                })
+                .map(|c| c.id.clone())
+                .collect()
+        };
+        let package_status = |m: &Manifest| -> Vec<PackageStatus> {
+            m.packages
+                .iter()
+                .map(|p| PackageStatus {
+                    id: p.id.clone(),
+                    version: p.version.clone(),
+                    state: match packages::locate(self.dirs, p, env_path) {
+                        Location::System(found) => PackageState::System { path: found.display().to_string() },
+                        Location::Managed { version, .. } => PackageState::Managed { version },
+                        Location::Missing => PackageState::Missing,
+                    },
+                    available: p.asset_for(&target).is_some(),
+                })
+                .collect()
+        };
+        let mut installed = Vec::new();
+        for b in builtins::BUILTINS {
+            let m = b.manifest().clone();
+            installed.push(Installed {
+                id: b.id.into(),
+                version: m.version.clone(),
+                source: builtins::SOURCE.into(),
+                verified: true,
+                enabled: settings.plugins.get(b.id).is_none_or(|c| c.enabled),
+                incompatible: None,
+                packages: package_status(&m),
+                unavailable_commands: unavailable_of(&m),
+                builtin: true,
+                manifest: m,
+                update: None,
+                installed_unix: 0,
+            });
+        }
+        for (id, e) in lock.plugins.iter().filter(|(id, _)| builtins::get(id).is_none()) {
+            let m = match lock::manifest_of(self.dirs, id, e) {
+                Ok(m) => m,
+                Err(err) => {
+                    issues.push(format!("{err:#}"));
+                    continue;
+                }
+            };
+            let update = snaps
+                .iter()
+                .find(|s| s.source.name == e.source)
+                .and_then(|s| s.index.latest(id))
+                .filter(|(v, _)| newer(v, &e.version))
+                .map(|(v, _)| v.to_owned());
+            installed.push(Installed {
+                id: id.clone(),
+                version: e.version.clone(),
+                source: e.source.clone(),
+                verified: e.verified,
+                enabled: settings.plugins.get(id).is_none_or(|c| c.enabled),
+                incompatible: m.compatible(GOATTY_VERSION, &target).err(),
+                packages: package_status(&m),
+                unavailable_commands: unavailable_of(&m),
+                builtin: false,
+                manifest: m,
+                update,
+                installed_unix: e.installed,
+            });
+        }
+        installed
     }
 }
 

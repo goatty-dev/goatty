@@ -154,6 +154,10 @@ impl HostService {
         let settings = self.settings().value;
         match req {
             api::Request::Catalog { refresh } => self.plugins(|p| Ok(api::Reply::Catalog(p.catalog(refresh, &settings)))),
+            api::Request::Installed => self.plugins(|p| {
+                let (installed, issues) = p.installed(&settings);
+                Ok(api::Reply::Installed { installed, issues })
+            }),
             api::Request::Plan { id, version } => {
                 self.plugins(|p| Ok(api::Reply::Plan(Box::new(p.plan(&p.find(&id, version.as_deref())?, &settings)?))))
             }
@@ -362,6 +366,14 @@ mod tests {
         let demo: Vec<_> = cat.installed.iter().filter(|i| !i.builtin).collect();
         assert_eq!(demo.len(), 1);
         assert!(demo[0].enabled);
+
+        let api::Reply::Installed { installed: local_installed, issues } = svc.plugin_request(api::Request::Installed).unwrap() else {
+            panic!()
+        };
+        assert!(issues.is_empty(), "{issues:?}");
+        let demo_local: Vec<_> = local_installed.iter().filter(|i| !i.builtin).collect();
+        assert_eq!(demo_local.len(), 1);
+        assert_eq!(demo_local[0].id, "demo");
 
         let api::Reply::Changed(c) = svc.plugin_request(api::Request::Uninstall { id: "demo".into() }).unwrap() else { panic!() };
         assert!(c.lines[0].starts_with("Uninstalled demo"));

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{self, find_action};
+use crate::keys;
 use crate::store::{Document, Issue, Migration};
 use crate::theme::ThemeSettings;
 
@@ -1004,7 +1004,7 @@ impl Document for ClientSettings {
         }
         for (key, action) in &self.keybindings {
             if let Some(a) = action
-                && find_action(a).is_none()
+                && !keys::is_valid_action(a)
             {
                 issues.push(Issue::new(format!("keybindings.{key}"), format!("unknown action {a:?}")));
             }
@@ -1470,6 +1470,20 @@ mod tests {
         let paths: Vec<_> = issues.iter().map(|i| i.path.as_str()).collect();
         assert_eq!(paths, ["font.size", "terminal.padding", "terminal.opacity", "keybindings.ctrl-x"]);
         assert!(ClientSettings::default().validate().is_empty());
+    }
+
+    #[test]
+    fn plugin_keybindings_validation() {
+        let mut s = ClientSettings::default();
+        s.keybindings.insert("ctrl-alt-e".into(), Some("plugin.docker.exec".into()));
+        s.keybindings.insert("ctrl-alt-l".into(), Some("plugin.a-b.x".into()));
+        assert!(s.validate().is_empty());
+
+        s.keybindings.insert("ctrl-alt-bad".into(), Some("plugin.d.exec".into()));
+        s.keybindings.insert("ctrl-alt-bad2".into(), Some("plugin.docker.Bad".into()));
+        let issues = s.validate();
+        let paths: Vec<_> = issues.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["keybindings.ctrl-alt-bad", "keybindings.ctrl-alt-bad2"]);
     }
 
     #[test]

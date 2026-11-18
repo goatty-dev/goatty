@@ -33,11 +33,15 @@ use crate::settings_window::{HostLink, HostLinkGlobal};
 struct State {
     link: Option<HostLink>,
     generation: u64,
+    /// True while a catalog refresh for the active host is in flight.
+    stale: bool,
+    active: std::collections::BTreeMap<String, MenuCommand>,
+    last_issues: Vec<String>,
 }
 
 impl Global for State {}
 
-/// A plugin command that is in the right-click menu too.
+/// A plugin command (palette entry, and optionally right-click menu entry).
 #[derive(Clone)]
 pub struct MenuCommand {
     /// The plugin's id.
@@ -89,6 +93,7 @@ pub fn refresh(cx: &mut App) {
     let link = cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone());
     let state = cx.default_global::<State>();
     state.generation += 1;
+    state.stale = true;
     let moved = match (&state.link, &link) {
         (Some(a), Some(b)) => !a.same(b),
         (a, b) => a.is_some() != b.is_some(),
@@ -97,22 +102,48 @@ pub fn refresh(cx: &mut App) {
     let generation = state.generation;
     // Another host: its plugins aren't the last one's, so none until fetched.
     if moved {
+        cx.default_global::<State>().last_issues.clear();
         replace(None, Vec::new(), cx);
+        if link.is_some() {
+            cx.default_global::<State>().stale = true;
+        }
     }
-    let Some(link) = link else { return };
+    let Some(link) = link else {
+        cx.default_global::<State>().stale = false;
+        return;
+    };
     cx.spawn(async move |cx: &mut AsyncApp| {
         let l = link.clone();
-        let reply = cx.background_executor().spawn(async move { l.plugin(Request::Catalog { refresh: false }) }).await;
+        let reply = cx
+            .background_executor()
+            .spawn(async move {
+                match l.plugin(Request::Installed) {
+                    Err(e) if e.to_string().contains("unknown variant") => l.plugin(Request::Catalog { refresh: false }),
+                    other => other,
+                }
+            })
+            .await;
         cx.update(|cx| {
             if cx.default_global::<State>().generation != generation {
                 return;
             }
             match reply {
-                Ok(Reply::Catalog(c)) => replace(Some(link), c.installed, cx),
-                Ok(_) => log::warn!("plugin commands: unexpected reply to a catalog request"),
+                Ok(Reply::Installed { installed, issues }) => {
+                    report_issues(&link, &issues, cx);
+                    replace(Some(link), installed, cx);
+                }
+                Ok(Reply::Catalog(c)) => {
+                    report_issues(&link, &c.issues, cx);
+                    replace(Some(link), c.installed, cx);
+                }
+                Ok(_) => {
+                    cx.default_global::<State>().stale = false;
+                    log::warn!("plugin commands: unexpected reply to an installed plugins request");
+                }
                 // An older goattyd, or a host without plugins: keep none.
                 Err(e) => {
                     log::info!("plugin commands: couldn't list {}'s plugins: {e:#}", link.label());
+                    cx.default_global::<State>().last_issues.clear();
                     replace(None, Vec::new(), cx);
                 }
             }
@@ -121,31 +152,42 @@ pub fn refresh(cx: &mut App) {
     .detach();
 }
 
+fn should_report_issues(state: &mut State, issues: &[String]) -> bool {
+    if issues.is_empty() {
+        state.last_issues.clear();
+        return false;
+    }
+    if state.last_issues == issues {
+        return false;
+    }
+    state.last_issues = issues.to_vec();
+    true
+}
+
+fn report_issues(link: &HostLink, issues: &[String], cx: &mut App) {
+    for issue in issues {
+        log::warn!("plugin commands on {}: {issue}", link.label());
+    }
+    if !should_report_issues(cx.default_global::<State>(), issues) {
+        return;
+    }
+    let body = if issues.len() == 1 { issues[0].clone() } else { format!("{} (and {} more)", issues[0], issues.len() - 1) };
+    crate::toast::show(
+        cx,
+        crate::toast::Toast::warning(format!("Some plugins on {} couldn't be loaded", link.label()))
+            .body(body)
+            .key("plugin.commands.issues"),
+    );
+}
+
 /// Replace the registry's plugin commands with `installed`'s.
 fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
-    let commands: Vec<Command> = match &link {
-        Some(link) => installed
-            .iter()
-            .filter(|p| p.enabled && p.incompatible.is_none())
-            .flat_map(|p| p.manifest.commands.iter().map(move |c| (p, c)))
-            .map(|(p, c)| command(link, &p.manifest.id, &p.manifest.name, c))
-            .collect(),
-        None => Vec::new(),
-    };
-    let menu = match &link {
-        Some(link) => installed
-            .iter()
-            .filter(|p| p.enabled && p.incompatible.is_none())
-            .flat_map(|p| p.manifest.commands.iter().filter(|c| c.menu.is_some()).map(move |c| (p, c)))
-            .map(|(p, c)| MenuCommand {
-                plugin_id: p.manifest.id.clone(),
-                plugin: p.manifest.name.clone(),
-                command: Rc::new(c.clone()),
-                origin: link.clone(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let (commands, active, menu) = build_with_active(link.as_ref(), &installed);
+    {
+        let state = cx.default_global::<State>();
+        state.stale = false;
+        state.active = active;
+    }
     cx.set_global(MenuCommands(menu));
     let reg = cx.default_global::<CommandRegistry>();
     reg.unregister_plugins();
@@ -154,18 +196,135 @@ fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "used by unit tests"))]
+fn build(link: Option<&HostLink>, installed: &[Installed]) -> (Vec<Command>, Vec<MenuCommand>) {
+    let (commands, _, menu) = build_with_active(link, installed);
+    (commands, menu)
+}
+
+fn build_with_active(
+    link: Option<&HostLink>,
+    installed: &[Installed],
+) -> (Vec<Command>, std::collections::BTreeMap<String, MenuCommand>, Vec<MenuCommand>) {
+    let Some(link) = link else {
+        return (Vec::new(), std::collections::BTreeMap::new(), Vec::new());
+    };
+    let active_cmds = installed
+        .iter()
+        .filter(|p| p.enabled && p.incompatible.is_none())
+        .flat_map(|p| p.manifest.commands.iter().filter(|c| !p.unavailable_commands.contains(&c.id)).map(move |c| (p, c)));
+    let mut commands = Vec::new();
+    let mut active = std::collections::BTreeMap::new();
+    let mut menu = Vec::new();
+    for (p, c) in active_cmds {
+        commands.push(command(link, &p.manifest.id, &p.manifest.name, c));
+        let entry = MenuCommand {
+            plugin_id: p.manifest.id.clone(),
+            plugin: p.manifest.name.clone(),
+            command: Rc::new(c.clone()),
+            origin: link.clone(),
+        };
+        active.insert(command_id(&p.manifest.id, &c.id), entry.clone());
+        if c.menu.is_some() {
+            menu.push(entry);
+        }
+    }
+    (commands, active, menu)
+}
+
 /// The palette id of a plugin's command: `plugin.<plugin>.<command>`.
 pub fn command_id(plugin: &str, command: &str) -> String {
     format!("plugin.{plugin}.{command}")
 }
 
-fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
-    let cmd = Rc::new(c.clone());
-    let origin = link.clone();
-    let (plugin_id, plugin_name) = (plugin.to_string(), name.to_string());
-    let mut out = Command::handler(&command_id(plugin, &c.id), name, &c.title, move |window, cx| {
-        start(&plugin_id, &plugin_name, &cmd, &origin, None, window, cx)
-    });
+/// Look up an active plugin command in `reg` by its `plugin.<plugin>.<command>` id,
+/// returning `None` while a catalog refresh is in flight (`stale`).
+pub(crate) fn lookup<'a>(reg: &'a CommandRegistry, stale: bool, id: &str) -> Option<&'a Rc<Command>> {
+    (!stale).then(|| reg.get(id).filter(|c| matches!(c.source, Source::Plugin(_)))).flatten()
+}
+
+fn resolve_dispatch<'a>(
+    reg: &'a CommandRegistry,
+    state: &'a State,
+    id: &str,
+    expected: Option<(&PaletteCommand, &HostLink)>,
+) -> Option<&'a MenuCommand> {
+    if state.stale {
+        return None;
+    }
+    lookup(reg, state.stale, id)?;
+    let entry = state.active.get(id)?;
+    if let Some((cmd, origin)) = expected
+        && (entry.command.as_ref() != cmd || !entry.origin.same(origin))
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Run the active plugin command with id `id` (`plugin.<plugin>.<command>`),
+/// or tell the user why it isn't available on the current host.
+pub fn run_by_id(id: &str, selection: Option<&str>, window: &mut Window, cx: &mut App) {
+    run_checked(id, None, selection, window, cx);
+}
+
+/// Run a menu item's plugin command only if the active host still offers the
+/// same definition that was displayed when the menu opened.
+pub fn run_menu_command(
+    id: &str,
+    expected: &PaletteCommand,
+    expected_origin: &HostLink,
+    selection: Option<&str>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    run_checked(id, Some((expected, expected_origin)), selection, window, cx);
+}
+
+fn run_checked(id: &str, expected: Option<(&PaletteCommand, &HostLink)>, selection: Option<&str>, window: &mut Window, cx: &mut App) {
+    let entry = cx
+        .try_global::<State>()
+        .zip(cx.try_global::<CommandRegistry>())
+        .and_then(|(state, reg)| resolve_dispatch(reg, state, id, expected).cloned());
+    if let Some(entry) = entry {
+        start(&entry.plugin_id, &entry.plugin, &entry.command, &entry.origin, selection, window, cx);
+    } else {
+        crate::toast::show_in(window, cx, unavailable_toast(id, expected, false, cx));
+    }
+}
+
+fn unavailable_toast(id: &str, expected: Option<(&PaletteCommand, &HostLink)>, reopen: bool, cx: &App) -> crate::toast::Toast {
+    let changed = expected.is_some() && cx.try_global::<State>().filter(|s| !s.stale).and_then(|s| s.active.get(id)).is_some();
+    let (title, body) = if changed {
+        (
+            "Plugin command changed",
+            if reopen {
+                format!("{id} changed after the form opened. Reopen the command to run the updated version.")
+            } else {
+                format!("{id} changed since the menu opened. Open the menu again to run the updated command.")
+            },
+        )
+    } else if reopen {
+        ("Plugin command isn't available", format!("{id} is no longer available on this host. Reopen the command once it's active again."))
+    } else {
+        (
+            "Plugin command isn't available",
+            format!("{id} isn't available here (plugin not installed or enabled, a setting is off, or its program is missing)."),
+        )
+    };
+    crate::toast::Toast::info(title).body(body).key("plugin.command.unavailable")
+}
+
+fn can_submit(id: &str, expected: &PaletteCommand, expected_origin: &HostLink, cx: &App) -> bool {
+    cx.try_global::<State>()
+        .zip(cx.try_global::<CommandRegistry>())
+        .is_some_and(|(state, reg)| resolve_dispatch(reg, state, id, Some((expected, expected_origin))).is_some())
+}
+
+fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
+    let id = command_id(plugin, &c.id);
+    let run_id = id.clone();
+    let mut out = Command::handler(&id, name, &c.title, move |window, cx| run_by_id(&run_id, None, window, cx)).with_key_action(id);
     let mut words: Vec<&str> = c.keywords.iter().map(String::as_str).collect();
     words.push(plugin);
     out = out.keywords(&words);
@@ -212,9 +371,17 @@ pub fn start(
             }
         })
         .collect();
+    let id = command_id(plugin_id, &cmd.id);
     let (then, then_origin) = (cmd.clone(), origin.clone());
     let title = format!("{plugin}: {}", cmd.title);
-    let a = Ask::new(title, fields, move |answers, window, cx| run(&then, &then_origin, answers, window, cx)).remote(!origin.is_local());
+    let a = Ask::new(title, fields, move |answers, window, cx| {
+        if !can_submit(&id, &then, &then_origin, cx) {
+            crate::toast::show_in(window, cx, unavailable_toast(&id, Some((&then, &then_origin)), true, cx));
+            return;
+        }
+        run(&then, &then_origin, answers, window, cx);
+    })
+    .remote(!origin.is_local());
     ask(window, cx, a);
 }
 
@@ -272,5 +439,160 @@ mod tests {
         let builtin = crate::command_palette::registry::builtins();
         assert!(builtin.iter().all(|c| !c.id.starts_with("plugin.")));
         assert_eq!(command_id("docker", "exec"), "plugin.docker.exec");
+    }
+
+    #[test]
+    fn build_filters_unavailable_commands_and_sets_key_action() {
+        let m = goatty_plugin::manifest::parse(
+            r#"
+schema = 1
+id = "docker"
+name = "Docker"
+version = "1.0.0"
+summary = "Containers"
+publisher = "tests"
+
+[requires]
+commands = ["docker"]
+
+[[command]]
+id = "ps"
+title = "List containers"
+run = ["docker", "ps"]
+[command.menu]
+icon = "search"
+
+[[command]]
+id = "hidden"
+title = "Hidden command"
+run = ["docker", "info"]
+[command.menu]
+icon = "search"
+"#,
+            None,
+        )
+        .unwrap();
+        let inst = Installed {
+            id: "docker".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec!["hidden".into()],
+        };
+        let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let (cmds, menu) = build(Some(&link), std::slice::from_ref(&inst));
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].id.as_ref(), "plugin.docker.ps");
+        assert_eq!(cmds[0].key_action(), Some("plugin.docker.ps"));
+        assert_eq!(menu.len(), 1);
+        assert_eq!(menu[0].command.id, "ps");
+
+        // Disabled plugin contributes nothing.
+        let mut disabled = inst;
+        disabled.enabled = false;
+        let (cmds, menu) = build(Some(&link), &[disabled]);
+        assert!(cmds.is_empty());
+        assert!(menu.is_empty());
+    }
+
+    #[test]
+    fn lookup_finds_only_plugin_commands() {
+        let mut reg = CommandRegistry::default();
+        let builtin = Command::handler("new_tab", "Tabs", "New tab", |_, _| {});
+        reg.register(builtin);
+
+        let mut plugin = Command::handler("plugin.docker.ps", "Docker", "List containers", |_, _| {});
+        plugin.source = Source::Plugin("docker".into());
+        reg.register(plugin);
+
+        assert!(lookup(&reg, false, "plugin.docker.ps").is_some());
+        assert!(lookup(&reg, true, "plugin.docker.ps").is_none());
+        assert!(lookup(&reg, false, "plugin.docker.missing").is_none());
+        assert!(lookup(&reg, false, "new_tab").is_none());
+    }
+
+    #[test]
+    fn resolve_dispatch_rejects_stale_and_changed_menu_commands() {
+        let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let other = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let m = goatty_plugin::manifest::parse(
+            r#"
+schema = 1
+id = "docker"
+name = "Docker"
+version = "1.0.0"
+summary = "Containers"
+publisher = "tests"
+
+[requires]
+commands = ["docker"]
+
+[[command]]
+id = "ps"
+title = "List containers"
+run = ["docker", "ps"]
+"#,
+            None,
+        )
+        .unwrap();
+        let orig_cmd = m.commands[0].clone();
+        let inst = Installed {
+            id: "docker".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec![],
+        };
+        let (cmds, active, _) = build_with_active(Some(&link), &[inst]);
+        let mut reg = CommandRegistry::default();
+        for c in cmds {
+            reg.register(c);
+        }
+        let mut state = State { link: Some(link.clone()), generation: 1, stale: false, active, last_issues: Vec::new() };
+
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_some());
+
+        let mut changed_cmd = orig_cmd.clone();
+        changed_cmd.run = vec!["docker".into(), "ps".into(), "-a".into()];
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&changed_cmd, &link))).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &other))).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", None).is_some());
+
+        state.stale = true;
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", None).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_none());
+
+        state.stale = false;
+        state.active.remove("plugin.docker.ps");
+        reg.unregister_plugins();
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_none());
+    }
+
+    #[test]
+    fn should_report_issues_suppresses_repeats_until_cleared_or_changed() {
+        let mut state = State::default();
+        let issues = vec!["installed/lock.json is unreadable".to_string()];
+        assert!(should_report_issues(&mut state, &issues));
+        // Repeated identical issues on the same host are suppressed.
+        assert!(!should_report_issues(&mut state, &issues));
+        // Clearing on host change (or empty issues) lets the same issue report again.
+        state.last_issues.clear();
+        assert!(should_report_issues(&mut state, &issues));
+        assert!(!should_report_issues(&mut state, &[]));
+        assert!(should_report_issues(&mut state, &issues));
     }
 }
