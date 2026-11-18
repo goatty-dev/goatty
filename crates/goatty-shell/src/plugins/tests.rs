@@ -614,7 +614,8 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
     assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo", "nonexec", "gated", "missing-bin"]);
 
     // `Plugins::installed` works locally without consulting registries.
-    let local_only = p.installed(&settings);
+    let (local_only, local_issues) = p.installed(&settings);
+    assert!(local_issues.is_empty(), "{local_issues:?}");
     assert!(local_only.iter().any(|i| i.id == "cmd-test"));
 
     // Turning on `extra` makes `gated` available.
@@ -647,4 +648,63 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
         crate::snippets::find_in(&format!("{}:{}", env_bin.display(), custom_bin.display()), "nonexec-tool").as_deref(),
         Some(fallback_exec.as_path())
     );
+}
+
+#[test]
+fn installed_reports_lock_and_manifest_issues_without_hiding_valid_entries() {
+    let w = world();
+    let p = w.plugins();
+    let settings = HostSettings::default();
+
+    // Missing lock is a valid empty user-installed inventory with no issues.
+    let (entries, issues) = p.installed_with_env_path(&settings, Some(""));
+    assert!(issues.is_empty(), "{issues:?}");
+    assert!(entries.iter().all(|e| e.builtin));
+
+    // Install a valid local plugin, then add a broken manifest entry in a second plugin
+    // and verify valid entries survive alongside the reported manifest error.
+    let dir = w.tmp.path().join("good-plugin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "schema = 1\nid = \"good-plugin\"\nname = \"Good\"\nversion = \"1.0.0\"\nsummary = \"Good\"\npublisher = \"tests\"\n",
+    )
+    .unwrap();
+    let c = Candidate::local(&dir).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    p.install(&c, &plan.digest, &settings).unwrap();
+
+    let broken_dir = w.dirs.installed_dir().join("broken-plugin");
+    std::fs::create_dir_all(&broken_dir).unwrap();
+    std::fs::write(broken_dir.join("plugin.toml"), "not valid toml [").unwrap();
+    let lock_path = w.dirs.installed_dir().join("lock.json");
+    let mut lock: Lock = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    lock.plugins.insert(
+        "broken-plugin".into(),
+        crate::plugins::lock::Entry {
+            version: "1.0.0".into(),
+            source: "local".into(),
+            path: None,
+            verified: true,
+            files: BTreeMap::new(),
+            packages: vec![],
+            permissions: vec![],
+            digest: "sha256:0".into(),
+            installed: 0,
+            dependency: false,
+        },
+    );
+    lock.save(&w.dirs).unwrap();
+
+    let (entries, issues) = p.installed_with_env_path(&settings, Some(""));
+    assert!(entries.iter().any(|e| e.id == "good-plugin"));
+    assert!(entries.iter().all(|e| e.id != "broken-plugin"));
+    assert_eq!(issues.len(), 1, "{issues:?}");
+
+    // An unreadable/corrupt lock.json reports its error while still returning builtins.
+    std::fs::write(&lock_path, "{broken json").unwrap();
+    let (entries, issues) = p.installed_with_env_path(&settings, Some(""));
+    assert!(entries.iter().all(|e| e.builtin));
+    assert!(!entries.is_empty());
+    assert!(issues.iter().any(|i| i.contains("installed/lock.json")), "{issues:?}");
 }

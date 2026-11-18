@@ -81,13 +81,21 @@ pub enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reply {
     Catalog(Catalog),
-    Installed { installed: Vec<Installed> },
+    Installed {
+        installed: Vec<Installed>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        issues: Vec<String>,
+    },
     Plan(Box<Plan>),
     Changed(Changed),
     Snippets(SnippetList),
     Suggestions(Suggestions),
-    Installs { installs: Vec<InstallProgress> },
-    Updates { updates: Vec<Update> },
+    Installs {
+        installs: Vec<InstallProgress>,
+    },
+    Updates {
+        updates: Vec<Update>,
+    },
 }
 
 /// One install on the host ([`Request::Installs`]).
@@ -527,11 +535,13 @@ publisher = "tests"
         assert_eq!(req_json, r#"{"op":"installed"}"#);
         assert_eq!(serde_json::from_str::<Request>(&req_json).unwrap(), Request::Installed);
 
-        for list in [vec![], vec![with_unavail]] {
-            let reply = Reply::Installed { installed: list };
+        for (list, issues) in [(vec![], vec![]), (vec![with_unavail], vec!["installed/lock.json is unreadable".into()])] {
+            let reply = Reply::Installed { installed: list, issues };
             let json = serde_json::to_string(&reply).unwrap();
             let back: Reply = serde_json::from_str(&json).unwrap();
             assert_eq!(back, reply);
         }
+        let legacy = r#"{"kind":"installed","installed":[]}"#;
+        assert_eq!(serde_json::from_str::<Reply>(legacy).unwrap(), Reply::Installed { installed: vec![], issues: vec![] });
     }
 }

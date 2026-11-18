@@ -36,6 +36,7 @@ struct State {
     /// True while a catalog refresh for the active host is in flight.
     stale: bool,
     active: std::collections::BTreeMap<String, MenuCommand>,
+    last_issues: Vec<String>,
 }
 
 impl Global for State {}
@@ -126,8 +127,14 @@ pub fn refresh(cx: &mut App) {
                 return;
             }
             match reply {
-                Ok(Reply::Installed { installed }) => replace(Some(link), installed, cx),
-                Ok(Reply::Catalog(c)) => replace(Some(link), c.installed, cx),
+                Ok(Reply::Installed { installed, issues }) => {
+                    report_issues(&link, &issues, cx);
+                    replace(Some(link), installed, cx);
+                }
+                Ok(Reply::Catalog(c)) => {
+                    report_issues(&link, &c.issues, cx);
+                    replace(Some(link), c.installed, cx);
+                }
                 Ok(_) => {
                     cx.default_global::<State>().stale = false;
                     log::warn!("plugin commands: unexpected reply to an installed plugins request");
@@ -135,12 +142,35 @@ pub fn refresh(cx: &mut App) {
                 // An older goattyd, or a host without plugins: keep none.
                 Err(e) => {
                     log::info!("plugin commands: couldn't list {}'s plugins: {e:#}", link.label());
+                    cx.default_global::<State>().last_issues.clear();
                     replace(None, Vec::new(), cx);
                 }
             }
         });
     })
     .detach();
+}
+
+fn report_issues(link: &HostLink, issues: &[String], cx: &mut App) {
+    if issues.is_empty() {
+        cx.default_global::<State>().last_issues.clear();
+        return;
+    }
+    for issue in issues {
+        log::warn!("plugin commands on {}: {issue}", link.label());
+    }
+    let state = cx.default_global::<State>();
+    if state.last_issues == issues {
+        return;
+    }
+    state.last_issues = issues.to_vec();
+    let body = if issues.len() == 1 { issues[0].clone() } else { format!("{} (and {} more)", issues[0], issues.len() - 1) };
+    crate::toast::show(
+        cx,
+        crate::toast::Toast::warning(format!("Some plugins on {} couldn't be loaded", link.label()))
+            .body(body)
+            .key("plugin.commands.issues"),
+    );
 }
 
 /// Replace the registry's plugin commands with `installed`'s.
@@ -252,17 +282,36 @@ fn run_checked(id: &str, expected: Option<(&PaletteCommand, &HostLink)>, selecti
     if let Some(entry) = entry {
         start(&entry.plugin_id, &entry.plugin, &entry.command, &entry.origin, selection, window, cx);
     } else {
-        let changed = expected.is_some() && cx.try_global::<State>().filter(|s| !s.stale).and_then(|s| s.active.get(id)).is_some();
-        let (title, body) = if changed {
-            ("Plugin command changed", format!("{id} changed since the menu opened. Open the menu again to run the updated command."))
-        } else {
-            (
-                "Plugin command isn't available",
-                format!("{id} isn't available here (plugin not installed or enabled, a setting is off, or its program is missing)."),
-            )
-        };
-        crate::toast::show_in(window, cx, crate::toast::Toast::info(title).body(body).key("plugin.command.unavailable"));
+        crate::toast::show_in(window, cx, unavailable_toast(id, expected, false, cx));
     }
+}
+
+fn unavailable_toast(id: &str, expected: Option<(&PaletteCommand, &HostLink)>, reopen: bool, cx: &App) -> crate::toast::Toast {
+    let changed = expected.is_some() && cx.try_global::<State>().filter(|s| !s.stale).and_then(|s| s.active.get(id)).is_some();
+    let (title, body) = if changed {
+        (
+            "Plugin command changed",
+            if reopen {
+                format!("{id} changed after the form opened. Reopen the command to run the updated version.")
+            } else {
+                format!("{id} changed since the menu opened. Open the menu again to run the updated command.")
+            },
+        )
+    } else if reopen {
+        ("Plugin command isn't available", format!("{id} is no longer available on this host. Reopen the command once it's active again."))
+    } else {
+        (
+            "Plugin command isn't available",
+            format!("{id} isn't available here (plugin not installed or enabled, a setting is off, or its program is missing)."),
+        )
+    };
+    crate::toast::Toast::info(title).body(body).key("plugin.command.unavailable")
+}
+
+fn can_submit(id: &str, expected: &PaletteCommand, expected_origin: &HostLink, cx: &App) -> bool {
+    cx.try_global::<State>()
+        .zip(cx.try_global::<CommandRegistry>())
+        .is_some_and(|(state, reg)| resolve_dispatch(reg, state, id, Some((expected, expected_origin))).is_some())
 }
 
 fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
@@ -315,9 +364,17 @@ pub fn start(
             }
         })
         .collect();
+    let id = command_id(plugin_id, &cmd.id);
     let (then, then_origin) = (cmd.clone(), origin.clone());
     let title = format!("{plugin}: {}", cmd.title);
-    let a = Ask::new(title, fields, move |answers, window, cx| run(&then, &then_origin, answers, window, cx)).remote(!origin.is_local());
+    let a = Ask::new(title, fields, move |answers, window, cx| {
+        if !can_submit(&id, &then, &then_origin, cx) {
+            crate::toast::show_in(window, cx, unavailable_toast(&id, Some((&then, &then_origin)), true, cx));
+            return;
+        }
+        run(&then, &then_origin, answers, window, cx);
+    })
+    .remote(!origin.is_local());
     ask(window, cx, a);
 }
 
@@ -498,7 +555,7 @@ run = ["docker", "ps"]
         for c in cmds {
             reg.register(c);
         }
-        let mut state = State { link: Some(link.clone()), generation: 1, stale: false, active };
+        let mut state = State { link: Some(link.clone()), generation: 1, stale: false, active, last_issues: Vec::new() };
 
         assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_some());
 
@@ -510,6 +567,11 @@ run = ["docker", "ps"]
 
         state.stale = true;
         assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", None).is_none());
+        assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_none());
+
+        state.stale = false;
+        state.active.remove("plugin.docker.ps");
+        reg.unregister_plugins();
         assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_none());
     }
 }

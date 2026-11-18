@@ -244,8 +244,10 @@ impl SettingsWindow {
         true
     }
 
-    fn shortcut_row(&self, ui: Ui, line: &Line, cx: &Context<'_, Self>) -> AnyElement {
+    fn shortcut_row(&self, ui: Ui, line: &Line, fallback_focus: &gpui::ElementId, cx: &Context<'_, Self>) -> AnyElement {
         let app = cx.global::<AppSettings>();
+        let filter = self.shortcuts.filter;
+        let pressed = self.shortcuts.pressed.clone();
         let name = line.name.as_ref().to_owned();
         let label_text: SharedString = line.label.as_ref().to_owned().into();
         let recording = self.recording.as_deref() == Some(name.as_str());
@@ -280,12 +282,14 @@ impl SettingsWindow {
             warnings.insert(0, msg.clone());
         }
         let group_id = SharedString::from(format!("sc-{name}"));
-        // A button that removes itself hands focus back to the row it was in.
-        let row_elem: gpui::ElementId = group_id.clone().into();
+        // A button that removes itself hands focus back to the row it was in,
+        // or to a surviving neighbor when clearing the binding removes the row.
+        let row_elem = row_elem_id(&name);
         let page_focus = self.focus.clone();
         let chips = div().flex().flex_wrap().items_center().gap(px(8.)).children(line.keys.iter().enumerate().map(|(ki, k)| {
             let key = k.clone();
-            let (row_elem, page_focus) = (row_elem.clone(), page_focus.clone());
+            let (row_elem, page_focus, fallback_focus) = (row_elem.clone(), page_focus.clone(), fallback_focus.clone());
+            let stays_after_remove = row_stays_after_remove(line, filter, pressed.as_deref(), k);
             let gid = SharedString::from(format!("sc-key-{name}-{ki}"));
             let rm_id: gpui::ElementId = SharedString::from(format!("sc-rm-{name}-{ki}")).into();
             let rm_focus = rm_id.clone();
@@ -309,7 +313,8 @@ impl SettingsWindow {
                 .tooltip(tooltip("Remove this shortcut"))
                 .on_click(move |_, window, cx| {
                     if focus::is_focused(&rm_focus, window) {
-                        focus::hand_over(&page_focus, focus::Handover::Control(row_elem.clone()), window, cx);
+                        let target = if stays_after_remove { row_elem.clone() } else { fallback_focus.clone() };
+                        focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
                     }
                     AppSettings::update(cx, |s| keys::set_binding(&mut s.keybindings, &key, None));
                 });
@@ -346,6 +351,7 @@ impl SettingsWindow {
             chips.into_any_element()
         };
         let this = cx.entity().downgrade();
+        let stays_after_reset = line.available && filter != Filter::Changed && pressed.is_none();
         let actions = div()
             .w(px(72.))
             .flex_shrink_0()
@@ -353,13 +359,15 @@ impl SettingsWindow {
             .justify_end()
             .gap(px(2.))
             .when(line.changed, |d| {
-                let (row_elem, page_focus, reset_name) = (row_elem.clone(), page_focus.clone(), name.clone());
+                let (row_elem, page_focus, reset_name, fallback_focus) =
+                    (row_elem.clone(), page_focus.clone(), name.clone(), fallback_focus.clone());
                 let reset_id = SharedString::from(format!("sc-reset-{name}"));
                 let reset_focus: gpui::ElementId = reset_id.clone().into();
                 d.child(icon_button(reset_id, Icon::RotateCcw, "Reset to the default", ui, move |window, cx| {
                     // The button goes away once the row is back to its default.
                     if focus::is_focused(&reset_focus, window) {
-                        focus::hand_over(&page_focus, focus::Handover::Control(row_elem.clone()), window, cx);
+                        let target = if stays_after_reset { row_elem.clone() } else { fallback_focus.clone() };
+                        focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
                     }
                     AppSettings::update(cx, |s| keys::reset_action(&mut s.keybindings, &reset_name));
                 }))
@@ -383,15 +391,17 @@ impl SettingsWindow {
                 }),
             );
         // The row is a tab stop: Enter records a new shortcut, Delete removes the last one.
-        let row_id: gpui::ElementId = group_id.clone().into();
+        let row_id = row_elem;
         let last_key = line.keys.last().cloned();
+        let stays_after_delete = last_key.as_deref().is_none_or(|k| row_stays_after_remove(line, filter, pressed.as_deref(), k));
+        let fallback_focus = fallback_focus.clone();
         let row = div()
             .id(row_id.clone())
             .role(gpui::Role::Row)
             .aria_label(label_text.clone())
             .aria_description("Enter adds a shortcut, Delete removes the last one")
             .on_key_down({
-                let (row_id, this, rec_name) = (row_id.clone(), cx.entity().downgrade(), name);
+                let (row_id, this, rec_name, page_focus) = (row_id.clone(), cx.entity().downgrade(), name, page_focus);
                 move |ev, window, cx| {
                     // Only the row itself: a button inside it has its own Enter.
                     if ev.keystroke.modifiers.modified() || !focus::is_focused(&row_id, window) {
@@ -411,6 +421,9 @@ impl SettingsWindow {
                         "delete" | "backspace" => {
                             if let Some(key) = &last_key {
                                 cx.stop_propagation();
+                                if !stays_after_delete {
+                                    focus::hand_over(&page_focus, focus::Handover::Control(fallback_focus.clone()), window, cx);
+                                }
                                 AppSettings::update(cx, |s| keys::set_binding(&mut s.keybindings, key, None));
                             }
                         }
@@ -629,18 +642,21 @@ impl SettingsWindow {
             table = table.child(kit::empty(ui, Icon::Keyboard, title, desc));
         } else if st.sort == Sort::Group {
             let searching = !query.is_empty() || st.pressed.is_some();
-            let mut first_group = true;
-            for g in GROUPS.iter().copied().chain(std::iter::once(PLUGINS_GROUP)) {
-                let rows: Vec<&&Line> = shown.iter().filter(|l| l.group == g).collect();
-                if rows.is_empty() {
-                    continue;
-                }
-                let folded = !searching && st.collapsed.contains(g);
-                if !first_group {
+            let groups: Vec<(&'static str, Vec<&Line>, bool)> = GROUPS
+                .iter()
+                .copied()
+                .chain(std::iter::once(PLUGINS_GROUP))
+                .filter_map(|g| {
+                    let rows: Vec<&Line> = shown.iter().filter(|l| l.group == g).copied().collect();
+                    (!rows.is_empty()).then_some((g, rows, !searching && st.collapsed.contains(g)))
+                })
+                .collect();
+            for (gi, (g, rows, folded)) in groups.iter().enumerate() {
+                if gi > 0 {
                     table = table.child(div().h(px(1.)).bg(ui.divider));
                 }
-                first_group = false;
-                let head_id: gpui::ElementId = SharedString::from(format!("sc-group-{g}")).into();
+                let g = *g;
+                let head_id = group_elem_id(g);
                 let head = div()
                     .id(head_id.clone())
                     .role(gpui::Role::Button)
@@ -654,7 +670,7 @@ impl SettingsWindow {
                     .bg(ui.field.opacity(0.5))
                     .cursor_pointer()
                     .hover(|s| s.bg(ui.field))
-                    .child((if folded { Icon::ChevronRight } else { Icon::ChevronDown }).svg().size(px(14.)).text_color(ui.muted))
+                    .child((if *folded { Icon::ChevronRight } else { Icon::ChevronDown }).svg().size(px(14.)).text_color(ui.muted))
                     .child(div().text_size(px(text::LABEL)).font_weight(FontWeight::SEMIBOLD).child(g))
                     .child(div().text_size(px(text::CAPTION)).text_color(ui.faint).child(rows.len().to_string()))
                     .on_click(cx.listener(move |v, _, _, cx| {
@@ -669,7 +685,8 @@ impl SettingsWindow {
                         if i > 0 {
                             table = table.child(divider(ui));
                         }
-                        table = table.child(self.shortcut_row(ui, l, cx));
+                        let fallback = grouped_removal_fallback(&groups, gi, i);
+                        table = table.child(self.shortcut_row(ui, l, &fallback, cx));
                     }
                 }
             }
@@ -678,7 +695,8 @@ impl SettingsWindow {
                 if i > 0 {
                     table = table.child(divider(ui));
                 }
-                table = table.child(self.shortcut_row(ui, l, cx));
+                let fallback = flat_removal_fallback(&shown, i);
+                table = table.child(self.shortcut_row(ui, l, &fallback, cx));
             }
         }
 
@@ -690,6 +708,63 @@ impl SettingsWindow {
             .child(kit::hint(ui, "Shortcuts work in terminal panes; keys no action uses go to the shell. Symbol keys show the character they type: Ctrl+Shift with the + key on a German layout is Ctrl+*.").px(px(4.)))
             .into_any_element()
     }
+}
+
+fn row_elem_id(name: &str) -> gpui::ElementId {
+    SharedString::from(format!("sc-{name}")).into()
+}
+
+fn group_elem_id(group: &str) -> gpui::ElementId {
+    SharedString::from(format!("sc-group-{group}")).into()
+}
+
+fn row_stays_after_remove(line: &Line, filter: Filter, pressed: Option<&str>, key: &str) -> bool {
+    if !line.available && line.keys.len() <= 1 {
+        return false;
+    }
+    if let Some(p) = pressed
+        && p == key
+        && line.keys.iter().filter(|k| k.as_str() == key).count() <= 1
+    {
+        return false;
+    }
+    if filter == Filter::Changed
+        && line.keys.iter().filter(|k| k.as_str() != key).count() == 0
+        && !keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| *da == line.name && *dk == key)
+    {
+        return false;
+    }
+    true
+}
+
+fn grouped_removal_fallback(groups: &[(&'static str, Vec<&Line>, bool)], gi: usize, ri: usize) -> gpui::ElementId {
+    let rows = &groups[gi].1;
+    if let Some(next) = rows.get(ri + 1) {
+        return row_elem_id(&next.name);
+    }
+    if let Some(prev) = ri.checked_sub(1).and_then(|p| rows.get(p)) {
+        return row_elem_id(&prev.name);
+    }
+    if let Some((next_g, _, _)) = groups.get(gi + 1) {
+        return group_elem_id(next_g);
+    }
+    if let Some((prev_g, prev_rows, prev_folded)) = gi.checked_sub(1).and_then(|pg| groups.get(pg)) {
+        if !prev_folded && let Some(last) = prev_rows.last() {
+            return row_elem_id(&last.name);
+        }
+        return group_elem_id(prev_g);
+    }
+    SharedString::from("sc-all").into()
+}
+
+fn flat_removal_fallback(shown: &[&Line], i: usize) -> gpui::ElementId {
+    if let Some(next) = shown.get(i + 1) {
+        return row_elem_id(&next.name);
+    }
+    if let Some(prev) = i.checked_sub(1).and_then(|p| shown.get(p)) {
+        return row_elem_id(&prev.name);
+    }
+    SharedString::from("sc-all").into()
 }
 
 #[cfg(test)]
@@ -752,5 +827,51 @@ mod tests {
         assert!(has_row_in("plugin.git.status", &overrides, Some(&reg)));
         assert!(!has_row_in("plugin.git.status", &BTreeMap::new(), Some(&reg)));
         assert!(!has_row_in("plugin.missing.cmd", &overrides, Some(&reg)));
+    }
+
+    #[test]
+    fn removal_focus_target_picks_surviving_neighbor() {
+        let tabs_line = Line {
+            name: Cow::Borrowed("new_tab"),
+            label: Cow::Borrowed("New tab"),
+            group: "Tabs",
+            keys: vec!["ctrl-shift-t".into()],
+            changed: false,
+            available: true,
+        };
+        let plugin_a = Line {
+            name: Cow::Borrowed("plugin.a.one"),
+            label: Cow::Borrowed("a: one"),
+            group: PLUGINS_GROUP,
+            keys: vec!["ctrl-alt-1".into()],
+            changed: true,
+            available: false,
+        };
+        let plugin_b = Line {
+            name: Cow::Borrowed("plugin.b.two"),
+            label: Cow::Borrowed("b: two"),
+            group: PLUGINS_GROUP,
+            keys: vec!["ctrl-alt-2".into(), "ctrl-alt-3".into()],
+            changed: true,
+            available: false,
+        };
+
+        assert!(!row_stays_after_remove(&plugin_a, Filter::All, None, "ctrl-alt-1"));
+        assert!(row_stays_after_remove(&plugin_b, Filter::All, None, "ctrl-alt-2"));
+        assert!(row_stays_after_remove(&tabs_line, Filter::All, None, "ctrl-shift-t"));
+        assert!(!row_stays_after_remove(&plugin_a, Filter::Changed, None, "ctrl-alt-1"));
+
+        let two_plugins = vec![("Tabs", vec![&tabs_line], false), (PLUGINS_GROUP, vec![&plugin_a, &plugin_b], false)];
+        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 0), row_elem_id("plugin.b.two"));
+        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 1), row_elem_id("plugin.a.one"));
+
+        // When the only plugin row disappears, `Plugins` header also disappears, so fall back to the preceding surviving row.
+        let one_plugin = vec![("Tabs", vec![&tabs_line], false), (PLUGINS_GROUP, vec![&plugin_a], false)];
+        assert_eq!(grouped_removal_fallback(&one_plugin, 1, 0), row_elem_id("new_tab"));
+
+        // If no rows remain anywhere on the page, fall back to the All filter chip.
+        let only_plugin = vec![(PLUGINS_GROUP, vec![&plugin_a], false)];
+        assert_eq!(grouped_removal_fallback(&only_plugin, 0, 0), gpui::ElementId::from(SharedString::from("sc-all")));
+        assert_eq!(flat_removal_fallback(&[&plugin_a], 0), gpui::ElementId::from(SharedString::from("sc-all")));
     }
 }

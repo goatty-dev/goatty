@@ -756,13 +756,19 @@ impl Plugins<'_> {
         install::uninstall_package(package, &bins, self.dirs).map(Some)
     }
 
-    /// Installed plugins (built-ins and lock entries), without reading or
-    /// refreshing any registry snapshot.
-    pub fn installed(&self, settings: &HostSettings) -> Vec<Installed> {
+    /// Installed plugins (built-ins and lock entries) and any problems reading
+    /// the lock or installed manifests, without reading or refreshing any
+    /// registry snapshot.
+    pub fn installed(&self, settings: &HostSettings) -> (Vec<Installed>, Vec<String>) {
         let path = std::env::var("PATH").ok();
+        self.installed_with_env_path(settings, path.as_deref())
+    }
+
+    pub(crate) fn installed_with_env_path(&self, settings: &HostSettings, env_path: Option<&str>) -> (Vec<Installed>, Vec<String>) {
         let mut issues = Vec::new();
         let lock = self.load_lock(&mut issues);
-        self.installed_entries(&lock, settings, path.as_deref(), &[], &mut issues)
+        let installed = self.installed_entries(&lock, settings, env_path, &[], &mut issues);
+        (installed, issues)
     }
 
     /// Installed plugins and what the registries offer.
