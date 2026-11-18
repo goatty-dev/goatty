@@ -248,11 +248,24 @@ impl SettingsWindow {
         true
     }
 
-    fn shortcut_row(&self, ui: Ui, line: &Line, query: &str, fallback_focus: &gpui::ElementId, cx: &Context<'_, Self>) -> AnyElement {
+    fn shortcut_focus_target(&self, action: &str, edit: ShortcutEdit<'_>, cx: &App) -> gpui::ElementId {
+        let overrides = &cx.global::<AppSettings>().file.value.keybindings;
+        let query = self.shortcuts.query.read(cx).text().trim().to_string();
+        focus_target_after_edit(
+            action,
+            edit,
+            overrides,
+            cx.try_global::<CommandRegistry>(),
+            self.shortcuts.filter,
+            self.shortcuts.sort,
+            &self.shortcuts.collapsed,
+            &query,
+            self.shortcuts.pressed.as_deref(),
+        )
+    }
+
+    fn shortcut_row(&self, ui: Ui, line: &Line, cx: &Context<'_, Self>) -> AnyElement {
         let app = cx.global::<AppSettings>();
-        let overrides = &app.file.value.keybindings;
-        let filter = self.shortcuts.filter;
-        let pressed = self.shortcuts.pressed.clone();
         let name = line.name.as_ref().to_owned();
         let label_text: SharedString = line.label.as_ref().to_owned().into();
         let recording = self.recording.as_deref() == Some(name.as_str());
@@ -291,10 +304,10 @@ impl SettingsWindow {
         // or to a surviving neighbor when clearing the binding removes the row.
         let row_elem = row_elem_id(&name);
         let page_focus = self.focus.clone();
+        let this = cx.entity().downgrade();
         let chips = div().flex().flex_wrap().items_center().gap(px(8.)).children(line.keys.iter().enumerate().map(|(ki, k)| {
             let key = k.clone();
-            let (row_elem, page_focus, fallback_focus) = (row_elem.clone(), page_focus.clone(), fallback_focus.clone());
-            let stays_after_remove = row_stays_after_remove(line, overrides, filter, query, pressed.as_deref(), k);
+            let (row_elem, page_focus, this, rm_name) = (row_elem.clone(), page_focus.clone(), this.clone(), name.clone());
             let gid = SharedString::from(format!("sc-key-{name}-{ki}"));
             let rm_id: gpui::ElementId = SharedString::from(format!("sc-rm-{name}-{ki}")).into();
             let rm_focus = rm_id.clone();
@@ -318,7 +331,9 @@ impl SettingsWindow {
                 .tooltip(tooltip("Remove this shortcut"))
                 .on_click(move |_, window, cx| {
                     if focus::is_focused(&rm_focus, window) {
-                        let target = if stays_after_remove { row_elem.clone() } else { fallback_focus.clone() };
+                        let target = this
+                            .update(cx, |v, cx| v.shortcut_focus_target(&rm_name, ShortcutEdit::Remove(&key), cx))
+                            .unwrap_or_else(|_| row_elem.clone());
                         focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
                     }
                     AppSettings::update(cx, |s| keys::set_binding(&mut s.keybindings, &key, None));
@@ -355,8 +370,6 @@ impl SettingsWindow {
         } else {
             chips.into_any_element()
         };
-        let this = cx.entity().downgrade();
-        let stays_after_reset = row_stays_after_reset(line, overrides, filter, query, pressed.as_deref());
         let actions = div()
             .w(px(72.))
             .flex_shrink_0()
@@ -364,14 +377,15 @@ impl SettingsWindow {
             .justify_end()
             .gap(px(2.))
             .when(line.changed, |d| {
-                let (row_elem, page_focus, reset_name, fallback_focus) =
-                    (row_elem.clone(), page_focus.clone(), name.clone(), fallback_focus.clone());
+                let (row_elem, page_focus, reset_name, this) = (row_elem.clone(), page_focus.clone(), name.clone(), this.clone());
                 let reset_id = SharedString::from(format!("sc-reset-{name}"));
                 let reset_focus: gpui::ElementId = reset_id.clone().into();
                 d.child(icon_button(reset_id, Icon::RotateCcw, "Reset to the default", ui, move |window, cx| {
                     // The button goes away once the row is back to its default.
                     if focus::is_focused(&reset_focus, window) {
-                        let target = if stays_after_reset { row_elem.clone() } else { fallback_focus.clone() };
+                        let target = this
+                            .update(cx, |v, cx| v.shortcut_focus_target(&reset_name, ShortcutEdit::Reset, cx))
+                            .unwrap_or_else(|_| row_elem.clone());
                         focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
                     }
                     AppSettings::update(cx, |s| keys::reset_action(&mut s.keybindings, &reset_name));
@@ -379,7 +393,7 @@ impl SettingsWindow {
             })
             .child(
                 icon_button(SharedString::from(format!("sc-add-{name}")), Icon::Plus, "Add a shortcut", ui, {
-                    let rec_name = name.clone();
+                    let (rec_name, this) = (name.clone(), this.clone());
                     move |window, cx| {
                         let _ = this.update(cx, |v, cx| {
                             v.recording = Some(rec_name.clone());
@@ -398,16 +412,13 @@ impl SettingsWindow {
         // The row is a tab stop: Enter records a new shortcut, Delete removes the last one.
         let row_id = row_elem;
         let last_key = line.keys.last().cloned();
-        let stays_after_delete =
-            last_key.as_deref().is_none_or(|k| row_stays_after_remove(line, overrides, filter, query, pressed.as_deref(), k));
-        let fallback_focus = fallback_focus.clone();
         let row = div()
             .id(row_id.clone())
             .role(gpui::Role::Row)
             .aria_label(label_text.clone())
             .aria_description("Enter adds a shortcut, Delete removes the last one")
             .on_key_down({
-                let (row_id, this, rec_name, page_focus) = (row_id.clone(), cx.entity().downgrade(), name, page_focus);
+                let (row_id, rec_name, page_focus) = (row_id.clone(), name, page_focus);
                 move |ev, window, cx| {
                     // Only the row itself: a button inside it has its own Enter.
                     if ev.keystroke.modifiers.modified() || !focus::is_focused(&row_id, window) {
@@ -427,8 +438,11 @@ impl SettingsWindow {
                         "delete" | "backspace" => {
                             if let Some(key) = &last_key {
                                 cx.stop_propagation();
-                                if !stays_after_delete {
-                                    focus::hand_over(&page_focus, focus::Handover::Control(fallback_focus.clone()), window, cx);
+                                if let Ok(target) =
+                                    this.update(cx, |v, cx| v.shortcut_focus_target(&rec_name, ShortcutEdit::Remove(key), cx))
+                                    && target != row_id
+                                {
+                                    focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
                                 }
                                 AppSettings::update(cx, |s| keys::set_binding(&mut s.keybindings, key, None));
                             }
@@ -538,12 +552,7 @@ impl SettingsWindow {
         let query = st.query.read(cx).text().trim().to_string();
         let changed_n = all.iter().filter(|l| l.changed).count();
         let unbound_n = all.iter().filter(|l| l.keys.is_empty()).count();
-        let mut shown: Vec<&Line> = all.iter().filter(|l| line_matches_view(l, st.filter, &query, st.pressed.as_deref())).collect();
-        match st.sort {
-            Sort::Group => {}
-            Sort::Name => shown.sort_by_key(|l| l.label.to_lowercase()),
-            Sort::Keys => shown.sort_by_key(|l| (l.keys.is_empty(), l.keys.first().map(|k| pretty_keys(k).to_lowercase()))),
-        }
+        let shown = visible_rows(&all, st.filter, st.sort, &query, st.pressed.as_deref());
 
         let listen = icon_button_tinted(
             "sc-listen",
@@ -626,26 +635,11 @@ impl SettingsWindow {
 
         let mut table = card(ui).overflow_hidden().child(self.column_header(ui, cx)).child(div().h(px(1.)).bg(ui.divider));
         if shown.is_empty() {
-            let (title, desc) = match (&st.pressed, st.filter) {
-                (Some(k), _) => {
-                    (format!("Nothing uses {}", pretty_keys(k)), "That key goes to the shell. Add it to an action with +.".to_string())
-                }
-                (None, Filter::Unbound) if query.is_empty() => ("Every action has a shortcut".into(), "Remove one to see it here.".into()),
-                (None, Filter::Changed) if query.is_empty() => ("No changes yet".into(), "Every shortcut is goatty's default.".into()),
-                _ => ("No matching shortcuts".into(), "Try another name or key, or clear the filter.".into()),
-            };
+            let (title, desc) = empty_state_message(&all, st.filter, &query, st.pressed.as_deref());
             table = table.child(kit::empty(ui, Icon::Keyboard, title, desc));
         } else if st.sort == Sort::Group {
             let searching = !query.is_empty() || st.pressed.is_some();
-            let groups: Vec<(&'static str, Vec<&Line>, bool)> = GROUPS
-                .iter()
-                .copied()
-                .chain(std::iter::once(PLUGINS_GROUP))
-                .filter_map(|g| {
-                    let rows: Vec<&Line> = shown.iter().filter(|l| l.group == g).copied().collect();
-                    (!rows.is_empty()).then_some((g, rows, !searching && st.collapsed.contains(g)))
-                })
-                .collect();
+            let groups = grouped_rows(&shown, &st.collapsed, searching);
             for (gi, (g, rows, folded)) in groups.iter().enumerate() {
                 if gi > 0 {
                     table = table.child(div().h(px(1.)).bg(ui.divider));
@@ -680,8 +674,7 @@ impl SettingsWindow {
                         if i > 0 {
                             table = table.child(divider(ui));
                         }
-                        let fallback = grouped_removal_fallback(&groups, gi, i);
-                        table = table.child(self.shortcut_row(ui, l, &query, &fallback, cx));
+                        table = table.child(self.shortcut_row(ui, l, cx));
                     }
                 }
             }
@@ -690,8 +683,7 @@ impl SettingsWindow {
                 if i > 0 {
                     table = table.child(divider(ui));
                 }
-                let fallback = flat_removal_fallback(&shown, i);
-                table = table.child(self.shortcut_row(ui, l, &query, &fallback, cx));
+                table = table.child(self.shortcut_row(ui, l, cx));
             }
         }
 
@@ -703,6 +695,12 @@ impl SettingsWindow {
             .child(kit::hint(ui, "Shortcuts work in terminal panes; keys no action uses go to the shell. Symbol keys show the character they type: Ctrl+Shift with the + key on a German layout is Ctrl+*.").px(px(4.)))
             .into_any_element()
     }
+}
+
+#[derive(Clone, Copy)]
+enum ShortcutEdit<'a> {
+    Remove(&'a str),
+    Reset,
 }
 
 fn row_elem_id(name: &str) -> gpui::ElementId {
@@ -726,68 +724,104 @@ fn line_matches_view(line: &Line, filter: Filter, query: &str, pressed: Option<&
     passes_filter && passes_search
 }
 
-fn row_stays_after_overrides(
-    line: &Line,
-    after: &BTreeMap<String, Option<String>>,
-    filter: Filter,
-    query: &str,
-    pressed: Option<&str>,
-) -> bool {
-    let after_keys = keys::keys_for(&line.name, after);
-    let is_builtin = keys::find_action(&line.name).is_some();
-    if !is_builtin && !line.available && after_keys.is_empty() {
-        return false;
+fn visible_rows<'a>(all: &'a [Line], filter: Filter, sort: Sort, query: &str, pressed: Option<&str>) -> Vec<&'a Line> {
+    let mut shown: Vec<&Line> = all.iter().filter(|l| line_matches_view(l, filter, query, pressed)).collect();
+    match sort {
+        Sort::Group => {}
+        Sort::Name => shown.sort_by_key(|l| l.label.to_lowercase()),
+        Sort::Keys => shown.sort_by_key(|l| (l.keys.is_empty(), l.keys.first().map(|k| pretty_keys(k).to_lowercase()))),
     }
-    let after_changed = if is_builtin { action_is_changed(&line.name, after) } else { !after_keys.is_empty() };
-    let after_line = Line {
-        name: line.name.clone(),
-        label: line.label.clone(),
-        group: line.group,
-        keys: after_keys,
-        changed: after_changed,
-        available: line.available,
-    };
-    line_matches_view(&after_line, filter, query, pressed)
+    shown
 }
 
-fn row_stays_after_remove(
-    line: &Line,
+fn grouped_rows<'a>(shown: &[&'a Line], collapsed: &HashSet<&'static str>, searching: bool) -> Vec<(&'static str, Vec<&'a Line>, bool)> {
+    GROUPS
+        .iter()
+        .copied()
+        .chain(std::iter::once(PLUGINS_GROUP))
+        .filter_map(|g| {
+            let rows: Vec<&Line> = shown.iter().filter(|l| l.group == g).copied().collect();
+            (!rows.is_empty()).then_some((g, rows, !searching && collapsed.contains(g)))
+        })
+        .collect()
+}
+
+fn empty_state_message(all: &[Line], filter: Filter, query: &str, pressed: Option<&str>) -> (String, String) {
+    match (pressed, filter) {
+        (Some(k), _) => {
+            if let Some(owner) = all.iter().find(|l| l.keys.iter().any(|key| key == k)) {
+                (format!("{} is used by \"{}\"", pretty_keys(k), owner.label), "Switch the filter to All to see it.".to_string())
+            } else {
+                (format!("Nothing uses {}", pretty_keys(k)), "That key goes to the shell. Add it to an action with +.".to_string())
+            }
+        }
+        (None, Filter::Unbound) if query.is_empty() => ("Every action has a shortcut".into(), "Remove one to see it here.".into()),
+        (None, Filter::Changed) if query.is_empty() => ("No changes yet".into(), "Every shortcut is goatty's default.".into()),
+        _ => ("No matching shortcuts".into(), "Try another name or key, or clear the filter.".into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn focus_target_after_edit(
+    action: &str,
+    edit: ShortcutEdit<'_>,
     overrides: &BTreeMap<String, Option<String>>,
+    registry: Option<&CommandRegistry>,
     filter: Filter,
+    sort: Sort,
+    collapsed: &HashSet<&'static str>,
     query: &str,
     pressed: Option<&str>,
-    key: &str,
-) -> bool {
+) -> gpui::ElementId {
+    let pre_all = lines(overrides, registry);
+    let pre_shown = visible_rows(&pre_all, filter, sort, query, pressed);
+
     let mut after = overrides.clone();
-    keys::set_binding(&mut after, key, None);
-    row_stays_after_overrides(line, &after, filter, query, pressed)
+    match edit {
+        ShortcutEdit::Remove(key) => keys::set_binding(&mut after, key, None),
+        ShortcutEdit::Reset => keys::reset_action(&mut after, action),
+    }
+    let post_all = lines(&after, registry);
+    let post_shown = visible_rows(&post_all, filter, sort, query, pressed);
+    if post_shown.iter().any(|l| l.name == action) {
+        return row_elem_id(action);
+    }
+
+    let surviving: HashSet<&str> = post_shown.iter().map(|l| l.name.as_ref()).collect();
+    if sort == Sort::Group {
+        let searching = !query.is_empty() || pressed.is_some();
+        let pre_groups = grouped_rows(&pre_shown, collapsed, searching);
+        for (gi, (_, rows, _)) in pre_groups.iter().enumerate() {
+            if let Some(ri) = rows.iter().position(|l| l.name == action) {
+                return grouped_removal_fallback(&pre_groups, gi, ri, &surviving);
+            }
+        }
+    } else if let Some(i) = pre_shown.iter().position(|l| l.name == action) {
+        return flat_removal_fallback(&pre_shown, i, &surviving);
+    }
+    SharedString::from("sc-all").into()
 }
 
-fn row_stays_after_reset(
-    line: &Line,
-    overrides: &BTreeMap<String, Option<String>>,
-    filter: Filter,
-    query: &str,
-    pressed: Option<&str>,
-) -> bool {
-    let mut after = overrides.clone();
-    keys::reset_action(&mut after, &line.name);
-    row_stays_after_overrides(line, &after, filter, query, pressed)
-}
-
-fn grouped_removal_fallback(groups: &[(&'static str, Vec<&Line>, bool)], gi: usize, ri: usize) -> gpui::ElementId {
+fn grouped_removal_fallback(
+    groups: &[(&'static str, Vec<&Line>, bool)],
+    gi: usize,
+    ri: usize,
+    surviving: &HashSet<&str>,
+) -> gpui::ElementId {
     let rows = &groups[gi].1;
-    if let Some(next) = rows.get(ri + 1) {
+    if let Some(next) = rows[ri + 1..].iter().find(|l| surviving.contains(l.name.as_ref())) {
         return row_elem_id(&next.name);
     }
-    if let Some(prev) = ri.checked_sub(1).and_then(|p| rows.get(p)) {
+    if let Some(prev) = rows[..ri].iter().rev().find(|l| surviving.contains(l.name.as_ref())) {
         return row_elem_id(&prev.name);
     }
-    if let Some((next_g, _, _)) = groups.get(gi + 1) {
+    if let Some((next_g, _, _)) = groups[gi + 1..].iter().find(|(_, r, _)| r.iter().any(|l| surviving.contains(l.name.as_ref()))) {
         return group_elem_id(next_g);
     }
-    if let Some((prev_g, prev_rows, prev_folded)) = gi.checked_sub(1).and_then(|pg| groups.get(pg)) {
-        if !prev_folded && let Some(last) = prev_rows.last() {
+    if let Some((prev_g, prev_rows, prev_folded)) =
+        groups[..gi].iter().rev().find(|(_, r, _)| r.iter().any(|l| surviving.contains(l.name.as_ref())))
+    {
+        if !prev_folded && let Some(last) = prev_rows.iter().rev().find(|l| surviving.contains(l.name.as_ref())) {
             return row_elem_id(&last.name);
         }
         return group_elem_id(prev_g);
@@ -795,11 +829,11 @@ fn grouped_removal_fallback(groups: &[(&'static str, Vec<&Line>, bool)], gi: usi
     SharedString::from("sc-all").into()
 }
 
-fn flat_removal_fallback(shown: &[&Line], i: usize) -> gpui::ElementId {
-    if let Some(next) = shown.get(i + 1) {
+fn flat_removal_fallback(shown: &[&Line], i: usize, surviving: &HashSet<&str>) -> gpui::ElementId {
+    if let Some(next) = shown[i + 1..].iter().find(|l| surviving.contains(l.name.as_ref())) {
         return row_elem_id(&next.name);
     }
-    if let Some(prev) = i.checked_sub(1).and_then(|p| shown.get(p)) {
+    if let Some(prev) = shown[..i].iter().rev().find(|l| surviving.contains(l.name.as_ref())) {
         return row_elem_id(&prev.name);
     }
     SharedString::from("sc-all").into()
@@ -869,38 +903,11 @@ mod tests {
 
     #[test]
     fn removal_focus_target_picks_surviving_neighbor() {
-        let tabs_line = Line {
-            name: Cow::Borrowed("new_tab"),
-            label: Cow::Borrowed("New tab"),
-            group: "Tabs",
-            keys: vec!["ctrl-shift-t".into(), "ctrl-alt-n".into()],
-            changed: true,
-            available: true,
-        };
-        let plugin_avail = Line {
-            name: Cow::Borrowed("plugin.docker.exec"),
-            label: Cow::Borrowed("Docker: Exec"),
-            group: PLUGINS_GROUP,
-            keys: vec!["ctrl-alt-e".into()],
-            changed: true,
-            available: true,
-        };
-        let plugin_a = Line {
-            name: Cow::Borrowed("plugin.alpha.one"),
-            label: Cow::Borrowed("alpha: one"),
-            group: PLUGINS_GROUP,
-            keys: vec!["ctrl-alt-1".into()],
-            changed: true,
-            available: false,
-        };
-        let plugin_b = Line {
-            name: Cow::Borrowed("plugin.beta.two"),
-            label: Cow::Borrowed("beta: two"),
-            group: PLUGINS_GROUP,
-            keys: vec!["ctrl-alt-2".into(), "ctrl-alt-3".into()],
-            changed: true,
-            available: false,
-        };
+        let mut reg = CommandRegistry::default();
+        let mut active = Command::handler("plugin.docker.exec", "Docker", "Exec", |_, _| {}).with_key_action("plugin.docker.exec");
+        active.source = Source::Plugin("docker".into());
+        reg.register(active);
+
         let overrides = BTreeMap::from([
             ("ctrl-alt-n".to_string(), Some("new_tab".to_string())),
             ("ctrl-alt-e".to_string(), Some("plugin.docker.exec".to_string())),
@@ -908,35 +915,230 @@ mod tests {
             ("ctrl-alt-2".to_string(), Some("plugin.beta.two".to_string())),
             ("ctrl-alt-3".to_string(), Some("plugin.beta.two".to_string())),
         ]);
+        let collapsed = HashSet::new();
 
-        assert!(!row_stays_after_remove(&plugin_a, &overrides, Filter::All, "", None, "ctrl-alt-1"));
-        assert!(row_stays_after_remove(&plugin_b, &overrides, Filter::All, "", None, "ctrl-alt-2"));
-        assert!(!row_stays_after_remove(&plugin_a, &overrides, Filter::Changed, "", None, "ctrl-alt-1"));
+        // Removing the only binding on an unavailable row drops it to the next surviving neighbor.
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.alpha.one",
+                ShortcutEdit::Remove("ctrl-alt-1"),
+                &overrides,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "",
+                None,
+            ),
+            row_elem_id("plugin.beta.two"),
+        );
+        // Removing one of two bindings keeps the row itself focused.
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.beta.two",
+                ShortcutEdit::Remove("ctrl-alt-2"),
+                &overrides,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "",
+                None,
+            ),
+            row_elem_id("plugin.beta.two"),
+        );
+        // When the only matching plugin row disappears, fall back to `sc-all` if nothing else matches.
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.alpha.one",
+                ShortcutEdit::Remove("ctrl-alt-1"),
+                &overrides,
+                Some(&reg),
+                Filter::Changed,
+                Sort::Group,
+                &collapsed,
+                "alpha",
+                None,
+            ),
+            gpui::ElementId::from(SharedString::from("sc-all")),
+        );
 
         // Text search matching only the removed/reset binding hides the row; label match keeps it.
-        assert!(!row_stays_after_remove(&plugin_avail, &overrides, Filter::All, "ctrl-alt-e", None, "ctrl-alt-e"));
-        assert!(!row_stays_after_reset(&plugin_avail, &overrides, Filter::All, "ctrl-alt-e", None));
-        assert!(row_stays_after_remove(&plugin_avail, &overrides, Filter::All, "docker", None, "ctrl-alt-e"));
-        assert!(row_stays_after_reset(&plugin_avail, &overrides, Filter::All, "docker", None));
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Remove("ctrl-alt-e"),
+                &overrides,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "ctrl-alt-e",
+                None,
+            ),
+            gpui::ElementId::from(SharedString::from("sc-all")),
+        );
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Reset,
+                &overrides,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "ctrl-alt-e",
+                None,
+            ),
+            gpui::ElementId::from(SharedString::from("sc-all")),
+        );
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Remove("ctrl-alt-e"),
+                &overrides,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "docker",
+                None,
+            ),
+            row_elem_id("plugin.docker.exec"),
+        );
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Reset,
+                &overrides,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "docker",
+                None,
+            ),
+            row_elem_id("plugin.docker.exec"),
+        );
 
-        // Removing a single custom binding on `new_tab` leaves its default key, so Changed drops it.
-        assert!(!row_stays_after_remove(&tabs_line, &overrides, Filter::Changed, "", None, "ctrl-alt-n"));
+        // Removing a single custom binding on `new_tab` leaves its default key, so Changed drops it to the next row.
+        assert_eq!(
+            focus_target_after_edit(
+                "new_tab",
+                ShortcutEdit::Remove("ctrl-alt-n"),
+                &overrides,
+                Some(&reg),
+                Filter::Changed,
+                Sort::Group,
+                &collapsed,
+                "",
+                None,
+            ),
+            gpui::ElementId::from(SharedString::from("sc-group-Plugins")),
+        );
         // Adding a second custom binding on `new_tab` keeps it in Changed when only one is removed.
         let mut two_custom = overrides.clone();
         two_custom.insert("ctrl-alt-m".to_string(), Some("new_tab".to_string()));
-        assert!(row_stays_after_remove(&tabs_line, &two_custom, Filter::Changed, "", None, "ctrl-alt-n"));
+        assert_eq!(
+            focus_target_after_edit(
+                "new_tab",
+                ShortcutEdit::Remove("ctrl-alt-n"),
+                &two_custom,
+                Some(&reg),
+                Filter::Changed,
+                Sort::Group,
+                &collapsed,
+                "",
+                None,
+            ),
+            row_elem_id("new_tab"),
+        );
 
-        let two_plugins = vec![("Tabs", vec![&tabs_line], false), (PLUGINS_GROUP, vec![&plugin_a, &plugin_b], false)];
-        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 0), row_elem_id("plugin.beta.two"));
-        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 1), row_elem_id("plugin.alpha.one"));
+        // When removing `hyper-k` on Beta also deletes Alpha's `Hyper-K` spelling, skip Alpha and land on the surviving neighbor.
+        let shared_spelling = BTreeMap::from([
+            ("ctrl-alt-n".to_string(), Some("new_tab".to_string())),
+            ("Hyper-K".to_string(), Some("plugin.alpha.one".to_string())),
+            ("hyper-k".to_string(), Some("plugin.beta.two".to_string())),
+        ]);
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.beta.two",
+                ShortcutEdit::Remove("hyper-k"),
+                &shared_spelling,
+                None,
+                Filter::Changed,
+                Sort::Group,
+                &collapsed,
+                "",
+                None,
+            ),
+            row_elem_id("new_tab"),
+        );
 
-        // When the only plugin row disappears, `Plugins` header also disappears, so fall back to the preceding surviving row.
-        let one_plugin = vec![("Tabs", vec![&tabs_line], false), (PLUGINS_GROUP, vec![&plugin_a], false)];
-        assert_eq!(grouped_removal_fallback(&one_plugin, 1, 0), row_elem_id("new_tab"));
+        // Unavailable row kept alive by a raw unparseable/shadowed spelling stays focused in All, but drops out of Changed.
+        let unavail_shadowed = BTreeMap::from([
+            ("Hyper-K".to_string(), Some("plugin.docker.exec".to_string())),
+            ("hyper-k".to_string(), None),
+            ("ctrl-alt-e".to_string(), Some("plugin.docker.exec".to_string())),
+        ]);
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Remove("ctrl-alt-e"),
+                &unavail_shadowed,
+                None,
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "Plugins",
+                None,
+            ),
+            row_elem_id("plugin.docker.exec"),
+        );
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Remove("ctrl-alt-e"),
+                &unavail_shadowed,
+                None,
+                Filter::Changed,
+                Sort::Group,
+                &collapsed,
+                "Plugins",
+                None,
+            ),
+            gpui::ElementId::from(SharedString::from("sc-all")),
+        );
 
-        // If no rows remain anywhere on the page, fall back to the All filter chip.
-        let only_plugin = vec![(PLUGINS_GROUP, vec![&plugin_a], false)];
-        assert_eq!(grouped_removal_fallback(&only_plugin, 0, 0), gpui::ElementId::from(SharedString::from("sc-all")));
-        assert_eq!(flat_removal_fallback(&[&plugin_a], 0), gpui::ElementId::from(SharedString::from("sc-all")));
+        // Flat sort fallback picks surviving neighbor or `sc-all`.
+        let only_alpha = BTreeMap::from([("ctrl-alt-1".to_string(), Some("plugin.alpha.one".to_string()))]);
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.alpha.one",
+                ShortcutEdit::Remove("ctrl-alt-1"),
+                &only_alpha,
+                None,
+                Filter::Changed,
+                Sort::Name,
+                &collapsed,
+                "",
+                None,
+            ),
+            gpui::ElementId::from(SharedString::from("sc-all")),
+        );
+    }
+
+    #[test]
+    fn empty_state_distinguishes_filtered_shortcuts_from_shell_input() {
+        let overrides = BTreeMap::from([("ctrl-alt-e".to_string(), Some("plugin.docker.exec".to_string()))]);
+        let all = lines(&overrides, None);
+
+        let (title, desc) = empty_state_message(&all, Filter::Unbound, "", Some("ctrl-alt-e"));
+        assert!(title.contains("Ctrl+Alt+E") && title.contains("docker: exec"), "{title}");
+        assert!(desc.contains("All"), "{desc}");
+
+        let (title, desc) = empty_state_message(&all, Filter::All, "", Some("ctrl-alt-q"));
+        assert!(title.contains("Nothing uses Ctrl+Alt+Q"), "{title}");
+        assert!(desc.contains("goes to the shell"), "{desc}");
     }
 }
