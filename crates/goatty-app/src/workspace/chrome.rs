@@ -160,6 +160,14 @@ fn window_button(button: WindowButton, maximized: bool, size: f32, c: Colors) ->
         .into_any_element()
 }
 
+/// How much of the window's width goatty's frame takes (the shadow and
+/// border along untiled sides); 0 without it.
+pub(super) fn frame_width(window: &Window) -> f32 {
+    let Some(t) = csd(window) else { return 0.0 };
+    let side = f32::from(SHADOW + BORDER);
+    [t.left, t.right].iter().filter(|tiled| !**tiled).count() as f32 * side
+}
+
 /// Round `el`'s top corners like the window's, when goatty draws its frame
 /// (the topmost bar paints over the frame's corners).
 pub(super) fn round_top<E: Styled>(el: E, window: &Window) -> E {
@@ -181,9 +189,10 @@ impl Workspace {
         let zoom = controls.maximize && window.is_resizable();
         el.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = true))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = false))
-            .on_mouse_move(cx.listener(|this, _, window, _| {
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = false))
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, _| {
                 // The compositor takes over: no mouse-up may follow.
-                if std::mem::take(&mut this.title_drag) {
+                if std::mem::take(&mut this.title_drag) && ev.dragging() {
                     window.start_window_move();
                 }
             }))
@@ -291,28 +300,23 @@ impl Workspace {
             .when(resizable, |d| {
                 d.on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, window, cx| {
                     // Repaint when the pointer enters or leaves an edge (its cursor).
-                    let edge = resize_edge(ev.position, window.window_bounds().get_bounds().size, tiling);
+                    let edge = resize_edge(ev.position, window.viewport_size(), tiling);
                     if edge != this.resize_edge {
                         this.resize_edge = edge;
                         cx.notify();
                     }
                 }))
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-                    if let Some(edge) = resize_edge(ev.position, window.window_bounds().get_bounds().size, tiling) {
+                    if let Some(edge) = resize_edge(ev.position, window.viewport_size(), tiling) {
                         window.start_window_resize(edge);
                         cx.stop_propagation();
                     }
                 })
                 .child(
                     canvas(
-                        |_, window, _| {
-                            window.insert_hitbox(
-                                Bounds::new(Point::default(), window.window_bounds().get_bounds().size),
-                                HitboxBehavior::Normal,
-                            )
-                        },
+                        |_, window, _| window.insert_hitbox(Bounds::new(Point::default(), window.viewport_size()), HitboxBehavior::Normal),
                         move |_, hitbox: Hitbox, window, _| {
-                            let size = window.window_bounds().get_bounds().size;
+                            let size = window.viewport_size();
                             if let Some(edge) = resize_edge(window.mouse_position(), size, tiling) {
                                 window.set_cursor_style(edge_cursor(edge), &hitbox);
                             }
