@@ -19,6 +19,7 @@ pub struct ClientSettings {
     /// (see [`keys::effective_bindings`]).
     pub keybindings: BTreeMap<String, Option<String>>,
     pub workspace: WorkspaceSettings,
+    pub window: WindowSettings,
     pub tabs: TabSettings,
     pub panes: PaneSettings,
     pub links: LinkSettings,
@@ -371,6 +372,28 @@ pub enum OnLaunch {
 #[serde(default)]
 pub struct WorkspaceSettings {
     pub on_launch: OnLaunch,
+}
+
+/// The terminal window itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WindowSettings {
+    pub title_bar: TitleBar,
+}
+
+/// Who draws the window's title bar (#120).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleBar {
+    /// The desktop's, above the tabs, where it draws one. Tiling
+    /// compositors (niri, Hyprland, Sway) draw none and goatty adds none;
+    /// where the desktop leaves it to apps (GNOME on Wayland), goatty draws
+    /// its own anyway.
+    #[default]
+    System,
+    /// goatty's: the tabs share the bar with the window buttons, and the
+    /// desktop draws none (where it lets apps do that).
+    Goatty,
 }
 
 /// How the tab bar looks.
@@ -1161,6 +1184,18 @@ mod tests {
         assert!(!LocalEcho::Never.wanted(ms(500)));
         let s: SshSettings = serde_json::from_str(r#"{"local_echo": "always"}"#).unwrap();
         assert_eq!(s.local_echo, LocalEcho::Always);
+    }
+
+    #[test]
+    fn title_bar_setting() {
+        use crate::store;
+        assert_eq!(ClientSettings::default().window.title_bar, TitleBar::System);
+        let l = store::parse::<ClientSettings>(r#"{"window": {"title_bar": "goatty"}}"#);
+        assert!(l.issues.is_empty(), "{:?}", l.issues);
+        assert_eq!(l.value.window.title_bar, TitleBar::Goatty);
+        let l = store::parse::<ClientSettings>(r#"{"window": {"title_bar": "fancy"}}"#);
+        assert_eq!(l.value.window.title_bar, TitleBar::System, "a bad value keeps the default");
+        assert!(!l.issues.is_empty());
     }
 
     #[test]

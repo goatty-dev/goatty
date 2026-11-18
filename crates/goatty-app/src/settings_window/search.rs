@@ -64,6 +64,8 @@ pub const INDEX: &[Entry] = &[
     e(Page::Appearance, "Text", "Bold text in bright colors", "bold bright xterm").keys(&["theme.bold_is_bright"]),
     e(Page::Appearance, "Cursor", "Shape", "cursor block bar beam underline caret").keys(&["terminal.cursor_shape"]),
     e(Page::Appearance, "Cursor", "Blinking", "cursor blink").keys(&["terminal.cursor_blink"]),
+    e(Page::Appearance, "Window", "Title bar", "titlebar decorations csd window buttons close minimize maximize tabs gnome")
+        .keys(&["window.title_bar"]),
     e(Page::Appearance, "Window", "Padding", "margin spacing border inset").keys(&["terminal.padding"]),
     e(Page::Appearance, "Window", "Background opacity", "transparency transparent alpha see through").keys(&["terminal.opacity"]),
     e(Page::Appearance, "Window", "Blur behind the window", "blur frosted glass").keys(&["terminal.blur"]),

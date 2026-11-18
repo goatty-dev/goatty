@@ -70,6 +70,7 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             app_id: Some("dev.goatty.goatty".into()),
             window_background: crate::workspace::background_appearance(&cx.global::<AppSettings>().client.terminal),
+            window_decorations: Some(crate::workspace::requested_decorations(cx.global::<AppSettings>().client.window.title_bar)),
             ..Default::default()
         },
         |window, cx| {

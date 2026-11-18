@@ -73,7 +73,7 @@ impl Workspace {
 
     /// How wide the sidebar is drawn in this window.
     pub(super) fn sidebar_width(&self, window: &Window, cx: &gpui::App) -> f32 {
-        self.sidebar(cx).drawn_width(f32::from(window.viewport_size().width))
+        self.sidebar(cx).drawn_width(f32::from(window.viewport_size().width) - super::chrome::frame_width(window))
     }
 
     /// The window's root in the vertical style: a row in the sidebar's
@@ -90,7 +90,7 @@ impl Workspace {
     fn on_sidebar_drag(&mut self, ev: &DragMoveEvent<SidebarDrag>, window: &mut Window, cx: &mut Context<'_, Self>) {
         let x = f32::from(ev.event.position.x - ev.bounds.left());
         let (start, so_far) = self.sidebar_drag.unwrap_or_else(|| (saved_sidebar(cx), saved_sidebar(cx)));
-        let now = so_far.dragged_to(x, f32::from(window.viewport_size().width), start);
+        let now = so_far.dragged_to(x, f32::from(window.viewport_size().width) - super::chrome::frame_width(window), start);
         if now == so_far && self.sidebar_drag.is_some() {
             return;
         }
@@ -121,7 +121,7 @@ impl Workspace {
 
     pub(super) fn render_sidebar(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
         let sidebar = self.sidebar(cx);
-        let width = sidebar.drawn_width(f32::from(window.viewport_size().width));
+        let width = sidebar.drawn_width(f32::from(window.viewport_size().width) - super::chrome::frame_width(window));
         let c = Colors::get(cx);
         let strip = self.strip_items(cx);
         let ui_font = cx.global::<AppSettings>().ui_font.clone();
@@ -160,7 +160,7 @@ impl Workspace {
                         .track_scroll(&self.tab_scroll)
                         .children(tiles)
                         .child(new_tab)
-                        .child(self.tabs_rest("tab-rail-rest", cx).w_full().flex_1().min_h(px(TILE))),
+                        .child(self.tabs_rest("tab-rail-rest", true, cx).w_full().flex_1().min_h(px(TILE))),
                 )
                 .child(
                     div().flex_none().flex().justify_center().pt(px(6.)).child(
@@ -221,7 +221,7 @@ impl Workspace {
                         .track_scroll(&self.tab_scroll)
                         .children(rows)
                         .child(new_tab)
-                        .child(self.tabs_rest("tab-sidebar-rest", cx).flex_1().min_h(px(24.))),
+                        .child(self.tabs_rest("tab-sidebar-rest", true, cx).flex_1().min_h(px(24.))),
                 )
                 .child(footer)
                 .into_any_element()

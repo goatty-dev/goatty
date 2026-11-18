@@ -43,6 +43,7 @@
 //! host (`settings_window::set_host_link`).
 
 mod arrange;
+mod chrome;
 mod gestures;
 mod groups;
 pub(crate) mod icons;
@@ -50,6 +51,7 @@ mod layout;
 mod menu;
 mod notices;
 pub mod saved;
+pub use chrome::requested as requested_decorations;
 mod sidebar;
 mod tab_bar;
 
@@ -242,6 +244,13 @@ pub struct Workspace {
     /// A dragged tab moved and the tabs haven't been laid out again: their
     /// bounds are from before the move.
     moved_unpainted: bool,
+    /// The left button went down on the title bar's empty space: the next
+    /// move starts moving the window (`chrome`).
+    title_drag: bool,
+    /// The window edge under the pointer, when goatty draws the frame.
+    resize_edge: Option<gpui::ResizeEdge>,
+    /// The frame last told to the platform: goatty's (with the tiling) or none.
+    frame_applied: Option<Option<gpui::Tiling>>,
     /// The vertical sidebar while its edge is being dragged (as it was when
     /// the drag started, and now); saved to the settings shortly after it
     /// stops and when the drag ends.
@@ -267,9 +276,13 @@ const SAVE_WINDOW_AFTER: std::time::Duration = std::time::Duration::from_millis(
 impl Workspace {
     pub fn new(initial: Initial, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         // The desktop's light/dark switch (themes can follow it).
+        // Also how the desktop decorates the window changed (Wayland).
         let appearance = cx.observe_window_appearance(window, |_, window, cx| {
             crate::settings::AppSettings::set_system_dark(cx, crate::settings::is_dark(window.appearance()));
+            cx.notify();
         });
+        let button_layout = cx.observe_button_layout_changed(window, |_, _, cx| cx.notify());
+        let mut title_bar = cx.global::<AppSettings>().client.window.title_bar;
         // `terminal.opacity` / `terminal.blur`, live.
         let mut background = background_appearance(&cx.global::<AppSettings>().client.terminal);
         window.set_background_appearance(background);
@@ -278,6 +291,11 @@ impl Workspace {
             if wanted != background {
                 background = wanted;
                 window.set_background_appearance(wanted);
+            }
+            let wanted = cx.global::<AppSettings>().client.window.title_bar;
+            if wanted != title_bar {
+                title_bar = wanted;
+                window.request_decorations(chrome::requested(wanted));
             }
             cx.notify();
         });
@@ -310,6 +328,9 @@ impl Workspace {
             wheel: WheelSwitch::default(),
             dragging: None,
             moved_unpainted: false,
+            title_drag: false,
+            resize_edge: None,
+            frame_applied: None,
             sidebar_drag: None,
             save_sidebar: None,
             menu: None,
@@ -317,7 +338,7 @@ impl Workspace {
             folded: Vec::new(),
             group_focus: Vec::new(),
             notices: Default::default(),
-            _subscriptions: vec![appearance, settings, activation, bounds],
+            _subscriptions: vec![appearance, button_layout, settings, activation, bounds],
         };
         match initial {
             Initial::Ready { startup, spawner } => {
@@ -1729,6 +1750,8 @@ impl Render for Workspace {
         let tabs = &cx.global::<AppSettings>().client.tabs;
         let show_bar = tabs.show == TabBarShow::Always || self.tabs.len() > 1;
         let vertical = show_bar && tabs.style == TabStyle::Vertical;
+        // goatty draws the title bar, and the tab bar can't be it.
+        let header = chrome::csd(window).is_some() && (vertical || !show_bar);
         // Where the panes start: the palette centers over them.
         let panes_left = if vertical { self.sidebar_width(window, cx) } else { 0.0 };
         let root = div().id("workspace").size_full().relative().flex();
@@ -1736,11 +1759,21 @@ impl Render for Workspace {
             let sidebar = self.render_sidebar(window, cx);
             let card = self.render_card(cx);
             let handle = self.render_sidebar_handle(window, cx);
-            self.sidebar_frame(root, cx).child(sidebar).child(card).child(handle)
+            if header {
+                let row = div().id("workspace-row").relative().flex().w_full().flex_1().min_h_0();
+                let row = self.sidebar_frame(row, cx).child(sidebar).child(card).child(handle);
+                root.flex_col().child(self.render_title_header(window, cx)).child(row)
+            } else {
+                self.sidebar_frame(root, cx).child(sidebar).child(card).child(handle)
+            }
         } else {
-            root.flex_col().when(show_bar, |d| d.child(self.render_tab_bar(window, cx))).child(self.render_panes(cx))
+            root.flex_col()
+                .when(header, |d| d.child(self.render_title_header(window, cx)))
+                .when(show_bar, |d| d.child(self.render_tab_bar(window, cx)))
+                .child(self.render_panes(cx))
         };
-        root.on_action(cx.listener(Self::toggle_palette))
+        let root = root
+            .on_action(cx.listener(Self::toggle_palette))
             .on_action(cx.listener(Self::show_recent_notifications))
             .on_action(|_: &DismissNotifications, _, cx| toast::dismiss_all(cx))
             .on_action(|_: &PressNotificationButton, window, cx| {
@@ -1823,6 +1856,8 @@ impl Render for Workspace {
             })
             .when_some(self.paste.as_ref(), |d, (dialog, _, _)| d.child(modal(dialog.clone())))
             .when_some(self.close.as_ref(), |d, (dialog, _, _)| d.child(modal(dialog.clone())))
+            .into_any_element();
+        self.window_frame(root, window, cx)
     }
 }
 

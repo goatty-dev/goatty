@@ -106,6 +106,9 @@ icons! {
     Unlink => "unlink.svg",
     Upload => "upload.svg",
     UserRound => "user-round.svg",
+    WindowMaximize => "window-maximize.svg",
+    WindowMinimize => "window-minimize.svg",
+    WindowRestore => "window-restore.svg",
     WrapText => "wrap-text.svg",
     Zap => "zap.svg",
 }
