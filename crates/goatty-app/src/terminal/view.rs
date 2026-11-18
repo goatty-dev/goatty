@@ -2180,7 +2180,12 @@ impl TerminalView {
         if self.refresh_hover(cx) {
             cx.notify();
         }
-        let held = self.buttons_to_program != 0 || self.right_to_program;
+        // Outside the grid, only a drag whose press went to the program.
+        let held = match ev.pressed_button {
+            Some(GMouseButton::Right) => self.right_to_program,
+            Some(b) => self.buttons_to_program & button_bit(b) != 0,
+            None => false,
+        };
         if self.mouse_mode_active(ev.modifiers.shift) && (inside || held) {
             let btn = mouse_button(ev.pressed_button).unwrap_or(MouseButton::None);
             self.report_mouse(btn, MouseAction::Motion, col, row, &ev.modifiers);
