@@ -266,6 +266,12 @@ pub(crate) struct Session {
     /// The connection that sets the session's size (#12). Guarded by
     /// `subs`' order: only changed while `subs` is held.
     pub(crate) controller: Mutex<Option<u64>>,
+    /// The connection that created the session, until it subscribes: it
+    /// gets control even when another client attached in between. `None`
+    /// for restored sessions. Changed while `subs` is held.
+    pub(crate) creator: Mutex<Option<u64>>,
+    /// The size the PTY gets next ([`Session::flush_pty`]).
+    pub(crate) pty_size: Mutex<Option<TermSize>>,
 }
 
 impl Session {
@@ -437,7 +443,7 @@ impl Session {
     /// when the size changed, else just `from`. Lagging ones don't: they lack
     /// output the line counts, and their `Resync` brings the line.
     pub(crate) fn resize(&self, ws: WinSize, from: u64) {
-        let applied = {
+        {
             // The reflow and its top line are one point in the stream, like a
             // snapshot and its top line in `subscribe`/`resync`.
             let subs = self.subs.lock();
@@ -457,15 +463,14 @@ impl Session {
                 self.push_size_control(&subs, None);
             }
             self.push_resized(&subs, changed, Some(from));
-            to_size(ws)
-        };
-        self.resize_pty(applied);
+        }
+        self.flush_pty();
     }
 
     /// Connection `conn` takes control of the session's size (`TakeSize`):
     /// the session takes the size it last asked for.
     pub(crate) fn take_size(&self, conn: u64) {
-        let applied = {
+        {
             let subs = self.subs.lock();
             let Some(sub) = subs.iter().find(|s| s.conn == conn) else { return };
             let ws = *sub.wanted.lock();
@@ -478,15 +483,16 @@ impl Session {
             let changed = self.apply_size(ws);
             self.push_size_control(&subs, None);
             self.push_resized(&subs, changed, Some(conn));
-            to_size(ws)
-        };
-        self.resize_pty(applied);
+        }
+        self.flush_pty();
     }
 
-    /// Resize the authoritative terminal to `ws`. Caller holds `subs` and
-    /// resizes the PTY after letting go of it. True when the size changed.
+    /// Resize the authoritative terminal to `ws` and queue the size for the
+    /// PTY. Caller holds `subs`, and calls [`Self::flush_pty`] after letting
+    /// go of it. True when the size changed.
     fn apply_size(&self, ws: WinSize) -> bool {
         let size = to_size(ws);
+        *self.pty_size.lock() = Some(size);
         let changed = self.term.size() != (size.cols, size.rows);
         if changed {
             self.term.resize(size);
@@ -494,8 +500,14 @@ impl Session {
         changed
     }
 
-    fn resize_pty(&self, size: TermSize) {
-        if let Err(e) = self.pty.lock().resize(size) {
+    /// Give the PTY the newest size queued by [`Self::apply_size`]. Taken
+    /// under the PTY's lock, so the size the PTY ends up with is the one
+    /// applied last under `subs`, whichever caller gets the lock first. Not
+    /// called under `subs`: an input write can hold the PTY's lock.
+    fn flush_pty(&self) {
+        let pty = self.pty.lock();
+        let Some(size) = self.pty_size.lock().take() else { return };
+        if let Err(e) = pty.resize(size) {
             log::warn!("session {}: resize failed: {e}", self.id);
         }
     }
@@ -518,21 +530,20 @@ impl Session {
     }
 
     /// The controller left: hand control to the newest remaining subscriber,
-    /// which brings its size. Caller holds `subs`; returns the size to give
-    /// the PTY.
-    fn hand_over(&self, subs: &[Arc<Subscriber>], gone: u64) -> Option<TermSize> {
+    /// which brings its size. Caller holds `subs`.
+    fn hand_over(&self, subs: &[Arc<Subscriber>], gone: u64) {
         let mut controller = self.controller.lock();
         if controller.is_none_or(|c| c != gone && subs.iter().any(|s| s.conn == c)) {
-            return None;
+            return;
         }
         let next = subs.last();
         *controller = next.map(|s| s.conn);
         drop(controller);
-        let ws = *next?.wanted.lock();
+        let Some(next) = next else { return };
+        let ws = *next.wanted.lock();
         let changed = self.apply_size(ws);
         self.push_size_control(subs, None);
         self.push_resized(subs, changed, None);
-        Some(to_size(ws))
     }
 
     /// Caller holds `subs`.
@@ -573,10 +584,8 @@ impl Session {
         features: SubFeatures,
         tx: &flume::Sender<Outbound>,
     ) -> Arc<Subscriber> {
-        let (sub, applied) = self.subscribe_locked(conn, req, size, opts, features, tx);
-        if let Some(size) = applied {
-            self.resize_pty(size);
-        }
+        let sub = self.subscribe_locked(conn, req, size, opts, features, tx);
+        self.flush_pty();
         sub
     }
 
@@ -588,13 +597,21 @@ impl Session {
         opts: StreamOpts,
         features: SubFeatures,
         tx: &flume::Sender<Outbound>,
-    ) -> (Arc<Subscriber>, Option<TermSize>) {
+    ) -> Arc<Subscriber> {
         let mut subs = self.subs.lock();
         subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
-        let applied = {
+        {
             let mut controller = self.controller.lock();
+            // The connection that created the session gets it, even if
+            // someone else attached before its own subscription.
+            let mut creator = self.creator.lock();
+            let reserved = creator.is_some_and(|c| c != conn);
+            if *creator == Some(conn) {
+                *creator = None;
+            }
+            drop(creator);
             let free = controller.is_none_or(|c| c == conn || !subs.iter().any(|s| s.conn == c));
-            if free || !features.size_ctl {
+            if (free && !reserved) || !features.size_ctl {
                 let took = *controller != Some(conn);
                 *controller = Some(conn);
                 drop(controller);
@@ -604,11 +621,8 @@ impl Session {
                     self.push_size_control(&subs, None);
                 }
                 self.push_resized(&subs, changed, None);
-                Some(to_size(size))
-            } else {
-                None
             }
-        };
+        }
         let sub = Arc::new(Subscriber {
             conn,
             tx: tx.clone(),
@@ -644,18 +658,21 @@ impl Session {
             }
         }
         subs.push(sub.clone());
-        (sub, applied)
+        sub
     }
 
     pub(crate) fn unsubscribe(&self, conn: u64) {
-        let applied = {
+        {
             let mut subs = self.subs.lock();
             subs.retain(|s| s.conn != conn);
-            self.hand_over(&subs, conn)
-        };
-        if let Some(size) = applied {
-            self.resize_pty(size);
+            let mut creator = self.creator.lock();
+            if *creator == Some(conn) {
+                *creator = None;
+            }
+            drop(creator);
+            self.hand_over(&subs, conn);
         }
+        self.flush_pty();
     }
 
     /// Client acknowledged `consumed` bytes. If it was lagging and has now

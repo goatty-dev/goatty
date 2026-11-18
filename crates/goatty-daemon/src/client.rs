@@ -153,14 +153,25 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(ServerMsg::Hello { version: agreed, daemon_pid, host });
                 }
                 ClientMsg::ListSessions { req } => reply(ServerMsg::Sessions { req, list: daemon.list() }),
-                ClientMsg::Create { req, size, cwd, opts } => match daemon.create(size, cwd, agreed_version >= goatty_proto::SHELL_SINCE) {
-                    Ok(s) => {
-                        let sub = s.subscribe(conn, req, size, opts, features, &tx);
-                        subs.insert(s.id, (s, sub));
+                ClientMsg::Create { size, req, .. } | ClientMsg::Run { size, req, .. } | ClientMsg::Attach { size, req, .. }
+                    if !size.is_sane() =>
+                {
+                    reply(ServerMsg::Error { req: Some(req), message: format!("window size {}×{} is too large", size.cols, size.rows) });
+                }
+                ClientMsg::Resize { size, .. } if !size.is_sane() => {
+                    log::warn!("connection {conn}: refused a {}×{} resize", size.cols, size.rows);
+                    reply(ServerMsg::Error { req: None, message: format!("window size {}×{} is too large", size.cols, size.rows) });
+                }
+                ClientMsg::Create { req, size, cwd, opts } => {
+                    match daemon.create(conn, size, cwd, agreed_version >= goatty_proto::SHELL_SINCE) {
+                        Ok(s) => {
+                            let sub = s.subscribe(conn, req, size, opts, features, &tx);
+                            subs.insert(s.id, (s, sub));
+                        }
+                        Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                     }
-                    Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
-                },
-                ClientMsg::Run { req, size, cwd, argv, opts } => match daemon.run(size, cwd, argv) {
+                }
+                ClientMsg::Run { req, size, cwd, argv, opts } => match daemon.run(conn, size, cwd, argv) {
                     Ok(s) => {
                         let sub = s.subscribe(conn, req, size, opts, features, &tx);
                         subs.insert(s.id, (s, sub));

@@ -66,6 +66,8 @@ enum Pending {
         tx: flume::Sender<ServerMsg>,
         sink: Arc<dyn PaneSink>,
         size: WinSize,
+        /// The session, for `Attach` (`Create` and `Run` learn it from the reply).
+        session: Option<SessionId>,
     },
     Reattach(SessionId),
     /// `fetch_history`: the answer goes to the pane's sink.
@@ -317,7 +319,7 @@ impl Connection {
     /// the host; pass `None` for remote endpoints.
     pub fn create(&self, size: WinSize, cwd: Option<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size }, |req| ClientMsg::Create { req, size, cwd, opts })? {
+        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Create { req, size, cwd, opts })? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -331,7 +333,7 @@ impl Connection {
             bail!("goattyd via {} is too old to run commands in sessions (protocol v{version}); restart it", self.endpoint().label());
         }
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size }, |req| ClientMsg::Run { req, size, cwd, argv, opts })? {
+        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Run { req, size, cwd, argv, opts })? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -339,7 +341,10 @@ impl Connection {
 
     pub fn attach(&self, session: SessionId, size: WinSize, sink: Arc<dyn PaneSink>) -> Result<()> {
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size }, |req| ClientMsg::Attach { req, session, size, opts })? {
+        match self.request(
+            |tx| Pending::Attach { tx, sink, size, session: Some(session) },
+            |req| ClientMsg::Attach { req, session, size, opts },
+        )? {
             ServerMsg::Attached { .. } => Ok(()),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -391,10 +396,13 @@ impl Connection {
 
     /// Take control of `session`'s size from the client that has it (v14):
     /// the session takes the size this connection last sent. Never blocks.
-    pub fn take_size(&self, session: SessionId) {
-        if self.is_connected() && self.supports_size_control() {
+    /// False when nothing was sent: the link is down, or the daemon is older.
+    pub fn take_size(&self, session: SessionId) -> bool {
+        let send = self.is_connected() && self.supports_size_control();
+        if send {
             self.shared.send(&ClientMsg::TakeSize { session });
         }
+        send
     }
 
     /// Whether the daemon on this link speaks protocol v14 (one controlling
@@ -791,7 +799,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         ServerMsg::Attached { req, session, snapshot } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, sink, size }) => {
+                Some(Pending::Attach { tx, sink, size, .. }) => {
                     if let Some(ev) = s.early_size.lock().remove(&session) {
                         sink.event(ev);
                     }
@@ -836,8 +844,15 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             }
         }
         ServerMsg::SizeControl { session, size, controlling } => {
+            if !size.is_sane() {
+                log::warn!("session {session}: ignoring a {}×{} size from the daemon", size.cols, size.rows);
+                return;
+            }
             let ev = PaneEvent::SizeControl { cols: size.cols, rows: size.rows, controlling };
-            let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+            // Before an `Attached` we're waiting for, it's for the sink that
+            // attach installs, not a pane the session may still have here.
+            let attaching = s.pending.lock().values().any(|p| matches!(p, Pending::Attach { session: Some(id), .. } if *id == session));
+            let sink = if attaching { None } else { s.panes.lock().get(&session).map(|p| p.sink.clone()) };
             match sink {
                 Some(sink) => sink.event(ev),
                 // Comes before the `Attached` that adds the pane.

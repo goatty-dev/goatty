@@ -576,9 +576,11 @@ impl Session {
     }
 
     /// Take control of the session's size from the client that has it.
-    pub fn take_size(&self) {
-        if let Backend::Daemon { conn, id } = &self.backend {
-            conn.take_size(id.load(Ordering::Relaxed));
+    /// False when the request couldn't be sent (the link is down).
+    pub fn take_size(&self) -> bool {
+        match &self.backend {
+            Backend::Daemon { conn, id } => conn.take_size(id.load(Ordering::Relaxed)),
+            Backend::Local(_) => false,
         }
     }
 

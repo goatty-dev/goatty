@@ -222,7 +222,8 @@ fn older_v12_clients_do_not_receive_cwd_messages() {
         match read_msg::<_, ServerMsg>(&mut s).unwrap() {
             ServerMsg::Attached { req: 1, session, .. } => break session,
             ServerMsg::Cwd { .. } => panic!("daemon sent v13 ServerMsg::Cwd to a v12 client"),
-            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } | ServerMsg::SizeControl { .. } => {}
+            ServerMsg::SizeControl { .. } => panic!("daemon sent v14 ServerMsg::SizeControl to a v12 client"),
+            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     };
@@ -233,6 +234,7 @@ fn older_v12_clients_do_not_receive_cwd_messages() {
         let msg = read_msg::<_, ServerMsg>(&mut s).unwrap();
         match msg {
             ServerMsg::Cwd { .. } => panic!("daemon sent v13 ServerMsg::Cwd to a v12 client"),
+            ServerMsg::SizeControl { .. } => panic!("daemon sent v14 ServerMsg::SizeControl to a v12 client"),
             ServerMsg::Output { data, .. } => {
                 seen.extend_from_slice(&data);
                 String::from_utf8_lossy(&seen).contains("ok-v12")

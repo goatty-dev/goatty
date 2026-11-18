@@ -37,12 +37,14 @@ fn start_daemon() -> Daemon {
         .env_remove("XDG_DATA_HOME")
         .spawn()
         .unwrap();
+    // The guard first, so a daemon that misses the deadline is killed too.
+    let d = Daemon { child, sock, _dir: dir };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while UnixStream::connect(&sock).is_err() {
+    while UnixStream::connect(&d.sock).is_err() {
         assert!(Instant::now() < deadline, "daemon did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Daemon { child, sock, _dir: dir }
+    d
 }
 
 fn send(s: &mut UnixStream, msg: &ClientMsg) {
@@ -78,6 +80,20 @@ fn round_trip(s: &mut UnixStream) {
     loop {
         if let ServerMsg::Pong { nonce: 7 } = read_msg::<_, ServerMsg>(s).unwrap() {
             return;
+        }
+    }
+}
+
+/// Read output of `session` until it contains `needle`.
+fn output_until(s: &mut UnixStream, session: SessionId, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        assert!(Instant::now() < deadline, "no {needle:?} in {:?}", String::from_utf8_lossy(&seen));
+        if let ServerMsg::Output { session: id, data } = read_msg::<_, ServerMsg>(s).unwrap()
+            && id == session
+        {
+            seen.extend(data);
         }
     }
 }
@@ -165,6 +181,10 @@ fn one_client_controls_the_size_and_others_watch_until_they_take_over() {
     drop(c);
     assert_eq!(next_size_control(&mut a, id), (80, 24, true));
     wait_size(&d.sock, id, (80, 24));
+
+    // The PTY has the size too, not only the daemon's terminal.
+    send(&mut a, &ClientMsg::Input { session: id, data: b"stty size\r".to_vec() });
+    output_until(&mut a, id, "24 80");
 }
 
 #[test]
@@ -177,11 +197,23 @@ fn the_first_client_to_attach_to_an_unwatched_session_controls_it() {
             break session;
         }
     };
-    drop(a);
+    send(&mut a, &ClientMsg::Detach { session: id });
+    round_trip(&mut a);
 
     // Nobody's left: the next client to attach sets the size.
     let mut b = connect(&d.sock, PROTOCOL_VERSION);
     send(&mut b, &ClientMsg::Attach { req: 2, session: id, size: ws(100, 30), opts: StreamOpts::LOCAL });
     assert_eq!(next_size_control(&mut b, id), (100, 30, true));
     wait_size(&d.sock, id, (100, 30));
+
+    // A size no screen has is refused, not clamped.
+    let mut c = connect(&d.sock, PROTOCOL_VERSION);
+    send(&mut c, &ClientMsg::Attach { req: 4, session: id, size: ws(5000, 5000), opts: StreamOpts::LOCAL });
+    match read_msg::<_, ServerMsg>(&mut c).unwrap() {
+        ServerMsg::Error { req: Some(4), message } => assert!(message.contains("too large"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    send(&mut b, &ClientMsg::Resize { session: id, size: ws(4000, 2000) });
+    round_trip(&mut b);
+    assert_eq!(size_of(&d.sock, id), (100, 30));
 }

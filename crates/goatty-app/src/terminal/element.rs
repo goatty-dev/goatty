@@ -43,6 +43,9 @@ pub struct Geom {
     /// The cursor cell (col, row), kept while the cursor is hidden: where
     /// IME composition shows and the input method puts its popup.
     pub caret: (usize, usize),
+    /// The part of the grid the pane shows, when another client sizes the
+    /// session (#12) and the grid doesn't fill the pane or overflows it.
+    pub visible: Option<Bounds<Pixels>>,
 }
 
 impl Geom {
@@ -63,14 +66,23 @@ impl Geom {
         point(self.origin.x + self.cell.width * col as f32, self.origin.y + self.cell.height * row as f32)
     }
 
+    /// Whether `p` is on the part of the grid the pane shows (not in the
+    /// letterbox around it).
+    pub fn in_grid(&self, p: Point<Pixels>) -> bool {
+        self.visible.is_none_or(|b| b.contains(&p))
+    }
+
     /// Selection auto-scroll: lines to scroll per tick for a drag at height
     /// `y`, positive towards history. 0 over the grid; past the top or
-    /// bottom edge it grows with the distance, one line per cell height.
+    /// bottom edge of what the pane shows it grows with the distance, one
+    /// line per cell height.
     pub fn edge_scroll(&self, y: Pixels) -> i32 {
         const MAX: f32 = 10.0;
         let h = self.cell.height.max(px(1.0));
-        let top = self.origin.y;
-        let bottom = top + h * self.rows as f32;
+        let (top, bottom) = match self.visible {
+            Some(b) => (b.top(), b.bottom()),
+            None => (self.origin.y, self.origin.y + h * self.rows as f32),
+        };
         if y < top {
             (1.0 + (top - y) / h).min(MAX) as i32
         } else if y >= bottom {
@@ -256,13 +268,14 @@ impl Element for TerminalElement {
         let caret = frame.caret.unwrap_or(self.geom.get().caret);
         let caret = (caret.0.min(frame.cols.saturating_sub(1)), caret.1.min(frame.rows.saturating_sub(1)));
         let letterbox = self.session.watching().then(|| {
-            // A grid taller than the pane scrolls so the cursor's row shows.
-            let over = frame.rows.saturating_sub(rows as usize);
-            let shift = (caret.1 + 1).saturating_sub(rows as usize).min(over);
-            origin.y -= line_height * shift as f32;
+            // A grid larger than the pane pans so the cursor's cell shows.
+            let pan = |cells: usize, fits: u16, at: usize| (at + 1).saturating_sub(fits as usize).min(cells.saturating_sub(fits as usize));
+            origin.x -= cell_w * pan(frame.cols, cols, caret.0) as f32;
+            origin.y -= line_height * pan(frame.rows, rows, caret.1) as f32;
             Bounds::new(origin, size(cell_w * frame.cols as f32, line_height * frame.rows as f32))
         });
-        let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret };
+        let visible = letterbox.map(|grid| grid.intersect(&bounds));
+        let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret, visible };
         self.geom.set(geom);
 
         let default_bg = frame.background;
@@ -649,7 +662,7 @@ mod tests {
 
     #[test]
     fn edge_scroll_grows_past_the_edges() {
-        let g = Geom { origin: point(px(5.0), px(10.0)), cell: size(px(8.0), px(20.0)), cols: 80, rows: 10, caret: (0, 0) };
+        let g = Geom { origin: point(px(5.0), px(10.0)), cell: size(px(8.0), px(20.0)), cols: 80, rows: 10, caret: (0, 0), visible: None };
         assert_eq!(g.edge_scroll(px(10.0)), 0);
         assert_eq!(g.edge_scroll(px(209.0)), 0);
         assert_eq!(g.edge_scroll(px(9.0)), 1);
@@ -661,8 +674,23 @@ mod tests {
     }
 
     #[test]
+    fn a_letterboxed_grid_scrolls_and_clicks_by_what_the_pane_shows() {
+        // A 60-row grid panned up by 15 rows in a pane showing 24 of them.
+        let (cell, rows) = (size(px(8.0), px(20.0)), 60);
+        let origin = point(px(0.0), px(-300.0));
+        let visible = Some(Bounds::new(point(px(0.0), px(0.0)), size(px(320.0), px(480.0))));
+        let g = Geom { origin, cell, cols: 40, rows, caret: (0, 44), visible };
+        assert_eq!(g.edge_scroll(px(479.0)), 0);
+        assert_eq!(g.edge_scroll(px(481.0)), -1);
+        assert_eq!(g.edge_scroll(px(-1.0)), 1);
+        assert!(g.in_grid(point(px(10.0), px(10.0))));
+        assert!(!g.in_grid(point(px(330.0), px(10.0))), "right of a 40-column grid");
+        assert!(Geom { visible: None, ..g }.in_grid(point(px(330.0), px(10.0))));
+    }
+
+    #[test]
     fn preedit_stays_inside_the_grid() {
-        let g = Geom { origin: point(px(0.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (5, 2) };
+        let g = Geom { origin: point(px(0.0), px(0.0)), cell: size(px(10.0), px(20.0)), cols: 80, rows: 10, caret: (5, 2), visible: None };
         assert_eq!(g.preedit_origin(3), point(px(50.0), px(40.0)));
         let g = Geom { caret: (78, 2), ..g };
         assert_eq!(g.preedit_origin(6), point(px(740.0), px(40.0)));

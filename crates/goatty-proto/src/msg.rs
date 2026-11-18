@@ -92,6 +92,21 @@ pub struct WinSize {
     pub cell_height: u16,
 }
 
+impl WinSize {
+    /// The most columns a session may have.
+    pub const MAX_COLS: u16 = 4096;
+    /// The most rows a session may have.
+    pub const MAX_ROWS: u16 = 2048;
+    /// The most cells a session may have (a grid is allocated per size).
+    pub const MAX_CELLS: u32 = 1 << 21;
+
+    /// Within the limits above. A peer refuses (never clamps) a size outside
+    /// them: a snapshot made for one grid size can't be fed into another.
+    pub fn is_sane(&self) -> bool {
+        self.cols <= Self::MAX_COLS && self.rows <= Self::MAX_ROWS && u32::from(self.cols) * u32::from(self.rows) <= Self::MAX_CELLS
+    }
+}
+
 /// Per-subscription stream parameters, chosen by the client per connection
 /// type.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -602,6 +617,17 @@ mod tests {
         assert_eq!(negotiate(PROTOCOL_VERSION + 3), Some(PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION), Some(MIN_PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION - 1), None);
+    }
+
+    #[test]
+    fn window_sizes_are_bounded() {
+        let ws = |cols, rows| WinSize { cols, rows, cell_width: 8, cell_height: 16 };
+        assert!(ws(80, 24).is_sane());
+        assert!(ws(1536, 600).is_sane());
+        assert!(!ws(WinSize::MAX_COLS + 1, 1).is_sane());
+        assert!(!ws(1, WinSize::MAX_ROWS + 1).is_sane());
+        assert!(!ws(4096, 2048).is_sane());
+        assert!(!ws(u16::MAX, u16::MAX).is_sane());
     }
 
     #[test]

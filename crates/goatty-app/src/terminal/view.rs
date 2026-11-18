@@ -338,6 +338,10 @@ pub struct TerminalView {
     keys_down: Vec<String>,
     /// A right press went to the program: its release goes there too.
     right_to_program: bool,
+    /// Left and middle presses that went to the program (bits 0 and 1):
+    /// only their releases go there, not the release of a press the pane
+    /// kept (the "Take over" chip, the letterbox).
+    buttons_to_program: u8,
     /// Text the input method (IME, dead keys, compose) is composing; it
     /// goes to the program only once committed (#21).
     preedit: String,
@@ -464,6 +468,7 @@ impl TerminalView {
             menu_cell: None,
             keys_down: Vec::new(),
             right_to_program: false,
+            buttons_to_program: 0,
             preedit: String::new(),
         };
         view.apply_settings(&app);
@@ -923,7 +928,15 @@ impl TerminalView {
             toast::show_in(window, cx, Toast::success("This pane already sets the session's size").key("terminal.size"));
             return;
         }
-        self.session.take_size();
+        self.request_take_size(window, cx);
+    }
+
+    /// Ask the daemon to size the session to this pane, or say why it can't.
+    fn request_take_size(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.session.take_size() {
+            let why = "The connection to the host is down. Try again once it's back.";
+            toast::show_in(window, cx, Toast::error("Can't take over the session's size").body(why).key("terminal.size"));
+        }
         cx.notify();
     }
 
@@ -2033,6 +2046,15 @@ impl TerminalView {
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.focus(&self.focus, cx);
+        if !self.geom.get().in_grid(ev.position) {
+            // The letterbox around a session another client sizes (#12): no
+            // cell is there. A right click still opens the pane's menu.
+            if ev.button == GMouseButton::Right {
+                self.menu_cell = None;
+                cx.emit(TerminalEvent::ContextMenu { at: ev.position, keyboard: false });
+            }
+            return;
+        }
         let (col, row, right) = self.geom.get().cell_at(ev.position);
         self.pressed_link = None;
         self.pressed_pending_link = None;
@@ -2064,6 +2086,7 @@ impl TerminalView {
         }
         if self.mouse_mode_active(ev.modifiers.shift) {
             if let Some(btn) = mouse_button(Some(ev.button)) {
+                self.buttons_to_program |= button_bit(ev.button);
                 self.report_mouse(btn, MouseAction::Press, col, row, &ev.modifiers);
             }
             return;
@@ -2095,7 +2118,10 @@ impl TerminalView {
             }
             return;
         }
-        if self.mouse_mode_active(ev.modifiers.shift)
+        let pressed_here = self.buttons_to_program & button_bit(ev.button) != 0;
+        self.buttons_to_program &= !button_bit(ev.button);
+        if pressed_here
+            && self.mouse_mode_active(ev.modifiers.shift)
             && let Some(btn) = mouse_button(Some(ev.button))
         {
             self.report_mouse(btn, MouseAction::Release, col, row, &ev.modifiers);
@@ -2264,6 +2290,15 @@ fn write_primary(cx: &App, item: ClipboardItem) {
     cx.write_to_primary(item);
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let _ = (cx, item);
+}
+
+/// `buttons_to_program`'s bit for a left or middle press.
+fn button_bit(b: GMouseButton) -> u8 {
+    match b {
+        GMouseButton::Left => 1,
+        GMouseButton::Middle => 2,
+        _ => 0,
+    }
 }
 
 fn mouse_button(b: Option<GMouseButton>) -> Option<MouseButton> {
@@ -2580,10 +2615,7 @@ impl Render for TerminalView {
                                 .hover(|s| s.underline())
                                 .child("Take over")
                                 .on_mouse_down(GMouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.session.take_size();
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, window, cx| this.request_take_size(window, cx))),
                         ),
                 )
             })

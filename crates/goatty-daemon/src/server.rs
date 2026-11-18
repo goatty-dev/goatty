@@ -59,6 +59,8 @@ pub(crate) struct NewSession {
     pub chans: TerminalChannels,
     pub created_unix: u64,
     pub managed: bool,
+    /// The connection that asked for it (`Create`, `Run`); `None` when restored.
+    pub creator: Option<u64>,
 }
 
 /// The program this process runs, as a path a restart can run again (not
@@ -94,7 +96,7 @@ impl Daemon {
     /// A session running the user's shell (goatty's managed zsh by default).
     /// `gui_setup`: the client offers the shell setup itself (protocol v9),
     /// so the shell's own missing-tools hint stays quiet.
-    pub(crate) fn create(self: &Arc<Self>, ws: WinSize, cwd: Option<String>, gui_setup: bool) -> Result<Arc<Session>> {
+    pub(crate) fn create(self: &Arc<Self>, conn: u64, ws: WinSize, cwd: Option<String>, gui_setup: bool) -> Result<Arc<Session>> {
         let host = self.host.settings();
         for issue in &host.file.issues {
             log::warn!("host settings: {issue}");
@@ -104,19 +106,19 @@ impl Daemon {
             goatty_shell::setup::gui_offers_setup(&mut launch);
         }
         let managed = launch.managed;
-        self.spawn(ShellCommand::new(launch.program, launch.args, launch.env), managed, ws, cwd)
+        self.spawn(conn, ShellCommand::new(launch.program, launch.args, launch.env), managed, ws, cwd)
     }
 
     /// A session running `argv` instead of a shell.
-    pub(crate) fn run(self: &Arc<Self>, ws: WinSize, cwd: Option<String>, mut argv: Vec<String>) -> Result<Arc<Session>> {
+    pub(crate) fn run(self: &Arc<Self>, conn: u64, ws: WinSize, cwd: Option<String>, mut argv: Vec<String>) -> Result<Arc<Session>> {
         if argv.is_empty() {
             bail!("nothing to run");
         }
         let program = argv.remove(0);
-        self.spawn(ShellCommand::new(program, argv, Vec::new()), false, ws, cwd)
+        self.spawn(conn, ShellCommand::new(program, argv, Vec::new()), false, ws, cwd)
     }
 
-    fn spawn(self: &Arc<Self>, mut cmd: ShellCommand, managed: bool, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
+    fn spawn(self: &Arc<Self>, conn: u64, mut cmd: ShellCommand, managed: bool, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
         let _admitted = self.admission.read();
         if self.restarting.load(Ordering::SeqCst) {
             bail!("goattyd is restarting; try again in a moment");
@@ -134,7 +136,7 @@ impl Daemon {
         let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let pid = pty.pid();
         log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
-        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed })?;
+        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator: Some(conn) })?;
         if crate::systemd::has_fd_store() {
             crate::systemd::store(&session.stored(), session.master_fd);
         }
@@ -144,7 +146,7 @@ impl Daemon {
     /// Register a session and start its threads: query replies → PTY, and
     /// PTY → terminal + subscribers until the process exits.
     pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
-        let NewSession { id, pty, reader, term, chans, created_unix, managed } = n;
+        let NewSession { id, pty, reader, term, chans, created_unix, managed, creator } = n;
         let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
         let proc_cwd = pty.cwd();
         let init_cwd = term
@@ -172,6 +174,8 @@ impl Daemon {
             replies_taken: AtomicU64::new(0),
             replies_written: AtomicU64::new(0),
             controller: Mutex::new(None),
+            creator: Mutex::new(creator),
+            pty_size: Mutex::new(None),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");
