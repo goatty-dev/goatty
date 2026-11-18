@@ -117,6 +117,12 @@ fn has_row_in(action: &str, overrides: &BTreeMap<String, Option<String>>, regist
     keys::parse_plugin_action(action).is_some() && overrides.values().flatten().any(|a| a == action)
 }
 
+fn action_is_changed(name: &str, overrides: &BTreeMap<String, Option<String>>) -> bool {
+    overrides
+        .iter()
+        .any(|(k, v)| v.as_deref() == Some(name) || (v.is_none() && keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| dk == k && *da == name)))
+}
+
 fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&CommandRegistry>) -> Vec<Line> {
     let mut out: Vec<Line> = ACTIONS
         .iter()
@@ -125,9 +131,7 @@ fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&Command
             label: Cow::Borrowed(a.label),
             group: a.group,
             keys: keys::keys_for(a.name, overrides),
-            changed: overrides.iter().any(|(k, v)| {
-                v.as_deref() == Some(a.name) || (v.is_none() && keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| dk == k && *da == a.name))
-            }),
+            changed: action_is_changed(a.name, overrides),
             available: true,
         })
         .collect();
@@ -244,8 +248,9 @@ impl SettingsWindow {
         true
     }
 
-    fn shortcut_row(&self, ui: Ui, line: &Line, fallback_focus: &gpui::ElementId, cx: &Context<'_, Self>) -> AnyElement {
+    fn shortcut_row(&self, ui: Ui, line: &Line, query: &str, fallback_focus: &gpui::ElementId, cx: &Context<'_, Self>) -> AnyElement {
         let app = cx.global::<AppSettings>();
+        let overrides = &app.file.value.keybindings;
         let filter = self.shortcuts.filter;
         let pressed = self.shortcuts.pressed.clone();
         let name = line.name.as_ref().to_owned();
@@ -289,7 +294,7 @@ impl SettingsWindow {
         let chips = div().flex().flex_wrap().items_center().gap(px(8.)).children(line.keys.iter().enumerate().map(|(ki, k)| {
             let key = k.clone();
             let (row_elem, page_focus, fallback_focus) = (row_elem.clone(), page_focus.clone(), fallback_focus.clone());
-            let stays_after_remove = row_stays_after_remove(line, filter, pressed.as_deref(), k);
+            let stays_after_remove = row_stays_after_remove(line, overrides, filter, query, pressed.as_deref(), k);
             let gid = SharedString::from(format!("sc-key-{name}-{ki}"));
             let rm_id: gpui::ElementId = SharedString::from(format!("sc-rm-{name}-{ki}")).into();
             let rm_focus = rm_id.clone();
@@ -351,7 +356,7 @@ impl SettingsWindow {
             chips.into_any_element()
         };
         let this = cx.entity().downgrade();
-        let stays_after_reset = line.available && filter != Filter::Changed && pressed.is_none();
+        let stays_after_reset = row_stays_after_reset(line, overrides, filter, query, pressed.as_deref());
         let actions = div()
             .w(px(72.))
             .flex_shrink_0()
@@ -393,7 +398,8 @@ impl SettingsWindow {
         // The row is a tab stop: Enter records a new shortcut, Delete removes the last one.
         let row_id = row_elem;
         let last_key = line.keys.last().cloned();
-        let stays_after_delete = last_key.as_deref().is_none_or(|k| row_stays_after_remove(line, filter, pressed.as_deref(), k));
+        let stays_after_delete =
+            last_key.as_deref().is_none_or(|k| row_stays_after_remove(line, overrides, filter, query, pressed.as_deref(), k));
         let fallback_focus = fallback_focus.clone();
         let row = div()
             .id(row_id.clone())
@@ -532,18 +538,7 @@ impl SettingsWindow {
         let query = st.query.read(cx).text().trim().to_string();
         let changed_n = all.iter().filter(|l| l.changed).count();
         let unbound_n = all.iter().filter(|l| l.keys.is_empty()).count();
-        let mut shown: Vec<&Line> = all
-            .iter()
-            .filter(|l| match st.filter {
-                Filter::All => true,
-                Filter::Changed => l.changed,
-                Filter::Unbound => l.keys.is_empty(),
-            })
-            .filter(|l| match &st.pressed {
-                Some(k) => l.keys.iter().any(|key| key == k),
-                None => matches(&query, l),
-            })
-            .collect();
+        let mut shown: Vec<&Line> = all.iter().filter(|l| line_matches_view(l, st.filter, &query, st.pressed.as_deref())).collect();
         match st.sort {
             Sort::Group => {}
             Sort::Name => shown.sort_by_key(|l| l.label.to_lowercase()),
@@ -686,7 +681,7 @@ impl SettingsWindow {
                             table = table.child(divider(ui));
                         }
                         let fallback = grouped_removal_fallback(&groups, gi, i);
-                        table = table.child(self.shortcut_row(ui, l, &fallback, cx));
+                        table = table.child(self.shortcut_row(ui, l, &query, &fallback, cx));
                     }
                 }
             }
@@ -696,7 +691,7 @@ impl SettingsWindow {
                     table = table.child(divider(ui));
                 }
                 let fallback = flat_removal_fallback(&shown, i);
-                table = table.child(self.shortcut_row(ui, l, &fallback, cx));
+                table = table.child(self.shortcut_row(ui, l, &query, &fallback, cx));
             }
         }
 
@@ -718,13 +713,66 @@ fn group_elem_id(group: &str) -> gpui::ElementId {
     SharedString::from(format!("sc-group-{group}")).into()
 }
 
-fn row_stays_after_remove(line: &Line, filter: Filter, pressed: Option<&str>, key: &str) -> bool {
-    let keeps_unavailable = line.available || line.keys.len() > 1;
-    let keeps_pressed = pressed != Some(key) || line.keys.iter().filter(|k| k.as_str() == key).count() > 1;
-    let keeps_changed = filter != Filter::Changed
-        || line.keys.iter().any(|k| k.as_str() != key)
-        || keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| *da == line.name && *dk == key);
-    keeps_unavailable && keeps_pressed && keeps_changed
+fn line_matches_view(line: &Line, filter: Filter, query: &str, pressed: Option<&str>) -> bool {
+    let passes_filter = match filter {
+        Filter::All => true,
+        Filter::Changed => line.changed,
+        Filter::Unbound => line.keys.is_empty(),
+    };
+    let passes_search = match pressed {
+        Some(k) => line.keys.iter().any(|key| key == k),
+        None => matches(query, line),
+    };
+    passes_filter && passes_search
+}
+
+fn row_stays_after_overrides(
+    line: &Line,
+    after: &BTreeMap<String, Option<String>>,
+    filter: Filter,
+    query: &str,
+    pressed: Option<&str>,
+) -> bool {
+    let after_keys = keys::keys_for(&line.name, after);
+    let is_builtin = keys::find_action(&line.name).is_some();
+    if !is_builtin && !line.available && after_keys.is_empty() {
+        return false;
+    }
+    let after_changed = if is_builtin { action_is_changed(&line.name, after) } else { !after_keys.is_empty() };
+    let after_line = Line {
+        name: line.name.clone(),
+        label: line.label.clone(),
+        group: line.group,
+        keys: after_keys,
+        changed: after_changed,
+        available: line.available,
+    };
+    line_matches_view(&after_line, filter, query, pressed)
+}
+
+fn row_stays_after_remove(
+    line: &Line,
+    overrides: &BTreeMap<String, Option<String>>,
+    filter: Filter,
+    query: &str,
+    pressed: Option<&str>,
+    key: &str,
+) -> bool {
+    let mut after = overrides.clone();
+    keys::set_binding(&mut after, key, None);
+    row_stays_after_overrides(line, &after, filter, query, pressed)
+}
+
+fn row_stays_after_reset(
+    line: &Line,
+    overrides: &BTreeMap<String, Option<String>>,
+    filter: Filter,
+    query: &str,
+    pressed: Option<&str>,
+) -> bool {
+    let mut after = overrides.clone();
+    keys::reset_action(&mut after, &line.name);
+    row_stays_after_overrides(line, &after, filter, query, pressed)
 }
 
 fn grouped_removal_fallback(groups: &[(&'static str, Vec<&Line>, bool)], gi: usize, ri: usize) -> gpui::ElementId {
@@ -825,35 +873,62 @@ mod tests {
             name: Cow::Borrowed("new_tab"),
             label: Cow::Borrowed("New tab"),
             group: "Tabs",
-            keys: vec!["ctrl-shift-t".into()],
-            changed: false,
+            keys: vec!["ctrl-shift-t".into(), "ctrl-alt-n".into()],
+            changed: true,
+            available: true,
+        };
+        let plugin_avail = Line {
+            name: Cow::Borrowed("plugin.docker.exec"),
+            label: Cow::Borrowed("Docker: Exec"),
+            group: PLUGINS_GROUP,
+            keys: vec!["ctrl-alt-e".into()],
+            changed: true,
             available: true,
         };
         let plugin_a = Line {
-            name: Cow::Borrowed("plugin.a.one"),
-            label: Cow::Borrowed("a: one"),
+            name: Cow::Borrowed("plugin.alpha.one"),
+            label: Cow::Borrowed("alpha: one"),
             group: PLUGINS_GROUP,
             keys: vec!["ctrl-alt-1".into()],
             changed: true,
             available: false,
         };
         let plugin_b = Line {
-            name: Cow::Borrowed("plugin.b.two"),
-            label: Cow::Borrowed("b: two"),
+            name: Cow::Borrowed("plugin.beta.two"),
+            label: Cow::Borrowed("beta: two"),
             group: PLUGINS_GROUP,
             keys: vec!["ctrl-alt-2".into(), "ctrl-alt-3".into()],
             changed: true,
             available: false,
         };
+        let overrides = BTreeMap::from([
+            ("ctrl-alt-n".to_string(), Some("new_tab".to_string())),
+            ("ctrl-alt-e".to_string(), Some("plugin.docker.exec".to_string())),
+            ("ctrl-alt-1".to_string(), Some("plugin.alpha.one".to_string())),
+            ("ctrl-alt-2".to_string(), Some("plugin.beta.two".to_string())),
+            ("ctrl-alt-3".to_string(), Some("plugin.beta.two".to_string())),
+        ]);
 
-        assert!(!row_stays_after_remove(&plugin_a, Filter::All, None, "ctrl-alt-1"));
-        assert!(row_stays_after_remove(&plugin_b, Filter::All, None, "ctrl-alt-2"));
-        assert!(row_stays_after_remove(&tabs_line, Filter::All, None, "ctrl-shift-t"));
-        assert!(!row_stays_after_remove(&plugin_a, Filter::Changed, None, "ctrl-alt-1"));
+        assert!(!row_stays_after_remove(&plugin_a, &overrides, Filter::All, "", None, "ctrl-alt-1"));
+        assert!(row_stays_after_remove(&plugin_b, &overrides, Filter::All, "", None, "ctrl-alt-2"));
+        assert!(!row_stays_after_remove(&plugin_a, &overrides, Filter::Changed, "", None, "ctrl-alt-1"));
+
+        // Text search matching only the removed/reset binding hides the row; label match keeps it.
+        assert!(!row_stays_after_remove(&plugin_avail, &overrides, Filter::All, "ctrl-alt-e", None, "ctrl-alt-e"));
+        assert!(!row_stays_after_reset(&plugin_avail, &overrides, Filter::All, "ctrl-alt-e", None));
+        assert!(row_stays_after_remove(&plugin_avail, &overrides, Filter::All, "docker", None, "ctrl-alt-e"));
+        assert!(row_stays_after_reset(&plugin_avail, &overrides, Filter::All, "docker", None));
+
+        // Removing a single custom binding on `new_tab` leaves its default key, so Changed drops it.
+        assert!(!row_stays_after_remove(&tabs_line, &overrides, Filter::Changed, "", None, "ctrl-alt-n"));
+        // Adding a second custom binding on `new_tab` keeps it in Changed when only one is removed.
+        let mut two_custom = overrides.clone();
+        two_custom.insert("ctrl-alt-m".to_string(), Some("new_tab".to_string()));
+        assert!(row_stays_after_remove(&tabs_line, &two_custom, Filter::Changed, "", None, "ctrl-alt-n"));
 
         let two_plugins = vec![("Tabs", vec![&tabs_line], false), (PLUGINS_GROUP, vec![&plugin_a, &plugin_b], false)];
-        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 0), row_elem_id("plugin.b.two"));
-        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 1), row_elem_id("plugin.a.one"));
+        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 0), row_elem_id("plugin.beta.two"));
+        assert_eq!(grouped_removal_fallback(&two_plugins, 1, 1), row_elem_id("plugin.alpha.one"));
 
         // When the only plugin row disappears, `Plugins` header also disappears, so fall back to the preceding surviving row.
         let one_plugin = vec![("Tabs", vec![&tabs_line], false), (PLUGINS_GROUP, vec![&plugin_a], false)];

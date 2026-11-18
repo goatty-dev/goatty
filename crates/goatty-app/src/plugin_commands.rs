@@ -102,6 +102,7 @@ pub fn refresh(cx: &mut App) {
     let generation = state.generation;
     // Another host: its plugins aren't the last one's, so none until fetched.
     if moved {
+        cx.default_global::<State>().last_issues.clear();
         replace(None, Vec::new(), cx);
         if link.is_some() {
             cx.default_global::<State>().stale = true;
@@ -151,19 +152,25 @@ pub fn refresh(cx: &mut App) {
     .detach();
 }
 
-fn report_issues(link: &HostLink, issues: &[String], cx: &mut App) {
+fn should_report_issues(state: &mut State, issues: &[String]) -> bool {
     if issues.is_empty() {
-        cx.default_global::<State>().last_issues.clear();
-        return;
+        state.last_issues.clear();
+        return false;
     }
+    if state.last_issues == issues {
+        return false;
+    }
+    state.last_issues = issues.to_vec();
+    true
+}
+
+fn report_issues(link: &HostLink, issues: &[String], cx: &mut App) {
     for issue in issues {
         log::warn!("plugin commands on {}: {issue}", link.label());
     }
-    let state = cx.default_global::<State>();
-    if state.last_issues == issues {
+    if !should_report_issues(cx.default_global::<State>(), issues) {
         return;
     }
-    state.last_issues = issues.to_vec();
     let body = if issues.len() == 1 { issues[0].clone() } else { format!("{} (and {} more)", issues[0], issues.len() - 1) };
     crate::toast::show(
         cx,
@@ -573,5 +580,19 @@ run = ["docker", "ps"]
         state.active.remove("plugin.docker.ps");
         reg.unregister_plugins();
         assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_none());
+    }
+
+    #[test]
+    fn should_report_issues_suppresses_repeats_until_cleared_or_changed() {
+        let mut state = State::default();
+        let issues = vec!["installed/lock.json is unreadable".to_string()];
+        assert!(should_report_issues(&mut state, &issues));
+        // Repeated identical issues on the same host are suppressed.
+        assert!(!should_report_issues(&mut state, &issues));
+        // Clearing on host change (or empty issues) lets the same issue report again.
+        state.last_issues.clear();
+        assert!(should_report_issues(&mut state, &issues));
+        assert!(!should_report_issues(&mut state, &[]));
+        assert!(should_report_issues(&mut state, &issues));
     }
 }
