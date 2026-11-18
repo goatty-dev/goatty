@@ -81,7 +81,7 @@ pub enum Request {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reply {
     Catalog(Catalog),
-    Installed(Vec<Installed>),
+    Installed { installed: Vec<Installed> },
     Plan(Box<Plan>),
     Changed(Changed),
     Snippets(SnippetList),
@@ -522,5 +522,16 @@ publisher = "tests"
         assert_eq!(back.unavailable_commands, ["exec", "logs"]);
         let back_empty: Installed = serde_json::from_str(&empty_json).unwrap();
         assert!(back_empty.unavailable_commands.is_empty());
+
+        let req_json = serde_json::to_string(&Request::Installed).unwrap();
+        assert_eq!(req_json, r#"{"op":"installed"}"#);
+        assert_eq!(serde_json::from_str::<Request>(&req_json).unwrap(), Request::Installed);
+
+        for list in [vec![], vec![with_unavail]] {
+            let reply = Reply::Installed { installed: list };
+            let json = serde_json::to_string(&reply).unwrap();
+            let back: Reply = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, reply);
+        }
     }
 }

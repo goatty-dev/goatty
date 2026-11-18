@@ -79,6 +79,7 @@ struct Line {
     group: &'static str,
     keys: Vec<String>,
     changed: bool,
+    available: bool,
 }
 
 /// `query` typed as keys: `Ctrl+Shift+T`, `ctrl t` → `ctrl-shift-t`, `ctrl-t`.
@@ -127,6 +128,7 @@ fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&Command
             changed: overrides.iter().any(|(k, v)| {
                 v.as_deref() == Some(a.name) || (v.is_none() && keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| dk == k && *da == a.name))
             }),
+            available: true,
         })
         .collect();
     let mut seen = HashSet::new();
@@ -146,6 +148,7 @@ fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&Command
                 group: PLUGINS_GROUP,
                 changed: !keys.is_empty(),
                 keys,
+                available: true,
             });
         }
     }
@@ -156,7 +159,14 @@ fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&Command
         let Some((plugin, cmd)) = keys::parse_plugin_action(&action) else { continue };
         let keys = keys::keys_for(&action, overrides);
         let changed = !keys.is_empty();
-        out.push(Line { label: Cow::Owned(format!("{plugin}: {cmd}")), name: Cow::Owned(action), group: PLUGINS_GROUP, keys, changed });
+        out.push(Line {
+            label: Cow::Owned(format!("{plugin}: {cmd}")),
+            name: Cow::Owned(action),
+            group: PLUGINS_GROUP,
+            keys,
+            changed,
+            available: false,
+        });
     }
     out
 }
@@ -425,12 +435,27 @@ impl SettingsWindow {
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap(px(8.))
+                            .flex_col()
+                            .gap(px(2.))
                             .flex_1()
                             .min_w(px(140.))
-                            .child(div().min_w_0().text_size(px(text::BODY)).text_color(ui.text).child(label_text))
-                            .when(line.changed, |d| d.child(badge("Changed", Tone::Accent, ui))),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(div().min_w_0().text_size(px(text::BODY)).text_color(ui.text).child(label_text))
+                                    .when(line.changed, |d| d.child(badge("Changed", Tone::Accent, ui)))
+                                    .when(!line.available, |d| d.child(badge("Unavailable", Tone::Neutral, ui))),
+                            )
+                            .when(!line.available, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(text::SMALL))
+                                        .text_color(ui.muted)
+                                        .child("Not active on this host (plugin not installed or enabled, a setting is off, or its program is missing)."),
+                                )
+                            }),
                     )
                     .child(div().w(px(240.)).flex_shrink(1.).min_w(px(150.)).child(cell))
                     .child(actions),
@@ -681,6 +706,7 @@ mod tests {
             group: a.group,
             keys: vec!["ctrl-shift-t".into()],
             changed: false,
+            available: true,
         };
         for q in ["", "new tab", "tab new", "TAB", "ctrl+shift+t", "Ctrl+Shift+T", "shift-t", "tabs"] {
             assert!(matches(q, &l), "{q:?}");
@@ -709,6 +735,7 @@ mod tests {
         assert_eq!(docker.label, "Docker: Open a shell in a container");
         assert_eq!(docker.keys, ["ctrl-alt-e"]);
         assert!(docker.changed);
+        assert!(docker.available);
         assert!(matches("docker exec", docker));
         assert!(matches("plugin.docker.exec", docker));
         assert!(matches("plugins", docker));
@@ -717,6 +744,7 @@ mod tests {
         assert_eq!(git.label, "git: status");
         assert_eq!(git.keys, ["ctrl-alt-g"]);
         assert!(git.changed);
+        assert!(!git.available);
         assert!(matches("plugin.git.status", git));
 
         assert!(has_row_in("new_tab", &overrides, Some(&reg)));

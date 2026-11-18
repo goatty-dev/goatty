@@ -761,7 +761,8 @@ impl Plugins<'_> {
     pub fn installed(&self, settings: &HostSettings) -> Vec<Installed> {
         let path = std::env::var("PATH").ok();
         let mut issues = Vec::new();
-        self.installed_entries(settings, path.as_deref(), &[], &mut issues)
+        let lock = self.load_lock(&mut issues);
+        self.installed_entries(&lock, settings, path.as_deref(), &[], &mut issues)
     }
 
     /// Installed plugins and what the registries offer.
@@ -772,8 +773,8 @@ impl Plugins<'_> {
 
     pub(crate) fn catalog_with_env_path(&self, refresh: bool, settings: &HostSettings, env_path: Option<&str>) -> Catalog {
         let (snaps, registries, mut issues) = self.snapshots(refresh, true);
-        let installed = self.installed_entries(settings, env_path, &snaps, &mut issues);
-        let lock = Lock::load(self.dirs).unwrap_or_default();
+        let lock = self.load_lock(&mut issues);
+        let installed = self.installed_entries(&lock, settings, env_path, &snaps, &mut issues);
         let target = current_target();
         let mut available: Vec<Available> = Vec::new();
         for s in &snaps {
@@ -813,8 +814,19 @@ impl Plugins<'_> {
         Catalog { installed, available, registries, issues }
     }
 
+    fn load_lock(&self, issues: &mut Vec<String>) -> Lock {
+        match Lock::load(self.dirs) {
+            Ok(l) => l,
+            Err(e) => {
+                issues.push(format!("{e:#}"));
+                Lock::default()
+            }
+        }
+    }
+
     fn installed_entries(
         &self,
+        lock: &Lock,
         settings: &HostSettings,
         env_path: Option<&str>,
         snaps: &[Snapshot],
@@ -826,16 +838,9 @@ impl Plugins<'_> {
             "eval", "exec", "exit", "export", "false", "fc", "fg", "float", "getopts", "history", "integer", "jobs", "kill", "let",
             "local", "noglob", "popd", "print", "printf", "pushd", "pwd", "r", "read", "readonly", "return", "set", "setopt", "shift",
             "source", "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait",
-            "whence", "where", "which", "z", "zcompile", "zmodload", "zstyle",
+            "whence", "where", "which", "zcompile", "zmodload", "zstyle",
         ];
 
-        let lock = match Lock::load(self.dirs) {
-            Ok(l) => l,
-            Err(e) => {
-                issues.push(format!("{e:#}"));
-                Lock::default()
-            }
-        };
         let target = current_target();
         let managed_path = std::cell::OnceCell::new();
         let mut found: BTreeMap<String, bool> = BTreeMap::new();

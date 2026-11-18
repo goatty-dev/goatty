@@ -126,7 +126,7 @@ pub fn refresh(cx: &mut App) {
                 return;
             }
             match reply {
-                Ok(Reply::Installed(installed)) => replace(Some(link), installed, cx),
+                Ok(Reply::Installed { installed }) => replace(Some(link), installed, cx),
                 Ok(Reply::Catalog(c)) => replace(Some(link), c.installed, cx),
                 Ok(_) => {
                     cx.default_global::<State>().stale = false;

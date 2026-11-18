@@ -551,7 +551,7 @@ summary = "Tests command availability"
 publisher = "tests"
 
 [requires]
-commands = ["present-tool", "nonexec-tool", "goatty-test-needed-tool-xyz", "setopt", "zcompile", "sudo"]
+commands = ["present-tool", "nonexec-tool", "goatty-test-needed-tool-xyz", "setopt", "zcompile", "z", "sudo"]
 
 [[setting]]
 id = "extra"
@@ -573,6 +573,11 @@ run = ["setopt", "nullglob"]
 id = "builtin-zcompile"
 title = "Zcompile"
 run = ["zcompile", "foo.zsh"]
+
+[[command]]
+id = "fn-z"
+title = "Zoxide jump"
+run = ["z", "projects"]
 
 [[command]]
 id = "external-sudo"
@@ -602,11 +607,11 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
     let plan = p.plan(&c, &settings).unwrap();
     p.install(&c, &plan.digest, &settings).unwrap();
 
-    // `sudo` (external, absent in env_path), `nonexec-tool` (0644), `gated` (`when = "extra"`),
+    // `z` (not a builtin), `sudo` (external, absent in env_path), `nonexec-tool` (0644), `gated` (`when = "extra"`),
     // and `missing-bin` are unavailable; `present-tool` (0755), `setopt`, and `zcompile` are available.
     let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
     let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
-    assert_eq!(inst.unavailable_commands, ["external-sudo", "nonexec", "gated", "missing-bin"]);
+    assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo", "nonexec", "gated", "missing-bin"]);
 
     // `Plugins::installed` works locally without consulting registries.
     let local_only = p.installed(&settings);
@@ -618,7 +623,7 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
     });
     let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
     let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
-    assert_eq!(inst.unavailable_commands, ["external-sudo", "nonexec", "missing-bin"]);
+    assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo", "nonexec", "missing-bin"]);
 
     // Adding `goatty-test-needed-tool-xyz` (0755) and an executable `nonexec-tool` (0755) later
     // in `shell.path` makes both available (earlier 0644 `nonexec-tool` in `env_bin` is skipped).
@@ -637,7 +642,7 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
     settings.shell.path.push(custom_bin.to_string_lossy().into_owned());
     let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
     let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
-    assert_eq!(inst.unavailable_commands, ["external-sudo"]);
+    assert_eq!(inst.unavailable_commands, ["fn-z", "external-sudo"]);
     assert_eq!(
         crate::snippets::find_in(&format!("{}:{}", env_bin.display(), custom_bin.display()), "nonexec-tool").as_deref(),
         Some(fallback_exec.as_path())
