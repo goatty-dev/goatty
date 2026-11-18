@@ -605,6 +605,10 @@ impl Session {
     /// controls the session's size; the daemon always hears it (it's the
     /// size the session takes when this client controls it).
     pub fn resize(&self, size: TermSize) {
+        if matches!(self.backend, Backend::Daemon { .. }) && !win(size).is_sane() {
+            // goattyd would refuse it: keep the mirror at the session's size.
+            return;
+        }
         // `view` is held while the terminal is resized, so a `SizeControl`
         // on the reader thread can't interleave with it.
         let mut view = self.view.lock();

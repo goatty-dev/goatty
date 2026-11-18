@@ -934,7 +934,7 @@ impl TerminalView {
     /// Ask the daemon to size the session to this pane, or say why it can't.
     fn request_take_size(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if !self.session.take_size() {
-            let why = "The connection to the host is down. Try again once it's back.";
+            let why = "This pane isn't connected to the session right now. Try again once it's back.";
             toast::show_in(window, cx, Toast::error("Can't take over the session's size").body(why).key("terminal.size"));
         }
         cx.notify();
@@ -2182,13 +2182,14 @@ impl TerminalView {
         if self.refresh_hover(cx) {
             cx.notify();
         }
-        // Outside the grid, only a drag whose press went to the program.
-        let held = match ev.pressed_button {
+        // Plain motion over the grid; a drag only when the program got its
+        // press (like the release), wherever it goes.
+        let report = match ev.pressed_button {
+            None => inside,
             Some(GMouseButton::Right) => self.right_to_program,
             Some(b) => self.buttons_to_program & button_bit(b) != 0,
-            None => false,
         };
-        if self.mouse_mode_active(ev.modifiers.shift) && (inside || held) {
+        if self.mouse_mode_active(ev.modifiers.shift) && report {
             let btn = mouse_button(ev.pressed_button).unwrap_or(MouseButton::None);
             self.report_mouse(btn, MouseAction::Motion, col, row, &ev.modifiers);
         }
