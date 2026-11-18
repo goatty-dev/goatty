@@ -224,21 +224,30 @@ fn remote_flags_reject_unsupported_subcommands() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
 
+    let o = goatty(home, &["--ssh", "box", "settings", "show"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--ssh and --via only apply to"), "{}", err(&o));
+
     let o = goatty(home, &["settings", "show", "--ssh", "box"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("--ssh and --via only apply to"), "{}", err(&o));
 
-    let o = goatty(home, &["settings", "set", "font.size", "14", "--via", "true"]);
+    let o = goatty(home, &["--via", "true", "settings", "set", "font.size", "14"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("--ssh and --via only apply to"), "{}", err(&o));
 
+    let o = goatty(home, &["--ssh", "box", "theme", "list"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--ssh and --via don't apply"), "{}", err(&o));
+
     let o = goatty(home, &["theme", "list", "--ssh", "box"]);
+    assert!(!o.status.success());
+
+    let o = goatty(home, &["--via", "true", "completions", "zsh"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("--ssh and --via don't apply"), "{}", err(&o));
 
     let o = goatty(home, &["completions", "zsh", "--via", "true"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("--ssh and --via don't apply"), "{}", err(&o));
 
     let o = goatty(home, &["--ssh", "box", "--plain", "settings", "export", "-"]);
     assert!(!o.status.success());
@@ -259,6 +268,21 @@ fn remote_flags_reject_unsupported_subcommands() {
     let o = goatty(home, &["settings", "export", "-", "--remote-daemon", "/opt/goattyd"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("--remote-daemon requires --ssh"), "{}", err(&o));
+
+    let o = goatty(home, &["--ssh", "staging", "settings", "import", "-", "--ssh", "prod"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--ssh cannot be used more than once"), "{}", err(&o));
+
+    let o = goatty(home, &["--via", "a", "settings", "export", "-", "--via", "b"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--via cannot be used more than once"), "{}", err(&o));
+
+    let o = goatty(home, &["--ssh", "prod", "--remote-daemon", "/a", "settings", "export", "-", "--remote-daemon", "/b"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--remote-daemon cannot be used more than once"), "{}", err(&o));
+
+    let o = goatty(home, &["settings", "export", "-", "--ssh", "staging", "--ssh", "prod"]);
+    assert!(!o.status.success());
 }
 
 fn spawn_fake_remote_daemon(
@@ -346,8 +370,12 @@ fn make_fifo(path: &Path) {
     assert!(status.success(), "mkfifo failed for {}", path.display());
 }
 
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 fn via_bridge(in_fifo: &Path, out_fifo: &Path) -> String {
-    format!("exec 3<&0; cat <&3 > '{}' & p=$!; exec 3<&-; cat < '{}'; wait $p 2>/dev/null", in_fifo.display(), out_fifo.display())
+    format!("exec 3<&0; cat <&3 > {} & p=$!; exec 3<&-; cat < {}; wait $p 2>/dev/null", sh_quote(in_fifo), sh_quote(out_fifo))
 }
 
 #[test]
@@ -407,7 +435,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --) shift; break;; -e|-o) shift 2;; -*) shift;; *) break;; esac
 done
 host="$1"; shift
-printf '%s\n' "$*" > '{log}'
+printf '%s\n' "$*" > {log}
 if [ "$host" = "missing" ]; then
   echo 'goatty-remote: Linux x86_64 -' >&2
   exit 127
@@ -415,23 +443,23 @@ fi
 echo 'goatty-remote: Linux x86_64 /opt/goattyd' >&2
 if [ "$host" = "outdated" ]; then
   exec 3<&0
-  cat <&3 > '{old_inf}' & p=$!
+  cat <&3 > {old_inf} & p=$!
   exec 3<&-
-  cat < '{old_outf}'
+  cat < {old_outf}
   wait $p 2>/dev/null
   exit 0
 fi
 exec 3<&0
-cat <&3 > '{inf}' & p=$!
+cat <&3 > {inf} & p=$!
 exec 3<&-
-cat < '{outf}'
+cat < {outf}
 wait $p 2>/dev/null
 "#,
-        log = ssh_log.display(),
-        inf = in_fifo2.display(),
-        outf = out_fifo2.display(),
-        old_inf = in_fifo3.display(),
-        old_outf = out_fifo3.display(),
+        log = sh_quote(&ssh_log),
+        inf = sh_quote(&in_fifo2),
+        outf = sh_quote(&out_fifo2),
+        old_inf = sh_quote(&in_fifo3),
+        old_outf = sh_quote(&out_fifo3),
     );
     let mut child =
         Command::new("sh").args(["-c", "cat > \"$1\" && chmod 0755 \"$1\"", "sh"]).arg(&fake_ssh).stdin(Stdio::piped()).spawn().unwrap();
@@ -440,6 +468,14 @@ wait $p 2>/dev/null
 
     let profile = tmp.path().join("import.json");
     std::fs::write(&profile, "{\"goatty_profile\": 1, \"host\": {\"version\": 3, \"history\": {\"size\": 4321}}}\n").unwrap();
+
+    // Noninteractive import without --yes rejects before touching ssh.
+    let _ = std::fs::remove_file(&ssh_log);
+    let o = goatty_with_path(&local_home, Some(&bin_dir), &["settings", "import", profile.to_str().unwrap(), "--ssh", "prod"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("pass --yes"), "{}", err(&o));
+    assert!(!ssh_log.exists(), "ssh must not be spawned when noninteractive import lacks --yes");
+
     let o = ok(goatty_with_path(
         &local_home,
         Some(&bin_dir),
@@ -456,17 +492,25 @@ wait $p 2>/dev/null
     assert!(std::fs::read_to_string(local_home.join(".config/goatty/settings.json")).unwrap().contains("nord"));
     assert!(std::fs::read_to_string(local_home.join(".config/goatty/host.json")).unwrap().contains("1111"));
 
-    // 3. Missing goattyd on SSH host surfaces a clear hint.
+    // 3. Missing goattyd on SSH host surfaces a clear hint (both default and --remote-daemon).
     let o = goatty_with_path(&local_home, Some(&bin_dir), &["settings", "export", "-", "--ssh", "missing"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("goatty --ssh missing"), "{}", err(&o));
 
+    let o = goatty_with_path(
+        &local_home,
+        Some(&bin_dir),
+        &["settings", "export", "-", "--ssh", "missing", "--remote-daemon", "/opt/custom-goattyd"],
+    );
+    assert!(!o.status.success());
+    assert!(err(&o).contains("--remote-daemon /opt/custom-goattyd"), "{}", err(&o));
+
     // 4. Outdated goattyd on SSH host surfaces the update hint.
     let old_server = spawn_fake_remote_daemon(&in_fifo3, &out_fifo3, &remote_home, Some(1));
     let o = goatty_with_path(&local_home, Some(&bin_dir), &["settings", "export", "-", "--ssh", "outdated"]);
-    old_server.join().unwrap();
     assert!(!o.status.success());
     assert!(err(&o).contains("run `goatty --ssh outdated` to update goattyd there"), "{}", err(&o));
+    old_server.join().unwrap();
 
     // 5. Client-only profile with --ssh skips connecting and informs the user.
     let client_only = tmp.path().join("client-only.json");

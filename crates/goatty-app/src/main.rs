@@ -57,35 +57,39 @@ fn main() -> Result<()> {
     if let Some(req) = goatty_client::askpass::request_from_env() {
         askpass::run(req);
     }
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
     // Subcommands work without a window (and without a display).
     if cli.cmd.is_some() {
         if cli.plain {
             anyhow::bail!("--plain only applies when opening a terminal window");
         }
-        let remote = cli.ssh.is_some() || cli.via.is_some() || cli.remote_daemon.is_some();
-        match cli.cmd.take().expect("checked is_some") {
-            cli::Command::Settings(c) => {
+        let remote = !cli.remote.is_empty();
+        match &cli.cmd {
+            Some(cli::Command::Settings(c)) => {
                 if remote && !matches!(c, cli::SettingsCmd::Export { .. } | cli::SettingsCmd::Import { .. }) {
                     anyhow::bail!(
                         "--ssh and --via only apply to `settings export` and `settings import` (run `goattyd settings` on the host for its host.json)"
                     );
                 }
-                return commands::settings(c, cli.endpoint()?);
+                let endpoint = cli.endpoint()?;
+                let Some(cli::Command::Settings(c)) = cli.cmd else { unreachable!() };
+                return commands::settings(c, endpoint);
             }
-            cli::Command::Theme(c) => {
+            Some(cli::Command::Theme(_)) => {
                 if remote {
                     anyhow::bail!("--ssh and --via don't apply to `theme`");
                 }
+                let Some(cli::Command::Theme(c)) = cli.cmd else { unreachable!() };
                 return commands::theme(c);
             }
-            cli::Command::Completions { shell } => {
+            Some(cli::Command::Completions { shell }) => {
                 if remote {
                     anyhow::bail!("--ssh and --via don't apply to `completions`");
                 }
-                print!("{}", cli::completion_script(shell));
+                print!("{}", cli::completion_script(*shell));
                 return Ok(());
             }
+            None => unreachable!(),
         }
     }
     // goatty's own crates at info; dependencies (wgpu, zbus, ...) only warn, and

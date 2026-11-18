@@ -8,9 +8,10 @@ use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use goatty_client::{Connection, Control, Endpoint, RemoteProblem};
+use goatty_client::{Connection, Control, Endpoint, RemoteProblem, ReplyLost};
 use goatty_config::theme_import;
 use goatty_config::themes::ThemeFile;
 use goatty_config::{ClientSettings, Document, HostSettings, Loaded, ThemeLibrary, store};
@@ -20,6 +21,8 @@ use goatty_shell::HostService;
 use crate::cli::{SettingsCmd, ThemeCmd, ThemeFor};
 
 const CLIENT: &str = concat!("goatty-cli ", env!("CARGO_PKG_VERSION"));
+const VIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const REMOTE_APPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn client_path() -> Result<PathBuf> {
     goatty_config::client_file().context("$HOME is not set: goatty has no settings directory")
@@ -33,9 +36,28 @@ fn read_or_empty(path: &Path) -> Result<String> {
     }
 }
 
+/// Escape control characters in daemon-provided strings before printing to the terminal.
+fn sanitize_terminal(s: &str) -> String {
+    if !s.chars().any(char::is_control) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            for e in c.escape_default() {
+                out.push(e);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn print_issues(label: &str, issues: &[String]) {
+    let label = sanitize_terminal(label);
     for i in issues {
-        eprintln!("⚠ {label}: {i}");
+        eprintln!("⚠ {label}: {}", sanitize_terminal(i));
     }
 }
 
@@ -62,19 +84,33 @@ impl Host {
                 }
             }),
             Some(remote) => {
-                let conn = Connection::open(remote, CLIENT).map_err(|e| {
+                let custom_daemon = match &remote {
+                    Endpoint::Ssh(t) => t.remote_daemon.clone(),
+                    _ => None,
+                };
+                // Bound `--via` handshakes so a silent relay cannot hang the CLI; leave
+                // SSH unbounded so interactive password/passphrase prompts aren't cut short.
+                let handshake_timeout = matches!(&remote, Endpoint::Command { .. }).then_some(VIA_HANDSHAKE_TIMEOUT);
+                let conn = Connection::open_once(remote, CLIENT, handshake_timeout).map_err(|e| {
                     let hint = match e.downcast_ref::<RemoteProblem>() {
-                        Some(RemoteProblem::NotInstalled { host, platform }) if platform.target().is_some() => {
-                            Some(format!("run `goatty --ssh {host}` once to install goattyd there"))
-                        }
-                        Some(RemoteProblem::Incompatible { host, mismatch, .. }) if !mismatch.daemon_is_newer => {
-                            Some(format!("run `goatty --ssh {host}` to update goattyd there"))
-                        }
+                        Some(RemoteProblem::NotInstalled { host, platform }) if platform.target().is_some() => match &custom_daemon {
+                            Some(path) => Some(format!(
+                                "check `--remote-daemon {path}` on {host}, or drop `--remote-daemon` and run `goatty --ssh {host}` once to install goattyd there"
+                            )),
+                            None => Some(format!("run `goatty --ssh {host}` once to install goattyd there")),
+                        },
+                        Some(RemoteProblem::Incompatible { host, mismatch, .. }) if !mismatch.daemon_is_newer => match &custom_daemon {
+                            Some(path) => Some(format!(
+                                "update `{path}` on {host}, or drop `--remote-daemon` and run `goatty --ssh {host}` to update goattyd there"
+                            )),
+                            None => Some(format!("run `goatty --ssh {host}` to update goattyd there")),
+                        },
                         _ => None,
                     };
+                    let sanitized = anyhow::anyhow!("{}", sanitize_terminal(&format!("{e:#}")));
                     match hint {
-                        Some(msg) => e.context(msg),
-                        None => e,
+                        Some(msg) => sanitized.context(sanitize_terminal(&msg)),
+                        None => sanitized,
                     }
                 })?;
                 Ok(Host::Remote(conn))
@@ -91,19 +127,19 @@ impl Host {
             Host::Remote(c) => {
                 let h = c.host();
                 match (h.user.is_empty(), h.hostname.is_empty()) {
-                    (false, false) => format!("goattyd on {}@{}", h.user, h.hostname),
-                    (true, false) => format!("goattyd on {}", h.hostname),
-                    _ => format!("goattyd via {}", c.endpoint().label()),
+                    (false, false) => format!("goattyd on {}@{}", sanitize_terminal(&h.user), sanitize_terminal(&h.hostname)),
+                    (true, false) => format!("goattyd on {}", sanitize_terminal(&h.hostname)),
+                    _ => format!("goattyd via {}", sanitize_terminal(c.endpoint().label())),
                 }
             }
-            Host::Daemon(c) => format!("goattyd on {}", c.host().hostname),
+            Host::Daemon(c) => format!("goattyd on {}", sanitize_terminal(&c.host().hostname)),
             Host::Local(_) => "this machine (no goattyd running)".into(),
         }
     }
 
     fn json(&mut self) -> Result<String> {
         match self {
-            Host::Remote(c) => Ok(c.host_settings()?.json),
+            Host::Remote(c) => Ok(c.host_settings().map_err(|e| anyhow::anyhow!("{}", sanitize_terminal(&format!("{e:#}"))))?.json),
             Host::Daemon(c) => c.host_settings_json(),
             Host::Local(s) => Ok(s.snapshot().json),
         }
@@ -113,7 +149,16 @@ impl Host {
     fn apply(&mut self, json: String) -> Result<Vec<String>> {
         match self {
             Host::Remote(c) => {
-                let r = c.set_host_settings(json, true)?;
+                let r = match c.set_host_settings_within(json, true, REMOTE_APPLY_TIMEOUT) {
+                    Ok(r) => r,
+                    Err(e) if e.downcast_ref::<ReplyLost>().is_some() => {
+                        bail!(
+                            "lost confirmation while applying host settings on {}; the daemon may still have applied them — check the host before retrying",
+                            self.label()
+                        );
+                    }
+                    Err(e) => bail!("{}", sanitize_terminal(&format!("{e:#}"))),
+                };
                 if !r.applied {
                     bail!("host settings were not applied ({})", self.label());
                 }
@@ -126,7 +171,11 @@ impl Host {
 
     fn plugin(&mut self, req: api::Request) -> Result<api::Reply> {
         match self {
-            Host::Remote(c) => Ok(serde_json::from_str(&c.plugin(serde_json::to_string(&req)?)?)?),
+            Host::Remote(c) => {
+                let raw =
+                    c.plugin(serde_json::to_string(&req)?).map_err(|e| anyhow::anyhow!("{}", sanitize_terminal(&format!("{e:#}"))))?;
+                Ok(serde_json::from_str(&raw)?)
+            }
             Host::Daemon(c) => Ok(serde_json::from_str(&c.plugin(serde_json::to_string(&req)?)?)?),
             Host::Local(s) => s.plugin_request(req),
         }
@@ -185,14 +234,14 @@ fn offer_imported_plugins_with(
         Ok(other) => {
             print_issues("host", apply_issues);
             println!("Host settings applied ({}).", target.label());
-            eprintln!("⚠ Couldn't check plugins: unexpected reply {other:?}");
+            eprintln!("⚠ Couldn't check plugins: unexpected reply {}", sanitize_terminal(&format!("{other:?}")));
             return Ok(report);
         }
         Err(e) => {
             print_issues("host", apply_issues);
             println!("Host settings applied ({}).", target.label());
-            eprintln!("⚠ Couldn't check plugins: {e:#}");
-            let ids: Vec<&str> = profile_plugins.iter().map(|(id, _)| id.as_str()).collect();
+            eprintln!("⚠ Couldn't check plugins: {}", sanitize_terminal(&format!("{e:#}")));
+            let ids: Vec<String> = profile_plugins.iter().map(|(id, _)| sanitize_terminal(id)).collect();
             println!("Review and install profile plugins{on_host} with: goattyd plugin install {}", ids.join(" "));
             return Ok(report);
         }
@@ -217,27 +266,34 @@ fn offer_imported_plugins_with(
     println!("\n{} plugin(s) in this profile are not installed ({}):", missing.len(), target.label());
     for (id, enabled) in &missing {
         report.listed.push(id.clone());
+        let safe_id = sanitize_terminal(id);
         let disabled_note = if !enabled { " [disabled in profile]" } else { "" };
         match cat.available.iter().find(|a| a.id == *id) {
             Some(a) if a.incompatible.is_none() => {
-                println!("  {} ({}) {} — {}{disabled_note}", a.id, a.registry, a.version, a.summary);
+                println!(
+                    "  {} ({}) {} — {}{disabled_note}",
+                    sanitize_terminal(&a.id),
+                    sanitize_terminal(&a.registry),
+                    sanitize_terminal(&a.version),
+                    sanitize_terminal(&a.summary),
+                );
                 installable.push((id.clone(), *enabled));
             }
             Some(a) => {
-                let why = a.incompatible.as_deref().unwrap_or("not compatible");
-                println!("  {} — not for this host ({why}){disabled_note}", a.id);
+                let why = sanitize_terminal(a.incompatible.as_deref().unwrap_or("not compatible"));
+                println!("  {} — not for this host ({why}){disabled_note}", sanitize_terminal(&a.id));
             }
             None if reg_errors => {
-                println!("  {id} — not in a readable registry on this host{disabled_note}");
+                println!("  {safe_id} — not in a readable registry on this host{disabled_note}");
             }
             None => {
-                println!("  {id} — not in any registry on this host{disabled_note}");
+                println!("  {safe_id} — not in any registry on this host{disabled_note}");
                 unfound = true;
             }
         }
     }
     for r in cat.registries.iter().filter(|r| r.error.is_some()) {
-        eprintln!("⚠ registry {}: {}", r.name, r.error.as_deref().unwrap_or_default());
+        eprintln!("⚠ registry {}: {}", sanitize_terminal(&r.name), sanitize_terminal(r.error.as_deref().unwrap_or_default()),);
     }
 
     if installable.is_empty() {
@@ -249,7 +305,7 @@ fn offer_imported_plugins_with(
         return Ok(report);
     }
 
-    let ids: Vec<&str> = installable.iter().map(|(id, _)| id.as_str()).collect();
+    let ids: Vec<String> = installable.iter().map(|(id, _)| sanitize_terminal(id)).collect();
     if yes || !is_terminal {
         println!("Review and install{on_host} with: goattyd plugin install {}", ids.join(" "));
         return Ok(report);
@@ -267,25 +323,26 @@ fn offer_imported_plugins_with(
         if report.installed.contains(&id) {
             continue;
         }
+        let safe_id = sanitize_terminal(&id);
         let plan = match target.plugin(api::Request::Plan { id: id.clone(), version: None }) {
             Ok(api::Reply::Plan(p)) => p,
             Ok(other) => {
-                eprintln!("⚠ Couldn't plan {id}: unexpected reply {other:?}");
+                eprintln!("⚠ Couldn't plan {safe_id}: unexpected reply {}", sanitize_terminal(&format!("{other:?}")));
                 report.failed.push(id);
                 continue;
             }
             Err(e) => {
-                eprintln!("⚠ Couldn't install {id}: {e:#}");
+                eprintln!("⚠ Couldn't install {safe_id}: {}", sanitize_terminal(&format!("{e:#}")));
                 report.failed.push(id);
                 continue;
             }
         };
         if !enabled {
-            println!("Note: {id} was disabled in the imported profile; installing it will enable it.");
+            println!("Note: {safe_id} was disabled in the imported profile; installing it will enable it.");
         }
         goatty_shell::plugins::cmd::print_plan(&plan);
-        if !ask(&goatty_shell::plugins::cmd::question(&plan))? {
-            println!("Skipped {}.", plan.name);
+        if !ask(&sanitize_terminal(&goatty_shell::plugins::cmd::question(&plan)))? {
+            println!("Skipped {}.", sanitize_terminal(&plan.name));
             report.skipped.push(id);
             continue;
         }
@@ -299,11 +356,11 @@ fn offer_imported_plugins_with(
                 report.installed.extend(plan.all().map(|p| p.id.clone()));
             }
             Ok(other) => {
-                eprintln!("⚠ Couldn't install {id}: unexpected reply {other:?}");
+                eprintln!("⚠ Couldn't install {safe_id}: unexpected reply {}", sanitize_terminal(&format!("{other:?}")));
                 report.failed.push(id);
             }
             Err(e) => {
-                eprintln!("⚠ Couldn't install {id}: {e:#}");
+                eprintln!("⚠ Couldn't install {safe_id}: {}", sanitize_terminal(&format!("{e:#}")));
                 report.failed.push(id);
             }
         }
@@ -396,7 +453,7 @@ pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
             println!("{key} = {} (default)", store::get_key(&loaded.value, &key).map(|v| v.to_string()).unwrap_or_default());
             Ok(())
         }
-        SettingsCmd::Export { file } => {
+        SettingsCmd::Export { file, .. } => {
             let client = goatty_config::load_client().file.value;
             let mut host = Host::open(endpoint)?;
             let host_settings = store::parse::<HostSettings>(&host.json()?).value;
@@ -409,7 +466,7 @@ pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
             }
             Ok(())
         }
-        SettingsCmd::Import { file, yes } => {
+        SettingsCmd::Import { file, yes, .. } => {
             let text = if file.as_os_str() == "-" {
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s)?;
@@ -418,7 +475,10 @@ pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
                 std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?
             };
             let (client, host) = goatty_config::profile::import(&text).map_err(anyhow::Error::msg)?;
-            let remote_label = endpoint.as_ref().filter(|e| !e.is_local()).map(|e| e.label().to_owned());
+            if !yes && !std::io::stdin().is_terminal() {
+                bail!("not asking without a terminal; pass --yes");
+            }
+            let remote_label = endpoint.as_ref().filter(|e| !e.is_local()).map(|e| sanitize_terminal(e.label()));
             let mut target = if host.is_some() { Some(Host::open(endpoint)?) } else { None };
             if host.is_none()
                 && let Some(label) = remote_label
@@ -722,5 +782,12 @@ shell-code = "uses greet"
         })
         .unwrap();
         assert_eq!(report, ImportPluginReport::default());
+    }
+
+    #[test]
+    fn sanitize_terminal_escapes_control_sequences() {
+        assert_eq!(sanitize_terminal("goattyd on deploy@box-1"), "goattyd on deploy@box-1");
+        assert_eq!(sanitize_terminal("hello \x1b[31mred\x1b[0m\r\n"), "hello \\u{1b}[31mred\\u{1b}[0m\\r\\n");
+        assert_eq!(sanitize_terminal("title\x1b]0;evil\x07\u{009b}K"), "title\\u{1b}]0;evil\\u{7}\\u{9b}K");
     }
 }
