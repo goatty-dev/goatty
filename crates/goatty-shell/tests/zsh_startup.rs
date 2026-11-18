@@ -1850,9 +1850,11 @@ echo \"ro:$*\" >> \"$HOME/init-calls\"
     unsafe_settings.shell.import.enabled = false;
     unsafe_settings.shell.program = Some(zsh.clone());
     let unsafe_ctx = goatty_shell::import::Context::new(sb.home.clone(), Some(zsh.clone()), sb.base_env(), &unsafe_dirs.zsh_dir());
-    let unsafe_launch = Launcher::new(Some(unsafe_dirs.clone()), Some(sb.home.join("goattyd")))
+    let mut unsafe_launch = Launcher::new(Some(unsafe_dirs.clone()), Some(sb.home.join("goattyd")))
         .with_import_context(unsafe_ctx)
         .launch(&Effective::plain(unsafe_settings));
+    assert!(unsafe_launch.managed);
+    unsafe_launch.env.retain(|(k, _)| k != "GOATTY_ORIG_ZDOTDIR");
     let _ = std::fs::remove_file(sb.home.join("init-calls"));
     let out_unsafe_parent = sb.run(&unsafe_launch, "print -r -- \"p=[$PROMPT]\"");
     assert!(String::from_utf8_lossy(&out_unsafe_parent.stderr).trim().is_empty());

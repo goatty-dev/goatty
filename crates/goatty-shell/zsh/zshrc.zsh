@@ -162,10 +162,10 @@ _goatty_cached_init() {
       return 0
     fi
 
-    out=$("$resolved" "${(@)args}" 2>/dev/null) || return 1
+    out=$(ARGV0=$bin "$resolved" "${(@)args}" 2>/dev/null) || return 1
     [[ -n $out ]] || return 1
     if [[ -n $post_fn ]]; then
-      "$post_fn" "$resolved" "$out"
+      "$post_fn" "$resolved" "$out" "$bin"
       out=$REPLY
       [[ -n $out ]] || return 1
     fi

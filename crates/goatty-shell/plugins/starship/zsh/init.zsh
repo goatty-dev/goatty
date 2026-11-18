@@ -26,7 +26,7 @@ _goatty_starship_post() {
   local bin=$1 out=$2
   if [[ ${TERM:-} != dumb && $out == *'PROMPT2="$('* ]]; then
     local p2
-    if p2=$(STARSHIP_SHELL=zsh "$bin" prompt --continuation 2>/dev/null); then
+    if p2=$(ARGV0=${3:-$bin} STARSHIP_SHELL=zsh "$bin" prompt --continuation 2>/dev/null); then
       local -a lines=("${(@f)out}")
       local i
       for i in {1..${#lines}}; do
