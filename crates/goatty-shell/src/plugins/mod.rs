@@ -758,6 +758,20 @@ impl Plugins<'_> {
 
     /// Installed plugins and what the registries offer.
     pub fn catalog(&self, refresh: bool, settings: &HostSettings) -> Catalog {
+        let path = std::env::var("PATH").ok();
+        self.catalog_with_env_path(refresh, settings, path.as_deref())
+    }
+
+    pub(crate) fn catalog_with_env_path(&self, refresh: bool, settings: &HostSettings, env_path: Option<&str>) -> Catalog {
+        /// zsh builtins that run in the shell without an external binary on PATH.
+        const ZSH_BUILTINS: &[&str] = &[
+            "alias", "autoload", "bg", "bindkey", "break", "builtin", "cd", "command", "continue", "declare", "dirs", "echo", "emulate",
+            "eval", "exec", "exit", "export", "false", "fc", "fg", "float", "getopts", "history", "integer", "jobs", "kill", "let",
+            "local", "noglob", "popd", "print", "printf", "pushd", "pwd", "r", "read", "readonly", "return", "set", "setopt", "shift",
+            "source", "test", "times", "trap", "true", "type", "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait",
+            "whence", "where", "which", "z", "zmodload", "zstyle",
+        ];
+
         let (snaps, registries, mut issues) = self.snapshots(refresh, true);
         let lock = match Lock::load(self.dirs) {
             Ok(l) => l,
@@ -767,7 +781,6 @@ impl Plugins<'_> {
             }
         };
         let target = current_target();
-        let path = std::env::var("PATH").ok();
         let managed_path = std::cell::OnceCell::new();
         let mut found: BTreeMap<String, bool> = BTreeMap::new();
         let mut unavailable_of = |m: &Manifest| -> Vec<String> {
@@ -781,9 +794,9 @@ impl Plugins<'_> {
                 .filter(|c| {
                     !manifest::applies(&c.when, &values)
                         || c.run.first().is_none_or(|prog| {
-                            !crate::snippets::BUILTINS.contains(&prog.as_str())
+                            !ZSH_BUILTINS.contains(&prog.as_str())
                                 && !*found.entry(prog.clone()).or_insert_with(|| {
-                                    let p = managed_path.get_or_init(|| crate::snippets::managed_path(self.dirs, settings));
+                                    let p = managed_path.get_or_init(|| crate::snippets::managed_path_with(self.dirs, settings, env_path));
                                     crate::snippets::find_in(p, prog).is_some()
                                 })
                         })
@@ -797,7 +810,7 @@ impl Plugins<'_> {
                 .map(|p| PackageStatus {
                     id: p.id.clone(),
                     version: p.version.clone(),
-                    state: match packages::locate(self.dirs, p, path.as_deref()) {
+                    state: match packages::locate(self.dirs, p, env_path) {
                         Location::System(found) => PackageState::System { path: found.display().to_string() },
                         Location::Managed { version, .. } => PackageState::Managed { version },
                         Location::Missing => PackageState::Missing,

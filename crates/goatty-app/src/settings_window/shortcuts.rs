@@ -92,12 +92,28 @@ fn matches(query: &str, line: &Line) -> bool {
         return true;
     }
     let q = query.to_lowercase();
-    let label = format!("{} {} {}", line.label, line.name.replace(['_', '.'], " "), line.group).to_lowercase();
+    let label = format!("{} {} {} {}", line.label, line.name, line.name.replace(['_', '.'], " "), line.group).to_lowercase();
     if q.split_whitespace().all(|w| label.contains(w)) {
         return true;
     }
     let k = as_keys(&q);
     line.keys.iter().any(|key| key.contains(&k) || pretty_keys(key).to_lowercase().contains(&q))
+}
+
+pub(super) fn has_row(action: &str, cx: &App) -> bool {
+    let overrides = &cx.global::<AppSettings>().client.keybindings;
+    has_row_in(action, overrides, cx.try_global::<CommandRegistry>())
+}
+
+fn has_row_in(action: &str, overrides: &BTreeMap<String, Option<String>>, registry: Option<&CommandRegistry>) -> bool {
+    if keys::find_action(action).is_some() {
+        return true;
+    }
+    if registry.is_some_and(|reg| reg.get(action).is_some_and(|c| matches!(c.source, Source::Plugin(_)) && c.key_action() == Some(action)))
+    {
+        return true;
+    }
+    keys::parse_plugin_action(action).is_some() && overrides.values().flatten().any(|a| a == action)
 }
 
 fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&CommandRegistry>) -> Vec<Line> {
@@ -694,11 +710,19 @@ mod tests {
         assert_eq!(docker.keys, ["ctrl-alt-e"]);
         assert!(docker.changed);
         assert!(matches("docker exec", docker));
+        assert!(matches("plugin.docker.exec", docker));
         assert!(matches("plugins", docker));
 
         let git = plugin_lines.iter().find(|l| l.name == "plugin.git.status").unwrap();
         assert_eq!(git.label, "git: status");
         assert_eq!(git.keys, ["ctrl-alt-g"]);
         assert!(git.changed);
+        assert!(matches("plugin.git.status", git));
+
+        assert!(has_row_in("new_tab", &overrides, Some(&reg)));
+        assert!(has_row_in("plugin.docker.exec", &overrides, Some(&reg)));
+        assert!(has_row_in("plugin.git.status", &overrides, Some(&reg)));
+        assert!(!has_row_in("plugin.git.status", &BTreeMap::new(), Some(&reg)));
+        assert!(!has_row_in("plugin.missing.cmd", &overrides, Some(&reg)));
     }
 }

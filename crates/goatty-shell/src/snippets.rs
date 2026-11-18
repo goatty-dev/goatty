@@ -97,7 +97,7 @@ pub fn render_expansions(settings: &HostSettings, active: &[Active]) -> (String,
 }
 
 /// zsh builtins and keywords a snippet line may use: never "missing".
-pub(crate) const BUILTINS: &[&str] = &[
+const BUILTINS: &[&str] = &[
     "cd", "echo", "printf", "print", "export", "source", "alias", "unalias", "eval", "exec", "exit", "history", "jobs", "fg", "bg", "kill",
     "pwd", "read", "set", "unset", "test", "type", "wait", "which", "where", "whence", "pushd", "popd", "dirs", "time", "ulimit", "umask",
     "true", "false", "for", "while", "if", "then", "do", "done", "fi", "case", "esac", "noglob", "sudo", "builtin", "command", "local",
@@ -108,6 +108,11 @@ pub(crate) const BUILTINS: &[&str] = &[
 /// it finds: the folders the import adds, goattyd's own PATH, `shell.path`
 /// and goatty's tools.
 pub fn managed_path(dirs: &Dirs, settings: &HostSettings) -> String {
+    let env_path = std::env::var("PATH").ok();
+    managed_path_with(dirs, settings, env_path.as_deref())
+}
+
+pub(crate) fn managed_path_with(dirs: &Dirs, settings: &HostSettings, env_path: Option<&str>) -> String {
     let mut folders: Vec<String> = Vec::new();
     if settings.shell.import.enabled && !settings.shell.import.skip_vars.iter().any(|v| v == "PATH") {
         let record = crate::import::Record::load(dirs);
@@ -115,7 +120,7 @@ pub fn managed_path(dirs: &Dirs, settings: &HostSettings) -> String {
             folders.extend(h.added_path().into_iter().map(str::to_string));
         }
     }
-    folders.extend(std::env::var("PATH").unwrap_or_default().split(':').filter(|d| !d.is_empty()).map(str::to_string));
+    folders.extend(env_path.unwrap_or_default().split(':').filter(|d| !d.is_empty()).map(str::to_string));
     let home = std::env::var_os("HOME").map(PathBuf::from);
     folders.extend(settings.shell.path.iter().map(|p| crate::path_report::expand(p, home.as_deref())));
     folders.push(dirs.bin_dir().to_string_lossy().into_owned());
@@ -124,13 +129,26 @@ pub fn managed_path(dirs: &Dirs, settings: &HostSettings) -> String {
     folders.join(":")
 }
 
-/// `program` in `path` (or itself when it's a path).
+fn is_executable(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+/// `program` in `path` (or itself when it's a path), requiring execute permission.
 pub(crate) fn find_in(path: &str, program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let p = PathBuf::from(program);
-        return p.is_file().then_some(p);
+        return is_executable(&p).then_some(p);
     }
-    path.split(':').map(|d| Path::new(d).join(program)).find(|p| p.is_file())
+    path.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join(program)).find(|p| is_executable(p))
 }
 
 /// Every snippet and expansion on this host, with the programs each

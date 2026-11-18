@@ -147,9 +147,7 @@ fn change(link: HostLink, change: Change, cx: &mut App) {
         cx.update(|cx| {
             let label = link.label();
             let reload = link.clone();
-            if matches!(result, Ok(Done::Changed { .. }))
-                && cx.try_global::<crate::settings_window::HostLinkGlobal>().and_then(|g| g.0.as_ref()).is_some_and(|g| g.same(&link))
-            {
+            if cx.try_global::<crate::settings_window::HostLinkGlobal>().and_then(|g| g.0.as_ref()).is_some_and(|g| g.same(&link)) {
                 crate::plugin_commands::refresh(cx);
                 crate::snippets::refresh(cx);
             }

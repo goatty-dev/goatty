@@ -1803,7 +1803,10 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ShowAllHosts, _, cx| this.show_all_groups(cx)))
-            .on_action(|act: &crate::actions::RunPluginCommand, w, cx| crate::plugin_commands::run_by_id(&act.id, w, cx))
+            .on_action(cx.listener(|this, act: &crate::actions::RunPluginCommand, w, cx| {
+                let sel = this.focused_view().and_then(|v| v.read(cx).session().terminal.selection_text()).filter(|t| !t.trim().is_empty());
+                crate::plugin_commands::run_by_id(&act.id, sel.as_deref(), w, cx);
+            }))
             .children(self.render_menu())
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {

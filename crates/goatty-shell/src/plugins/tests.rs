@@ -528,6 +528,20 @@ fn catalog_marks_unavailable_commands_from_when_and_missing_programs() {
     let w = world();
     let dir = w.tmp.path().join("cmd-plugin");
     std::fs::create_dir_all(&dir).unwrap();
+    let env_bin = w.tmp.path().join("env-bin");
+    std::fs::create_dir_all(&env_bin).unwrap();
+    let present = env_bin.join("present-tool");
+    std::fs::write(&present, "#!/bin/sh\n").unwrap();
+    let nonexec = env_bin.join("nonexec-tool");
+    std::fs::write(&nonexec, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&nonexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let env_path = env_bin.to_string_lossy().into_owned();
+
     let manifest = r#"
 schema = 1
 id = "cmd-test"
@@ -537,7 +551,7 @@ summary = "Tests command availability"
 publisher = "tests"
 
 [requires]
-commands = ["goatty-test-needed-tool-xyz", "sh", "echo"]
+commands = ["present-tool", "nonexec-tool", "goatty-test-needed-tool-xyz", "setopt", "sudo"]
 
 [[setting]]
 id = "extra"
@@ -548,18 +562,28 @@ default = false
 [[command]]
 id = "always"
 title = "Always"
-run = ["sh", "-c", "true"]
+run = ["present-tool", "--version"]
 
 [[command]]
 id = "builtin"
 title = "Builtin"
-run = ["echo", "ok"]
+run = ["setopt", "nullglob"]
+
+[[command]]
+id = "external-sudo"
+title = "Sudo"
+run = ["sudo", "-l"]
+
+[[command]]
+id = "nonexec"
+title = "Non-executable"
+run = ["nonexec-tool"]
 
 [[command]]
 id = "gated"
 title = "Gated"
 when = "extra"
-run = ["sh", "-c", "true"]
+run = ["present-tool", "--extra"]
 
 [[command]]
 id = "missing-bin"
@@ -573,20 +597,21 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
     let plan = p.plan(&c, &settings).unwrap();
     p.install(&c, &plan.digest, &settings).unwrap();
 
-    // `gated` has `when = "extra"` (default false); `missing-bin` needs `goatty-test-needed-tool-xyz` (absent).
-    let cat = p.catalog(false, &settings);
+    // `sudo` (external, absent in env_path), `nonexec-tool` (0644), `gated` (`when = "extra"`),
+    // and `missing-bin` are unavailable; `present-tool` (0755) and `setopt` (zsh builtin) are available.
+    let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
     let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
-    assert_eq!(inst.unavailable_commands, ["gated", "missing-bin"]);
+    assert_eq!(inst.unavailable_commands, ["external-sudo", "nonexec", "gated", "missing-bin"]);
 
-    // Turning on `extra` makes `gated` available; `missing-bin` stays unavailable.
+    // Turning on `extra` makes `gated` available.
     settings.edit_plugin("cmd-test", |pc| {
         pc.settings.insert("extra".into(), true.into());
     });
-    let cat = p.catalog(false, &settings);
+    let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
     let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
-    assert_eq!(inst.unavailable_commands, ["missing-bin"]);
+    assert_eq!(inst.unavailable_commands, ["external-sudo", "nonexec", "missing-bin"]);
 
-    // Adding `goatty-test-needed-tool-xyz` in a custom bin dir on `shell.path` makes all available.
+    // Adding `goatty-test-needed-tool-xyz` (0755) in `shell.path` makes `missing-bin` available.
     let custom_bin = w.tmp.path().join("custom-bin");
     std::fs::create_dir_all(&custom_bin).unwrap();
     let tool = custom_bin.join("goatty-test-needed-tool-xyz");
@@ -597,7 +622,7 @@ run = ["goatty-test-needed-tool-xyz", "--help"]
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     settings.shell.path.push(custom_bin.to_string_lossy().into_owned());
-    let cat = p.catalog(false, &settings);
+    let cat = p.catalog_with_env_path(false, &settings, Some(&env_path));
     let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
-    assert!(inst.unavailable_commands.is_empty(), "{:?}", inst.unavailable_commands);
+    assert_eq!(inst.unavailable_commands, ["external-sudo", "nonexec"]);
 }

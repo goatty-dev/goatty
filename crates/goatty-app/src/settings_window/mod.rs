@@ -624,6 +624,11 @@ impl SettingsWindow {
                 subs.push(net_sub);
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
                 subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
+                    if let Some(id) = this.recording.as_deref()
+                        && !shortcuts::has_row(id, cx)
+                    {
+                        this.recording = None;
+                    }
                     if this.page == Page::Shortcuts {
                         cx.notify();
                     }

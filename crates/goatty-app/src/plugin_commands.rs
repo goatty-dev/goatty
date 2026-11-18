@@ -33,11 +33,14 @@ use crate::settings_window::{HostLink, HostLinkGlobal};
 struct State {
     link: Option<HostLink>,
     generation: u64,
+    /// True while a catalog refresh for the active host is in flight.
+    stale: bool,
+    active: std::collections::BTreeMap<String, MenuCommand>,
 }
 
 impl Global for State {}
 
-/// A plugin command that is in the right-click menu too.
+/// A plugin command (palette entry, and optionally right-click menu entry).
 #[derive(Clone)]
 pub struct MenuCommand {
     /// The plugin's id.
@@ -89,6 +92,7 @@ pub fn refresh(cx: &mut App) {
     let link = cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone());
     let state = cx.default_global::<State>();
     state.generation += 1;
+    state.stale = true;
     let moved = match (&state.link, &link) {
         (Some(a), Some(b)) => !a.same(b),
         (a, b) => a.is_some() != b.is_some(),
@@ -98,8 +102,14 @@ pub fn refresh(cx: &mut App) {
     // Another host: its plugins aren't the last one's, so none until fetched.
     if moved {
         replace(None, Vec::new(), cx);
+        if link.is_some() {
+            cx.default_global::<State>().stale = true;
+        }
     }
-    let Some(link) = link else { return };
+    let Some(link) = link else {
+        cx.default_global::<State>().stale = false;
+        return;
+    };
     cx.spawn(async move |cx: &mut AsyncApp| {
         let l = link.clone();
         let reply = cx.background_executor().spawn(async move { l.plugin(Request::Catalog { refresh: false }) }).await;
@@ -109,7 +119,10 @@ pub fn refresh(cx: &mut App) {
             }
             match reply {
                 Ok(Reply::Catalog(c)) => replace(Some(link), c.installed, cx),
-                Ok(_) => log::warn!("plugin commands: unexpected reply to a catalog request"),
+                Ok(_) => {
+                    cx.default_global::<State>().stale = false;
+                    log::warn!("plugin commands: unexpected reply to a catalog request");
+                }
                 // An older goattyd, or a host without plugins: keep none.
                 Err(e) => {
                     log::info!("plugin commands: couldn't list {}'s plugins: {e:#}", link.label());
@@ -123,7 +136,12 @@ pub fn refresh(cx: &mut App) {
 
 /// Replace the registry's plugin commands with `installed`'s.
 fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
-    let (commands, menu) = build(link.as_ref(), &installed);
+    let (commands, active, menu) = build_with_active(link.as_ref(), &installed);
+    {
+        let state = cx.default_global::<State>();
+        state.stale = false;
+        state.active = active;
+    }
     cx.set_global(MenuCommands(menu));
     let reg = cx.default_global::<CommandRegistry>();
     reg.unregister_plugins();
@@ -132,28 +150,40 @@ fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
     }
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "used by unit tests"))]
 fn build(link: Option<&HostLink>, installed: &[Installed]) -> (Vec<Command>, Vec<MenuCommand>) {
+    let (commands, _, menu) = build_with_active(link, installed);
+    (commands, menu)
+}
+
+fn build_with_active(
+    link: Option<&HostLink>,
+    installed: &[Installed],
+) -> (Vec<Command>, std::collections::BTreeMap<String, MenuCommand>, Vec<MenuCommand>) {
     let Some(link) = link else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), std::collections::BTreeMap::new(), Vec::new());
     };
     let active_cmds = installed
         .iter()
         .filter(|p| p.enabled && p.incompatible.is_none())
         .flat_map(|p| p.manifest.commands.iter().filter(|c| !p.unavailable_commands.contains(&c.id)).map(move |c| (p, c)));
     let mut commands = Vec::new();
+    let mut active = std::collections::BTreeMap::new();
     let mut menu = Vec::new();
     for (p, c) in active_cmds {
         commands.push(command(link, &p.manifest.id, &p.manifest.name, c));
+        let entry = MenuCommand {
+            plugin_id: p.manifest.id.clone(),
+            plugin: p.manifest.name.clone(),
+            command: Rc::new(c.clone()),
+            origin: link.clone(),
+        };
+        active.insert(command_id(&p.manifest.id, &c.id), entry.clone());
         if c.menu.is_some() {
-            menu.push(MenuCommand {
-                plugin_id: p.manifest.id.clone(),
-                plugin: p.manifest.name.clone(),
-                command: Rc::new(c.clone()),
-                origin: link.clone(),
-            });
+            menu.push(entry);
         }
     }
-    (commands, menu)
+    (commands, active, menu)
 }
 
 /// The palette id of a plugin's command: `plugin.<plugin>.<command>`.
@@ -161,17 +191,21 @@ pub fn command_id(plugin: &str, command: &str) -> String {
     format!("plugin.{plugin}.{command}")
 }
 
-/// Look up an active plugin command in `reg` by its `plugin.<plugin>.<command>` id.
-pub(crate) fn lookup<'a>(reg: &'a CommandRegistry, id: &str) -> Option<&'a Rc<Command>> {
-    reg.get(id).filter(|c| matches!(c.source, Source::Plugin(_)))
+/// Look up an active plugin command in `reg` by its `plugin.<plugin>.<command>` id,
+/// returning `None` while a catalog refresh is in flight (`stale`).
+pub(crate) fn lookup<'a>(reg: &'a CommandRegistry, stale: bool, id: &str) -> Option<&'a Rc<Command>> {
+    (!stale).then(|| reg.get(id).filter(|c| matches!(c.source, Source::Plugin(_)))).flatten()
 }
 
 /// Run the active plugin command with id `id` (`plugin.<plugin>.<command>`),
 /// or tell the user why it isn't available on the current host.
-pub fn run_by_id(id: &str, window: &mut Window, cx: &mut App) {
-    let cmd = cx.try_global::<CommandRegistry>().and_then(|reg| lookup(reg, id)).cloned();
-    if let Some(cmd) = cmd {
-        cmd.run(window, cx);
+pub fn run_by_id(id: &str, selection: Option<&str>, window: &mut Window, cx: &mut App) {
+    let state = cx.try_global::<State>();
+    let stale = state.is_some_and(|s| s.stale);
+    let active = state.filter(|s| !s.stale).and_then(|s| s.active.get(id)).cloned();
+    let in_reg = cx.try_global::<CommandRegistry>().is_some_and(|reg| lookup(reg, stale, id).is_some());
+    if in_reg && let Some(entry) = active {
+        start(&entry.plugin_id, &entry.plugin, &entry.command, &entry.origin, selection, window, cx);
     } else {
         crate::toast::show_in(
             window,
@@ -369,8 +403,9 @@ icon = "search"
         plugin.source = Source::Plugin("docker".into());
         reg.register(plugin);
 
-        assert!(lookup(&reg, "plugin.docker.ps").is_some());
-        assert!(lookup(&reg, "plugin.docker.missing").is_none());
-        assert!(lookup(&reg, "new_tab").is_none());
+        assert!(lookup(&reg, false, "plugin.docker.ps").is_some());
+        assert!(lookup(&reg, true, "plugin.docker.ps").is_none());
+        assert!(lookup(&reg, false, "plugin.docker.missing").is_none());
+        assert!(lookup(&reg, false, "new_tab").is_none());
     }
 }
