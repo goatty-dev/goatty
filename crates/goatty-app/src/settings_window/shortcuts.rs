@@ -719,22 +719,12 @@ fn group_elem_id(group: &str) -> gpui::ElementId {
 }
 
 fn row_stays_after_remove(line: &Line, filter: Filter, pressed: Option<&str>, key: &str) -> bool {
-    if !line.available && line.keys.len() <= 1 {
-        return false;
-    }
-    if let Some(p) = pressed
-        && p == key
-        && line.keys.iter().filter(|k| k.as_str() == key).count() <= 1
-    {
-        return false;
-    }
-    if filter == Filter::Changed
-        && line.keys.iter().filter(|k| k.as_str() != key).count() == 0
-        && !keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| *da == line.name && *dk == key)
-    {
-        return false;
-    }
-    true
+    let keeps_unavailable = line.available || line.keys.len() > 1;
+    let keeps_pressed = pressed != Some(key) || line.keys.iter().filter(|k| k.as_str() == key).count() > 1;
+    let keeps_changed = filter != Filter::Changed
+        || line.keys.iter().any(|k| k.as_str() != key)
+        || keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| *da == line.name && *dk == key);
+    keeps_unavailable && keeps_pressed && keeps_changed
 }
 
 fn grouped_removal_fallback(groups: &[(&'static str, Vec<&Line>, bool)], gi: usize, ri: usize) -> gpui::ElementId {
