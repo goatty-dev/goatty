@@ -361,6 +361,17 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
             }
         })?;
     }
+    // Drop clients that went silent (#13). Its own thread: the socket
+    // watchdog below can block probing another listener.
+    {
+        let d = daemon.clone();
+        std::thread::Builder::new().name("reaper".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                crate::client::reap_silent(&d.conns, std::time::Instant::now(), crate::client::SILENT_AFTER);
+            }
+        })?;
+    }
     // Socket watchdog. On a server, systemd-logind deletes
     // /run/user/$UID when the user's last login session ends (unless
     // lingering is enabled). The daemon and its shells survive that, but the
@@ -370,7 +381,6 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
     loop {
         std::thread::sleep(Duration::from_secs(2));
         crate::net::check(&daemon);
-        crate::client::reap_silent(&daemon.conns, std::time::Instant::now(), crate::client::SILENT_AFTER);
         let current = std::fs::metadata(&path).ok().map(|m| m.ino());
         if current == Some(ino) || daemon.restarting.load(Ordering::SeqCst) {
             continue;

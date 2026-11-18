@@ -71,7 +71,7 @@ impl Liveness {
 
 /// Shut down every pinging connection silent for longer than `after`. Its
 /// reader then sees EOF and ends its subscriptions, which keeps the
-/// `attached` count and size control right. Run by the socket watchdog.
+/// `attached` count and size control right. Run every 2 s by `serve`.
 pub(crate) fn reap_silent(conns: &parking_lot::Mutex<HashMap<u64, Arc<Liveness>>>, now: Instant, after: Duration) {
     for (conn, live) in conns.lock().iter() {
         let Some(silent) = live.silent_for(now).filter(|s| *s > after) else { continue };
@@ -149,7 +149,6 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let (flushed_tx, flushed_rx) = flume::bounded::<()>(1);
     let wstream = stream.try_clone()?;
     let live = Arc::new(Liveness::new(stream.try_clone()?));
-    daemon.conns.lock().insert(conn, live.clone());
     let writer = std::thread::Builder::new().name(format!("c{conn}-writer")).spawn(move || {
         let mut w = BufWriter::with_capacity(128 << 10, &wstream);
         while let Ok(out) = rx.recv() {
@@ -172,6 +171,8 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         }
         let _ = wstream.shutdown(std::net::Shutdown::Both);
     })?;
+    // Registered only once nothing can fail before the cleanup below.
+    daemon.conns.lock().insert(conn, live.clone());
     let reply = |msg: ServerMsg| {
         if let Ok(f) = encode(&msg) {
             let _ = tx.send(Outbound::from(f));
@@ -436,14 +437,16 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         }
     })();
 
-    daemon.conns.lock().remove(&conn);
     daemon.layouts.lock().release(conn);
     for (id, (s, _)) in subs {
         s.unsubscribe(conn);
         log::info!("connection {conn} detached from session {id}");
     }
     drop(tx);
+    // A worker stuck on a hung mount keeps the writer waiting: stay
+    // registered meanwhile, so silence still closes the socket.
     let _ = writer.join();
+    daemon.conns.lock().remove(&conn);
     result
 }
 
