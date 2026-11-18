@@ -3,7 +3,7 @@
 //! for changed and unbound actions.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use goatty_config::keys::{self, ACTIONS, GROUPS};
 use gpui::{
@@ -57,6 +57,7 @@ impl ShortcutsPage {
         let query = cx.new(|cx| TextInput::new("Search by name or keys, like ctrl+t", "", cx).bare());
         let subs = vec![cx.subscribe(&query, |v, _, _: &TextInputEvent, cx| {
             v.shortcuts.pressed = None;
+            v.sync_recording(cx);
             cx.notify();
         })];
         Self {
@@ -101,20 +102,31 @@ fn matches(query: &str, line: &Line) -> bool {
     line.keys.iter().any(|key| key.contains(&k) || pretty_keys(key).to_lowercase().contains(&q))
 }
 
-pub(super) fn has_row(action: &str, cx: &App) -> bool {
-    let overrides = &cx.global::<AppSettings>().file.value.keybindings;
-    has_row_in(action, overrides, cx.try_global::<CommandRegistry>())
-}
-
-fn has_row_in(action: &str, overrides: &BTreeMap<String, Option<String>>, registry: Option<&CommandRegistry>) -> bool {
-    if keys::find_action(action).is_some() {
-        return true;
+#[allow(clippy::too_many_arguments)]
+fn is_row_visible(
+    action: &str,
+    overrides: &BTreeMap<String, Option<String>>,
+    registry: Option<&CommandRegistry>,
+    filter: Filter,
+    sort: Sort,
+    collapsed: &HashSet<&'static str>,
+    query: &str,
+    pressed: Option<&str>,
+) -> bool {
+    let all = lines(overrides, registry);
+    let Some(line) = all.iter().find(|l| l.name == action) else {
+        return false;
+    };
+    if !line_matches_view(line, filter, query, pressed) {
+        return false;
     }
-    if registry.is_some_and(|reg| reg.get(action).is_some_and(|c| matches!(c.source, Source::Plugin(_)) && c.key_action() == Some(action)))
-    {
-        return true;
+    if sort == Sort::Group {
+        let searching = !query.is_empty() || pressed.is_some();
+        if !searching && collapsed.contains(line.group) {
+            return false;
+        }
     }
-    keys::parse_plugin_action(action).is_some() && overrides.values().flatten().any(|a| a == action)
+    true
 }
 
 fn action_is_changed(name: &str, overrides: &BTreeMap<String, Option<String>>) -> bool {
@@ -124,13 +136,17 @@ fn action_is_changed(name: &str, overrides: &BTreeMap<String, Option<String>>) -
 }
 
 fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&CommandRegistry>) -> Vec<Line> {
+    let mut keys_by_action: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, action) in keys::effective_bindings(overrides) {
+        keys_by_action.entry(action).or_default().push(k);
+    }
     let mut out: Vec<Line> = ACTIONS
         .iter()
         .map(|a| Line {
             name: Cow::Borrowed(a.name),
             label: Cow::Borrowed(a.label),
             group: a.group,
-            keys: keys::keys_for(a.name, overrides),
+            keys: keys_by_action.remove(a.name).unwrap_or_default(),
             changed: action_is_changed(a.name, overrides),
             available: true,
         })
@@ -145,7 +161,7 @@ fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&Command
             if !seen.insert(action.to_string()) {
                 continue;
             }
-            let keys = keys::keys_for(action, overrides);
+            let keys = keys_by_action.remove(action).unwrap_or_default();
             out.push(Line {
                 name: Cow::Owned(action.to_string()),
                 label: Cow::Owned(c.label()),
@@ -161,7 +177,7 @@ fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&Command
     extra.sort();
     for action in extra {
         let Some((plugin, cmd)) = keys::parse_plugin_action(&action) else { continue };
-        let keys = keys::keys_for(&action, overrides);
+        let keys = keys_by_action.remove(&action).unwrap_or_default();
         let changed = !keys.is_empty();
         out.push(Line {
             label: Cow::Owned(format!("{plugin}: {cmd}")),
@@ -189,11 +205,35 @@ fn action_label(name: &str, cx: &App) -> String {
 }
 
 impl SettingsWindow {
+    /// Cancel an active recording if its row is no longer visible in the table.
+    pub(super) fn sync_recording(&mut self, cx: &App) -> bool {
+        let Some(id) = self.recording.as_deref() else {
+            return false;
+        };
+        let overrides = &cx.global::<AppSettings>().file.value.keybindings;
+        let query = self.shortcuts.query.read(cx).text().trim().to_string();
+        if !is_row_visible(
+            id,
+            overrides,
+            cx.try_global::<CommandRegistry>(),
+            self.shortcuts.filter,
+            self.shortcuts.sort,
+            &self.shortcuts.collapsed,
+            &query,
+            self.shortcuts.pressed.as_deref(),
+        ) {
+            self.recording = None;
+            return true;
+        }
+        false
+    }
+
     /// Show the actions matching `text` (from a settings search result).
     pub(super) fn shortcuts_search(&mut self, text: &str, cx: &mut Context<'_, Self>) {
         self.shortcuts.filter = Filter::All;
         self.shortcuts.pressed = None;
         self.shortcuts.query.update(cx, |i, cx| i.set_text(text.to_owned(), cx));
+        self.sync_recording(cx);
     }
 
     /// Take a keystroke for the shortcut being recorded, or as the key
@@ -572,6 +612,7 @@ impl SettingsWindow {
         let set_filter = |f: Filter| {
             self.act(cx, move |v, cx| {
                 v.shortcuts.filter = f;
+                v.sync_recording(cx);
                 cx.notify();
             })
         };
@@ -666,6 +707,7 @@ impl SettingsWindow {
                         if !v.shortcuts.collapsed.remove(g) {
                             v.shortcuts.collapsed.insert(g);
                         }
+                        v.sync_recording(cx);
                         cx.notify();
                     }));
                 table = table.child(focus::tab(head, &head_id, ui, Ring::Inner, Scroller::Page));
@@ -787,19 +829,29 @@ fn focus_target_after_edit(
         return row_elem_id(action);
     }
 
+    let searching = !query.is_empty() || pressed.is_some();
     let surviving: HashSet<&str> = post_shown.iter().map(|l| l.name.as_ref()).collect();
-    if sort == Sort::Group {
-        let searching = !query.is_empty() || pressed.is_some();
+    let fallback = if sort == Sort::Group {
         let pre_groups = grouped_rows(&pre_shown, collapsed, searching);
-        for (gi, (_, rows, _)) in pre_groups.iter().enumerate() {
-            if let Some(ri) = rows.iter().position(|l| l.name == action) {
-                return grouped_removal_fallback(&pre_groups, gi, ri, &surviving);
-            }
-        }
-    } else if let Some(i) = pre_shown.iter().position(|l| l.name == action) {
-        return flat_removal_fallback(&pre_shown, i, &surviving);
-    }
-    SharedString::from("sc-all").into()
+        pre_groups
+            .iter()
+            .enumerate()
+            .find_map(|(gi, (_, rows, _))| {
+                rows.iter().position(|l| l.name == action).and_then(|ri| grouped_removal_fallback(&pre_groups, gi, ri, &surviving))
+            })
+            .or_else(|| {
+                grouped_rows(&post_shown, collapsed, searching).into_iter().next().map(|(g, rows, folded)| {
+                    if !folded && let Some(first) = rows.first() { row_elem_id(&first.name) } else { group_elem_id(g) }
+                })
+            })
+    } else {
+        pre_shown
+            .iter()
+            .position(|l| l.name == action)
+            .and_then(|i| flat_removal_fallback(&pre_shown, i, &surviving))
+            .or_else(|| post_shown.first().map(|l| row_elem_id(&l.name)))
+    };
+    fallback.unwrap_or_else(|| SharedString::from("sc-all").into())
 }
 
 fn grouped_removal_fallback(
@@ -807,36 +859,36 @@ fn grouped_removal_fallback(
     gi: usize,
     ri: usize,
     surviving: &HashSet<&str>,
-) -> gpui::ElementId {
+) -> Option<gpui::ElementId> {
     let rows = &groups[gi].1;
     if let Some(next) = rows[ri + 1..].iter().find(|l| surviving.contains(l.name.as_ref())) {
-        return row_elem_id(&next.name);
+        return Some(row_elem_id(&next.name));
     }
     if let Some(prev) = rows[..ri].iter().rev().find(|l| surviving.contains(l.name.as_ref())) {
-        return row_elem_id(&prev.name);
+        return Some(row_elem_id(&prev.name));
     }
     if let Some((next_g, _, _)) = groups[gi + 1..].iter().find(|(_, r, _)| r.iter().any(|l| surviving.contains(l.name.as_ref()))) {
-        return group_elem_id(next_g);
+        return Some(group_elem_id(next_g));
     }
     if let Some((prev_g, prev_rows, prev_folded)) =
         groups[..gi].iter().rev().find(|(_, r, _)| r.iter().any(|l| surviving.contains(l.name.as_ref())))
     {
         if !prev_folded && let Some(last) = prev_rows.iter().rev().find(|l| surviving.contains(l.name.as_ref())) {
-            return row_elem_id(&last.name);
+            return Some(row_elem_id(&last.name));
         }
-        return group_elem_id(prev_g);
+        return Some(group_elem_id(prev_g));
     }
-    SharedString::from("sc-all").into()
+    None
 }
 
-fn flat_removal_fallback(shown: &[&Line], i: usize, surviving: &HashSet<&str>) -> gpui::ElementId {
+fn flat_removal_fallback(shown: &[&Line], i: usize, surviving: &HashSet<&str>) -> Option<gpui::ElementId> {
     if let Some(next) = shown[i + 1..].iter().find(|l| surviving.contains(l.name.as_ref())) {
-        return row_elem_id(&next.name);
+        return Some(row_elem_id(&next.name));
     }
     if let Some(prev) = shown[..i].iter().rev().find(|l| surviving.contains(l.name.as_ref())) {
-        return row_elem_id(&prev.name);
+        return Some(row_elem_id(&prev.name));
     }
-    SharedString::from("sc-all").into()
+    None
 }
 
 #[cfg(test)]
@@ -894,11 +946,29 @@ mod tests {
         assert!(!git.available);
         assert!(matches("plugin.git.status", git));
 
-        assert!(has_row_in("new_tab", &overrides, Some(&reg)));
-        assert!(has_row_in("plugin.docker.exec", &BTreeMap::new(), Some(&reg)));
-        assert!(has_row_in("plugin.git.status", &overrides, Some(&reg)));
-        assert!(!has_row_in("plugin.git.status", &BTreeMap::new(), Some(&reg)));
-        assert!(!has_row_in("plugin.missing.cmd", &overrides, Some(&reg)));
+        let empty_collapsed = HashSet::new();
+        assert!(is_row_visible("new_tab", &overrides, Some(&reg), Filter::All, Sort::Group, &empty_collapsed, "", None));
+        assert!(is_row_visible("plugin.docker.exec", &BTreeMap::new(), Some(&reg), Filter::All, Sort::Group, &empty_collapsed, "", None));
+        assert!(is_row_visible("plugin.git.status", &overrides, Some(&reg), Filter::All, Sort::Group, &empty_collapsed, "", None));
+        assert!(!is_row_visible("plugin.git.status", &BTreeMap::new(), Some(&reg), Filter::All, Sort::Group, &empty_collapsed, "", None));
+        assert!(!is_row_visible("plugin.missing.cmd", &overrides, Some(&reg), Filter::All, Sort::Group, &empty_collapsed, "", None));
+
+        // Recording visibility respects active search, filter, and group collapse (e.g. when a host swap changes the label).
+        assert!(is_row_visible(
+            "plugin.docker.exec",
+            &overrides,
+            Some(&reg),
+            Filter::All,
+            Sort::Group,
+            &empty_collapsed,
+            "container",
+            None
+        ));
+        assert!(!is_row_visible("plugin.docker.exec", &overrides, None, Filter::All, Sort::Group, &empty_collapsed, "container", None));
+        assert!(!is_row_visible("plugin.docker.exec", &overrides, Some(&reg), Filter::Unbound, Sort::Group, &empty_collapsed, "", None));
+        let plugins_collapsed = HashSet::from([PLUGINS_GROUP]);
+        assert!(!is_row_visible("plugin.docker.exec", &overrides, Some(&reg), Filter::All, Sort::Group, &plugins_collapsed, "", None));
+        assert!(is_row_visible("plugin.docker.exec", &overrides, Some(&reg), Filter::All, Sort::Group, &plugins_collapsed, "docker", None));
     }
 
     #[test]
@@ -1108,6 +1178,37 @@ mod tests {
                 None,
             ),
             gpui::ElementId::from(SharedString::from("sc-all")),
+        );
+
+        // When Reset restores a default key that matches the pressed search, land on the newly revealed row instead of `sc-all`.
+        let hijacked_default = BTreeMap::from([("ctrl-shift-t".to_string(), Some("plugin.docker.exec".to_string()))]);
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Reset,
+                &hijacked_default,
+                Some(&reg),
+                Filter::All,
+                Sort::Group,
+                &collapsed,
+                "",
+                Some("ctrl-shift-t"),
+            ),
+            row_elem_id("new_tab"),
+        );
+        assert_eq!(
+            focus_target_after_edit(
+                "plugin.docker.exec",
+                ShortcutEdit::Reset,
+                &hijacked_default,
+                Some(&reg),
+                Filter::All,
+                Sort::Name,
+                &collapsed,
+                "",
+                Some("ctrl-shift-t"),
+            ),
+            row_elem_id("new_tab"),
         );
 
         // Flat sort fallback picks surviving neighbor or `sc-all`.

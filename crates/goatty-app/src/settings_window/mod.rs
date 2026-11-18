@@ -500,10 +500,7 @@ impl SettingsWindow {
             cx.observe_global::<AppSettings>(|this, cx| {
                 this.sync_picker(cx);
                 this.sync_remote_opener(cx);
-                if let Some(id) = this.recording.as_deref()
-                    && !shortcuts::has_row(id, cx)
-                {
-                    this.recording = None;
+                if this.sync_recording(cx) {
                     cx.notify();
                 }
             }),
@@ -630,12 +627,8 @@ impl SettingsWindow {
                 subs.push(net_sub);
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
                 subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
-                    if let Some(id) = this.recording.as_deref()
-                        && !shortcuts::has_row(id, cx)
-                    {
-                        this.recording = None;
-                    }
-                    if this.page == Page::Shortcuts {
+                    let canceled = this.sync_recording(cx);
+                    if this.page == Page::Shortcuts || canceled {
                         cx.notify();
                     }
                 }));
