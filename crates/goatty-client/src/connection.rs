@@ -157,6 +157,9 @@ impl Shared {
     /// `interactive: false` for automatic reconnects (ssh must not prompt).
     fn connect(&self, interactive: bool) -> Result<(Reader, HostInfo, u32)> {
         for _ in 0..2 {
+            if self.closed.load(Ordering::Acquire) {
+                bail!("connection closed");
+            }
             if let Some(ok) = self.handshake(self.endpoint.connect(interactive)?)? {
                 return Ok(ok);
             }
@@ -276,7 +279,11 @@ impl Connection {
                 Ok(res) => res?,
                 Err(_) => {
                     shared.closed.store(true, Ordering::Release);
-                    shared.close_transport();
+                    let cleanup = shared.clone();
+                    if std::thread::Builder::new().name("goatty-handshake-cleanup".into()).spawn(move || cleanup.close_transport()).is_err()
+                    {
+                        shared.close_transport();
+                    }
                     bail!("timed out waiting for goattyd greeting via {}", shared.endpoint.label());
                 }
             }
@@ -346,12 +353,17 @@ impl Connection {
         pending: impl FnOnce(flume::Sender<ServerMsg>) -> Pending,
         msg: impl FnOnce(ReqId) -> ClientMsg,
     ) -> Result<ServerMsg> {
-        if !self.is_connected() {
-            bail!("not connected to goattyd");
-        }
         let req = self.shared.req_id();
         let (tx, rx) = flume::bounded(1);
-        self.shared.pending.lock().insert(req, pending(tx));
+        {
+            // Checked under the lock the disconnect drain takes: a request
+            // registered here is either drained (waking `rx`) or goes out on a live link.
+            let mut map = self.shared.pending.lock();
+            if !self.is_connected() {
+                bail!("not connected to goattyd");
+            }
+            map.insert(req, pending(tx));
+        }
         self.shared.send(&msg(req));
         let reply = rx.recv_timeout(timeout);
         self.shared.pending.lock().remove(&req);
