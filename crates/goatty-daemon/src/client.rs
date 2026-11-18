@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use goatty_proto::{
@@ -25,15 +26,124 @@ const MAX_STAT_WORKERS: usize = 4;
 const MAX_FILE_WORKERS: usize = 2;
 /// Max queued `FileData` bytes per connection waiting in the writer queue.
 const MAX_QUEUED_FILE_BYTES: usize = goatty_proto::MAX_FRAME;
+/// Max input bytes per connection waiting for a PTY that doesn't read. Past
+/// it the reader waits (the client feels backpressure) until the queue
+/// drains or the connection is dropped.
+const MAX_QUEUED_INPUT_BYTES: usize = 4 << 20;
+/// A connection that pings (remote clients do, every 5 s) and then sends
+/// nothing for this long is gone: a dead TCP link behind ssh never closes
+/// the proxy's socket, so EOF alone would keep it subscribed (#13).
+pub(crate) const SILENT_AFTER: Duration = Duration::from_secs(60);
+
+/// When a connection was last heard from, for [`reap_silent`].
+pub(crate) struct Liveness {
+    born: Instant,
+    /// Milliseconds after `born` of the last message.
+    last_ms: AtomicU64,
+    /// It has sent a `Ping`, so silence means it's gone. Local clients
+    /// don't ping: an idle one is just idle, and a dead one closes the
+    /// socket.
+    pings: AtomicBool,
+    /// Already shut down for silence.
+    dropped: AtomicBool,
+    stream: UnixStream,
+    /// The connection's writer queue, to stop the writer even while workers
+    /// (a stat on a hung mount) still hold senders.
+    writer: flume::WeakSender<Outbound>,
+}
+
+impl Liveness {
+    fn new(stream: UnixStream, writer: flume::WeakSender<Outbound>) -> Self {
+        Self {
+            born: Instant::now(),
+            last_ms: AtomicU64::new(0),
+            pings: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
+            stream,
+            writer,
+        }
+    }
+
+    fn heard(&self, ping: bool) {
+        let ms = u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(ms, Ordering::Relaxed);
+        if ping {
+            self.pings.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// How long a pinging connection has been silent at `now`; `None` for
+    /// one that never pinged.
+    fn silent_for(&self, now: Instant) -> Option<Duration> {
+        if !self.pings.load(Ordering::Relaxed) {
+            return None;
+        }
+        let last = self.born + Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        Some(now.saturating_duration_since(last))
+    }
+}
+
+/// Shut down every pinging connection silent for longer than `after`. Its
+/// reader then sees EOF and ends its subscriptions, which keeps the
+/// `attached` count and size control right, and its writer stops. Run every
+/// 2 s by `serve`.
+pub(crate) fn reap_silent(conns: &parking_lot::Mutex<HashMap<u64, Arc<Liveness>>>, now: Instant, after: Duration) {
+    for (conn, live) in conns.lock().iter() {
+        let Some(silent) = live.silent_for(now).filter(|s| *s > after) else { continue };
+        if !live.dropped.swap(true, Ordering::AcqRel) {
+            log::info!("connection {conn}: nothing heard for {}s; dropping it", silent.as_secs());
+            if let Some(tx) = live.writer.upgrade() {
+                let _ = tx.send(Outbound::stop());
+            }
+        }
+        let _ = live.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
 
 pub(crate) struct Outbound {
     pub(crate) frame: Frame,
-    _file_bytes: Option<FileByteGuard>,
+    _bytes: Option<ByteGuard>,
+    /// Tells the writer to stop: the connection was dropped.
+    stop: bool,
 }
 
 impl From<Frame> for Outbound {
     fn from(frame: Frame) -> Self {
-        Self { frame, _file_bytes: None }
+        Self { frame, _bytes: None, stop: false }
+    }
+}
+
+impl Outbound {
+    fn stop() -> Self {
+        Self { frame: Frame::from(&[][..]), _bytes: None, stop: true }
+    }
+}
+
+/// Input on its way to a session's PTY (see [`input_loop`]).
+struct InputJob {
+    session: Arc<Session>,
+    data: Vec<u8>,
+    /// `SendInput`'s request, answered once the input is written.
+    reply: Option<goatty_proto::ReqId>,
+    _bytes: ByteGuard,
+}
+
+/// Write a connection's input to the PTYs, in order. Off the reader thread:
+/// a program that stops reading fills the PTY and blocks the write, and the
+/// reader must still see pings, `Detach` and EOF meanwhile. Replies go
+/// through a weak sender so a stuck write never keeps the writer alive.
+fn input_loop(rx: flume::Receiver<InputJob>, replies: flume::WeakSender<Outbound>) {
+    while let Ok(job) = rx.recv() {
+        let _ = job.session.pty.lock().write(&job.data);
+        match job.reply {
+            Some(req) => {
+                if let (Some(tx), Ok(f)) = (replies.upgrade(), encode(&ServerMsg::Ok { req })) {
+                    let _ = tx.send(Outbound::from(f));
+                }
+            }
+            // Enter may have started a program that prints nothing.
+            None => job.session.poke_foreground(),
+        }
     }
 }
 
@@ -45,12 +155,12 @@ impl Drop for WorkerGuard {
     }
 }
 
-struct FileByteGuard {
+struct ByteGuard {
     counter: Arc<AtomicUsize>,
     bytes: usize,
 }
 
-impl Drop for FileByteGuard {
+impl Drop for ByteGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(self.bytes, Ordering::AcqRel);
     }
@@ -67,13 +177,13 @@ pub(crate) fn try_acquire_worker(counter: &Arc<AtomicUsize>, limit: usize) -> Op
     None
 }
 
-fn try_reserve_file_bytes(counter: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Option<FileByteGuard> {
+fn try_reserve_bytes(counter: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Option<ByteGuard> {
     let mut cur = counter.load(Ordering::Acquire);
     // Always admit a single valid frame when nothing else is queued so a
     // HARD_MAX_FILE_BYTES reply cannot be starved by metadata overhead.
     while cur == 0 || cur.saturating_add(bytes) <= limit {
         match counter.compare_exchange_weak(cur, cur.saturating_add(bytes), Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(FileByteGuard { counter: counter.clone(), bytes }),
+            Ok(_) => return Some(ByteGuard { counter: counter.clone(), bytes }),
             Err(next) => cur = next,
         }
     }
@@ -86,15 +196,19 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let conn = daemon.next_conn.fetch_add(1, Ordering::Relaxed);
     // Unbounded for stream/control: stream frames are limited by each
     // subscriber's window, control replies are tiny, and `FileData` frames
-    // carry a `FileByteGuard` bounded by `MAX_QUEUED_FILE_BYTES`.
+    // carry a `ByteGuard` bounded by `MAX_QUEUED_FILE_BYTES`.
     let (tx, rx) = flume::unbounded::<Outbound>();
     // An empty frame (real ones never are) asks the writer to flush and say
     // so here: everything queued before it has been sent.
     let (flushed_tx, flushed_rx) = flume::bounded::<()>(1);
     let wstream = stream.try_clone()?;
+    let live = Arc::new(Liveness::new(stream.try_clone()?, tx.downgrade()));
     let writer = std::thread::Builder::new().name(format!("c{conn}-writer")).spawn(move || {
         let mut w = BufWriter::with_capacity(128 << 10, &wstream);
         while let Ok(out) = rx.recv() {
+            if out.stop {
+                break;
+            }
             if out.frame.is_empty() {
                 if w.flush().is_err() {
                     break;
@@ -105,7 +219,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             if w.write_all(&out.frame).is_err() {
                 break;
             }
-            // Drop `out` (and any `FileByteGuard`) as soon as it is written.
+            // Drop `out` (and any `ByteGuard`) as soon as it is written.
             drop(out);
             // Batch under load; flush the moment the queue is idle.
             if rx.is_empty() && w.flush().is_err() {
@@ -114,6 +228,28 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         }
         let _ = wstream.shutdown(std::net::Shutdown::Both);
     })?;
+    let (input_tx, input_rx) = flume::unbounded::<InputJob>();
+    {
+        let replies = tx.downgrade();
+        std::thread::Builder::new().name(format!("c{conn}-input")).spawn(move || input_loop(input_rx, replies))?;
+    }
+    let input_queued = Arc::new(AtomicUsize::new(0));
+    // Queue input for the PTY. Past the budget wait for room, unless the
+    // connection was dropped meanwhile (`false`: stop reading).
+    let queue_input = |session: Arc<Session>, data: Vec<u8>, reply| {
+        loop {
+            if let Some(guard) = try_reserve_bytes(&input_queued, data.len(), MAX_QUEUED_INPUT_BYTES) {
+                let _ = input_tx.send(InputJob { session, data, reply, _bytes: guard });
+                return true;
+            }
+            if live.dropped.load(Ordering::Acquire) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Registered only once nothing can fail before the cleanup below.
+    daemon.conns.lock().insert(conn, live.clone());
     let reply = |msg: ServerMsg| {
         if let Ok(f) = encode(&msg) {
             let _ = tx.send(Outbound::from(f));
@@ -135,6 +271,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e.into()),
             };
+            live.heard(matches!(msg, ClientMsg::Ping { .. }));
             match msg {
                 ClientMsg::Hello { version, client } => {
                     let host = crate::server::host_info();
@@ -191,10 +328,10 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     }
                 }
                 ClientMsg::Input { session, data } => {
-                    if let Some((s, _)) = subs.get(&session) {
-                        let _ = s.pty.lock().write(&data);
-                        // Enter may have started a program that prints nothing.
-                        s.poke_foreground();
+                    if let Some((s, _)) = subs.get(&session)
+                        && !queue_input(s.clone(), data, None)
+                    {
+                        return Ok(());
                     }
                 }
                 ClientMsg::Resize { session, size } => {
@@ -217,8 +354,9 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 },
                 ClientMsg::SendInput { req, session, data } => match daemon.get(session) {
                     Some(s) => {
-                        let _ = s.pty.lock().write(&data);
-                        reply(ServerMsg::Ok { req });
+                        if !queue_input(s, data, Some(req)) {
+                            return Ok(());
+                        }
                     }
                     None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
                 },
@@ -356,8 +494,8 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let is_data = matches!(msg, ServerMsg::FileData { .. });
                         if let Ok(f) = encode_server(&msg, zstd) {
                             if is_data {
-                                if let Some(byte_guard) = try_reserve_file_bytes(&file_queued_bytes, f.len(), MAX_QUEUED_FILE_BYTES) {
-                                    let _ = tx.send(Outbound { frame: f, _file_bytes: Some(byte_guard) });
+                                if let Some(byte_guard) = try_reserve_bytes(&file_queued_bytes, f.len(), MAX_QUEUED_FILE_BYTES) {
+                                    let _ = tx.send(Outbound { frame: f, _bytes: Some(byte_guard), stop: false });
                                 } else if let Ok(err) = encode(&ServerMsg::Error {
                                     req: Some(req),
                                     message: "file transfer queue is full; try again shortly".into(),
@@ -382,8 +520,13 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         s.unsubscribe(conn);
         log::info!("connection {conn} detached from session {id}");
     }
+    // Queued input still goes out; the input thread ends after it.
+    drop(input_tx);
     drop(tx);
+    // A worker stuck on a hung mount keeps the writer waiting: stay
+    // registered meanwhile, so silence still closes the socket and stops it.
     let _ = writer.join();
+    daemon.conns.lock().remove(&conn);
     result
 }
 
@@ -391,14 +534,55 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Whether the peer of a reaped stream sees it closed.
+    fn closed(peer: &UnixStream) -> bool {
+        use std::io::Read;
+        peer.set_nonblocking(true).unwrap();
+        matches!((&*peer).read(&mut [0u8; 1]), Ok(0))
+    }
+
+    #[test]
+    fn reaps_only_silent_pinging_connections() {
+        let (quiet, quiet_peer) = UnixStream::pair().unwrap();
+        let (pinging, pinging_peer) = UnixStream::pair().unwrap();
+        let conns = parking_lot::Mutex::new(HashMap::new());
+        // A worker (stuck on a hung mount) still holds a sender of each queue.
+        let (quiet_tx, quiet_rx) = flume::unbounded::<Outbound>();
+        let (pinging_tx, pinging_rx) = flume::unbounded::<Outbound>();
+        let quiet = Arc::new(Liveness::new(quiet, quiet_tx.downgrade()));
+        let pinging = Arc::new(Liveness::new(pinging, pinging_tx.downgrade()));
+        quiet.heard(false);
+        pinging.heard(true);
+        conns.lock().insert(1, quiet);
+        conns.lock().insert(2, pinging.clone());
+
+        // Recently heard from: both stay.
+        reap_silent(&conns, Instant::now(), SILENT_AFTER);
+        assert!(!closed(&quiet_peer) && !closed(&pinging_peer));
+
+        // Long silent: only the one that pings goes; a local client that
+        // never pings may idle forever.
+        let later = Instant::now() + SILENT_AFTER + Duration::from_secs(1);
+        reap_silent(&conns, later, SILENT_AFTER);
+        assert!(!closed(&quiet_peer), "a connection that never pinged is kept");
+        assert!(closed(&pinging_peer), "a silent pinging connection is shut down");
+        assert!(pinging.dropped.load(Ordering::Relaxed));
+        assert!(quiet_rx.is_empty(), "a kept connection's writer goes on");
+        assert!(pinging_rx.try_recv().is_ok_and(|o| o.stop), "the dropped connection's writer is told to stop");
+
+        // Later ticks don't queue more stops.
+        reap_silent(&conns, later, SILENT_AFTER);
+        assert!(pinging_rx.is_empty());
+    }
+
     #[test]
     fn queued_file_byte_budget_bounds_and_releases() {
         let queued = Arc::new(AtomicUsize::new(0));
         let limit = 100;
-        let g1 = try_reserve_file_bytes(&queued, 60, limit).expect("first fits");
+        let g1 = try_reserve_bytes(&queued, 60, limit).expect("first fits");
         assert_eq!(queued.load(Ordering::Acquire), 60);
-        assert!(try_reserve_file_bytes(&queued, 50, limit).is_none(), "second exceeds remaining budget");
-        let g2 = try_reserve_file_bytes(&queued, 40, limit).expect("exact remaining fits");
+        assert!(try_reserve_bytes(&queued, 50, limit).is_none(), "second exceeds remaining budget");
+        let g2 = try_reserve_bytes(&queued, 40, limit).expect("exact remaining fits");
         assert_eq!(queued.load(Ordering::Acquire), 100);
         drop(g1);
         assert_eq!(queued.load(Ordering::Acquire), 40);
@@ -406,9 +590,9 @@ mod tests {
         assert_eq!(queued.load(Ordering::Acquire), 0);
 
         // Single oversized frame is still admitted when the queue is empty.
-        let big = try_reserve_file_bytes(&queued, 120, limit).expect("single frame when empty");
+        let big = try_reserve_bytes(&queued, 120, limit).expect("single frame when empty");
         assert_eq!(queued.load(Ordering::Acquire), 120);
-        assert!(try_reserve_file_bytes(&queued, 1, limit).is_none(), "blocks while oversized frame queued");
+        assert!(try_reserve_bytes(&queued, 1, limit).is_none(), "blocks while oversized frame queued");
         drop(big);
         assert_eq!(queued.load(Ordering::Acquire), 0);
     }
