@@ -14,6 +14,7 @@
 //! title = "Open a shell in a container"      # shown as "docker: Open a shell…"
 //! keywords = ["exec", "attach"]
 //! run = ["docker", "exec", "-it", "{container}", "{shell}"]
+//! # when = "some_setting"                    # optional condition on plugin settings
 //!
 //! [[command.input]]
 //! id = "container"
@@ -46,11 +47,14 @@
 //! run = ["git", "branch", "--format=%(refname:short)"]
 //! ```
 //!
-//! A command can also be in the terminal's right-click menu (#186), under
-//! the plugin's name, with one of goatty's icons ([`MENU_ICONS`]). With
-//! `when = "selection"` it shows only while text is selected, and `fill`
-//! names the input the selected text goes into (still asked, so the user
-//! sees and can change it):
+//! `[[command]].when` gates the command on plugin settings (like
+//! `[[alias]].when`), hiding it from the palette and right-click menu when
+//! false. A command can also be in the terminal's right-click menu (#186),
+//! under the plugin's name, with one of goatty's icons ([`MENU_ICONS`]).
+//! There, `[command.menu].when` controls terminal context (`always`,
+//! `selection` when text is selected, or `prompt`), and `fill` names the
+//! input the selected text goes into (still asked, so the user sees and
+//! can change it):
 //!
 //! ```toml
 //! [command.menu]
@@ -85,6 +89,10 @@ pub struct PaletteCommand {
     /// Asked in this order.
     #[serde(default, rename = "input")]
     pub inputs: Vec<CommandInput>,
+    /// Condition on settings (see [`Condition`](crate::manifest::Condition)):
+    /// when false, the command isn't offered in the palette or menu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
     /// Also in the terminal's right-click menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<CommandMenu>,
@@ -503,6 +511,11 @@ pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
                 }
             }
         }
+        if let Some(w) = &c.when
+            && let Err(e) = crate::manifest::Condition::parse(w).and_then(|cond| cond.check(m))
+        {
+            err(format!("{at}.when"), e);
+        }
         if let Some(menu) = &c.menu {
             if let Some(icon) = &menu.icon
                 && !MENU_ICONS.contains(&icon.as_str())
@@ -787,6 +800,27 @@ fill = "filter"
     }
 
     #[test]
+    fn when_conditions() {
+        let m = with_commands("[[command]]\nid = \"t\"\ntitle = \"T\"\nrun = [\"eza\"]\nwhen = \"replace_ls\"\n").unwrap();
+        assert_eq!(m.commands[0].when.as_deref(), Some("replace_ls"));
+        let plain = with_commands(COMMANDS).unwrap();
+        assert!(!serde_json::to_string(&plain.commands[0]).unwrap().contains("when"));
+
+        let bad = |w: &str| -> Vec<String> {
+            with_commands(&format!("[[command]]\nid = \"t\"\ntitle = \"T\"\nrun = [\"eza\"]\nwhen = {w:?}\n"))
+                .unwrap_err()
+                .0
+                .iter()
+                .map(|p| format!("{}: {}", p.path, p.message))
+                .collect()
+        };
+        assert_eq!(bad("nope"), ["command[0].when: no setting \"nope\""]);
+        assert!(bad("icons")[0].starts_with("command[0].when: icons is not a bool"));
+        assert!(bad("icons=nope")[0].contains("not one of icons's choices"));
+        assert_eq!(bad(""), ["command[0].when: empty condition"]);
+    }
+
+    #[test]
     fn quoted_lines_survive_a_real_shell() {
         // The rendered line, run by sh with `printf '%s\n'` in place of
         // the program, prints each value back unchanged.
@@ -798,6 +832,7 @@ fill = "filter"
             keywords: Vec::new(),
             run: vec!["printf".into(), "%s\\n".into(), "{a}".into(), "pre-{b}".into()],
             inputs: Vec::new(),
+            when: None,
             menu: None,
         };
         let nasty = ["it's \"$HOME\" `id` $(echo hi); ls *", "\\ ' \" ! ~ # &"];

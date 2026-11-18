@@ -2,22 +2,26 @@
 //! sorted, searchable by name or by keys (typed or pressed), with filters
 //! for changed and unbound actions.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 
-use goatty_config::keys::{self, ACTIONS, ActionInfo, GROUPS};
+use goatty_config::keys::{self, ACTIONS, GROUPS};
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, KeyDownEvent, ParentElement, SharedString, Styled, Subscription, Window, div,
-    prelude::*, px,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, KeyDownEvent, ParentElement, SharedString, Styled, Subscription, Window,
+    div, prelude::*, px,
 };
 
 use super::SettingsWindow;
 use super::kit::{self, card, chip, divider, search_field};
+use crate::command_palette::registry::{CommandRegistry, Source};
 use crate::settings::AppSettings;
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button_with, icon_button, icon_button_tinted, keycaps, pretty_keys, tooltip};
 use crate::ui::focus::{self, Ring, Scroller};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
 use crate::ui::text_input::{TextInput, TextInputEvent};
+
+const PLUGINS_GROUP: &str = "Plugins";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
@@ -70,7 +74,9 @@ impl ShortcutsPage {
 
 /// One action as the table shows it.
 struct Line {
-    action: &'static ActionInfo,
+    name: Cow<'static, str>,
+    label: Cow<'static, str>,
+    group: &'static str,
     keys: Vec<String>,
     changed: bool,
 }
@@ -86,7 +92,7 @@ fn matches(query: &str, line: &Line) -> bool {
         return true;
     }
     let q = query.to_lowercase();
-    let label = format!("{} {} {}", line.action.label, line.action.name.replace('_', " "), line.action.group).to_lowercase();
+    let label = format!("{} {} {}", line.label, line.name.replace(['_', '.'], " "), line.group).to_lowercase();
     if q.split_whitespace().all(|w| label.contains(w)) {
         return true;
     }
@@ -94,17 +100,62 @@ fn matches(query: &str, line: &Line) -> bool {
     line.keys.iter().any(|key| key.contains(&k) || pretty_keys(key).to_lowercase().contains(&q))
 }
 
-fn lines(overrides: &BTreeMap<String, Option<String>>) -> Vec<Line> {
-    ACTIONS
+fn lines(overrides: &BTreeMap<String, Option<String>>, registry: Option<&CommandRegistry>) -> Vec<Line> {
+    let mut out: Vec<Line> = ACTIONS
         .iter()
         .map(|a| Line {
-            action: a,
+            name: Cow::Borrowed(a.name),
+            label: Cow::Borrowed(a.label),
+            group: a.group,
             keys: keys::keys_for(a.name, overrides),
             changed: overrides.iter().any(|(k, v)| {
                 v.as_deref() == Some(a.name) || (v.is_none() && keys::DEFAULT_BINDINGS.iter().any(|(dk, da)| dk == k && *da == a.name))
             }),
         })
-        .collect()
+        .collect();
+    let mut seen = HashSet::new();
+    if let Some(reg) = registry {
+        for c in reg.commands() {
+            if !matches!(c.source, Source::Plugin(_)) {
+                continue;
+            }
+            let Some(action) = c.key_action() else { continue };
+            if !seen.insert(action.to_string()) {
+                continue;
+            }
+            let keys = keys::keys_for(action, overrides);
+            out.push(Line {
+                name: Cow::Owned(action.to_string()),
+                label: Cow::Owned(c.label()),
+                group: PLUGINS_GROUP,
+                changed: !keys.is_empty(),
+                keys,
+            });
+        }
+    }
+    let mut extra: Vec<String> =
+        overrides.values().flatten().filter(|a| keys::parse_plugin_action(a).is_some() && seen.insert((*a).clone())).cloned().collect();
+    extra.sort();
+    for action in extra {
+        let Some((plugin, cmd)) = keys::parse_plugin_action(&action) else { continue };
+        let keys = keys::keys_for(&action, overrides);
+        let changed = !keys.is_empty();
+        out.push(Line { label: Cow::Owned(format!("{plugin}: {cmd}")), name: Cow::Owned(action), group: PLUGINS_GROUP, keys, changed });
+    }
+    out
+}
+
+fn action_label(name: &str, cx: &App) -> String {
+    if let Some(a) = keys::find_action(name) {
+        return a.label.to_string();
+    }
+    if let Some(c) = cx.try_global::<CommandRegistry>().and_then(|r| r.get(name)) {
+        return c.label();
+    }
+    if let Some((plugin, cmd)) = keys::parse_plugin_action(name) {
+        return format!("{plugin}: {cmd}");
+    }
+    name.to_string()
 }
 
 impl SettingsWindow {
@@ -158,19 +209,20 @@ impl SettingsWindow {
         let Some(action) = self.recording.take() else { return true };
         let overrides = &cx.global::<AppSettings>().file.value.keybindings;
         // One keystroke runs one action: say which one this took it from.
-        self.shortcut_note = keys::action_for(&keystroke, overrides).filter(|a| a != action).map(|prev| {
-            let label = keys::find_action(&prev).map_or(prev.as_str(), |a| a.label);
-            (action, format!("{} was bound to \"{label}\"; it does this now.", pretty_keys(&keystroke)))
+        self.shortcut_note = keys::action_for(&keystroke, overrides).filter(|a| a != &action).map(|prev| {
+            let label = action_label(&prev, cx);
+            (action.clone(), format!("{} was bound to \"{label}\"; it does this now.", pretty_keys(&keystroke)))
         });
-        AppSettings::update(cx, |s| keys::set_binding(&mut s.keybindings, &keystroke, Some(action)));
+        AppSettings::update(cx, |s| keys::set_binding(&mut s.keybindings, &keystroke, Some(&action)));
         cx.notify();
         true
     }
 
     fn shortcut_row(&self, ui: Ui, line: &Line, cx: &Context<'_, Self>) -> AnyElement {
         let app = cx.global::<AppSettings>();
-        let name = line.action.name;
-        let recording = self.recording == Some(name);
+        let name = line.name.as_ref().to_owned();
+        let label_text: SharedString = line.label.as_ref().to_owned().into();
+        let recording = self.recording.as_deref() == Some(name.as_str());
         // Problems per keystroke: unreadable ones, and keys the user added
         // that the shell would otherwise get (the defaults are curated).
         let mut warnings = Vec::new();
@@ -187,7 +239,7 @@ impl SettingsWindow {
                     warnings.push(format!("{} doesn't work: {e}", pretty_keys(k)));
                     return true;
                 }
-                if !keys::is_default(k, name)
+                if !keys::is_default(k, &name)
                     && let Some(c) = keys::shell_conflict(k)
                 {
                     warnings.push(format!("{}: {c}. Bound here, the shell no longer gets it.", pretty_keys(k)));
@@ -197,7 +249,7 @@ impl SettingsWindow {
             })
             .collect();
         if let Some((for_action, msg)) = &self.shortcut_note
-            && *for_action == name
+            && for_action == &name
         {
             warnings.insert(0, msg.clone());
         }
@@ -216,7 +268,7 @@ impl SettingsWindow {
             let remove = div()
                 .id(rm_id.clone())
                 .role(gpui::Role::Button)
-                .aria_label(SharedString::from(format!("Remove {} from {}", pretty_keys(k), line.action.label)))
+                .aria_label(SharedString::from(format!("Remove {} from {}", pretty_keys(k), line.label)))
                 .size(px(18.))
                 .rounded_full()
                 .flex()
@@ -275,7 +327,7 @@ impl SettingsWindow {
             .justify_end()
             .gap(px(2.))
             .when(line.changed, |d| {
-                let (row_elem, page_focus) = (row_elem.clone(), page_focus.clone());
+                let (row_elem, page_focus, reset_name) = (row_elem.clone(), page_focus.clone(), name.clone());
                 let reset_id = SharedString::from(format!("sc-reset-{name}"));
                 let reset_focus: gpui::ElementId = reset_id.clone().into();
                 d.child(icon_button(reset_id, Icon::RotateCcw, "Reset to the default", ui, move |window, cx| {
@@ -283,18 +335,21 @@ impl SettingsWindow {
                     if focus::is_focused(&reset_focus, window) {
                         focus::hand_over(&page_focus, focus::Handover::Control(row_elem.clone()), window, cx);
                     }
-                    AppSettings::update(cx, |s| keys::reset_action(&mut s.keybindings, name));
+                    AppSettings::update(cx, |s| keys::reset_action(&mut s.keybindings, &reset_name));
                 }))
             })
             .child(
-                icon_button(SharedString::from(format!("sc-add-{name}")), Icon::Plus, "Add a shortcut", ui, move |window, cx| {
-                    let _ = this.update(cx, |v, cx| {
-                        v.recording = Some(name);
-                        v.shortcuts.listening = false;
-                        v.shortcut_note = None;
-                        window.focus(&v.focus, cx);
-                        cx.notify();
-                    });
+                icon_button(SharedString::from(format!("sc-add-{name}")), Icon::Plus, "Add a shortcut", ui, {
+                    let rec_name = name.clone();
+                    move |window, cx| {
+                        let _ = this.update(cx, |v, cx| {
+                            v.recording = Some(rec_name.clone());
+                            v.shortcuts.listening = false;
+                            v.shortcut_note = None;
+                            window.focus(&v.focus, cx);
+                            cx.notify();
+                        });
+                    }
                 })
                 .when(!line.keys.is_empty() && !line.changed, |d| {
                     // Enter on the row does the same: hidden until hover or focus, still a tab stop.
@@ -307,10 +362,10 @@ impl SettingsWindow {
         let row = div()
             .id(row_id.clone())
             .role(gpui::Role::Row)
-            .aria_label(line.action.label)
+            .aria_label(label_text.clone())
             .aria_description("Enter adds a shortcut, Delete removes the last one")
             .on_key_down({
-                let (row_id, this) = (row_id.clone(), cx.entity().downgrade());
+                let (row_id, this, rec_name) = (row_id.clone(), cx.entity().downgrade(), name);
                 move |ev, window, cx| {
                     // Only the row itself: a button inside it has its own Enter.
                     if ev.keystroke.modifiers.modified() || !focus::is_focused(&row_id, window) {
@@ -320,7 +375,7 @@ impl SettingsWindow {
                         "enter" => {
                             cx.stop_propagation();
                             let _ = this.update(cx, |v, cx| {
-                                v.recording = Some(name);
+                                v.recording = Some(rec_name.clone());
                                 v.shortcuts.listening = false;
                                 v.shortcut_note = None;
                                 window.focus(&v.focus, cx);
@@ -358,7 +413,7 @@ impl SettingsWindow {
                             .gap(px(8.))
                             .flex_1()
                             .min_w(px(140.))
-                            .child(div().min_w_0().text_size(px(text::BODY)).text_color(ui.text).child(line.action.label))
+                            .child(div().min_w_0().text_size(px(text::BODY)).text_color(ui.text).child(label_text))
                             .when(line.changed, |d| d.child(badge("Changed", Tone::Accent, ui))),
                     )
                     .child(div().w(px(240.)).flex_shrink(1.).min_w(px(150.)).child(cell))
@@ -418,7 +473,7 @@ impl SettingsWindow {
 
     pub(super) fn shortcuts_page(&self, ui: Ui, window: &Window, cx: &Context<'_, Self>) -> AnyElement {
         let app = cx.global::<AppSettings>();
-        let all = lines(&app.file.value.keybindings);
+        let all = lines(&app.file.value.keybindings, cx.try_global::<CommandRegistry>());
         let st = &self.shortcuts;
         let query = st.query.read(cx).text().trim().to_string();
         let changed_n = all.iter().filter(|l| l.changed).count();
@@ -437,7 +492,7 @@ impl SettingsWindow {
             .collect();
         match st.sort {
             Sort::Group => {}
-            Sort::Name => shown.sort_by_key(|l| l.action.label.to_lowercase()),
+            Sort::Name => shown.sort_by_key(|l| l.label.to_lowercase()),
             Sort::Keys => shown.sort_by_key(|l| (l.keys.is_empty(), l.keys.first().map(|k| pretty_keys(k).to_lowercase()))),
         }
 
@@ -533,16 +588,17 @@ impl SettingsWindow {
             table = table.child(kit::empty(ui, Icon::Keyboard, title, desc));
         } else if st.sort == Sort::Group {
             let searching = !query.is_empty() || st.pressed.is_some();
-            for (gi, g) in GROUPS.iter().enumerate() {
-                let rows: Vec<&&Line> = shown.iter().filter(|l| l.action.group == *g).collect();
+            let mut first_group = true;
+            for g in GROUPS.iter().copied().chain(std::iter::once(PLUGINS_GROUP)) {
+                let rows: Vec<&&Line> = shown.iter().filter(|l| l.group == g).collect();
                 if rows.is_empty() {
                     continue;
                 }
                 let folded = !searching && st.collapsed.contains(g);
-                let g = *g;
-                if gi > 0 {
+                if !first_group {
                     table = table.child(div().h(px(1.)).bg(ui.divider));
                 }
+                first_group = false;
                 let head_id: gpui::ElementId = SharedString::from(format!("sc-group-{g}")).into();
                 let head = div()
                     .id(head_id.clone())
@@ -598,15 +654,51 @@ impl SettingsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_palette::Command;
 
     #[test]
     fn search_by_name_or_keys() {
         let a = keys::find_action("new_tab").unwrap();
-        let l = Line { action: a, keys: vec!["ctrl-shift-t".into()], changed: false };
+        let l = Line {
+            name: Cow::Borrowed(a.name),
+            label: Cow::Borrowed(a.label),
+            group: a.group,
+            keys: vec!["ctrl-shift-t".into()],
+            changed: false,
+        };
         for q in ["", "new tab", "tab new", "TAB", "ctrl+shift+t", "Ctrl+Shift+T", "shift-t", "tabs"] {
             assert!(matches(q, &l), "{q:?}");
         }
         assert!(!matches("paste", &l));
         assert!(!matches("ctrl+alt", &l));
+    }
+
+    #[test]
+    fn plugin_commands_and_inactive_bound_overrides_appear_under_plugins() {
+        let mut reg = CommandRegistry::default();
+        let mut active = Command::handler("plugin.docker.exec", "Docker", "Open a shell in a container", |_, _| {})
+            .with_key_action("plugin.docker.exec");
+        active.source = Source::Plugin("docker".into());
+        reg.register(active);
+
+        let overrides = BTreeMap::from([
+            ("ctrl-alt-e".to_string(), Some("plugin.docker.exec".to_string())),
+            ("ctrl-alt-g".to_string(), Some("plugin.git.status".to_string())),
+        ]);
+        let all = lines(&overrides, Some(&reg));
+        let plugin_lines: Vec<&Line> = all.iter().filter(|l| l.group == PLUGINS_GROUP).collect();
+        assert_eq!(plugin_lines.len(), 2);
+
+        let docker = plugin_lines.iter().find(|l| l.name == "plugin.docker.exec").unwrap();
+        assert_eq!(docker.label, "Docker: Open a shell in a container");
+        assert_eq!(docker.keys, ["ctrl-alt-e"]);
+        assert!(docker.changed);
+        assert!(matches("docker exec", docker));
+        assert!(matches("plugins", docker));
+
+        let git = plugin_lines.iter().find(|l| l.name == "plugin.git.status").unwrap();
+        assert_eq!(git.label, "git: status");
+        assert_eq!(git.keys, ["ctrl-alt-g"]);
+        assert!(git.changed);
     }
 }

@@ -243,6 +243,7 @@ pub fn start_install(link: HostLink, tools: Vec<Tool>, cx: &mut App) {
     cx.spawn(async move |cx| {
         let k = key.clone();
         let retry_link = link.clone();
+        let active_link = link.clone();
         let p = install(link, progress, cx, move |p, cx| {
             if !p.finished {
                 toast::update(cx, id, Toast::loading(p.status_line()).key(k.clone()));
@@ -252,6 +253,15 @@ pub fn start_install(link: HostLink, tools: Vec<Tool>, cx: &mut App) {
         cx.update(|cx| {
             let failures = p.failures();
             let done: Vec<&str> = p.tools.iter().filter(|t| t.2 == Step::Done).map(|t| t.1.as_str()).collect();
+            if !done.is_empty()
+                && cx
+                    .try_global::<crate::settings_window::HostLinkGlobal>()
+                    .and_then(|g| g.0.as_ref())
+                    .is_some_and(|g| g.same(&active_link))
+            {
+                crate::plugin_commands::refresh(cx);
+                crate::snippets::refresh(cx);
+            }
             let past = if only_updates { "Updated" } else { "Installed" };
             let t = if failures.is_empty() {
                 Toast::success(format!("{past} {}", names(&done)))

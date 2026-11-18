@@ -470,7 +470,7 @@ impl HostSettings {
 
 /// Same rule as `goatty_plugin::manifest::is_id` (goatty-config doesn't
 /// depend on the plugin crate).
-fn is_plugin_id(s: &str) -> bool {
+pub(crate) fn is_plugin_id(s: &str) -> bool {
     (2..=40).contains(&s.len())
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && s.as_bytes()[0].is_ascii_lowercase()

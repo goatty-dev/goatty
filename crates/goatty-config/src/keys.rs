@@ -112,6 +112,24 @@ pub fn find_action(name: &str) -> Option<&'static ActionInfo> {
     ACTIONS.iter().find(|a| a.name == name)
 }
 
+/// Split a plugin command action (`plugin.<plugin>.<command>`) into its
+/// `(plugin, command)` ids. Same syntax as `goatty_plugin` (`is_id` and
+/// `commands::is_command_id`); `goatty-config` stays dependency-free.
+pub fn parse_plugin_action(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("plugin.")?;
+    let (plugin, cmd) = rest.split_once('.')?;
+    let valid_cmd = (1..=40).contains(&cmd.len())
+        && cmd.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && cmd.as_bytes()[0].is_ascii_lowercase();
+    (crate::host::is_plugin_id(plugin) && valid_cmd).then_some((plugin, cmd))
+}
+
+/// Whether `name` names a built-in action or a well-formed plugin command
+/// action (`plugin.<plugin>.<command>`).
+pub fn is_valid_action(name: &str) -> bool {
+    find_action(name).is_some() || parse_plugin_action(name).is_some()
+}
+
 /// Default keystroke → action table (canonical spellings).
 pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl-shift-c", "copy"),
@@ -289,7 +307,7 @@ pub fn effective_bindings(overrides: &BTreeMap<String, Option<String>>) -> Vec<(
     for (key, action) in overrides {
         let key = normalize_keystroke(key);
         match action {
-            Some(a) if find_action(a).is_some() => {
+            Some(a) if is_valid_action(a) => {
                 map.insert(key, a.clone());
             }
             Some(_) => {} // reported by validation
@@ -517,5 +535,42 @@ mod tests {
         assert_eq!(shell_conflict("ctrl-,"), None);
         assert_eq!(shell_conflict("shift-pageup"), None);
         assert_eq!(shell_conflict("f5"), None);
+    }
+
+    #[test]
+    fn plugin_command_actions() {
+        assert_eq!(parse_plugin_action("plugin.docker.exec"), Some(("docker", "exec")));
+        assert_eq!(parse_plugin_action("plugin.a1.x"), Some(("a1", "x")));
+        assert_eq!(parse_plugin_action("plugin.my-plug.run-2"), Some(("my-plug", "run-2")));
+        for bad in [
+            "docker.exec",
+            "plugin.",
+            "plugin.docker",
+            "plugin.docker.",
+            "plugin.d.exec",       // plugin id must be >= 2 chars
+            "plugin.docker-.exec", // plugin id cannot end with '-'
+            "plugin.docker.Exec",
+            "plugin.docker.exec.extra",
+            "plugin.docker.exec_1",
+        ] {
+            assert_eq!(parse_plugin_action(bad), None, "{bad:?}");
+            assert!(!is_valid_action(bad), "{bad:?}");
+        }
+        assert!(is_valid_action("plugin.docker.exec"));
+        assert!(is_valid_action("copy"));
+
+        let mut o = BTreeMap::new();
+        set_binding(&mut o, "Ctrl-Alt-E", Some("plugin.docker.exec"));
+        assert_eq!(keys_for("plugin.docker.exec", &o), ["ctrl-alt-e"]);
+        assert_eq!(action_for("ctrl-alt-e", &o).as_deref(), Some("plugin.docker.exec"));
+
+        // Overriding a default key for a plugin command, then resetting it restores the default.
+        set_binding(&mut o, "ctrl-shift-t", Some("plugin.docker.logs"));
+        assert_eq!(action_for("ctrl-shift-t", &o).as_deref(), Some("plugin.docker.logs"));
+        reset_action(&mut o, "plugin.docker.logs");
+        assert_eq!(action_for("ctrl-shift-t", &o).as_deref(), Some("new_tab"));
+        assert_eq!(keys_for("plugin.docker.exec", &o), ["ctrl-alt-e"]);
+        reset_action(&mut o, "plugin.docker.exec");
+        assert!(o.is_empty(), "{o:?}");
     }
 }

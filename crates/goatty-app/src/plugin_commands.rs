@@ -123,29 +123,7 @@ pub fn refresh(cx: &mut App) {
 
 /// Replace the registry's plugin commands with `installed`'s.
 fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
-    let commands: Vec<Command> = match &link {
-        Some(link) => installed
-            .iter()
-            .filter(|p| p.enabled && p.incompatible.is_none())
-            .flat_map(|p| p.manifest.commands.iter().map(move |c| (p, c)))
-            .map(|(p, c)| command(link, &p.manifest.id, &p.manifest.name, c))
-            .collect(),
-        None => Vec::new(),
-    };
-    let menu = match &link {
-        Some(link) => installed
-            .iter()
-            .filter(|p| p.enabled && p.incompatible.is_none())
-            .flat_map(|p| p.manifest.commands.iter().filter(|c| c.menu.is_some()).map(move |c| (p, c)))
-            .map(|(p, c)| MenuCommand {
-                plugin_id: p.manifest.id.clone(),
-                plugin: p.manifest.name.clone(),
-                command: Rc::new(c.clone()),
-                origin: link.clone(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let (commands, menu) = build(link.as_ref(), &installed);
     cx.set_global(MenuCommands(menu));
     let reg = cx.default_global::<CommandRegistry>();
     reg.unregister_plugins();
@@ -154,18 +132,64 @@ fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
     }
 }
 
+fn build(link: Option<&HostLink>, installed: &[Installed]) -> (Vec<Command>, Vec<MenuCommand>) {
+    let Some(link) = link else {
+        return (Vec::new(), Vec::new());
+    };
+    let active_cmds = installed
+        .iter()
+        .filter(|p| p.enabled && p.incompatible.is_none())
+        .flat_map(|p| p.manifest.commands.iter().filter(|c| !p.unavailable_commands.contains(&c.id)).map(move |c| (p, c)));
+    let mut commands = Vec::new();
+    let mut menu = Vec::new();
+    for (p, c) in active_cmds {
+        commands.push(command(link, &p.manifest.id, &p.manifest.name, c));
+        if c.menu.is_some() {
+            menu.push(MenuCommand {
+                plugin_id: p.manifest.id.clone(),
+                plugin: p.manifest.name.clone(),
+                command: Rc::new(c.clone()),
+                origin: link.clone(),
+            });
+        }
+    }
+    (commands, menu)
+}
+
 /// The palette id of a plugin's command: `plugin.<plugin>.<command>`.
 pub fn command_id(plugin: &str, command: &str) -> String {
     format!("plugin.{plugin}.{command}")
+}
+
+/// Look up an active plugin command in `reg` by its `plugin.<plugin>.<command>` id.
+pub(crate) fn lookup<'a>(reg: &'a CommandRegistry, id: &str) -> Option<&'a Rc<Command>> {
+    reg.get(id).filter(|c| matches!(c.source, Source::Plugin(_)))
+}
+
+/// Run the active plugin command with id `id` (`plugin.<plugin>.<command>`),
+/// or tell the user why it isn't available on the current host.
+pub fn run_by_id(id: &str, window: &mut Window, cx: &mut App) {
+    let cmd = cx.try_global::<CommandRegistry>().and_then(|reg| lookup(reg, id)).cloned();
+    if let Some(cmd) = cmd {
+        cmd.run(window, cx);
+    } else {
+        crate::toast::show_in(
+            window,
+            cx,
+            crate::toast::Toast::info("Plugin command isn't available")
+                .body(format!("{id} isn't available here (plugin not installed or enabled, a setting is off, or its program is missing)."))
+                .key("plugin.command.unavailable"),
+        );
+    }
 }
 
 fn command(link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
     let cmd = Rc::new(c.clone());
     let origin = link.clone();
     let (plugin_id, plugin_name) = (plugin.to_string(), name.to_string());
-    let mut out = Command::handler(&command_id(plugin, &c.id), name, &c.title, move |window, cx| {
-        start(&plugin_id, &plugin_name, &cmd, &origin, None, window, cx)
-    });
+    let id = command_id(plugin, &c.id);
+    let mut out = Command::handler(&id, name, &c.title, move |window, cx| start(&plugin_id, &plugin_name, &cmd, &origin, None, window, cx))
+        .with_key_action(id);
     let mut words: Vec<&str> = c.keywords.iter().map(String::as_str).collect();
     words.push(plugin);
     out = out.keywords(&words);
@@ -272,5 +296,81 @@ mod tests {
         let builtin = crate::command_palette::registry::builtins();
         assert!(builtin.iter().all(|c| !c.id.starts_with("plugin.")));
         assert_eq!(command_id("docker", "exec"), "plugin.docker.exec");
+    }
+
+    #[test]
+    fn build_filters_unavailable_commands_and_sets_key_action() {
+        let m = goatty_plugin::manifest::parse(
+            r#"
+schema = 1
+id = "docker"
+name = "Docker"
+version = "1.0.0"
+summary = "Containers"
+publisher = "tests"
+
+[requires]
+commands = ["docker"]
+
+[[command]]
+id = "ps"
+title = "List containers"
+run = ["docker", "ps"]
+[command.menu]
+icon = "search"
+
+[[command]]
+id = "hidden"
+title = "Hidden command"
+run = ["docker", "info"]
+[command.menu]
+icon = "search"
+"#,
+            None,
+        )
+        .unwrap();
+        let inst = Installed {
+            id: "docker".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec!["hidden".into()],
+        };
+        let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let (cmds, menu) = build(Some(&link), std::slice::from_ref(&inst));
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].id.as_ref(), "plugin.docker.ps");
+        assert_eq!(cmds[0].key_action(), Some("plugin.docker.ps"));
+        assert_eq!(menu.len(), 1);
+        assert_eq!(menu[0].command.id, "ps");
+
+        // Disabled plugin contributes nothing.
+        let mut disabled = inst;
+        disabled.enabled = false;
+        let (cmds, menu) = build(Some(&link), &[disabled]);
+        assert!(cmds.is_empty());
+        assert!(menu.is_empty());
+    }
+
+    #[test]
+    fn lookup_finds_only_plugin_commands() {
+        let mut reg = CommandRegistry::default();
+        let builtin = Command::handler("new_tab", "Tabs", "New tab", |_, _| {});
+        reg.register(builtin);
+
+        let mut plugin = Command::handler("plugin.docker.ps", "Docker", "List containers", |_, _| {});
+        plugin.source = Source::Plugin("docker".into());
+        reg.register(plugin);
+
+        assert!(lookup(&reg, "plugin.docker.ps").is_some());
+        assert!(lookup(&reg, "plugin.docker.missing").is_none());
+        assert!(lookup(&reg, "new_tab").is_none());
     }
 }

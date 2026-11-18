@@ -428,10 +428,10 @@ pub struct SettingsWindow {
     color_save_gen: u64,
     theme_name: Entity<TextInput>,
     /// Shortcut being recorded: the next keystroke binds to this action.
-    recording: Option<&'static str>,
+    recording: Option<String>,
     /// What the last recorded shortcut replaced or takes from the shell:
     /// (action it was recorded for, message).
-    shortcut_note: Option<(&'static str, String)>,
+    shortcut_note: Option<(String, String)>,
     plugins: plugins::PluginsPage,
     diag: diagnostics::DiagPage,
     path: path::PathPage,
@@ -623,6 +623,11 @@ impl SettingsWindow {
             _subs: {
                 subs.push(net_sub);
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
+                subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
+                    if this.page == Page::Shortcuts {
+                        cx.notify();
+                    }
+                }));
                 subs
             },
         };

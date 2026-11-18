@@ -1803,6 +1803,7 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ShowAllHosts, _, cx| this.show_all_groups(cx)))
+            .on_action(|act: &crate::actions::RunPluginCommand, w, cx| crate::plugin_commands::run_by_id(&act.id, w, cx))
             .children(self.render_menu())
             .child(self.toasts.clone())
             .when_some(self.palette.as_ref(), |d, (palette, _)| {

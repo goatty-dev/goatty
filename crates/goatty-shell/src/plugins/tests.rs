@@ -522,3 +522,82 @@ fn a_cancelled_install_leaves_its_dependencies_out_too() {
     let leftovers: Vec<_> = std::fs::read_dir(w.dirs.installed_dir()).unwrap().flatten().filter(|e| e.file_name() != ".lock").collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+#[test]
+fn catalog_marks_unavailable_commands_from_when_and_missing_programs() {
+    let w = world();
+    let dir = w.tmp.path().join("cmd-plugin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = r#"
+schema = 1
+id = "cmd-test"
+name = "Cmd Test"
+version = "1.0.0"
+summary = "Tests command availability"
+publisher = "tests"
+
+[requires]
+commands = ["goatty-test-needed-tool-xyz", "sh", "echo"]
+
+[[setting]]
+id = "extra"
+label = "Extra"
+type = "bool"
+default = false
+
+[[command]]
+id = "always"
+title = "Always"
+run = ["sh", "-c", "true"]
+
+[[command]]
+id = "builtin"
+title = "Builtin"
+run = ["echo", "ok"]
+
+[[command]]
+id = "gated"
+title = "Gated"
+when = "extra"
+run = ["sh", "-c", "true"]
+
+[[command]]
+id = "missing-bin"
+title = "Missing bin"
+run = ["goatty-test-needed-tool-xyz", "--help"]
+"#;
+    std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
+    let p = w.plugins();
+    let mut settings = HostSettings::default();
+    let c = Candidate::local(&dir).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    p.install(&c, &plan.digest, &settings).unwrap();
+
+    // `gated` has `when = "extra"` (default false); `missing-bin` needs `goatty-test-needed-tool-xyz` (absent).
+    let cat = p.catalog(false, &settings);
+    let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
+    assert_eq!(inst.unavailable_commands, ["gated", "missing-bin"]);
+
+    // Turning on `extra` makes `gated` available; `missing-bin` stays unavailable.
+    settings.edit_plugin("cmd-test", |pc| {
+        pc.settings.insert("extra".into(), true.into());
+    });
+    let cat = p.catalog(false, &settings);
+    let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
+    assert_eq!(inst.unavailable_commands, ["missing-bin"]);
+
+    // Adding `goatty-test-needed-tool-xyz` in a custom bin dir on `shell.path` makes all available.
+    let custom_bin = w.tmp.path().join("custom-bin");
+    std::fs::create_dir_all(&custom_bin).unwrap();
+    let tool = custom_bin.join("goatty-test-needed-tool-xyz");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    settings.shell.path.push(custom_bin.to_string_lossy().into_owned());
+    let cat = p.catalog(false, &settings);
+    let inst = installed(&cat).into_iter().find(|i| i.id == "cmd-test").unwrap();
+    assert!(inst.unavailable_commands.is_empty(), "{:?}", inst.unavailable_commands);
+}

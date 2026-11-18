@@ -97,7 +97,7 @@ pub fn render_expansions(settings: &HostSettings, active: &[Active]) -> (String,
 }
 
 /// zsh builtins and keywords a snippet line may use: never "missing".
-const BUILTINS: &[&str] = &[
+pub(crate) const BUILTINS: &[&str] = &[
     "cd", "echo", "printf", "print", "export", "source", "alias", "unalias", "eval", "exec", "exit", "history", "jobs", "fg", "bg", "kill",
     "pwd", "read", "set", "unset", "test", "type", "wait", "which", "where", "whence", "pushd", "popd", "dirs", "time", "ulimit", "umask",
     "true", "false", "for", "while", "if", "then", "do", "done", "fi", "case", "esac", "noglob", "sudo", "builtin", "command", "local",
@@ -125,7 +125,7 @@ pub fn managed_path(dirs: &Dirs, settings: &HostSettings) -> String {
 }
 
 /// `program` in `path` (or itself when it's a path).
-fn find_in(path: &str, program: &str) -> Option<PathBuf> {
+pub(crate) fn find_in(path: &str, program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let p = PathBuf::from(program);
         return p.is_file().then_some(p);

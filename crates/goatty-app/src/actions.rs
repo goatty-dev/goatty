@@ -147,7 +147,16 @@ actions!(
     ]
 );
 
-/// The GPUI action for a settings name (`goatty_config::keys::ACTIONS`).
+/// Run a plugin's palette command (`plugin.<plugin>.<command>`), bound as a
+/// user shortcut.
+#[derive(Clone, PartialEq, Eq, Debug, gpui::Action)]
+#[action(namespace = plugin, no_json)]
+pub struct RunPluginCommand {
+    pub id: String,
+}
+
+/// The GPUI action for a settings name (`goatty_config::keys::ACTIONS`, or
+/// `plugin.<plugin>.<command>`).
 pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
     Some(match name {
         "copy" => Box::new(Copy),
@@ -225,7 +234,10 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "merge_tab" => Box::new(MergeTab),
         "rotate_panes" => Box::new(RotatePanes),
         "rotate_panes_back" => Box::new(RotatePanesBack),
-        _ => return None,
+        _ => {
+            return goatty_config::keys::parse_plugin_action(name)
+                .map(|_| Box::new(RunPluginCommand { id: name.to_string() }) as Box<dyn Action>);
+        }
     })
 }
 
@@ -292,5 +304,17 @@ mod tests {
         for (key, _) in goatty_config::keys::DEFAULT_BINDINGS {
             assert!(gpui::Keystroke::parse(key).is_ok(), "{key}");
         }
+    }
+
+    #[test]
+    fn plugin_action_resolution() {
+        let act = action_by_name("plugin.docker.exec").expect("valid plugin action resolves");
+        assert_eq!(act.name(), "plugin::RunPluginCommand");
+        let run = act.as_any().downcast_ref::<RunPluginCommand>().expect("downcasts to RunPluginCommand");
+        assert_eq!(run.id, "plugin.docker.exec");
+
+        assert!(action_by_name("plugin.d.exec").is_none());
+        assert!(action_by_name("plugin.docker.Bad").is_none());
+        assert!(action_by_name("unknown_action").is_none());
     }
 }

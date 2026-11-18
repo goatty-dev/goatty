@@ -429,13 +429,12 @@ fn plugin_entries(view: &Entity<TerminalView>, cx: &gpui::App) -> Vec<Entry> {
             last_plugin = Some(c.plugin.as_str());
         }
         let (cmd, sel) = (c.clone(), selection.clone());
-        out.push(
-            Item::new(c.command.title.clone(), move |window, cx| {
-                start(&cmd.plugin_id, &cmd.plugin, &cmd.command, &cmd.origin, sel.as_deref(), window, cx);
-            })
-            .icon(c.icon())
-            .into(),
-        );
+        let mut item = Item::new(c.command.title.clone(), move |window, cx| {
+            start(&cmd.plugin_id, &cmd.plugin, &cmd.command, &cmd.origin, sel.as_deref(), window, cx);
+        })
+        .icon(c.icon());
+        item.shortcut = context_menu::shortcut(&crate::plugin_commands::command_id(&c.plugin_id, &c.command.id), cx);
+        out.push(item.into());
     }
     out
 }

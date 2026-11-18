@@ -768,6 +768,29 @@ impl Plugins<'_> {
         };
         let target = current_target();
         let path = std::env::var("PATH").ok();
+        let managed_path = std::cell::OnceCell::new();
+        let mut found: BTreeMap<String, bool> = BTreeMap::new();
+        let mut unavailable_of = |m: &Manifest| -> Vec<String> {
+            if m.commands.is_empty() {
+                return Vec::new();
+            }
+            let stored = settings.plugins.get(&m.id).map(|c| c.settings.clone()).unwrap_or_default();
+            let (values, _) = schema::resolve(m, &stored);
+            m.commands
+                .iter()
+                .filter(|c| {
+                    !manifest::applies(&c.when, &values)
+                        || c.run.first().is_none_or(|prog| {
+                            !crate::snippets::BUILTINS.contains(&prog.as_str())
+                                && !*found.entry(prog.clone()).or_insert_with(|| {
+                                    let p = managed_path.get_or_init(|| crate::snippets::managed_path(self.dirs, settings));
+                                    crate::snippets::find_in(p, prog).is_some()
+                                })
+                        })
+                })
+                .map(|c| c.id.clone())
+                .collect()
+        };
         let package_status = |m: &Manifest| -> Vec<PackageStatus> {
             m.packages
                 .iter()
@@ -794,6 +817,7 @@ impl Plugins<'_> {
                 enabled: settings.plugins.get(b.id).is_none_or(|c| c.enabled),
                 incompatible: None,
                 packages: package_status(&m),
+                unavailable_commands: unavailable_of(&m),
                 builtin: true,
                 manifest: m,
                 update: None,
@@ -822,6 +846,7 @@ impl Plugins<'_> {
                 enabled: settings.plugins.get(id).is_none_or(|c| c.enabled),
                 incompatible: m.compatible(GOATTY_VERSION, &target).err(),
                 packages: package_status(&m),
+                unavailable_commands: unavailable_of(&m),
                 builtin: false,
                 manifest: m,
                 update,

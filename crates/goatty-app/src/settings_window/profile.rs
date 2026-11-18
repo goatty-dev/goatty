@@ -569,6 +569,7 @@ mod tests {
             installed_unix: 0,
             builtin: false,
             packages: Vec::new(),
+            unavailable_commands: Vec::new(),
         }
     }
 

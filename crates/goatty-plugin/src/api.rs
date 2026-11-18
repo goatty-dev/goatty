@@ -236,6 +236,11 @@ pub struct Installed {
     /// Where each of its packages is on this host.
     #[serde(default)]
     pub packages: Vec<PackageStatus>,
+    /// Ids of this plugin's `[[command]]`s that don't apply here (a `when`
+    /// condition on settings is false, or the program `run` starts isn't
+    /// installed on this host).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_commands: Vec<String>,
 }
 
 /// One package of an installed plugin, as found on the host.
@@ -474,5 +479,44 @@ mod tests {
         let back: Reply = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
         assert_eq!(serde_json::to_string(&Request::CancelInstall { id: "eza".into() }).unwrap(), r#"{"op":"cancel_install","id":"eza"}"#);
+    }
+
+    #[test]
+    fn installed_unavailable_commands_defaults_and_round_trips() {
+        let m: Manifest = toml::from_str(
+            r#"
+schema = 1
+id = "demo"
+name = "Demo"
+version = "1.0.0"
+summary = "Test"
+publisher = "tests"
+"#,
+        )
+        .unwrap();
+        let inst = Installed {
+            id: "demo".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec![],
+        };
+        let empty_json = serde_json::to_string(&inst).unwrap();
+        assert!(!empty_json.contains("unavailable_commands"), "{empty_json}");
+        let mut with_unavail = inst.clone();
+        with_unavail.unavailable_commands = vec!["exec".into(), "logs".into()];
+        let full_json = serde_json::to_string(&with_unavail).unwrap();
+        assert!(full_json.contains("unavailable_commands"));
+        let back: Installed = serde_json::from_str(&full_json).unwrap();
+        assert_eq!(back.unavailable_commands, ["exec", "logs"]);
+        let back_empty: Installed = serde_json::from_str(&empty_json).unwrap();
+        assert!(back_empty.unavailable_commands.is_empty());
     }
 }

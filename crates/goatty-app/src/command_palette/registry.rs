@@ -11,6 +11,7 @@
 //! handler. Commands run with the focused terminal as the action target,
 //! after the palette has closed.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
 use gpui::{Action, App, Global, SharedString, Window};
@@ -35,9 +36,8 @@ pub type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 /// What running a command does.
 pub enum Run {
     /// Dispatch this action to the focused terminal (and up to the window
-    /// and app). `key_action` is its name in `goatty_config::keys`, for
-    /// showing the shortcut; `None` for actions that aren't bindable.
-    Action { action: Box<dyn Action>, key_action: Option<&'static str> },
+    /// and app).
+    Action(Box<dyn Action>),
     /// Call a function.
     Handler(Handler),
 }
@@ -58,6 +58,9 @@ pub struct Command {
     /// hosts, which would otherwise crowd the full list.
     pub only_when_searched: bool,
     pub source: Source,
+    /// Its name in `goatty_config::keys`, for showing shortcuts (`None` when
+    /// not bindable).
+    key_action: Option<Cow<'static, str>>,
     pub run: Run,
 }
 
@@ -65,7 +68,7 @@ impl Command {
     /// A built-in command that dispatches a bindable action.
     pub fn action(id: &str, category: &str, title: &str, key_action: &'static str) -> Self {
         let action = actions::action_by_name(key_action).unwrap_or_else(|| panic!("unknown action {key_action}"));
-        Self::new(id, category, title, Run::Action { action, key_action: Some(key_action) })
+        Self::new(id, category, title, Run::Action(action)).with_key_action(key_action)
     }
 
     /// A built-in command that calls `f`.
@@ -82,12 +85,19 @@ impl Command {
             detail: None,
             only_when_searched: false,
             source: Source::Builtin,
+            key_action: None,
             run,
         }
     }
 
     pub fn keywords(mut self, words: &[&str]) -> Self {
         self.keywords.extend(words.iter().map(|w| SharedString::from(w.to_string())));
+        self
+    }
+
+    /// Bind this command's displayed shortcut to `action` in `goatty_config::keys`.
+    pub fn with_key_action(mut self, action: impl Into<Cow<'static, str>>) -> Self {
+        self.key_action = Some(action.into());
         self
     }
 
@@ -102,11 +112,8 @@ impl Command {
     }
 
     /// The `goatty_config::keys` action whose shortcuts this command shows.
-    pub fn key_action(&self) -> Option<&'static str> {
-        match &self.run {
-            Run::Action { key_action, .. } => *key_action,
-            Run::Handler(_) => None,
-        }
+    pub fn key_action(&self) -> Option<&str> {
+        self.key_action.as_deref()
     }
 
     /// Run the command. The caller has closed the palette and focused the
@@ -114,7 +121,7 @@ impl Command {
     pub fn run(&self, window: &mut Window, cx: &mut App) {
         log::debug!("command: {}", self.id);
         match &self.run {
-            Run::Action { action, .. } => window.dispatch_action(action.boxed_clone(), cx),
+            Run::Action(action) => window.dispatch_action(action.boxed_clone(), cx),
             Run::Handler(f) => f(window, cx),
         }
     }
@@ -163,7 +170,6 @@ impl CommandRegistry {
         self.commands.retain(|c| &c.source != source);
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "only tests look commands up by id"))]
     pub fn get(&self, id: &str) -> Option<&Rc<Command>> {
         self.commands.iter().find(|c| c.id == id)
     }
