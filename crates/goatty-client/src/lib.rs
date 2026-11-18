@@ -92,4 +92,8 @@ pub enum PaneEvent {
     Process(Option<String>),
     /// The session's working directory on the daemon host changed.
     Cwd(Option<String>),
+    /// In stream order (protocol v14): the session is `cols`×`rows`, and
+    /// this client controls its size or only watches. A watcher keeps its
+    /// terminal at that size; the controller's follows its own pane.
+    SizeControl { cols: u16, rows: u16, controlling: bool },
 }

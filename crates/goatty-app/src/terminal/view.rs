@@ -53,8 +53,8 @@ use super::links::{self, Place, RemoteAction, RemoteLookup, Target};
 use super::stats::Stats;
 use crate::actions::{
     ClearCommandLine, Copy, CopyCommandLine, CopyOrInterrupt, DecreaseFontSize, EditCommandLine, Find, IncreaseFontSize, NextPrompt,
-    OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT, ToggleSudo,
-    ViewLastOutput,
+    OpenContextMenu, Paste, PreviousPrompt, ResetFontSize, SaveCommandLine, ScrollPageDown, ScrollPageUp, TERMINAL_CONTEXT,
+    TakeSessionSize, ToggleSudo, ViewLastOutput,
 };
 use crate::agent::notify::Notice;
 use crate::agent::{AgentStatus, Identity};
@@ -917,6 +917,16 @@ impl TerminalView {
         self.line_edit(LineEdit::Clear, window, cx);
     }
 
+    /// Another client sets the session's size: make it this pane's (#12).
+    fn take_session_size(&mut self, _: &TakeSessionSize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.session.watching() {
+            toast::show_in(window, cx, Toast::success("This pane already sets the session's size").key("terminal.size"));
+            return;
+        }
+        self.session.take_size();
+        cx.notify();
+    }
+
     // ---- the menu (#186) ------------------------------------------------------
 
     /// Shift+F10 / the Menu key: the menu at the text cursor (or the
@@ -1099,6 +1109,9 @@ impl TerminalView {
         }
 
         out.push(Entry::Separator);
+        if self.session.watching() {
+            out.push(Item::action("Size the session to this pane", "take_session_size", cx).icon(Icon::Maximize2).into());
+        }
         out.push(Item::action("Find in the output…", "find", cx).icon(Icon::Search).into());
         out.push(Item::action("View the last command's output", "view_last_output", cx).icon(Icon::FileText).into());
         out
@@ -2481,6 +2494,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::toggle_sudo))
             .on_action(cx.listener(Self::edit_command_line))
             .on_action(cx.listener(Self::clear_command_line))
+            .on_action(cx.listener(Self::take_session_size))
             .on_key_down(cx.listener(Self::on_key))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_mouse_down(GMouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -2537,6 +2551,41 @@ impl Render for TerminalView {
                         });
                     },
                 ))
+            })
+            .when(self.session.watching(), |d| {
+                // Another client sets the size: say so, and offer to take over.
+                let font = cx.global::<AppSettings>().ui_font.clone();
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(4.))
+                        .right(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .bg(ui.surface)
+                        .border_1()
+                        .border_color(ui.border)
+                        .text_xs()
+                        .font_family(font)
+                        .child(div().text_color(ui.muted).child("Sized by another window"))
+                        .child(
+                            div()
+                                .id("take-session-size")
+                                .cursor_pointer()
+                                .text_color(ui.text)
+                                .hover(|s| s.underline())
+                                .child("Take over")
+                                .on_mouse_down(GMouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.session.take_size();
+                                    cx.notify();
+                                })),
+                        ),
+                )
             })
             .when_some(hint, |d, (target, action)| {
                 // The target, since an OSC 8 link's text can say anything.

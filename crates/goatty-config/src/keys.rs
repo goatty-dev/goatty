@@ -92,6 +92,7 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "focus_pane_right", label: "Focus the pane on the right", group: "Panes" },
     ActionInfo { name: "focus_pane_up", label: "Focus the pane above", group: "Panes" },
     ActionInfo { name: "focus_pane_down", label: "Focus the pane below", group: "Panes" },
+    ActionInfo { name: "take_session_size", label: "Size the session to this pane (take over from another window)", group: "Panes" },
     ActionInfo { name: "resize_pane_left", label: "Move the pane's divider left", group: "Panes" },
     ActionInfo { name: "resize_pane_right", label: "Move the pane's divider right", group: "Panes" },
     ActionInfo { name: "resize_pane_up", label: "Move the pane's divider up", group: "Panes" },

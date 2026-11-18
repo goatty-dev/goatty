@@ -99,6 +99,16 @@ fn wait_exited(s: &mut UnixStream, session: SessionId) -> Option<u32> {
     }
 }
 
+/// The next message that isn't a `SizeControl` (v14 sends one before `Attached`).
+fn next_msg(s: &mut UnixStream) -> ServerMsg {
+    loop {
+        match read_msg::<_, ServerMsg>(s).unwrap() {
+            ServerMsg::SizeControl { .. } => {}
+            m => return m,
+        }
+    }
+}
+
 #[test]
 fn a_restart_into_an_updated_build_keeps_the_session() {
     let dir = tempfile::Builder::new().prefix("goatty-test-").tempdir().unwrap();
@@ -110,7 +120,7 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
 
     let mut s = connect(&sock);
     send(&mut s, &ClientMsg::Create { req: 1, size: SIZE, cwd: None, opts: StreamOpts::LOCAL });
-    let id = match read_msg::<_, ServerMsg>(&mut s).unwrap() {
+    let id = match next_msg(&mut s) {
         ServerMsg::Attached { session, .. } => session,
         other => panic!("{other:?}"),
     };
@@ -153,7 +163,7 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
     read_until(&mut s, "after-2");
     let mut viewer = connect(&sock);
     send(&mut viewer, &ClientMsg::Attach { req: 1, session: id, size: SIZE, opts: StreamOpts::LOCAL });
-    match read_msg::<_, ServerMsg>(&mut viewer).unwrap() {
+    match next_msg(&mut viewer) {
         ServerMsg::Attached { snapshot, .. } => {
             let text = String::from_utf8_lossy(&snapshot);
             assert!(text.contains("before-42") && text.contains("after-2"), "{text:?}");
@@ -184,7 +194,7 @@ fn a_program_that_cant_take_over_is_refused() {
     wait_for_socket(&sock);
     let mut s = connect(&sock);
     send(&mut s, &ClientMsg::Create { req: 1, size: SIZE, cwd: None, opts: StreamOpts::LOCAL });
-    let id = match read_msg::<_, ServerMsg>(&mut s).unwrap() {
+    let id = match next_msg(&mut s) {
         ServerMsg::Attached { session, .. } => session,
         other => panic!("{other:?}"),
     };

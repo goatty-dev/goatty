@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
     ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE, PROTOCOL_VERSION,
-    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts, WinSize, encode,
-    read_msg,
+    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts,
+    WinSize, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -84,6 +84,9 @@ struct Shared {
     /// daemon frees a layout when its connection drops).
     layout: Mutex<Option<ClientMsg>>,
     pending: Mutex<HashMap<ReqId, Pending>>,
+    /// `SizeControl` that came before the `Attached` of a session we don't
+    /// have a pane for yet (v14 sends it first); delivered before its snapshot.
+    early_size: Mutex<HashMap<SessionId, PaneEvent>>,
     next_req: AtomicU32,
     host: Mutex<HostInfo>,
     /// The protocol version we announce: ours, or lower after an old
@@ -205,6 +208,7 @@ impl Connection {
             panes: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
             host: Mutex::new(HostInfo::default()),
             announce: AtomicU32::new(PROTOCOL_VERSION),
@@ -383,6 +387,20 @@ impl Connection {
             p.size = size;
         }
         self.shared.send(&ClientMsg::Resize { session, size });
+    }
+
+    /// Take control of `session`'s size from the client that has it (v14):
+    /// the session takes the size this connection last sent. Never blocks.
+    pub fn take_size(&self, session: SessionId) {
+        if self.is_connected() && self.supports_size_control() {
+            self.shared.send(&ClientMsg::TakeSize { session });
+        }
+    }
+
+    /// Whether the daemon on this link speaks protocol v14 (one controlling
+    /// client per session sets its size; `take_size`).
+    pub fn supports_size_control(&self) -> bool {
+        self.protocol_version() >= SIZE_CONTROL_SINCE
     }
 
     /// Tell the daemon which colors this session is shown with, so color
@@ -774,6 +792,9 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             let pending = s.pending.lock().remove(&req);
             match pending {
                 Some(Pending::Attach { tx, sink, size }) => {
+                    if let Some(ev) = s.early_size.lock().remove(&session) {
+                        sink.event(ev);
+                    }
                     sink.feed(&snapshot);
                     let n = snapshot.len() as u64;
                     s.panes.lock().insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None });
@@ -812,6 +833,22 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
             if let Some(sink) = sink {
                 sink.event(PaneEvent::Cwd(cwd));
+            }
+        }
+        ServerMsg::SizeControl { session, size, controlling } => {
+            let ev = PaneEvent::SizeControl { cols: size.cols, rows: size.rows, controlling };
+            let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
+            match sink {
+                Some(sink) => sink.event(ev),
+                // Comes before the `Attached` that adds the pane.
+                // Or after we detached: keep such leftovers bounded.
+                None => {
+                    let mut early = s.early_size.lock();
+                    if early.len() >= 64 {
+                        early.clear();
+                    }
+                    early.insert(session, ev);
+                }
             }
         }
         ServerMsg::TopLine { session, line, cause } => {

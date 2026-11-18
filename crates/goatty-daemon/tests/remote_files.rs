@@ -222,7 +222,7 @@ fn older_v12_clients_do_not_receive_cwd_messages() {
         match read_msg::<_, ServerMsg>(&mut s).unwrap() {
             ServerMsg::Attached { req: 1, session, .. } => break session,
             ServerMsg::Cwd { .. } => panic!("daemon sent v13 ServerMsg::Cwd to a v12 client"),
-            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
+            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } | ServerMsg::SizeControl { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     };

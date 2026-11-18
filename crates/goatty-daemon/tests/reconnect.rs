@@ -102,7 +102,8 @@ fn pump_until(s: &mut UnixStream, session: SessionId, t: &Terminal, consumed: &m
             | ServerMsg::Pong { .. }
             | ServerMsg::Process { .. }
             | ServerMsg::Cwd { .. }
-            | ServerMsg::TopLine { .. } => {}
+            | ServerMsg::TopLine { .. }
+            | ServerMsg::SizeControl { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
         send(s, &ClientMsg::Ack { session, consumed: *consumed });
@@ -115,7 +116,7 @@ fn create(s: &mut UnixStream, opts: StreamOpts) -> (SessionId, u64) {
         match read_msg::<_, ServerMsg>(s).unwrap() {
             ServerMsg::Attached { req: 1, session, snapshot } => return (session, snapshot.len() as u64),
             // Another session's foreground program, cwd, or line numbers (multiplexed connection).
-            ServerMsg::Process { .. } | ServerMsg::Cwd { .. } | ServerMsg::TopLine { .. } => {}
+            ServerMsg::Process { .. } | ServerMsg::Cwd { .. } | ServerMsg::TopLine { .. } | ServerMsg::SizeControl { .. } => {}
             other => panic!("{other:?}"),
         }
     }
@@ -249,7 +250,7 @@ fn sessions_multiplex_over_one_connection() {
                 c2 += data.len() as u64;
                 t2.feed(&data);
             }
-            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } | ServerMsg::Cwd { .. } => {}
+            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } | ServerMsg::SizeControl { .. } | ServerMsg::Cwd { .. } => {}
             other => panic!("{other:?}"),
         }
     }

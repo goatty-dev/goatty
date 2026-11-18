@@ -171,6 +171,7 @@ impl Daemon {
             replies: chans.replies.clone(),
             replies_taken: AtomicU64::new(0),
             replies_written: AtomicU64::new(0),
+            controller: Mutex::new(None),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");

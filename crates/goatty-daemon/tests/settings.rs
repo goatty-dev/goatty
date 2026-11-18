@@ -128,7 +128,7 @@ fn palette_answers_color_queries() {
     assert!(matches!(read_msg::<_, ServerMsg>(&mut s).unwrap(), ServerMsg::Hello { .. }));
     let size = WinSize { cols: 80, rows: 10, cell_width: 8, cell_height: 16 };
     send(&mut s, &ClientMsg::Create { req: 1, size, cwd: None, opts: StreamOpts::LOCAL });
-    let session = match read_msg::<_, ServerMsg>(&mut s).unwrap() {
+    let session = match attached(&mut s) {
         ServerMsg::Attached { session, .. } => session,
         other => panic!("{other:?}"),
     };
@@ -170,9 +170,19 @@ fn create_session(d: &Daemon) -> u64 {
     assert!(matches!(read_msg::<_, ServerMsg>(&mut s).unwrap(), ServerMsg::Hello { .. }));
     let size = WinSize { cols: 80, rows: 10, cell_width: 8, cell_height: 16 };
     s.write_all(&encode(&ClientMsg::Create { req: 1, size, cwd: None, opts: StreamOpts::LOCAL }).unwrap()).unwrap();
-    match read_msg::<_, ServerMsg>(&mut s).unwrap() {
+    match attached(&mut s) {
         ServerMsg::Attached { session, .. } => session,
         other => panic!("{other:?}"),
+    }
+}
+
+/// The reply to `Create`, past the `SizeControl` that v14 sends before it.
+fn attached(s: &mut UnixStream) -> ServerMsg {
+    loop {
+        match read_msg::<_, ServerMsg>(s).unwrap() {
+            ServerMsg::SizeControl { .. } => {}
+            m => return m,
+        }
     }
 }
 

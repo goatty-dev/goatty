@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -60,6 +60,11 @@ pub const NET_SINCE: u32 = 12;
 /// and stat (`StatPath` / `PathStat`), and reading remote files
 /// (`ReadFile` / `FileData`).
 pub const REMOTE_FILES_SINCE: u32 = 13;
+
+/// v14: one controlling client per session sets its size (`TakeSize` /
+/// `ServerMsg::SizeControl`). Other v14 clients watch at the session's size;
+/// clients older than v14 take control with every `Attach` and `Resize`.
+pub const SIZE_CONTROL_SINCE: u32 = 14;
 
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
 /// for postcard headers and path metadata).
@@ -298,6 +303,13 @@ pub enum ClientMsg {
         path: String,
         max_bytes: u64,
     },
+    /// v14: make this connection the controlling client of `session` (it
+    /// must be subscribed). The session takes the size this connection last
+    /// asked for (`Attach`/`Resize`), and every v14 subscriber hears
+    /// `SizeControl`.
+    TakeSize {
+        session: SessionId,
+    },
 }
 
 /// Why the daemon sent `ServerMsg::TopLine`.
@@ -520,6 +532,20 @@ pub enum ServerMsg {
         path: String,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+    },
+    /// v14: the session's size and whether this connection controls it. In
+    /// stream order (sent under the subscriber lock): right *before*
+    /// `Attached` (so a watching client sizes its terminal before the
+    /// snapshot; it may precede the reply that tells a `Create` its session
+    /// id), and whenever the controller or the size changes, before the reflowed
+    /// output and its `TopLine`. A client that doesn't control the session
+    /// keeps its mirror at `size` (letterboxed in its pane); the controlling
+    /// client's mirror follows its own pane, whose sizes it sends as `Resize`.
+    SizeControl {
+        session: SessionId,
+        /// Only `cols` and `rows` are meaningful; the cell size is 0.
+        size: WinSize,
+        controlling: bool,
     },
 }
 

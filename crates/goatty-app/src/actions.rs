@@ -66,6 +66,9 @@ actions!(
         /// The typed command in `$VISUAL`/`$EDITOR`.
         EditCommandLine,
         ClearCommandLine,
+        /// Size the session to this pane, taking over from the client
+        /// (another window or computer) that sets its size now (#12).
+        TakeSessionSize,
     ]
 );
 
@@ -174,6 +177,7 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "toggle_sudo" => Box::new(ToggleSudo),
         "edit_command_line" => Box::new(EditCommandLine),
         "clear_command_line" => Box::new(ClearCommandLine),
+        "take_session_size" => Box::new(TakeSessionSize),
         "dismiss_notifications" => Box::new(DismissNotifications),
         "press_notification_button" => Box::new(PressNotificationButton),
         "show_recent_notifications" => Box::new(ShowRecentNotifications),

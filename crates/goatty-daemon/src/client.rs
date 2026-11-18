@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use goatty_proto::{
-    ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, ServerMsg, SessionId, encode, encode_server, read_msg,
+    ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId, encode, encode_server,
+    read_msg,
 };
 use goatty_term::Palette;
 
@@ -148,29 +149,27 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     agreed_version = agreed;
                     features.lines = agreed >= HISTORY_SINCE;
                     features.cwd = agreed >= REMOTE_FILES_SINCE;
+                    features.size_ctl = agreed >= SIZE_CONTROL_SINCE;
                     reply(ServerMsg::Hello { version: agreed, daemon_pid, host });
                 }
                 ClientMsg::ListSessions { req } => reply(ServerMsg::Sessions { req, list: daemon.list() }),
                 ClientMsg::Create { req, size, cwd, opts } => match daemon.create(size, cwd, agreed_version >= goatty_proto::SHELL_SINCE) {
                     Ok(s) => {
-                        let sub = s.subscribe(conn, req, opts, features, &tx);
+                        let sub = s.subscribe(conn, req, size, opts, features, &tx);
                         subs.insert(s.id, (s, sub));
                     }
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                 },
                 ClientMsg::Run { req, size, cwd, argv, opts } => match daemon.run(size, cwd, argv) {
                     Ok(s) => {
-                        let sub = s.subscribe(conn, req, opts, features, &tx);
+                        let sub = s.subscribe(conn, req, size, opts, features, &tx);
                         subs.insert(s.id, (s, sub));
                     }
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                 },
                 ClientMsg::Attach { req, session, size, opts } => match daemon.get(session) {
                     Some(s) => {
-                        // Resize first so the snapshot already has the
-                        // client's geometry (reflowed by the VT core).
-                        s.resize(size, None);
-                        let sub = s.subscribe(conn, req, opts, features, &tx);
+                        let sub = s.subscribe(conn, req, size, opts, features, &tx);
                         subs.insert(s.id, (s, sub));
                     }
                     None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
@@ -189,7 +188,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientMsg::Resize { session, size } => {
                     if let Some((s, _)) = subs.get(&session) {
-                        s.resize(size, Some(conn));
+                        s.resize(size, conn);
                     }
                 }
                 ClientMsg::Ack { session, consumed } => {
@@ -323,6 +322,11 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     });
                     if let Err(e) = spawned {
                         reply(ServerMsg::Error { req: Some(req), message: format!("couldn't stat path: {e}") });
+                    }
+                }
+                ClientMsg::TakeSize { session } => {
+                    if let Some((s, _)) = subs.get(&session) {
+                        s.take_size(conn);
                     }
                 }
                 ClientMsg::ReadFile { req, path, max_bytes } => {

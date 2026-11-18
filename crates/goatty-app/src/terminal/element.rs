@@ -134,6 +134,10 @@ pub struct Layout {
     cursor_color: Hsla,
     line_height: Pixels,
     started: Instant,
+    /// Another client controls the session's size (#12): the grid's bounds,
+    /// which may be smaller or larger than the pane. Painting is clipped to
+    /// the pane and the space around the grid is shaded.
+    letterbox: Option<Bounds<Pixels>>,
 }
 
 impl IntoElement for TerminalElement {
@@ -228,9 +232,9 @@ impl Element for TerminalElement {
         let inner_h = bounds.size.height - pad.top - pad.bottom;
         let cols = ((inner_w / cell_w).floor() as u16).max(2);
         let rows = ((inner_h / line_height).floor() as u16).max(1);
-        let origin = bounds.origin + point(pad.left, pad.top);
+        let mut origin = bounds.origin + point(pad.left, pad.top);
 
-        if self.session.terminal.size() != (cols, rows) {
+        if self.session.view_differs(cols, rows) {
             let scale = window.scale_factor();
             self.session.resize(TermSize {
                 cols,
@@ -251,6 +255,13 @@ impl Element for TerminalElement {
         }
         let caret = frame.caret.unwrap_or(self.geom.get().caret);
         let caret = (caret.0.min(frame.cols.saturating_sub(1)), caret.1.min(frame.rows.saturating_sub(1)));
+        let letterbox = self.session.watching().then(|| {
+            // A grid taller than the pane scrolls so the cursor's row shows.
+            let over = frame.rows.saturating_sub(rows as usize);
+            let shift = (caret.1 + 1).saturating_sub(rows as usize).min(over);
+            origin.y -= line_height * shift as f32;
+            Bounds::new(origin, size(cell_w * frame.cols as f32, line_height * frame.rows as f32))
+        });
         let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret };
         self.geom.set(geom);
 
@@ -478,7 +489,18 @@ impl Element for TerminalElement {
         });
 
         self.stats.borrow_mut().shaped_segments += if self.glyph_mode { glyph_draws.len() } else { lines.len() } as u64;
-        Layout { rects, lines, glyphs: glyph_draws, decos, cursor, preedit, cursor_color: hsla(frame.cursor_color), line_height, started }
+        Layout {
+            rects,
+            lines,
+            glyphs: glyph_draws,
+            decos,
+            cursor,
+            preedit,
+            cursor_color: hsla(frame.cursor_color),
+            line_height,
+            started,
+            letterbox,
+        }
     }
 
     fn paint(
@@ -493,6 +515,39 @@ impl Element for TerminalElement {
     ) {
         let paint_start = Instant::now();
         window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
+        let mask = layout.letterbox.map(|_| ContentMask { bounds });
+        window.with_content_mask(mask, |window| self.paint_grid(layout, window, cx));
+        if let Some(grid) = layout.letterbox {
+            paint_letterbox(bounds, grid, window);
+        }
+        let mut st = self.stats.borrow_mut();
+        let pre = paint_start.duration_since(layout.started).as_micros() as u64;
+        let paint = paint_start.elapsed().as_micros() as u64;
+        st.frames += 1;
+        st.prepaint_us += pre;
+        st.paint_us += paint;
+        st.max_frame_us = st.max_frame_us.max(pre + paint);
+    }
+}
+
+/// Shade the pane outside the grid of a session another client sizes, and
+/// draw the grid's right and bottom edges where they fall inside the pane.
+fn paint_letterbox(pane: Bounds<Pixels>, grid: Bounds<Pixels>, window: &mut Window) {
+    let shade = gpui::hsla(0., 0., 0.5, 0.12);
+    let edge = gpui::hsla(0., 0., 0.5, 0.45);
+    let (right, bottom) = (grid.right().min(pane.right()), grid.bottom().min(pane.bottom()));
+    if grid.right() < pane.right() {
+        window.paint_quad(fill(Bounds::from_corners(point(right, pane.top()), pane.bottom_right()), shade));
+        window.paint_quad(fill(Bounds::new(point(right, pane.top()), size(px(1.), bottom - pane.top())), edge));
+    }
+    if grid.bottom() < pane.bottom() {
+        window.paint_quad(fill(Bounds::from_corners(point(pane.left(), bottom), point(right, pane.bottom())), shade));
+        window.paint_quad(fill(Bounds::new(point(pane.left(), bottom), size(right + px(1.) - pane.left(), px(1.))), edge));
+    }
+}
+
+impl TerminalElement {
+    fn paint_grid(&mut self, layout: &mut Layout, window: &mut Window, cx: &mut App) {
         for (b, color) in layout.rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
@@ -551,13 +606,6 @@ impl Element for TerminalElement {
                 let _ = line.paint(bg.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
             });
         }
-        let mut st = self.stats.borrow_mut();
-        let pre = paint_start.duration_since(layout.started).as_micros() as u64;
-        let paint = paint_start.elapsed().as_micros() as u64;
-        st.frames += 1;
-        st.prepaint_us += pre;
-        st.paint_us += paint;
-        st.max_frame_us = st.max_frame_us.max(pre + paint);
     }
 }
 

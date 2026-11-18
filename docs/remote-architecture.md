@@ -111,6 +111,20 @@ When hovering or clicking a file path in a remote tab, the client checks whether
 - **`ReadFile { req, path, max_bytes }` → `FileData { req, path, data }`** (`crates/goatty-daemon/src/files.rs`): opens regular files with `O_NONBLOCK | O_NOCTTY` after `stat`, re-checks `fstat` to defeat stat-to-open races, and caps reads at `min(max_bytes, HARD_MAX_FILE_BYTES)` (`MAX_FRAME - 64 KiB`), returning `Error` if the file exceeds the cap. Bounded to 2 concurrent read workers (`MAX_FILE_WORKERS = 2`) and bounded queued `FileData` bytes (`MAX_QUEUED_FILE_BYTES = MAX_FRAME`) per connection without blocking control or terminal stream frames.
 - **Head-of-line trade-off and client cache:** `FileData` travels as one postcard frame (zstd-compressed when enabled) on the connection's single writer queue, so large transfers temporarily queue with live terminal `Output` on slow links. To keep transfers bounded, `max_bytes` defaults to `links.remote_max_size_mb` (10 MiB, prompting before larger fetches up to `HARD_MAX_FILE_BYTES`), and `Connection::read_file` scales its request timeout from `max_bytes`. Fetched files are cached under `<runtime_dir>/goatty/remote/p<pid>/<hash16>/<basename>` (`goatty_proto::runtime_dir()`) as read-only (`0444`) files written via temp-and-rename; `<hash16>` hashes `(Endpoint::cache_key, remote_path)` so distinct endpoints never overwrite one another's files, and process-scoped `p<pid>` directories let startup cleanup remove stale caches after 24 hours only when the owning PID is no longer alive.
 
+## 4c. Size policy for several clients (v14, #12)
+
+A session has one size, the PTY's, and one **controlling** client sets it (`Session::controller` in goattyd). The other clients watch at that size.
+
+- **Who controls.** The client that creates a session. A client that attaches takes control only when nobody has it (no other subscriber, or the controller is gone), so reattaching from a new window still sizes the session to it, while a second window on a session someone is using doesn't shrink it under them. When the controller detaches or its connection ends, the newest remaining subscriber gets control and the session takes the size that client last asked for.
+- **`Resize`** from any client records the size it wants. It is applied only while that client controls the session; a watcher's resize changes nothing yet.
+- **`TakeSize{session}`** (v14): take control explicitly. The session takes the size this connection last sent.
+- **`SizeControl{session, size, controlling}`** (v14, in stream order under the subscriber lock): the session's size and whether this client controls it. It comes right *before* `Attached`, so a watcher sizes its mirror before the snapshot lands (the client keeps it until the `Attached` that adds the pane; for `Create` it precedes the reply carrying the session id), and to every v14 subscriber whenever the controller or the size changes, before the reflowed output and the `TopLine`.
+- **The GUI** (`goatty-app` `Session`): while controlling, the mirror follows the pane as before. While watching, the mirror stays at the session's size and the pane letterboxes it: the space past the grid is shaded with an edge line, a grid larger than the pane is clipped and scrolls so the cursor row shows, and a chip says "Sized by another window · Take over". Taking over (the chip, the pane's menu, the palette's "Size the session to this pane", bindable as `take_session_size`) sends `TakeSize`; on gaining control the mirror goes back to the pane's size and sends it as `Resize`.
+- **Older clients** (before v14) can't watch at another size or take over, so for them nothing changed: each `Attach` and `Resize` takes control. A v14 daemon tells the v14 clients about it like any other change of control.
+- **Limits.** A controller that vanished without closing its connection keeps control until the connection times out (daemon-side liveness, roadmap R1.10). Control isn't part of the restore state: after a restart, the first client to reattach gets it.
+
+Covered by `crates/goatty-daemon/tests/size_control.rs`.
+
 ## 5. Transports
 
 ### Local
@@ -251,7 +265,7 @@ Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow con
 6. **Adaptive window**: measure delivery rate from acks and RTT from pings, then set `window ≈ max(64 KiB, rate × 50 ms)`. A fast LAN streams losslessly, a slow link skips early.
 7. ✅ **Lazy history**: `FetchHistory` fills the client's scrollback on demand, for the trimmed attach snapshot and for lines skipped by resync, with stable host line numbers (§4a).
 8. ✅ **Compression** for snapshots and history (zstd, negotiated per connection; §4a). Live output stays uncompressed (it's small, and latency matters more).
-9. **Size policy for multiple clients**: one *controlling* client per session sets the PTY size. Others watch (letterboxed) or take over explicitly. Today, last resize wins.
+9. ✅ **Size policy for multiple clients**: one *controlling* client per session sets the PTY size. Others watch (letterboxed) or take over explicitly (§4c, protocol v14).
 10. **Daemon-side liveness**: drop subscribers whose connection has been silent for >60 s (pings), so the attached count and size control are correct after a client vanished without FIN.
 11. **Client vs host settings split** in the profile model (font/keys/theme are client; shell/plugins/env are host). The plugin manager always acts on the connected host.
 
