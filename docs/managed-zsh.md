@@ -65,7 +65,7 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
 ~/.local/share/goatty/plugins/<package>         → active managed zsh plugin (a package with a `source` script)
 ~/.local/share/goatty/share/zsh/site-functions/ completion functions: `_goatty`, `_goattyd`, managed tools' (appended to fpath)
 ~/.config/goatty/zshrc          the user's additions (goatty never writes it)
-~/.cache/goatty/                zcompdump, completion cache, downloads
+~/.cache/goatty/                zcompdump, completion cache, init/ (cached tool init scripts), downloads
 ~/.local/state/goatty/shell-hint-dismissed      set by `goatty-setup --dismiss` or the GUI's "Don't ask again"
 ~/.local/state/goatty/shell-setup-offered       set once goatty's window offered the install (the shell hint stays quiet)
 ~/.local/state/goatty/import/   what your own shell sets up: harvest.json (the last harvest and failure), import.zsh
@@ -244,9 +244,21 @@ fzf and fzf-tab by default (#165), measured 2026-11-13 on the same machine: sand
 | + fzf (`fzf --zsh` and its eval, fd/bat/eza lookups) | 58.7–59.7 | 77.1–80.1 |
 | + fzf-tab (sourcing it, zstyles)     | 62.5–64.4 | 83.6–84.3 |
 
-So fzf costs about 6 ms (one process spawn for `fzf --zsh`) and fzf-tab about 5 ms. Caching `fzf --zsh` belongs to #41.
+So fzf cost about 6 ms (one process spawn for `fzf --zsh`) and fzf-tab about 5 ms.
 
-goatty's part is about 30 ms, half of it `starship init` (two process spawns). Caching the init scripts is #41. The first start after a zsh upgrade or on a fresh machine builds the completion dump (178 ms once in the real home dir; 47 ms after that, measured with `goattyd shell status`).
+goatty's part was about 30 ms, roughly half of it `starship init` (spawning `starship` for the init script and `PROMPT2`) and `fzf --zsh`. The first start after a zsh upgrade or on a fresh machine builds the completion dump (178 ms once in the real home dir; 47 ms after that, measured with `goattyd shell status`).
+
+**Init script caching (#41).** Starship (`starship init zsh --print-full-init`, with `PROMPT2` pre-evaluated via `STARSHIP_SHELL=zsh starship prompt --continuation` when `$TERM != dumb`) and fzf (`fzf --zsh`) are cached and byte-compiled without alias expansion (`zcompile -U`) under `~/.cache/goatty/init/<name>-<hash>.zsh{,.zwc}` (`starship-dumb` when `TERM=dumb`) via `_goatty_cached_init`. Each cached file starts with a key header embedding `ZSH_VERSION`, `$commands[<cmd>]`, its resolved realpath (`:A`), subsecond `zstat` metadata (`device:inode:size:mtime:ctime`), plugin-specific inputs (for Starship: resolved `STARSHIP_CONFIG` or `$HOME/.config/starship.toml` path + `zstat` metadata and `TERM == dumb`), and command arguments. On a cache hit, zero subprocesses spawn and the caller runs `builtin source` at top level so `typeset` stays global. Regeneration triggers whenever the selected executable or any other cache-key input changes (binary update, PATH change that selects a different executable, `starship.toml` edit, or zsh upgrade); `goatty_shell::install` also drops `init/<name>*.zsh{,.zwc}` on package install/uninstall. Writes serialize on a kernel-released `zsystem flock` advisory lock, cache entries are verified to be non-symlinks owned by `$EUID` without group/other write bits, and contention, unsafe permissions, or non-writable directories fall back to in-memory `eval`.
+
+Measured 2026-11-18 on the same dev machine (CachyOS, zsh 5.9.2, Starship 1.27.0, fzf 0.75.0, fd, bat, eza, distro zsh plugins, managed fzf-tab 1.3.0; sandboxed `$HOME` with `shell.import` off, `goattyd` from `main` vs cached):
+
+| Measurement (median) | Before | After | Delta |
+|---|---|---|---|
+| `starship` init + `PROMPT2` (`zsh -f -i`, 23 warm runs, PTY) | 7.40 ms | 0.64 ms | -6.76 ms (11.6×) |
+| `fzf --zsh` (`zsh -f -i`, 23 warm runs, PTY) | 6.93 ms | 1.44 ms | -5.49 ms (4.8×) |
+| Combined init cost (23 warm runs, PTY) | 14.24 ms | 2.10 ms | -12.14 ms (6.8×) |
+| Full `zsh -l -i -c exit` (all defaults, 41 runs, PTY) | 71.70 ms | 61.54 ms | -10.16 ms (-14.2%) |
+| Full `zsh -l -i -c exit` (all defaults, 2×21 runs, no TTY) | 66.3–68.5 ms | 55.4–59.9 ms | ~-9.7 ms |
 
 ## Expansions
 
@@ -258,4 +270,4 @@ Installed plugins (Stage 5, [`plugins.md`](plugins.md)) render into `plugins-ear
 
 ## Not done yet
 
-Caching tool init scripts (#41, including `fzf --zsh`), installs for other architectures and a distro-specific hint when zsh is missing (#42), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).
+Installs for other architectures and a distro-specific hint when zsh is missing (#42), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).

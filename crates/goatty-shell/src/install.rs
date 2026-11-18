@@ -126,7 +126,34 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
             log::warn!("no zsh completions for {}: {e:#}", p.id);
         }
     }
+    for name in &names {
+        invalidate_init_cache(dirs, name);
+    }
     Ok(links)
+}
+
+/// Drop cached init scripts for executable `name` (if any), so a newly
+/// installed, updated, or removed managed copy doesn't leave stale cache files.
+fn invalidate_init_cache(dirs: &Dirs, name: &str) {
+    let init_dir = dirs.init_cache_dir();
+    let _ = std::fs::remove_file(init_dir.join(format!("{name}.zsh.zwc")));
+    let _ = std::fs::remove_file(init_dir.join(format!("{name}.zsh")));
+    if let Ok(entries) = std::fs::read_dir(&init_dir) {
+        let prefix = format!("{name}-");
+        let mut variants: Vec<PathBuf> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                (s.starts_with(&prefix) && (s.ends_with(".zsh") || s.ends_with(".zsh.zwc"))).then(|| e.path())
+            })
+            .collect();
+        // Remove `.zsh.zwc` before `.zsh` so a concurrent reader never sees a stale `.zwc`.
+        variants.sort_by_key(|p| !p.extension().is_some_and(|e| e == "zwc"));
+        for path in variants {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Which managed tool or package `bin/<name>` belongs to: the `<id>` of
@@ -154,6 +181,7 @@ pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool>
         if link_owner(dirs, name).as_deref() == Some(id) {
             std::fs::remove_file(dirs.bin_dir().join(name)).with_context(|| format!("remove bin/{name}"))?;
             crate::completions::remove(dirs, name)?;
+            invalidate_init_cache(dirs, name);
             had = true;
         }
     }
@@ -355,5 +383,50 @@ mod tests {
         assert!(dirs.bin_dir().join("eza").symlink_metadata().is_err());
         assert!(!dirs.tools_dir().join("eza").exists());
         assert!(dirs.bin_dir().join("tool").exists(), "other packages untouched");
+    }
+
+    #[test]
+    fn installs_and_uninstalls_invalidate_init_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let init_dir = dirs.init_cache_dir();
+        std::fs::create_dir_all(&init_dir).unwrap();
+        let seed = || {
+            std::fs::write(init_dir.join("tool.zsh"), "# cached\n").unwrap();
+            std::fs::write(init_dir.join("tool.zsh.zwc"), "zwc").unwrap();
+            std::fs::write(init_dir.join("tool-dumb.zsh"), "# cached dumb\n").unwrap();
+            std::fs::write(init_dir.join("tool-dumb.zsh.zwc"), "zwc").unwrap();
+            std::fs::write(init_dir.join("other.zsh"), "# keep\n").unwrap();
+        };
+
+        let archive = targz(&[("t/tool", b"#!/bin/sh\necho v1\n", 0o755)]);
+        let sha = sha256_hex(&archive);
+        let bins = vec!["tool".to_string()];
+        let p = PackageInstall {
+            id: "tool",
+            version: "1",
+            sha256: &sha,
+            format: AssetFormat::TarGz,
+            root: "t",
+            bins: &bins,
+            source: None,
+            completions: &[],
+        };
+
+        seed();
+        install_package(&p, &archive, &dirs).unwrap();
+        assert!(!init_dir.join("tool.zsh").exists());
+        assert!(!init_dir.join("tool.zsh.zwc").exists());
+        assert!(!init_dir.join("tool-dumb.zsh").exists());
+        assert!(!init_dir.join("tool-dumb.zsh.zwc").exists());
+        assert!(init_dir.join("other.zsh").exists());
+
+        seed();
+        assert!(uninstall_package("tool", &bins, &dirs).unwrap());
+        assert!(!init_dir.join("tool.zsh").exists());
+        assert!(!init_dir.join("tool.zsh.zwc").exists());
+        assert!(!init_dir.join("tool-dumb.zsh").exists());
+        assert!(!init_dir.join("tool-dumb.zsh.zwc").exists());
+        assert!(init_dir.join("other.zsh").exists());
     }
 }

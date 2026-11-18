@@ -15,7 +15,7 @@
 //!   tailnet/                      device.key (0600), devices.json, hosts.json, state.json (goatty-net)
 //! $XDG_CONFIG_HOME/goatty/zshrc   the user's own additions (goatty never writes it)
 //! $XDG_CONFIG_HOME/goatty/registries.json   plugin registries added besides the official one
-//! $XDG_CACHE_HOME/goatty/         completion dump, downloads
+//! $XDG_CACHE_HOME/goatty/         completion dump, init/ (cached tool init scripts), downloads
 //! $XDG_STATE_HOME/goatty/         small flags (the dismissed setup hint, the GUI offered the setup)
 //!   import/                       what the user's own shell sets up (harvest.json, import.zsh)
 //! ```
@@ -76,6 +76,10 @@ impl Dirs {
     }
     pub fn plugins_dir(&self) -> PathBuf {
         self.data.join("plugins")
+    }
+    /// Cached tool init scripts (`_goatty_cache/init`).
+    pub fn init_cache_dir(&self) -> PathBuf {
+        self.cache.join("init")
     }
     /// Zsh completion functions goatty provides ([`crate::completions`]).
     pub fn site_functions_dir(&self) -> PathBuf {

@@ -31,6 +31,251 @@ _goatty_find() {
 }
 _goatty_ok() { _goatty_state[$1]="ok"$'\t'"$2" }
 
+# Cache a tool's init output under $_goatty_cache/init/<name>-<hash>.zsh{,.zwc},
+# keyed on the zsh version, binary path + resolved path + subsecond stat, extra
+# key, and arguments. Sets REPLY to the cache file (return 0) or _goatty_init_code
+# when the cache isn't usable/lockable or -n is passed (return 2); returns 1 if
+# the command is missing or fails/empty.
+# Usage: _goatty_cached_init [-n] [-p POST_FN] NAME EXTRA CMD [ARGS...]
+builtin zmodload -F zsh/stat b:zstat 2>/dev/null
+builtin zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
+builtin zmodload -F zsh/system b:zsystem 2>/dev/null
+builtin zmodload -F zsh/files b:zf_chmod 2>/dev/null
+_goatty_cached_init() {
+  builtin emulate -L zsh
+  local no_cache=0 post_fn=
+  while (( $# )); do
+    case $1 in
+      -n) no_cache=1; builtin shift ;;
+      -p) post_fn=$2; builtin shift 2 ;;
+      --) builtin shift; break ;;
+      *) break ;;
+    esac
+  done
+  local name=$1 extra=$2 cmd=$3
+  builtin shift 3
+  local -a args=("$@")
+
+  if [[ -z $name || $name == */* || $name == .* || -z $cmd ]]; then
+    return 1
+  fi
+  local bin=${commands[$cmd]-}
+  [[ -n $bin ]] || return 1
+  local resolved=${bin:A}
+
+  local -A st
+  if (( no_cache || ! $+builtins[zstat] )) || ! builtin zstat -F '%s.%N' -H st -- "$resolved" 2>/dev/null; then
+    local out
+    out=$("$bin" "${(@)args}" 2>/dev/null) || return 1
+    [[ -n $out ]] || return 1
+    if [[ -n $post_fn ]]; then
+      "$post_fn" "$bin" "$out"
+      out=$REPLY
+      [[ -n $out ]] || return 1
+    fi
+    typeset -g _goatty_init_code=$out
+    return 2
+  fi
+
+  local key="# goatty-cache-key: v2|${(q+)ZSH_VERSION}|${(q+)bin}|${(q+)resolved}|${st[device]}:${st[inode]}:${st[size]}:${st[mtime]}:${st[ctime]}|${(q+)extra}|${(j: :)${(q+)args}}"
+  integer h1=2166136261 h2=3735928559 idx=1 klen=$#key
+  while (( idx <= klen )); do
+    (( h1 = ((h1 ^ #key[idx]) * 16777619) & 16#ffffffff ))
+    (( h2 = ((h2 * 33) ^ #key[idx]) & 16#ffffffff ))
+    (( idx++ ))
+  done
+  local tag
+  builtin printf -v tag '%08x%08x' $h1 $h2
+
+  local cache_dir=${_goatty_cache:-${XDG_CACHE_HOME:-$HOME/.cache}/goatty}/init
+  local cache=$cache_dir/$name-$tag.zsh
+  local out
+
+  {
+    _goatty_ci_dir_ok() {
+      local target=${1:a} leaf_private=$2
+      local p=$target
+      local -A st_dir
+      local is_leaf=1
+      while (( 1 )); do
+        builtin zstat -L -H st_dir -- "$p" 2>/dev/null || return 1
+        if (( (st_dir[mode] & 8#170000) == 8#120000 )); then
+          (( is_leaf && leaf_private )) && return 1
+          (( st_dir[uid] == EUID || st_dir[uid] == 0 )) || return 1
+        elif (( (st_dir[mode] & 8#170000) == 8#040000 )); then
+          if (( is_leaf && leaf_private )); then
+            (( st_dir[uid] == EUID && (st_dir[mode] & 8#0022) == 0 )) || return 1
+          else
+            (( (st_dir[uid] == EUID || st_dir[uid] == 0) && ((st_dir[mode] & 8#0022) == 0 || (st_dir[mode] & 8#1000) != 0) )) || return 1
+          fi
+        else
+          return 1
+        fi
+        is_leaf=0
+        [[ $p == / ]] && break
+        p=${p:h}
+      done
+      p=${target:A}
+      is_leaf=1
+      while (( 1 )); do
+        builtin zstat -L -H st_dir -- "$p" 2>/dev/null || return 1
+        (( (st_dir[mode] & 8#170000) == 8#040000 )) || return 1
+        if (( is_leaf && leaf_private )); then
+          (( st_dir[uid] == EUID && (st_dir[mode] & 8#0022) == 0 )) || return 1
+        else
+          (( (st_dir[uid] == EUID || st_dir[uid] == 0) && ((st_dir[mode] & 8#0022) == 0 || (st_dir[mode] & 8#1000) != 0) )) || return 1
+        fi
+        is_leaf=0
+        [[ $p == / ]] && break
+        p=${p:h}
+      done
+      return 0
+    }
+
+    local -A cst zwc_st
+    local dir_ok=0
+    if _goatty_ci_dir_ok "$cache_dir" 1; then
+      dir_ok=1
+    fi
+
+    local hdr hit_ok=0
+    if (( dir_ok )) \
+       && builtin zstat -L -H cst -- "$cache" 2>/dev/null \
+       && (( (cst[mode] & 8#170000) == 8#100000 && cst[uid] == EUID && (cst[mode] & 8#0022) == 0 && cst[size] > 0 )) \
+       && [[ -r $cache ]] \
+       && { IFS= builtin read -r hdr < "$cache"; } 2>/dev/null \
+       && [[ $hdr == "$key" ]]; then
+      if (( $+builtins[zcompile] )); then
+        if builtin zstat -L -H zwc_st -- "$cache.zwc" 2>/dev/null \
+           && (( (zwc_st[mode] & 8#170000) == 8#100000 && zwc_st[uid] == EUID && (zwc_st[mode] & 8#0022) == 0 && zwc_st[size] > 0 )) \
+           && (( zwc_st[mtime] >= cst[mtime] )) \
+           && builtin zcompile -t -- "$cache.zwc" >/dev/null 2>&1; then
+          hit_ok=1
+        fi
+      elif [[ ! -L $cache.zwc && ! -e $cache.zwc ]] && "${commands[zsh]:-zsh}" -n -- "$cache" 2>/dev/null; then
+        hit_ok=1
+      fi
+    fi
+
+    if (( hit_ok )); then
+      REPLY=$cache
+      return 0
+    fi
+
+    out=$(ARGV0=$bin "$resolved" "${(@)args}" 2>/dev/null) || return 1
+    [[ -n $out ]] || return 1
+    if [[ -n $post_fn ]]; then
+      "$post_fn" "$resolved" "$out" "$bin"
+      out=$REPLY
+      [[ -n $out ]] || return 1
+    fi
+
+    if (( ! dir_ok )) && [[ ! -L $cache_dir && ! -e $cache_dir ]]; then
+      local anc=${cache_dir:a}
+      while [[ $anc != / && ! -e $anc && ! -L $anc ]]; do
+        anc=${anc:h}
+      done
+      if _goatty_ci_dir_ok "$anc" 0 \
+         && command mkdir -p -m 0700 -- "$cache_dir" 2>/dev/null \
+         && _goatty_ci_dir_ok "$cache_dir" 1; then
+        dir_ok=1
+      fi
+    fi
+
+    if (( dir_ok )) && (( $+builtins[zsystem] )) && builtin zsystem supports flock 2>/dev/null; then
+      local lock_file="$cache_dir/.lock-$name"
+      local lock_fd= got_lock=0
+      if [[ ! -L $lock_file ]] && { : >>! "$lock_file"; } 2>/dev/null; then
+        if builtin zstat -L -H cst -- "$lock_file" 2>/dev/null \
+           && (( (cst[mode] & 8#170000) == 8#100000 && cst[uid] == EUID )); then
+          if (( (cst[mode] & 8#0022) != 0 )); then
+            if (( $+builtins[zf_chmod] )); then
+              builtin zf_chmod 0600 "$lock_file" 2>/dev/null
+            else
+              command chmod 0600 -- "$lock_file" 2>/dev/null
+            fi
+          fi
+          if builtin zstat -L -H cst -- "$lock_file" 2>/dev/null \
+             && (( (cst[mode] & 8#170000) == 8#100000 && cst[uid] == EUID && (cst[mode] & 8#0022) == 0 )) \
+             && builtin zsystem flock -t 0 -f lock_fd -- "$lock_file" 2>/dev/null; then
+            got_lock=1
+          fi
+        fi
+      fi
+
+      if (( got_lock )); then
+        local tmp_dir="$cache_dir/.tmp-$name-$tag.$$"
+        local tmp="$tmp_dir/$name-$tag.zsh"
+        local zc_ok=1
+        if command mkdir -p -m 0700 -- "$tmp_dir" 2>/dev/null \
+           && { builtin print -rn -- "${key}"$'\n'"${out}"$'\n' >| "$tmp"; } 2>/dev/null; then
+          if (( $+builtins[zcompile] )) && ! builtin zcompile -U -- "$tmp" 2>/dev/null; then
+            command rm -f -- "$tmp.zwc" 2>/dev/null
+            zc_ok=0
+          fi
+          if (( zc_ok )); then
+            if (( $+builtins[zf_chmod] )); then
+              builtin zf_chmod 0600 "$tmp" 2>/dev/null
+              [[ -f $tmp.zwc ]] && builtin zf_chmod 0400 "$tmp.zwc" 2>/dev/null
+            else
+              command chmod 0600 -- "$tmp" 2>/dev/null
+              [[ -f $tmp.zwc ]] && command chmod 0400 -- "$tmp.zwc" 2>/dev/null
+            fi
+            local -A st2
+            if [[ ${bin:A} == $resolved ]] \
+               && builtin zstat -F '%s.%N' -H st2 -- "$resolved" 2>/dev/null \
+               && [[ ${st2[device]}:${st2[inode]}:${st2[size]}:${st2[mtime]}:${st2[ctime]} == ${st[device]}:${st[inode]}:${st[size]}:${st[mtime]}:${st[ctime]} ]] \
+               && _goatty_ci_dir_ok "$cache_dir" 1 \
+               && builtin zstat -L -H cst -- "$tmp" 2>/dev/null \
+               && (( (cst[mode] & 8#170000) == 8#100000 && cst[uid] == EUID && (cst[mode] & 8#0022) == 0 )) \
+               && { { (( ! $+builtins[zcompile] )) && [[ ! -L $tmp.zwc && ! -e $tmp.zwc ]]; } || { builtin zstat -L -H cst -- "$tmp.zwc" 2>/dev/null && (( (cst[mode] & 8#170000) == 8#100000 && cst[uid] == EUID && (cst[mode] & 8#0022) == 0 )); }; }; then
+              [[ -L $cache.zwc || -e $cache.zwc ]] && command rm -f -- "$cache.zwc" 2>/dev/null
+              if command mv -f -- "$tmp" "$cache" 2>/dev/null; then
+                local pub_ok=1
+                if [[ -f $tmp.zwc ]]; then
+                  if ! command mv -f -- "$tmp.zwc" "$cache.zwc" 2>/dev/null; then
+                    command rm -f -- "$tmp.zwc" "$cache.zwc" "$cache" 2>/dev/null
+                    pub_ok=0
+                  fi
+                elif (( $+builtins[zcompile] )); then
+                  command rm -f -- "$cache" 2>/dev/null
+                  pub_ok=0
+                fi
+                if (( pub_ok )); then
+                  if (( ${+EPOCHSECONDS} )); then
+                    local old tail
+                    local -A ost
+                    for old in "$cache_dir"/"$name"-*.zsh(N); do
+                      [[ $old == "$cache" ]] && continue
+                      tail=${${old:t}#"$name"-}
+                      [[ $tail == *-* ]] && continue
+                      if builtin zstat -L -H ost -- "$old" 2>/dev/null \
+                         && (( (ost[mode] & 8#170000) == 8#100000 && ost[uid] == EUID && EPOCHSECONDS - ost[mtime] > 60 )); then
+                        command rm -f -- "$old.zwc" "$old" 2>/dev/null
+                      fi
+                    done
+                  fi
+                  command rm -rf -- "$tmp_dir" 2>/dev/null
+                  builtin zsystem flock -u "$lock_fd" 2>/dev/null
+                  REPLY=$cache
+                  return 0
+                fi
+              fi
+            fi
+          fi
+        fi
+        command rm -rf -- "$tmp_dir" 2>/dev/null
+        builtin zsystem flock -u "$lock_fd" 2>/dev/null
+      fi
+    fi
+  } always {
+    builtin unfunction _goatty_ci_dir_ok 2>/dev/null
+  }
+
+  typeset -g _goatty_init_code=$out
+  return 2
+}
+
 # --- What your own shell sets up (shell.import) -----------------------------
 # goatty ran your login shell with its startup files in a separate process
 # and noted the variables and PATH folders it added (import.zsh, written by
@@ -133,7 +378,7 @@ zle -N down-line-or-beginning-search
 WORDCHARS=${WORDCHARS//\/}
 
 # --- Completion -------------------------------------------------------------
-[[ -d $_goatty_cache ]] || mkdir -p -- "$_goatty_cache"
+[[ -d $_goatty_cache ]] || command mkdir -p -m 0700 -- "$_goatty_cache"
 zmodload -i zsh/complist
 autoload -Uz compinit
 compinit -i -d "$_goatty_cache/zcompdump-$ZSH_VERSION"
@@ -477,6 +722,6 @@ add-zsh-hook precmd _goatty_reload_requested
 }
 
 # --- Done --------------------------------------------------------------------
-builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file _goatty_on _goatty_find _goatty_ok
+builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file _goatty_on _goatty_find _goatty_ok _goatty_cached_init
 builtin unset _goatty_user_zdotdir _goatty_src _goatty_prompt GOATTY_GUI_SETUP _goatty_ps1_before
 builtin unset _goatty_imported_vars _goatty_imported_path _goatty_imported_from
