@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use goatty_proto::{
@@ -25,6 +26,61 @@ const MAX_STAT_WORKERS: usize = 4;
 const MAX_FILE_WORKERS: usize = 2;
 /// Max queued `FileData` bytes per connection waiting in the writer queue.
 const MAX_QUEUED_FILE_BYTES: usize = goatty_proto::MAX_FRAME;
+/// A connection that pings (remote clients do, every 5 s) and then sends
+/// nothing for this long is gone: a dead TCP link behind ssh never closes
+/// the proxy's socket, so EOF alone would keep it subscribed (#13).
+pub(crate) const SILENT_AFTER: Duration = Duration::from_secs(60);
+
+/// When a connection was last heard from, for [`reap_silent`].
+pub(crate) struct Liveness {
+    born: Instant,
+    /// Milliseconds after `born` of the last message.
+    last_ms: AtomicU64,
+    /// It has sent a `Ping`, so silence means it's gone. Local clients
+    /// don't ping: an idle one is just idle, and a dead one closes the
+    /// socket.
+    pings: AtomicBool,
+    /// Already shut down for silence (log it once).
+    dropped: AtomicBool,
+    stream: UnixStream,
+}
+
+impl Liveness {
+    fn new(stream: UnixStream) -> Self {
+        Self { born: Instant::now(), last_ms: AtomicU64::new(0), pings: AtomicBool::new(false), dropped: AtomicBool::new(false), stream }
+    }
+
+    fn heard(&self, ping: bool) {
+        let ms = u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(ms, Ordering::Relaxed);
+        if ping {
+            self.pings.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// How long a pinging connection has been silent at `now`; `None` for
+    /// one that never pinged.
+    fn silent_for(&self, now: Instant) -> Option<Duration> {
+        if !self.pings.load(Ordering::Relaxed) {
+            return None;
+        }
+        let last = self.born + Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        Some(now.saturating_duration_since(last))
+    }
+}
+
+/// Shut down every pinging connection silent for longer than `after`. Its
+/// reader then sees EOF and ends its subscriptions, which keeps the
+/// `attached` count and size control right. Run by the socket watchdog.
+pub(crate) fn reap_silent(conns: &parking_lot::Mutex<HashMap<u64, Arc<Liveness>>>, now: Instant, after: Duration) {
+    for (conn, live) in conns.lock().iter() {
+        let Some(silent) = live.silent_for(now).filter(|s| *s > after) else { continue };
+        if !live.dropped.swap(true, Ordering::Relaxed) {
+            log::info!("connection {conn}: nothing heard for {}s; dropping it", silent.as_secs());
+        }
+        let _ = live.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
 
 pub(crate) struct Outbound {
     pub(crate) frame: Frame,
@@ -92,6 +148,8 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // so here: everything queued before it has been sent.
     let (flushed_tx, flushed_rx) = flume::bounded::<()>(1);
     let wstream = stream.try_clone()?;
+    let live = Arc::new(Liveness::new(stream.try_clone()?));
+    daemon.conns.lock().insert(conn, live.clone());
     let writer = std::thread::Builder::new().name(format!("c{conn}-writer")).spawn(move || {
         let mut w = BufWriter::with_capacity(128 << 10, &wstream);
         while let Ok(out) = rx.recv() {
@@ -135,6 +193,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e.into()),
             };
+            live.heard(matches!(msg, ClientMsg::Ping { .. }));
             match msg {
                 ClientMsg::Hello { version, client } => {
                     let host = crate::server::host_info();
@@ -377,6 +436,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         }
     })();
 
+    daemon.conns.lock().remove(&conn);
     daemon.layouts.lock().release(conn);
     for (id, (s, _)) in subs {
         s.unsubscribe(conn);
@@ -390,6 +450,38 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the peer of a reaped stream sees it closed.
+    fn closed(peer: &UnixStream) -> bool {
+        use std::io::Read;
+        peer.set_nonblocking(true).unwrap();
+        matches!((&*peer).read(&mut [0u8; 1]), Ok(0))
+    }
+
+    #[test]
+    fn reaps_only_silent_pinging_connections() {
+        let (quiet, quiet_peer) = UnixStream::pair().unwrap();
+        let (pinging, pinging_peer) = UnixStream::pair().unwrap();
+        let conns = parking_lot::Mutex::new(HashMap::new());
+        let quiet = Arc::new(Liveness::new(quiet));
+        let pinging = Arc::new(Liveness::new(pinging));
+        quiet.heard(false);
+        pinging.heard(true);
+        conns.lock().insert(1, quiet);
+        conns.lock().insert(2, pinging.clone());
+
+        // Recently heard from: both stay.
+        reap_silent(&conns, Instant::now(), SILENT_AFTER);
+        assert!(!closed(&quiet_peer) && !closed(&pinging_peer));
+
+        // Long silent: only the one that pings goes; a local client that
+        // never pings may idle forever.
+        let later = Instant::now() + SILENT_AFTER + Duration::from_secs(1);
+        reap_silent(&conns, later, SILENT_AFTER);
+        assert!(!closed(&quiet_peer), "a connection that never pinged is kept");
+        assert!(closed(&pinging_peer), "a silent pinging connection is shut down");
+        assert!(pinging.dropped.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn queued_file_byte_budget_bounds_and_releases() {

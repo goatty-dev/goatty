@@ -47,6 +47,8 @@ pub(crate) struct Daemon {
     pub(crate) admission: RwLock<()>,
     /// This host on the user's tailnet (`crate::net`), once used.
     pub(crate) net: Mutex<Option<Arc<goatty_net::host::Host>>>,
+    /// Every open connection, for dropping the silent ones (#13).
+    pub(crate) conns: Mutex<HashMap<u64, Arc<crate::client::Liveness>>>,
 }
 
 /// What [`Daemon::start`] makes a session of: a PTY with its process, and
@@ -86,6 +88,7 @@ impl Daemon {
             restarting: AtomicBool::new(false),
             admission: RwLock::new(()),
             net: Mutex::new(None),
+            conns: Mutex::default(),
         }
     }
 
@@ -367,6 +370,7 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
     loop {
         std::thread::sleep(Duration::from_secs(2));
         crate::net::check(&daemon);
+        crate::client::reap_silent(&daemon.conns, std::time::Instant::now(), crate::client::SILENT_AFTER);
         let current = std::fs::metadata(&path).ok().map(|m| m.ino());
         if current == Some(ino) || daemon.restarting.load(Ordering::SeqCst) {
             continue;

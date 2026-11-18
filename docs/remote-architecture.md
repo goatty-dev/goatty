@@ -203,6 +203,7 @@ A shell lives as long as its PTY master is open, so goattyd hands the masters on
 ## 6. Reconnect (implemented)
 
 - The client's reader sees EOF/error, or the heartbeat sees 20 s of silence (Ping every 5 s on remote links). It closes the transport (kills the ssh child), marks panes `Disconnected`, and fails in-flight requests.
+- The daemon side (#13): a client that vanished without closing its link (dead TCP behind ssh) leaves the proxy's socket open, so goattyd never sees EOF. Its socket watchdog therefore shuts down every connection that has pinged and then sent nothing for 60 s (`client::reap_silent`, checked every 2 s), which ends its subscriptions and corrects the `attached` count and size control; the proxy exits with it. Connections that never ping (local clients) are left alone: an idle one is just idle, and a dead one closes its socket.
 - Backoff: 0.2, 0.5, 1, 2, then every 5 s. Each attempt runs a new transport, handshake, and then `Attach` for every pane with its last size.
 - The reattach snapshot starts with RIS, which also wipes the local "[goatty: connection lost; reconnecting…]" line the client printed into its mirror. The window title shows `— user@host (reconnecting…)`.
 - `Attach` fails (e.g. the daemon restarted) → `Lost`.
