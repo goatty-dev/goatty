@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,10 @@ pub struct AttachRequest {
     pub sink: Arc<dyn PaneSink>,
 }
 
+const ATTACH_ACTIVE: u8 = 0;
+const ATTACH_CANCELLED: u8 = 1;
+const ATTACH_FINISHING: u8 = 2;
+
 enum Pending {
     Reply(flume::Sender<ServerMsg>),
     Attach {
@@ -95,6 +99,8 @@ enum Pending {
         size: WinSize,
         /// The session, for `Attach` (`Create` and `Run` learn it from the reply).
         session: Option<SessionId>,
+        /// Coordinates `attach_many_within` timeout cancellation with `dispatch`.
+        state: Option<Arc<AtomicU8>>,
     },
     Reattach(SessionId),
     /// `fetch_history`: the answer goes to the pane's sink.
@@ -444,7 +450,10 @@ impl Connection {
     pub fn create(&self, size: WinSize, cwd: Option<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
         ensure_sane(size)?;
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Create { req, size, cwd, opts })? {
+        match self.request(
+            |tx| Pending::Attach { tx, sink, size, session: None, state: None },
+            |req| ClientMsg::Create { req, size, cwd, opts },
+        )? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -459,7 +468,10 @@ impl Connection {
             bail!("goattyd via {} is too old to run commands in sessions (protocol v{version}); restart it", self.endpoint().label());
         }
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Run { req, size, cwd, argv, opts })? {
+        match self.request(
+            |tx| Pending::Attach { tx, sink, size, session: None, state: None },
+            |req| ClientMsg::Run { req, size, cwd, argv, opts },
+        )? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -515,13 +527,13 @@ impl Connection {
 
         let opts = self.shared.opts;
         let (tx, rx) = flume::bounded(to_send.len());
-        let mut in_flight: HashMap<ReqId, (usize, SessionId)> = HashMap::with_capacity(to_send.len());
+        let mut in_flight: HashMap<ReqId, (usize, SessionId, Arc<AtomicU8>)> = HashMap::with_capacity(to_send.len());
         let mut msgs: Vec<ClientMsg> = Vec::with_capacity(to_send.len());
 
-        {
+        let link_gen = {
             // Checked under the lock the disconnect drain takes: every request
             // registered here is either drained (closing `rx`) or sent on a
-            // live link.
+            // live link with this exact `link_gen`.
             let mut map = self.shared.pending.lock();
             if !self.is_connected() {
                 for (i, _) in to_send {
@@ -529,13 +541,19 @@ impl Connection {
                 }
                 return results.into_iter().map(|r| r.expect("every attach entry resolved")).collect();
             }
+            let link_gen = self.shared.link_gen.load(Ordering::Acquire);
             for (i, r) in to_send {
                 let req = self.shared.req_id();
-                map.insert(req, Pending::Attach { tx: tx.clone(), sink: r.sink, size: r.size, session: Some(r.session) });
-                in_flight.insert(req, (i, r.session));
+                let state = Arc::new(AtomicU8::new(ATTACH_ACTIVE));
+                map.insert(
+                    req,
+                    Pending::Attach { tx: tx.clone(), sink: r.sink, size: r.size, session: Some(r.session), state: Some(state.clone()) },
+                );
+                in_flight.insert(req, (i, r.session, state));
                 msgs.push(ClientMsg::Attach { req, session: r.session, size: r.size, opts });
             }
-        }
+            link_gen
+        };
         // Drop the local sender so `rx` closes as soon as every pending entry
         // is answered or drained on disconnect.
         drop(tx);
@@ -546,20 +564,21 @@ impl Connection {
             self.shared.send(msg);
         }
 
-        let apply_reply = |msg: ServerMsg, in_flight: &mut HashMap<ReqId, (usize, SessionId)>, results: &mut [Option<Result<()>>]| {
-            let Some(req) = msg.reply_to() else {
-                log::warn!("attach_many received message without req id: {msg:?}");
-                return;
+        let apply_reply =
+            |msg: ServerMsg, in_flight: &mut HashMap<ReqId, (usize, SessionId, Arc<AtomicU8>)>, results: &mut [Option<Result<()>>]| {
+                let Some(req) = msg.reply_to() else {
+                    log::warn!("attach_many received message without req id: {msg:?}");
+                    return;
+                };
+                let Some((i, _, _)) = in_flight.remove(&req) else {
+                    return;
+                };
+                results[i] = Some(match msg {
+                    ServerMsg::Attached { .. } => Ok(()),
+                    ServerMsg::Error { message, .. } => Err(anyhow!("goattyd: {message}")),
+                    other => Err(anyhow!("unexpected reply {other:?}")),
+                });
             };
-            let Some((i, _)) = in_flight.remove(&req) else {
-                return;
-            };
-            results[i] = Some(match msg {
-                ServerMsg::Attached { .. } => Ok(()),
-                ServerMsg::Error { message, .. } => Err(anyhow!("goattyd: {message}")),
-                other => Err(anyhow!("unexpected reply {other:?}")),
-            });
-        };
 
         while !in_flight.is_empty() {
             match rx.recv_timeout(timeout) {
@@ -569,30 +588,41 @@ impl Connection {
         }
 
         if !in_flight.is_empty() {
+            while let Ok(msg) = rx.try_recv() {
+                apply_reply(msg, &mut in_flight, &mut results);
+            }
+        }
+
+        if !in_flight.is_empty() {
             let mut timed_out_sessions = Vec::new();
             {
                 let mut map = self.shared.pending.lock();
-                in_flight.retain(|&req, &mut (i, session)| {
-                    if map.remove(&req).is_some() {
+                in_flight.retain(|&req, &mut (i, session, ref state)| {
+                    if map.remove(&req).is_some()
+                        || state.compare_exchange(ATTACH_ACTIVE, ATTACH_CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                    {
+                        // Cancelled before `dispatch` committed to installing
+                        // the pane (or already drained on disconnect).
                         results[i] = Some(Err(ReplyLost.into()));
                         timed_out_sessions.push(session);
                         false
                     } else {
-                        // Already taken by `dispatch` (currently delivering the
-                        // reply) or drained on disconnect (will close `rx`).
+                        // `dispatch` already transitioned to `ATTACH_FINISHING`
+                        // and is installing the pane / sending the reply.
                         true
                     }
                 });
             }
-            // Recover any reply that raced in just before we locked `pending`,
-            // so an installed pane is never reported as failed (and leaked).
+            // Wait for any reply that `dispatch` already committed to
+            // installing before we locked `pending`, so an installed pane is
+            // never reported as failed (and leaked).
             while !in_flight.is_empty() {
-                match rx.recv_timeout(Duration::from_secs(1)) {
+                match rx.recv() {
                     Ok(msg) => apply_reply(msg, &mut in_flight, &mut results),
                     Err(_) => break,
                 }
             }
-            for (_, (i, session)) in in_flight {
+            for (_, (i, session, _)) in in_flight {
                 results[i] = Some(Err(ReplyLost.into()));
                 timed_out_sessions.push(session);
             }
@@ -609,9 +639,9 @@ impl Connection {
                             early.remove(&id);
                         }
                     }
-                    // If the link is still live, unsubscribe any late `Attach`
-                    // the daemon may still finish processing for timed-out ids.
-                    if self.is_connected() {
+                    // If we are still on the same live link, unsubscribe any
+                    // late `Attach` the daemon may still finish processing.
+                    if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
                         for id in unattached {
                             self.shared.send(&ClientMsg::Detach { session: id });
                         }
@@ -825,8 +855,8 @@ impl Connection {
     /// `ClientMsg::ClaimLayout`). Blocks: call off the UI thread.
     pub fn claim_layout(&self) -> Result<Option<LayoutInfo>> {
         {
-            let cur = self.shared.link_gen.load(Ordering::Acquire);
             let mut claimed = self.shared.claimed_layouts.lock();
+            let cur = self.shared.link_gen.load(Ordering::Acquire);
             while let Some((g, info)) = claimed.unclaimed.pop_front() {
                 if g == cur && self.is_connected() {
                     claimed.gens.insert(info.id, cur);
@@ -1161,11 +1191,20 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         ServerMsg::Attached { req, session, snapshot } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, sink, size, .. }) => {
+                Some(Pending::Attach { tx, sink, size, state, .. }) => {
+                    if state.as_ref().is_some_and(|st| st.load(Ordering::Acquire) == ATTACH_CANCELLED) {
+                        return;
+                    }
                     if let Some(ev) = s.early_size.lock().remove(&session) {
                         sink.event(ev);
                     }
                     sink.feed(&snapshot);
+                    let committed = state
+                        .as_ref()
+                        .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                    if !committed {
+                        return;
+                    }
                     let n = snapshot.len() as u64;
                     s.panes.lock().insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None, linked: true });
                     let _ = tx.send(ServerMsg::Attached { req, session, snapshot: Vec::new() });
@@ -1282,15 +1321,24 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::Shell { req, .. }
         | ServerMsg::Net { req, .. }
         | ServerMsg::PathStat { req, .. }
-        | ServerMsg::FileData { req, .. } => {
-            if let Some(Pending::Reply(tx) | Pending::Attach { tx, .. }) = s.pending.lock().remove(&req) {
+        | ServerMsg::FileData { req, .. } => match s.pending.lock().remove(&req) {
+            Some(Pending::Reply(tx)) => {
                 let _ = tx.send(msg);
             }
-        }
+            Some(Pending::Attach { tx, state, .. }) => {
+                let committed = state
+                    .as_ref()
+                    .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                if committed {
+                    let _ = tx.send(msg);
+                }
+            }
+            _ => {}
+        },
         ServerMsg::Error { req: Some(req), ref message } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, session, .. }) => {
+                Some(Pending::Attach { tx, session, state, .. }) => {
                     // A refused replacement attach: a live size change held
                     // for it belongs to the pane that stays.
                     if let Some(session) = session {
@@ -1301,7 +1349,12 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                             sink.event(ev);
                         }
                     }
-                    let _ = tx.send(msg);
+                    let committed = state
+                        .as_ref()
+                        .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                    if committed {
+                        let _ = tx.send(msg);
+                    }
                 }
                 Some(Pending::Reply(tx)) => {
                     let _ = tx.send(msg);
@@ -1745,6 +1798,60 @@ mod tests {
         assert!(conn.shared.claimed_layouts.lock().unclaimed.is_empty());
 
         drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_timeout_during_slow_sink_feed_does_not_leak_pane() {
+        struct SlowSink {
+            entered: flume::Sender<()>,
+            release: flume::Receiver<()>,
+        }
+        impl PaneSink for SlowSink {
+            fn feed(&self, _bytes: &[u8]) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+            }
+            fn event(&self, _ev: PaneEvent) {}
+        }
+
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (entered_tx, entered_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (detach_tx, detach_rx) = flume::bounded::<SessionId>(1);
+        let (tx_done, rx_done) = flume::bounded::<()>(1);
+
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let req = match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::Attach { req, session: 1, .. } => req,
+                other => panic!("unexpected client msg: {other:?}"),
+            };
+            let att = ServerMsg::Attached { req, session: 1, snapshot: b"slow-snapshot".to_vec() };
+            w.write_all(&encode(&att).unwrap()).unwrap();
+            w.flush().unwrap();
+
+            if let Ok(ClientMsg::Detach { session }) = read_msg::<_, ClientMsg>(&mut r) {
+                let _ = detach_tx.send(session);
+            }
+            let _ = rx_done.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        let sink = Arc::new(SlowSink { entered: entered_tx, release: release_rx });
+        let start = Instant::now();
+        let results = conn.attach_many_within(vec![AttachRequest { session: 1, size, sink }], Duration::from_millis(120));
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(entered_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "sink.feed should have started before timeout");
+        assert!(results[0].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert_eq!(detach_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+
+        // Allow `sink.feed` to finish; the cancelled attach must not install a pane.
+        let shared = conn.shared.clone();
+        let _ = release_tx.send(());
+        let _ = tx_done.send(());
+        drop(conn);
+        reader_h.join().unwrap();
+        assert!(shared.panes.lock().is_empty(), "cancelled attach must not leak pane");
         server_h.join().unwrap();
     }
 }

@@ -187,7 +187,10 @@ impl Drop for RestoreCleanup<'_> {
         if self.ids.is_empty() && !self.layout_saved {
             return;
         }
-        let conn = self.conn.take().or_else(|| Connection::open(self.setup_endpoint.clone(), "netbench-cleanup").ok());
+        let conn = self
+            .conn
+            .take()
+            .or_else(|| Connection::open_once(self.setup_endpoint.clone(), "netbench-cleanup", Some(Duration::from_secs(5))).ok());
         let Some(conn) = conn else { return };
         if self.layout_saved {
             conn.save_layout(0x127, Vec::new(), String::new());
