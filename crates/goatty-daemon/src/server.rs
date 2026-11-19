@@ -49,6 +49,9 @@ pub(crate) struct Daemon {
     pub(crate) net: Mutex<Option<Arc<goatty_net::host::Host>>>,
     /// Every open connection, for dropping the silent ones (#13).
     pub(crate) conns: Mutex<HashMap<u64, Arc<crate::client::Liveness>>>,
+    /// The listening socket is owned by systemd or launchd (socket activation),
+    /// so `shutdown` must not unlink the socket path.
+    pub(crate) socket_activated: AtomicBool,
 }
 
 /// What [`Daemon::start`] makes a session of: a PTY with its process, and
@@ -89,6 +92,7 @@ impl Daemon {
             admission: RwLock::new(()),
             net: Mutex::new(None),
             conns: Mutex::default(),
+            socket_activated: AtomicBool::new(false),
         }
     }
 
@@ -234,7 +238,8 @@ impl Daemon {
         list
     }
 
-    /// Kill every session, remove the socket and exit the process.
+    /// Kill every session, remove the socket (unless socket-activated) and exit
+    /// the process.
     pub(crate) fn shutdown(&self) -> ! {
         log::info!("shutdown requested");
         for s in self.sessions.lock().values() {
@@ -242,7 +247,11 @@ impl Daemon {
         }
         // Give the connection writers a moment to flush the `Ok` reply.
         std::thread::sleep(Duration::from_millis(100));
-        let _ = std::fs::remove_file(&self.socket);
+        // Under systemd/launchd socket activation the supervisor owns the
+        // socket file and keeps listening on it for the next connection.
+        if !self.socket_activated.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
         // The Serve route stays (the next goattyd serves it again); the socket goes.
         if let Some(net) = self.net.lock().as_ref() {
             let _ = std::fs::remove_file(net.socket());
@@ -298,9 +307,9 @@ fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
 
 /// How `serve` starts.
 pub enum Start {
-    /// Fresh, or with the socket and PTYs systemd passed (`LISTEN_FDS`: the
-    /// socket of `goattyd.socket`, and after a crash or `systemctl --user
-    /// restart` the PTYs from the fd store).
+    /// Fresh, or with the socket passed by systemd (`LISTEN_FDS`, plus any
+    /// PTYs from the fd store after a crash or `systemctl --user restart`) or
+    /// macOS launchd (`launch_activate_socket`).
     Normal,
     /// Taking over from the previous goattyd (`goattyd serve --restore
     /// FILE`, run by `Restart`): its socket and PTYs are inherited fds.
@@ -309,7 +318,7 @@ pub enum Start {
 
 /// Run the daemon on the socket at `path` until `goattyd stop`. Never returns
 /// `Ok`; startup errors (socket in use, permissions) are returned. Under
-/// systemd socket activation it serves the socket it was given.
+/// systemd or launchd socket activation it serves the socket it was given.
 pub fn serve(path: &Path, start: Start) -> Result<()> {
     crate::systemd::capture_env();
     let path = path.to_path_buf();
@@ -323,10 +332,22 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
         Start::Normal => {
             let passed = crate::systemd::take_passed();
             crate::restore::adopt_stored(&daemon, passed.ptys);
-            passed.listener.map(|fd| {
-                log::info!("using the socket from systemd");
-                UnixListener::from(fd)
-            })
+            let activated = passed
+                .listener
+                .map(|fd| {
+                    log::info!("using the socket from systemd");
+                    UnixListener::from(fd)
+                })
+                .or_else(|| {
+                    crate::launchd::activate_socket().map(|fd| {
+                        log::info!("using the socket from launchd");
+                        UnixListener::from(fd)
+                    })
+                });
+            if activated.is_some() {
+                daemon.socket_activated.store(true, Ordering::SeqCst);
+            }
+            activated
         }
     };
     let (listener, mut ino) = match listener {
@@ -399,6 +420,7 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
             Ok((l, i)) => {
                 ino = i;
                 taken_over = false;
+                daemon.socket_activated.store(false, Ordering::SeqCst);
                 let d = daemon.clone();
                 std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, l))?;
             }

@@ -13,13 +13,15 @@
 //! * `net`: this host on the user's tailnet (the gateway socket, pairing),
 //! * [`proxy`]: stdio ⇄ socket relay for remote transports,
 //! * `restore`: sessions that outlive goattyd (restart, upgrade, crash),
-//! * [`systemd`]: socket activation and the fd store.
+//! * [`systemd`]: Linux socket activation and the fd store,
+//! * `launchd`: macOS socket activation (`launch_activate_socket`).
 //!
 //! The `goattyd` binary is a thin CLI over this crate.
 
 mod client;
 mod files;
 mod flow;
+mod launchd;
 mod layouts;
 mod net;
 pub mod proxy;

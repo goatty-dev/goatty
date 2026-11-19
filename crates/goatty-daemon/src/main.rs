@@ -46,7 +46,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Run goattyd as a systemd user service (socket-activated).
+    /// Run goattyd as a user service (systemd on Linux, launchd on macOS).
     #[command(subcommand)]
     Service(ServiceCmd),
     /// goatty's managed zsh on this host: status, tool installs and updates.
@@ -76,11 +76,11 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Install and enable goattyd.socket + goattyd.service in ~/.config/systemd/user.
+    /// Install and enable the user service (systemd units on Linux, LaunchAgent on macOS).
     Install,
-    /// Disable and remove the units (a running daemon keeps its sessions).
+    /// Disable and remove the user service.
     Uninstall,
-    /// Whether the units are installed and running, and whether lingering is on.
+    /// Show whether the user service is installed and running.
     Status,
 }
 
@@ -535,7 +535,7 @@ fn stop(force: bool) -> Result<()> {
     match stop_daemon(force)? {
         Stopped::NotRunning => eprintln!("goattyd isn't running"),
         Stopped::Asked => {}
-        Stopped::Service { why } => eprintln!("goattyd: {why}\nstopped {}", goatty_client::service::SERVICE_UNIT),
+        Stopped::Service { why } => eprintln!("goattyd: {why}\nstopped {}", goatty_client::service::service_name()),
         Stopped::Killed { pid, why } => eprintln!("goattyd: {why}\nstopped pid {pid}"),
     }
     Ok(())
@@ -545,19 +545,35 @@ fn service_install() -> Result<()> {
     use goatty_client::service;
     let exe = std::env::current_exe()?;
     let done = service::install(&exe, &goatty_proto::socket_path())?;
-    println!("installed {} and {} in {}", service::SOCKET_UNIT, service::SERVICE_UNIT, done.unit_dir.display());
-    if done.started {
-        println!("goattyd now starts through systemd on the first connection (logs: journalctl --user -u goattyd)");
-    } else {
-        println!(
-            "a goattyd started outside systemd is still running; systemd takes over once it stops\n\
-             (`goattyd stop` ends its sessions now, or it happens at your next login)"
-        );
+    #[cfg(target_os = "macos")]
+    {
+        println!("installed {} in {}", service::LAUNCHD_PLIST, done.unit_dir.display());
+        if done.started {
+            println!("goattyd now starts through launchd on the first connection (logs: {})", service::logs_hint());
+        } else {
+            println!(
+                "a goattyd started outside launchd is still running; launchd takes over once it stops\n\
+                 (`goattyd stop` ends its sessions now, or it happens at your next login)"
+            );
+        }
     }
-    print_linger(done.linger);
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("installed {} and {} in {}", service::SOCKET_UNIT, service::SERVICE_UNIT, done.unit_dir.display());
+        if done.started {
+            println!("goattyd now starts through systemd on the first connection (logs: journalctl --user -u goattyd)");
+        } else {
+            println!(
+                "a goattyd started outside systemd is still running; systemd takes over once it stops\n\
+                 (`goattyd stop` ends its sessions now, or it happens at your next login)"
+            );
+        }
+        print_linger(done.linger);
+    }
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn print_linger(linger: Option<bool>) {
     match linger {
         Some(true) => println!("lingering is on: goattyd and its sessions keep running after you log out"),
@@ -570,10 +586,22 @@ fn print_linger(linger: Option<bool>) {
 }
 
 fn service_uninstall() -> Result<()> {
-    if goatty_client::service::uninstall()? {
-        println!("removed goattyd's systemd units; a running goattyd keeps its sessions until `goattyd stop`");
-    } else {
-        println!("goattyd's systemd units aren't installed");
+    let removed = goatty_client::service::uninstall()?;
+    #[cfg(target_os = "macos")]
+    {
+        if removed {
+            println!("unloaded and removed {}", goatty_client::service::LAUNCHD_PLIST);
+        } else {
+            println!("goattyd's launchd agent isn't installed");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if removed {
+            println!("removed goattyd's systemd units; a running goattyd keeps its sessions until `goattyd stop`");
+        } else {
+            println!("goattyd's systemd units aren't installed");
+        }
     }
     Ok(())
 }
@@ -582,6 +610,9 @@ fn service_status() -> Result<()> {
     let s = goatty_client::service::status();
     let dir = s.unit_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "?".into());
     if !s.installed {
+        #[cfg(target_os = "macos")]
+        println!("not installed (plist would go to {dir}); `goattyd service install` sets it up");
+        #[cfg(not(target_os = "macos"))]
         println!("not installed (units would go to {dir}); `goattyd service install` sets them up");
         return Ok(());
     }
@@ -592,12 +623,22 @@ fn service_status() -> Result<()> {
     let state = |on: bool| if on { "active" } else { "inactive" };
     println!("socket    {}", state(s.socket_active));
     println!("service   {}", state(s.service_active));
-    if s.keeps_sessions {
-        println!("sessions  survive daemon restarts and crashes; `systemctl --user stop goattyd` ends them");
-    } else {
-        println!("sessions  end when the daemon does: units from an older goattyd (`goattyd service install` updates them)");
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(log) = &s.log_path {
+            println!("logs      {}", log.display());
+        }
+        println!("sessions  survive `goattyd restart` (re-exec); crashes and `launchctl kickstart -k` end them (launchd has no fd store)");
     }
-    print_linger(s.linger);
+    #[cfg(not(target_os = "macos"))]
+    {
+        if s.keeps_sessions {
+            println!("sessions  survive daemon restarts and crashes; `systemctl --user stop goattyd` ends them");
+        } else {
+            println!("sessions  end when the daemon does: units from an older goattyd (`goattyd service install` updates them)");
+        }
+        print_linger(s.linger);
+    }
     Ok(())
 }
 

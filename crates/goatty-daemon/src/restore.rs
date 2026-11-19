@@ -58,6 +58,9 @@ struct State {
     next_session: u64,
     /// The listening socket, inherited (restart only).
     listener_fd: Option<RawFd>,
+    /// Whether the listening socket belongs to systemd/launchd (socket activation).
+    #[serde(default)]
+    socket_activated: bool,
     sessions: Vec<SavedSession>,
     layouts: Vec<SavedLayout>,
 }
@@ -163,6 +166,7 @@ fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: 
         version: STATE_VERSION,
         next_session: daemon.next_session.load(Ordering::SeqCst),
         listener_fd: if with_fds { *daemon.listener_fd.lock() } else { None },
+        socket_activated: daemon.socket_activated.load(Ordering::SeqCst),
         sessions: saved,
         layouts: daemon.layouts.lock().export(),
     };
@@ -322,6 +326,7 @@ pub(crate) fn take_over(daemon: &Arc<Daemon>, file: &Path) -> Result<Option<Unix
         bump_next_session(daemon, s.id);
     }
     bump_next_session(daemon, state.next_session);
+    daemon.socket_activated.store(state.socket_activated, Ordering::SeqCst);
     *daemon.layouts.lock() = Layouts::import(state.layouts);
     let _ = std::fs::remove_dir_all(&dir);
     state.listener_fd.map(crate::server::listener_from_fd).transpose()

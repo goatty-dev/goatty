@@ -300,10 +300,10 @@ pub struct Transport {
     pub stderr: StderrTail,
 }
 
-/// Connect to the local goattyd, starting it if needed: through systemd
-/// when its user units are installed ([`crate::service`]), else detached in
-/// its own session. `daemon_exe` defaults to `goattyd` next to the current
-/// binary.
+/// Connect to the local goattyd, starting it if needed: through the user
+/// service (systemd on Linux, launchd on macOS) when installed
+/// ([`crate::service`]), else detached in its own session. `daemon_exe`
+/// defaults to `goattyd` next to the current binary.
 pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream> {
     let path = goatty_proto::socket_path();
     if let Ok(s) = UnixStream::connect(&path) {
@@ -311,17 +311,17 @@ pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream
     }
     let dir = goatty_proto::runtime_dir();
     let log_path = dir.join("goattyd.log");
-    // Only for the socket the units listen on (not a GOATTY_SOCKET sandbox).
-    let via_systemd = crate::service::unit_socket_path().is_some_and(|p| p == path) && crate::service::installed() && {
+    // Only for the socket the service listens on (not a GOATTY_SOCKET sandbox).
+    let via_service = crate::service::unit_socket_path().is_some_and(|p| p == path) && crate::service::installed() && {
         match crate::service::start_socket() {
             Ok(()) => true,
             Err(e) => {
-                log::warn!("couldn't start goattyd's systemd socket, starting it directly: {e:#}");
+                log::warn!("couldn't start goattyd's user service, starting it directly: {e:#}");
                 false
             }
         }
     };
-    if !via_systemd {
+    if !via_service {
         spawn_daemon(daemon_exe, &dir, &log_path)?;
     }
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -330,8 +330,8 @@ pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream
             return Ok(s);
         }
         if Instant::now() > deadline {
-            if via_systemd {
-                bail!("goattyd did not come up; see `journalctl --user -u goattyd`");
+            if via_service {
+                bail!("goattyd did not come up; see {}", crate::service::logs_hint());
             }
             bail!("goattyd did not come up; see {}", log_path.display());
         }

@@ -54,13 +54,14 @@ fn a_rebuilt_goattyd_is_noticed_and_the_old_one_stopped() {
     // It runs the installed file.
     assert_eq!(local::outdated_than(pid, exe.clone()), None);
 
-    // Rebuilt: a new file at the same path. Only Linux can tell (macOS has
-    // no /proc/<pid>/exe to stat the old file through).
+    // Rebuilt: a new file at the same path.
     copy_goattyd(&exe);
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         let o = local::outdated_than(pid, exe.clone()).expect("the running build is older now");
         assert_eq!(o.pid, pid);
-        assert!(o.running.to_string_lossy().ends_with(" (deleted)"), "{}", o.running.display());
+        if cfg!(target_os = "linux") {
+            assert!(o.running.to_string_lossy().ends_with(" (deleted)"), "{}", o.running.display());
+        }
     }
 
     // `stop --force` from the new build stops it.
