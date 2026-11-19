@@ -14,10 +14,12 @@
 //! no fd store, so a crash or `launchctl kickstart -k` ends sessions.
 
 #[cfg(target_os = "macos")]
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
@@ -289,22 +291,54 @@ fn target() -> String {
     format!("{}/{LAUNCHD_LABEL}", domain())
 }
 
+/// Whether a failed `launchctl` invocation indicates that the target agent or
+/// domain does not exist (already unloaded / no GUI session).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_not_found_detail(code: Option<i32>, stderr: &str, stdout: &str) -> bool {
+    matches!(code, Some(3 | 113)) || stderr.contains("Could not find") || stdout.contains("Could not find")
+}
+
+#[cfg(target_os = "macos")]
+const LAUNCHCTL: &str = "/bin/launchctl";
+
+#[cfg(target_os = "macos")]
+fn launchctl_raw(args: &[&str]) -> Result<Output> {
+    Command::new(LAUNCHCTL).args(args).stdin(Stdio::null()).output().with_context(|| format!("couldn't run {LAUNCHCTL}"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_error(args: &[&str], out: &Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    anyhow::anyhow!("launchctl {}: {detail}", args.join(" "))
+}
+
 #[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> Result<String> {
-    let out = Command::new("launchctl").args(args).stdin(Stdio::null()).output().context("couldn't run launchctl")?;
+    let out = launchctl_raw(args)?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        bail!("launchctl {}: {detail}", args.join(" "));
+        return Err(launchctl_error(args, &out));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn is_not_found_output(out: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    is_not_found_detail(out.status.code(), &stderr, &stdout)
 }
 
 #[cfg(target_os = "macos")]
 fn query_launchd() -> Option<LaunchdState> {
     let out = launchctl(&["print", &target()]).ok()?;
     Some(parse_launchctl_print(&out))
+}
+
+#[cfg(target_os = "macos")]
+pub fn service_active() -> bool {
+    query_launchd().is_some_and(|s| s.service_active)
 }
 
 #[cfg(target_os = "macos")]
@@ -321,6 +355,59 @@ fn wait_unloaded(timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while query_launchd().is_some() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Unload the agent if it is loaded, waiting for launchd teardown to finish.
+/// Confirmed already-unloaded states succeed; genuine `launchctl` failures
+/// (e.g. exec error or failure while still loaded) are returned.
+#[cfg(target_os = "macos")]
+fn bootout_if_loaded() -> Result<()> {
+    let tgt = target();
+    let out = launchctl_raw(&["bootout", &tgt])?;
+    if out.status.success() {
+        wait_unloaded(Duration::from_secs(5));
+        return Ok(());
+    }
+    if is_not_found_output(&out) {
+        return Ok(());
+    }
+    // Some macOS versions report other errors (e.g. 5: Input/output error)
+    // when the agent is already unloaded; confirm via `launchctl print`.
+    let check = launchctl_raw(&["print", &tgt])?;
+    if !check.status.success() && is_not_found_output(&check) {
+        return Ok(());
+    }
+    Err(launchctl_error(&["bootout", &tgt], &out))
+}
+
+/// Exclusive cross-process lock serializing LaunchAgent startup and socket
+/// recovery; released automatically when dropped.
+#[cfg(target_os = "macos")]
+struct StartLock(#[allow(dead_code)] std::fs::File);
+
+#[cfg(target_os = "macos")]
+impl StartLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        loop {
+            // SAFETY: `file` is an open file descriptor owned by this scope;
+            // `flock` takes an integer fd and flags only.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                return Ok(Self(file));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err).with_context(|| format!("flock {}", path.display()));
+            }
+        }
     }
 }
 
@@ -353,18 +440,33 @@ pub fn start_socket() -> Result<()> {
     anyhow::ensure!(plist_path.is_file(), "{} is not installed", plist_path.display());
 
     let sock = unit_socket_path().context("$HOME is not set")?;
-    if let Some(parent) = sock.parent() {
-        ensure_private_dir(parent)?;
-    }
-    if let Some(log_dir) = log_path().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        ensure_private_dir(&log_dir)?;
+    let sock_dir = sock.parent().context("socket path has no parent")?;
+    ensure_private_dir(sock_dir)?;
+    let log_dir = log_path().and_then(|p| p.parent().map(Path::to_path_buf));
+    if let Some(ref log_dir) = log_dir {
+        ensure_private_dir(log_dir)?;
     }
 
-    // If the job is already loaded in launchd, the socket file may have been
-    // removed (e.g. cache cleanup); bootout + bootstrap recreates it.
-    if query_launchd().is_some() {
-        let _ = launchctl(&["bootout", &target()]);
-        wait_unloaded(Duration::from_secs(5));
+    // Serialize startup and recovery across concurrent clients so one process
+    // cannot unload an agent another process just made available.
+    let lock_path = log_dir.as_deref().unwrap_or(sock_dir).join(".launchd-start.lock");
+    let _lock = StartLock::acquire(&lock_path)?;
+
+    // Another client may have bootstrapped the agent (or the daemon's watchdog
+    // may have rebound the socket) while we waited for the lock.
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        return Ok(());
+    }
+
+    // Never bootout a running daemon: if cache cleanup removed its socket, the
+    // daemon's watchdog re-binds it without ending live sessions.
+    if let Some(state) = query_launchd() {
+        if state.service_active {
+            return Ok(());
+        }
+        // Loaded but idle with a genuinely missing/unconnectable socket:
+        // bootout + bootstrap recreates launchd's listener socket.
+        bootout_if_loaded()?;
     }
     bootstrap_plist(&plist_path)
 }
@@ -490,9 +592,12 @@ pub fn install(exe: &Path, socket_path: &Path) -> Result<Installed> {
 
     let live = query_launchd();
     let already_loaded = live.is_some();
-    // A daemon started outside launchd (setsid) owns the socket path;
-    // bootstrapping over it would orphan it. Let it finish first.
-    let foreign = !already_loaded && std::os::unix::net::UnixStream::connect(socket_path).is_ok();
+    // A daemon started outside launchd (setsid) owns the socket path (or the
+    // previous macOS $TMPDIR default); bootstrapping over it would orphan its
+    // sessions. Let it finish first.
+    let foreign = !already_loaded
+        && (std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+            || goatty_proto::legacy_socket_path().is_some_and(|p| std::os::unix::net::UnixStream::connect(&p).is_ok()));
     if foreign {
         return Ok(Installed { unit_dir: dir, started: false, linger: None });
     }
@@ -503,8 +608,7 @@ pub fn install(exe: &Path, socket_path: &Path) -> Result<Installed> {
     }
 
     if already_loaded {
-        let _ = launchctl(&["bootout", &target()]);
-        wait_unloaded(Duration::from_secs(5));
+        bootout_if_loaded()?;
     }
     // Remove a stale socket left behind by an earlier non-launchd crash.
     if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_err() {
@@ -520,7 +624,7 @@ pub fn uninstall() -> Result<bool> {
     let path = dir.join(LAUNCHD_PLIST);
     match std::fs::read_to_string(&path) {
         Ok(text) if is_goatty_plist(&text) => {
-            let _ = launchctl(&["bootout", &target()]);
+            bootout_if_loaded()?;
             std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
             Ok(true)
         }
@@ -639,6 +743,40 @@ gui/501/dev.goatty.goattyd = {
 }
 "#;
         assert_eq!(parse_launchctl_print(sample), LaunchdState { socket_active: false, service_active: false, pid: None });
+    }
+
+    #[test]
+    fn detects_launchctl_not_found_errors() {
+        assert!(is_not_found_detail(Some(3), "Boot-out failed: 3: No such process", ""));
+        assert!(is_not_found_detail(Some(113), "Could not find service \"dev.goatty.goattyd\" in domain for user gui: 501", ""));
+        assert!(is_not_found_detail(Some(1), "Could not find domain for user gui: 501", ""));
+        assert!(!is_not_found_detail(Some(5), "Boot-out failed: 5: Input/output error", ""));
+        assert!(!is_not_found_detail(Some(1), "Permission denied", ""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_lock_serializes_concurrent_acquirers() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".launchd-start.lock");
+        let first = StartLock::acquire(&lock_path).unwrap();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let flag = acquired.clone();
+        let path_clone = lock_path.clone();
+        let handle = std::thread::spawn(move || {
+            let _second = StartLock::acquire(&path_clone).unwrap();
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!acquired.load(Ordering::SeqCst), "second acquirer must block until first lock drops");
+        drop(first);
+        handle.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[cfg(target_os = "macos")]

@@ -139,6 +139,19 @@ pub fn service_program() -> Option<PathBuf> {
     }
 }
 
+/// Whether the managed daemon process is currently running under the user
+/// service manager.
+pub fn service_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        launchd::service_active()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        systemd::service_active()
+    }
+}
+
 /// Start the installed socket listener (clients do this instead of spawning a
 /// detached daemon when the service is installed).
 pub fn start_socket() -> Result<()> {

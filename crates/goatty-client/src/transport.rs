@@ -300,31 +300,50 @@ pub struct Transport {
     pub stderr: StderrTail,
 }
 
+fn try_connect_existing(primary: &std::path::Path, legacy: Option<&std::path::Path>) -> Option<UnixStream> {
+    if let Ok(s) = UnixStream::connect(primary) {
+        return Some(s);
+    }
+    legacy.and_then(|p| UnixStream::connect(p).ok())
+}
+
 /// Connect to the local goattyd, starting it if needed: through the user
 /// service (systemd on Linux, launchd on macOS) when installed
 /// ([`crate::service`]), else detached in its own session. `daemon_exe`
 /// defaults to `goattyd` next to the current binary.
 pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream> {
     let path = goatty_proto::socket_path();
-    if let Ok(s) = UnixStream::connect(&path) {
+    let legacy = goatty_proto::legacy_socket_path();
+    if let Some(s) = try_connect_existing(&path, legacy.as_deref()) {
         return Ok(s);
     }
     let dir = goatty_proto::runtime_dir();
     let log_path = dir.join("goattyd.log");
     // Only for the socket the service listens on (not a GOATTY_SOCKET sandbox).
-    let via_service = crate::service::unit_socket_path().is_some_and(|p| p == path) && crate::service::installed() && {
-        match crate::service::start_socket() {
-            Ok(()) => true,
-            Err(e) => {
-                log::warn!("couldn't start goattyd's user service, starting it directly: {e:#}");
-                false
+    let is_service = crate::service::unit_socket_path().is_some_and(|p| p == path) && crate::service::installed();
+    let via_service = is_service && {
+        if crate::service::service_active() {
+            // The service's daemon is already running (e.g. its socket was
+            // removed by cache cleanup and the daemon's 2 s watchdog is about
+            // to re-bind it). Leave it untouched so its sessions survive.
+            true
+        } else {
+            match crate::service::start_socket() {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("couldn't start goattyd's user service, starting it directly: {e:#}");
+                    false
+                }
             }
         }
     };
     if !via_service {
         spawn_daemon(daemon_exe, &dir, &log_path)?;
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    // Under a user service, give a running daemon's 2 s socket watchdog ample
+    // time to re-bind if its socket file vanished.
+    let wait = if via_service { Duration::from_secs(4) } else { Duration::from_secs(3) };
+    let deadline = Instant::now() + wait;
     loop {
         if let Ok(s) = UnixStream::connect(&path) {
             return Ok(s);
@@ -429,5 +448,33 @@ mod tests {
         assert_ne!(cmd_a.cache_key(), cmd_b.cache_key());
         assert_ne!(cmd_a.cache_key(), ssh_a.cache_key());
         assert_ne!(Endpoint::Local.cache_key(), ssh_a.cache_key());
+    }
+
+    #[test]
+    fn try_connect_existing_falls_back_to_legacy_socket_and_prefers_primary() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary.sock");
+        let legacy = dir.path().join("legacy.sock");
+
+        assert!(try_connect_existing(&primary, Some(&legacy)).is_none());
+
+        let legacy_listener = UnixListener::bind(&legacy).unwrap();
+        let client = try_connect_existing(&primary, Some(&legacy)).expect("should fall back to legacy socket");
+        let (mut server, _) = legacy_listener.accept().unwrap();
+        server.write_all(b"legacy").unwrap();
+        let mut buf = [0u8; 6];
+        let mut client = client;
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"legacy");
+
+        let primary_listener = UnixListener::bind(&primary).unwrap();
+        let client = try_connect_existing(&primary, Some(&legacy)).expect("should prefer primary socket");
+        let (mut server, _) = primary_listener.accept().unwrap();
+        server.write_all(b"primry").unwrap();
+        let mut client = client;
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"primry");
     }
 }

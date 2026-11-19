@@ -149,6 +149,11 @@ fn is_active(unit: &str) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
+pub fn service_active() -> bool {
+    is_active(SERVICE_UNIT)
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn start_socket() -> Result<()> {
     systemctl(&["start", SOCKET_UNIT]).map(drop)
 }

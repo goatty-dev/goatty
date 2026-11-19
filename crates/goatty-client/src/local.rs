@@ -288,14 +288,33 @@ pub fn can_keep_sessions(protocol: u32) -> bool {
 /// can do that (protocol v10 on). One that can't is stopped only with
 /// `force`, which ends its sessions; without it that's an error.
 pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
-    let mut control = match Control::connect_local("goatty-restart") {
+    let primary = goatty_proto::socket_path();
+    let mut sock = primary.clone();
+    let mut control = match Control::connect(&primary, "goatty-restart") {
         Ok(c) => c,
         Err(e) => {
-            if UnixStream::connect(goatty_proto::socket_path()).is_err() {
-                return Ok(Restarted::NotRunning);
+            if UnixStream::connect(&primary).is_err()
+                && let Some(legacy) = goatty_proto::legacy_socket_path()
+                && UnixStream::connect(&legacy).is_ok()
+            {
+                sock = legacy;
+                match Control::connect(&sock, "goatty-restart") {
+                    Ok(c) => c,
+                    Err(le) => {
+                        if UnixStream::connect(&sock).is_err() {
+                            return Ok(Restarted::NotRunning);
+                        }
+                        anyhow::ensure!(force, "{le:#}");
+                        return stop_daemon(true).map(Restarted::Stopped);
+                    }
+                }
+            } else {
+                if UnixStream::connect(&primary).is_err() {
+                    return Ok(Restarted::NotRunning);
+                }
+                anyhow::ensure!(force, "{e:#}");
+                return stop_daemon(true).map(Restarted::Stopped);
             }
-            anyhow::ensure!(force, "{e:#}");
-            return stop_daemon(true).map(Restarted::Stopped);
         }
     };
     if !can_keep_sessions(control.protocol_version()) {
@@ -312,11 +331,15 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     let pid = control.pid();
     let sessions = control.list_sessions()?.len();
     control.restart(exe)?;
-    // The new image accepts on the same socket once it took the sessions over.
+    // The new image accepts on the same socket once it took the sessions over
+    // (and may also bind `primary` if upgrading off the legacy macOS path).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(50));
-        match Control::connect_within(&goatty_proto::socket_path(), "goatty-restart", Some(left)) {
+        let attempt = Control::connect_within(&sock, "goatty-restart", Some(left)).or_else(|e| {
+            if sock != primary { Control::connect_within(&primary, "goatty-restart", Some(left)).map_err(|_| e) } else { Err(e) }
+        });
+        match attempt {
             Ok(c) if c.pid() == pid => return Ok(Restarted::Kept { sessions }),
             Ok(c) => anyhow::bail!("another goattyd (pid {}) answers now", c.pid()),
             Err(e) if Instant::now() > deadline => return Err(e.context("goattyd didn't come back after restarting")),
@@ -397,29 +420,59 @@ fn wait_gone(pid: u32, timeout: Duration) -> bool {
 /// runs it, else SIGTERM (SIGKILL after 5 s) to the socket's owner once it's
 /// checked to be a goattyd (`SO_PEERCRED` / `LOCAL_PEERPID`).
 pub fn stop_daemon(force: bool) -> Result<Stopped> {
-    let path = goatty_proto::socket_path();
-    let is_service_socket = service::unit_socket_path().is_some_and(|p| p == path);
+    let mut path = goatty_proto::socket_path();
+    let mut is_service_socket = service::unit_socket_path().is_some_and(|p| p == path);
     // Under socket activation, connecting to an idle listener would wake
     // goattyd just to shut it down. If only the supervisor's socket is active,
-    // no daemon is running.
+    // no daemon is running there (still check any pre-upgrade macOS socket).
     if is_service_socket && service::installed() {
         let st = service::status();
         if st.socket_active && !st.service_active {
-            return Ok(Stopped::NotRunning);
+            if let Some(legacy) = goatty_proto::legacy_socket_path()
+                && UnixStream::connect(&legacy).is_ok()
+            {
+                path = legacy;
+                is_service_socket = false;
+            } else {
+                return Ok(Stopped::NotRunning);
+            }
         }
     }
-    let err = match Control::connect_local("goatty-stop").and_then(|mut c| c.shutdown().map(|()| c.pid())) {
+    let connect_and_shutdown = |p: &Path| Control::connect(p, "goatty-stop").and_then(|mut c| c.shutdown().map(|()| c.pid()));
+    let err = match connect_and_shutdown(&path) {
         Ok(pid) => {
             if !wait_gone(pid, Duration::from_secs(5)) {
                 anyhow::bail!("goattyd (pid {pid}) is still running 5 s after it was asked to stop");
             }
             return Ok(Stopped::Asked);
         }
-        Err(e) if force => e,
-        Err(e) => return Err(e),
+        Err(e) => {
+            if UnixStream::connect(&path).is_err()
+                && let Some(legacy) = goatty_proto::legacy_socket_path()
+                && legacy != path
+                && UnixStream::connect(&legacy).is_ok()
+            {
+                path = legacy;
+                is_service_socket = false;
+                match connect_and_shutdown(&path) {
+                    Ok(pid) => {
+                        if !wait_gone(pid, Duration::from_secs(5)) {
+                            anyhow::bail!("goattyd (pid {pid}) is still running 5 s after it was asked to stop");
+                        }
+                        return Ok(Stopped::Asked);
+                    }
+                    Err(le) if force => le,
+                    Err(le) => return Err(le),
+                }
+            } else if force {
+                e
+            } else {
+                return Err(e);
+            }
+        }
     };
     let why = format!("{err:#}");
-    if is_service_socket && service::status().service_active {
+    if is_service_socket && service::service_active() {
         service::stop_service()?;
         return Ok(Stopped::Service { why });
     }

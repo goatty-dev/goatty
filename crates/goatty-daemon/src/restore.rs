@@ -47,7 +47,7 @@ use crate::systemd::StoredPty;
 
 /// The newest state format this build reads; `goattyd restore-version`
 /// prints it, and a restart only runs a goattyd that reads ours.
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 /// How long a restart waits for a session's output pump to pause.
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(1);
