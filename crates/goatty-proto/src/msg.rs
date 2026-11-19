@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -65,6 +65,10 @@ pub const REMOTE_FILES_SINCE: u32 = 13;
 /// `ServerMsg::SizeControl`). Other v14 clients watch at the session's size;
 /// clients older than v14 take control with every `Attach` and `Resize`.
 pub const SIZE_CONTROL_SINCE: u32 = 14;
+
+/// v15: adaptive flow-control window on remote links (`ClientMsg::Rtt` /
+/// `ServerMsg::FlowWindow`, #9).
+pub const FLOW_CONTROL_SINCE: u32 = 15;
 
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
 /// for postcard headers and path metadata).
@@ -112,17 +116,22 @@ impl WinSize {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StreamOpts {
     /// Max unacknowledged stream bytes before the daemon switches this
-    /// subscriber to skip-and-resync.
+    /// subscriber to skip-and-resync. For remote links this is the starting
+    /// window; the daemon adapts it from delivery rate and RTT (#9).
     pub window: u32,
     /// Max scrollback lines replayed in the attach snapshot.
     pub history: u32,
 }
 
 impl StreamOpts {
+    /// Minimum flow-control window (64 KiB).
+    pub const MIN_WINDOW: u32 = 64 << 10;
+    /// Maximum adaptive flow-control window (8 MiB, matching `LOCAL`).
+    pub const MAX_WINDOW: u32 = 8 << 20;
     /// Unix socket: effectively lossless and full history.
-    pub const LOCAL: Self = Self { window: 8 << 20, history: 5_000 };
-    /// SSH/network: bounded in-flight data, so Ctrl+C on a flood is visible
-    /// within roughly one window's transfer time.
+    pub const LOCAL: Self = Self { window: Self::MAX_WINDOW, history: 5_000 };
+    /// SSH/network: bounded initial in-flight data; adapted across
+    /// `MIN_WINDOW..=MAX_WINDOW` from measured delivery rate and RTT (#9).
     pub const REMOTE: Self = Self { window: 256 << 10, history: 2_000 };
 }
 
@@ -324,6 +333,13 @@ pub enum ClientMsg {
     /// `SizeControl`.
     TakeSize {
         session: SessionId,
+    },
+    /// v15: latest round-trip time measured by the client from `Ping`/`Pong`,
+    /// in microseconds. The daemon combines this with delivery rate from
+    /// `Ack`s to size the adaptive flow-control window on remote links (#9).
+    /// No reply.
+    Rtt {
+        rtt_us: u64,
     },
 }
 
@@ -562,6 +578,12 @@ pub enum ServerMsg {
         size: WinSize,
         controlling: bool,
     },
+    /// v15: active adaptive flow-control window for this connection, in bytes.
+    /// Sent when the window changes materially so the client matches its `Ack`
+    /// cadence (`window / 4`) to the daemon's active window. Not stream data.
+    FlowWindow {
+        window: u32,
+    },
 }
 
 impl ServerMsg {
@@ -670,5 +692,11 @@ mod tests {
         assert_eq!(postcard::to_allocvec(&ServerMsg::Cwd { session: 1, cwd: None }).unwrap()[0], 21);
         assert_eq!(postcard::to_allocvec(&ServerMsg::PathStat { req: 1, info: None }).unwrap()[0], 22);
         assert_eq!(postcard::to_allocvec(&ServerMsg::FileData { req: 1, path: String::new(), data: vec![] }).unwrap()[0], 23);
+        // v14 additions come after v13's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::TakeSize { session: 1 }).unwrap()[0], 29);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::SizeControl { session: 1, size, controlling: true }).unwrap()[0], 24);
+        // v15 additions come after v14's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Rtt { rtt_us: 1000 }).unwrap()[0], 30);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::FlowWindow { window: StreamOpts::REMOTE.window }).unwrap()[0], 25);
     }
 }

@@ -103,7 +103,8 @@ fn pump_until(s: &mut UnixStream, session: SessionId, t: &Terminal, consumed: &m
             | ServerMsg::Process { .. }
             | ServerMsg::Cwd { .. }
             | ServerMsg::TopLine { .. }
-            | ServerMsg::SizeControl { .. } => {}
+            | ServerMsg::SizeControl { .. }
+            | ServerMsg::FlowWindow { .. } => {}
             other => panic!("unexpected {other:?}"),
         }
         send(s, &ClientMsg::Ack { session, consumed: *consumed });
@@ -116,7 +117,11 @@ fn create(s: &mut UnixStream, opts: StreamOpts) -> (SessionId, u64) {
         match read_msg::<_, ServerMsg>(s).unwrap() {
             ServerMsg::Attached { req: 1, session, snapshot } => return (session, snapshot.len() as u64),
             // Another session's foreground program, cwd, or line numbers (multiplexed connection).
-            ServerMsg::Process { .. } | ServerMsg::Cwd { .. } | ServerMsg::TopLine { .. } | ServerMsg::SizeControl { .. } => {}
+            ServerMsg::Process { .. }
+            | ServerMsg::Cwd { .. }
+            | ServerMsg::TopLine { .. }
+            | ServerMsg::SizeControl { .. }
+            | ServerMsg::FlowWindow { .. } => {}
             other => panic!("{other:?}"),
         }
     }
@@ -290,7 +295,7 @@ fn slow_client_is_skipped_forward_with_resync() {
     // Foreground-program changes aren't stream data and may come first.
     let resync = loop {
         match read_msg::<_, ServerMsg>(&mut c).unwrap() {
-            ServerMsg::Process { .. } => continue,
+            ServerMsg::Process { .. } | ServerMsg::FlowWindow { .. } => continue,
             other => break other,
         }
     };

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
-    ClientMsg, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE, PROTOCOL_VERSION,
-    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId, SessionInfo, StreamOpts,
-    WinSize, encode, read_msg,
+    ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE,
+    PROTOCOL_VERSION, REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId,
+    SessionInfo, StreamOpts, WinSize, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -97,6 +97,9 @@ type Reader = std::io::BufReader<Box<dyn Read + Send>>;
 struct Shared {
     endpoint: Endpoint,
     opts: StreamOpts,
+    /// Active flow-control window in bytes (starts at `opts.window` and
+    /// tracks `ServerMsg::FlowWindow` on remote v15+ links).
+    flow_window: AtomicU32,
     client_name: String,
     auto_reconnect: bool,
     out: flume::Sender<WriterCmd>,
@@ -193,6 +196,8 @@ impl Shared {
                 let _ = self.out.send(WriterCmd::Replace(t.writer));
                 self.version.store(g.version, Ordering::Relaxed);
                 self.daemon_pid.store(g.pid, Ordering::Relaxed);
+                self.flow_window.store(self.opts.window, Ordering::Relaxed);
+                self.rtt_us.store(0, Ordering::Relaxed);
                 self.last_rx_us.store(self.now_us(), Ordering::Relaxed);
                 self.connected.store(true, Ordering::Release);
                 // Snapshots and history are mostly repetitive text: worth
@@ -245,6 +250,7 @@ impl Connection {
         let shared = Arc::new(Shared {
             endpoint,
             opts,
+            flow_window: AtomicU32::new(opts.window),
             client_name: client_name.into(),
             auto_reconnect,
             out,
@@ -303,6 +309,9 @@ impl Connection {
         let s = shared.clone();
         std::thread::Builder::new().name("goatty-reader".into()).spawn(move || reader_main(s, reader))?;
         if auto_reconnect && !shared.endpoint.is_local() {
+            // Measure RTT right away (for adaptive flow control, echo
+            // prediction and the host switcher) instead of waiting 5 s.
+            shared.send(&ClientMsg::Ping { nonce: shared.now_us() });
             let weak = Arc::downgrade(&shared);
             std::thread::Builder::new().name("goatty-heartbeat".into()).spawn(move || heartbeat(weak))?;
         }
@@ -337,6 +346,12 @@ impl Connection {
             0 => None,
             us => Some(Duration::from_micros(us)),
         }
+    }
+
+    /// Active flow-control window in bytes (starts at `opts.window` and adapts
+    /// on remote v15+ links).
+    pub fn flow_window(&self) -> u32 {
+        self.shared.flow_window.load(Ordering::Relaxed)
     }
 
     fn request(
@@ -754,6 +769,7 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
     loop {
         let err = read_loop(&s, &mut reader);
         s.connected.store(false, Ordering::Release);
+        s.rtt_us.store(0, Ordering::Relaxed);
         s.close_transport();
         if s.closed.load(Ordering::Acquire) {
             return;
@@ -814,6 +830,9 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                     *s.host.lock() = host;
                     reader = r;
                     backoff = [200u64, 500, 1000, 2000, 5000].iter().copied().chain(std::iter::repeat(5000));
+                    if !s.endpoint.is_local() {
+                        s.send(&ClientMsg::Ping { nonce: s.now_us() });
+                    }
                     // Under the panes lock, so a resize meanwhile is either in
                     // the `Attach` or sent after it (see `Connection::resize`).
                     let panes = s.panes.lock();
@@ -870,11 +889,14 @@ fn read_loop(s: &Shared, reader: &mut Reader) -> anyhow::Error {
         dispatch(s, msg);
         // Ack policy: always once the transport buffer is drained (so a
         // lagging subscriber is never left waiting on a partial ack), and in
-        // between every quarter window so the stream keeps flowing.
+        // between every quarter of the active window so the stream keeps flowing.
         let drained = reader.buffer().is_empty();
-        let quarter = (s.opts.window / 4) as u64;
+        let quarter = u64::from((s.flow_window.load(Ordering::Relaxed) / 4).max(StreamOpts::MIN_WINDOW / 4));
         let mut acks = Vec::new();
         for (id, p) in s.panes.lock().iter_mut() {
+            if !p.linked {
+                continue;
+            }
             let unacked = p.consumed - p.acked;
             if unacked > 0 && (drained || unacked >= quarter) {
                 p.acked = p.consumed;
@@ -979,6 +1001,12 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 }
             }
         }
+        ServerMsg::FlowWindow { window } => {
+            if !s.endpoint.is_local() {
+                let clamped = window.clamp(StreamOpts::MIN_WINDOW, StreamOpts::MAX_WINDOW);
+                s.flow_window.store(clamped, Ordering::Relaxed);
+            }
+        }
         ServerMsg::TopLine { session, line, cause } => {
             let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
             if let Some(sink) = sink {
@@ -994,7 +1022,14 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         }
         ServerMsg::Zstd { .. } => log::warn!("nested compressed frame"),
         ServerMsg::Pong { nonce } => {
-            s.rtt_us.store(s.now_us().saturating_sub(nonce).max(1), Ordering::Relaxed);
+            let now = s.now_us();
+            if nonce <= now {
+                let rtt_us = now.saturating_sub(nonce).max(1);
+                s.rtt_us.store(rtt_us, Ordering::Relaxed);
+                if s.version.load(Ordering::Relaxed) >= FLOW_CONTROL_SINCE && !s.endpoint.is_local() {
+                    s.send(&ClientMsg::Rtt { rtt_us });
+                }
+            }
         }
         ServerMsg::Sessions { req, .. }
         | ServerMsg::Ok { req }
@@ -1121,6 +1156,7 @@ mod tests {
         let shared = Arc::new(Shared {
             endpoint: Endpoint::command_line("false").unwrap(),
             opts: StreamOpts::LOCAL,
+            flow_window: AtomicU32::new(StreamOpts::LOCAL.window),
             client_name: "test".into(),
             auto_reconnect: false,
             out,
@@ -1138,7 +1174,7 @@ mod tests {
             closer: Mutex::new(None),
             epoch: Instant::now(),
             last_rx_us: AtomicU64::new(0),
-            rtt_us: AtomicU64::new(0),
+            rtt_us: AtomicU64::new(42_000),
             reconnect_tx,
             reconnect_rx,
         });
@@ -1153,6 +1189,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         let conn = Connection { shared };
+        assert_eq!(conn.rtt(), Some(Duration::from_millis(42)));
 
         let err = conn.set_host_settings_within("{}".into(), true, Duration::from_secs(5)).unwrap_err();
         assert!(err.downcast_ref::<ReplyLost>().is_some(), "expected ReplyLost, got: {err:#}");
@@ -1161,6 +1198,7 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "reader did not exit after one-shot disconnect");
         reader_handle.join().unwrap();
         assert!(!conn.is_connected());
+        assert_eq!(conn.rtt(), None, "disconnect must clear stale RTT");
         drop(client_w);
         server.join().unwrap();
     }
