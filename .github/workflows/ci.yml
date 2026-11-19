@@ -39,6 +39,8 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
       - run: cargo install --locked cargo-zigbuild
       - run: cargo zigbuild --release --locked -p goatty-daemon --target x86_64-unknown-linux-musl
       - run: target/x86_64-unknown-linux-musl/release/goattyd --version
