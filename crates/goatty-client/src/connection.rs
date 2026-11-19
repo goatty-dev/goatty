@@ -197,6 +197,7 @@ impl Shared {
                 self.version.store(g.version, Ordering::Relaxed);
                 self.daemon_pid.store(g.pid, Ordering::Relaxed);
                 self.flow_window.store(self.opts.window, Ordering::Relaxed);
+                self.rtt_us.store(0, Ordering::Relaxed);
                 self.last_rx_us.store(self.now_us(), Ordering::Relaxed);
                 self.connected.store(true, Ordering::Release);
                 // Snapshots and history are mostly repetitive text: worth
@@ -768,6 +769,7 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
     loop {
         let err = read_loop(&s, &mut reader);
         s.connected.store(false, Ordering::Release);
+        s.rtt_us.store(0, Ordering::Relaxed);
         s.close_transport();
         if s.closed.load(Ordering::Acquire) {
             return;
@@ -892,6 +894,9 @@ fn read_loop(s: &Shared, reader: &mut Reader) -> anyhow::Error {
         let quarter = u64::from((s.flow_window.load(Ordering::Relaxed) / 4).max(StreamOpts::MIN_WINDOW / 4));
         let mut acks = Vec::new();
         for (id, p) in s.panes.lock().iter_mut() {
+            if !p.linked {
+                continue;
+            }
             let unacked = p.consumed - p.acked;
             if unacked > 0 && (drained || unacked >= quarter) {
                 p.acked = p.consumed;
@@ -1169,7 +1174,7 @@ mod tests {
             closer: Mutex::new(None),
             epoch: Instant::now(),
             last_rx_us: AtomicU64::new(0),
-            rtt_us: AtomicU64::new(0),
+            rtt_us: AtomicU64::new(42_000),
             reconnect_tx,
             reconnect_rx,
         });
@@ -1184,6 +1189,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         let conn = Connection { shared };
+        assert_eq!(conn.rtt(), Some(Duration::from_millis(42)));
 
         let err = conn.set_host_settings_within("{}".into(), true, Duration::from_secs(5)).unwrap_err();
         assert!(err.downcast_ref::<ReplyLost>().is_some(), "expected ReplyLost, got: {err:#}");
@@ -1192,6 +1198,7 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "reader did not exit after one-shot disconnect");
         reader_handle.join().unwrap();
         assert!(!conn.is_connected());
+        assert_eq!(conn.rtt(), None, "disconnect must clear stale RTT");
         drop(client_w);
         server.join().unwrap();
     }

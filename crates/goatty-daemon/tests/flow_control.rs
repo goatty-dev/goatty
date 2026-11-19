@@ -7,7 +7,7 @@
 //! * pre-v15 clients never receive `ServerMsg::FlowWindow`,
 //! * reconnect resets the flow window and re-measures RTT on the new transport.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -45,12 +45,15 @@ fn start_daemon() -> Daemon {
         .env_remove("XDG_DATA_HOME")
         .spawn()
         .unwrap();
+    // Wrap `child` in `Daemon` before polling so Drop kills/reaps it even if
+    // startup times out.
+    let daemon = Daemon { child, sock, _dir: dir };
     let deadline = Instant::now() + Duration::from_secs(5);
-    while UnixStream::connect(&sock).is_err() {
+    while UnixStream::connect(&daemon.sock).is_err() {
         assert!(Instant::now() < deadline, "daemon did not start");
         std::thread::sleep(Duration::from_millis(20));
     }
-    Daemon { child, sock, _dir: dir }
+    daemon
 }
 
 const SIZE: WinSize = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
@@ -115,26 +118,73 @@ fn proxy_endpoint(d: &Daemon) -> Endpoint {
     }
 }
 
-fn send(s: &mut UnixStream, msg: &ClientMsg) {
-    s.write_all(&encode(msg).unwrap()).unwrap();
+/// Framed protocol reader that retains partial header/body bytes across
+/// `WouldBlock`/`TimedOut` retries so idle timeouts never split a frame.
+struct FrameReader {
+    stream: UnixStream,
+    buf: Vec<u8>,
 }
 
-fn connect_version(sock: &Path, version: u32) -> UnixStream {
-    let mut s = UnixStream::connect(sock).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    send(&mut s, &ClientMsg::Hello { version, client: "flow-test".into() });
-    match read_msg::<_, ServerMsg>(&mut s).unwrap() {
+impl FrameReader {
+    fn new(stream: UnixStream) -> Self {
+        Self { stream, buf: Vec::new() }
+    }
+
+    fn send(&mut self, msg: &ClientMsg) {
+        self.stream.write_all(&encode(msg).unwrap()).unwrap();
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) {
+        self.stream.set_read_timeout(timeout).unwrap();
+    }
+
+    fn try_read_msg(&mut self) -> std::io::Result<Option<ServerMsg>> {
+        let mut tmp = [0u8; 64 * 1024];
+        loop {
+            if self.buf.len() >= 4 {
+                let body_len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
+                let frame_len = 4usize.checked_add(body_len).expect("frame length overflow");
+                if self.buf.len() >= frame_len {
+                    let msg = read_msg::<_, ServerMsg>(&mut std::io::Cursor::new(&self.buf[..frame_len]))?;
+                    self.buf.drain(..frame_len);
+                    return Ok(Some(msg));
+                }
+            }
+            match self.stream.read(&mut tmp) {
+                Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn read_msg(&mut self) -> ServerMsg {
+        self.try_read_msg().unwrap().expect("unexpected read timeout")
+    }
+}
+
+fn connect_version(sock: &Path, version: u32) -> FrameReader {
+    let s = UnixStream::connect(sock).unwrap();
+    let mut r = FrameReader::new(s);
+    r.set_read_timeout(Some(Duration::from_secs(5)));
+    r.send(&ClientMsg::Hello { version, client: "flow-test".into() });
+    match r.read_msg() {
         ServerMsg::Hello { version: agreed, .. } => assert_eq!(agreed, version.min(PROTOCOL_VERSION)),
         other => panic!("expected Hello, got {other:?}"),
     }
-    s
+    r
 }
 
-fn create_raw(s: &mut UnixStream, opts: StreamOpts) -> (SessionId, u64) {
-    send(s, &ClientMsg::Create { req: 1, size: SIZE, cwd: None, opts });
+fn create_raw(r: &mut FrameReader, opts: StreamOpts, allow_flow_window: bool) -> (SessionId, u64) {
+    r.send(&ClientMsg::Create { req: 1, size: SIZE, cwd: None, opts });
     loop {
-        match read_msg::<_, ServerMsg>(s).unwrap() {
+        match r.read_msg() {
             ServerMsg::Attached { req: 1, session, snapshot } => return (session, snapshot.len() as u64),
+            ServerMsg::FlowWindow { window } if !allow_flow_window => {
+                panic!("unexpected FlowWindow({window}) during Create");
+            }
             ServerMsg::Process { .. }
             | ServerMsg::Cwd { .. }
             | ServerMsg::TopLine { .. }
@@ -182,18 +232,15 @@ fn fast_proxy_ramps_window_up_and_measures_rtt() {
 fn slow_link_shrinks_window_to_floor_and_resyncs() {
     let d = start_daemon();
     let mut c = connect_version(&d.sock, PROTOCOL_VERSION);
-    send(&mut c, &ClientMsg::Rtt { rtt_us: 1_000 });
-    let (id, mut consumed) = create_raw(&mut c, StreamOpts::REMOTE);
-    send(&mut c, &ClientMsg::Ack { session: id, consumed });
+    c.send(&ClientMsg::Rtt { rtt_us: 1_000 });
+    let (id, mut consumed) = create_raw(&mut c, StreamOpts::REMOTE, true);
+    c.send(&ClientMsg::Ack { session: id, consumed });
 
     // Flood ~12 MB so the daemon stays backpressured while we pace acks at ~400 KB/s.
-    send(
-        &mut c,
-        &ClientMsg::Input {
-            session: id,
-            data: b"dd if=/dev/zero bs=65536 count=200 2>/dev/null | tr '\\0' B; echo; echo SLOW-$((40+2))\r".to_vec(),
-        },
-    );
+    c.send(&ClientMsg::Input {
+        session: id,
+        data: b"dd if=/dev/zero bs=65536 count=200 2>/dev/null | tr '\\0' B; echo; echo SLOW-$((40+2))\r".to_vec(),
+    });
 
     let t = term();
     let mut min_window_seen = StreamOpts::REMOTE.window;
@@ -201,23 +248,19 @@ fn slow_link_shrinks_window_to_floor_and_resyncs() {
     let mut delivered = 0u64;
     let mut unacked = 0u64;
     let deadline = Instant::now() + Duration::from_secs(15);
-    c.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    c.set_read_timeout(Some(Duration::from_millis(100)));
 
     while !screen_text(&t).contains("SLOW-42") {
         assert!(Instant::now() < deadline, "timed out waiting for SLOW-42; screen:\n{}", screen_text(&t));
-        let msg = match read_msg::<_, ServerMsg>(&mut c) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                if unacked > 0 {
-                    // Drain-ack partial window (matches real client's buffer-empty rule).
-                    let pace_ms = (unacked * 1000 / 400_000).max(50);
-                    std::thread::sleep(Duration::from_millis(pace_ms));
-                    send(&mut c, &ClientMsg::Ack { session: id, consumed });
-                    unacked = 0;
-                }
-                continue;
+        let Some(msg) = c.try_read_msg().unwrap() else {
+            if unacked > 0 {
+                // Drain-ack partial window (matches real client's buffer-empty rule).
+                let pace_ms = (unacked * 1000 / 400_000).max(50);
+                std::thread::sleep(Duration::from_millis(pace_ms));
+                c.send(&ClientMsg::Ack { session: id, consumed });
+                unacked = 0;
             }
-            Err(e) => panic!("read_msg failed: {e}"),
+            continue;
         };
         let slen = msg.stream_len() as u64;
         consumed += slen;
@@ -244,7 +287,7 @@ fn slow_link_shrinks_window_to_floor_and_resyncs() {
         // Simulate a ~400 KB/s link: wait ~160 ms per 64 KiB before acking.
         if unacked >= 64 << 10 {
             std::thread::sleep(Duration::from_millis(160));
-            send(&mut c, &ClientMsg::Ack { session: id, consumed });
+            c.send(&ClientMsg::Ack { session: id, consumed });
             unacked = 0;
         }
     }
@@ -264,20 +307,17 @@ fn slow_link_shrinks_window_to_floor_and_resyncs() {
 fn local_connection_keeps_fixed_local_window() {
     let d = start_daemon();
     let mut c = connect_version(&d.sock, PROTOCOL_VERSION);
-    let (id, mut consumed) = create_raw(&mut c, StreamOpts::LOCAL);
-    send(&mut c, &ClientMsg::Ack { session: id, consumed });
+    let (id, mut consumed) = create_raw(&mut c, StreamOpts::LOCAL, false);
+    c.send(&ClientMsg::Ack { session: id, consumed });
 
     // Even if a client sends Rtt and paces acks slowly, a LOCAL (8 MiB)
     // subscription never attaches adaptive flow control, never emits
     // FlowWindow, and delivers a 2 MiB burst losslessly without resync.
-    send(&mut c, &ClientMsg::Rtt { rtt_us: 1_000 });
-    send(
-        &mut c,
-        &ClientMsg::Input {
-            session: id,
-            data: b"dd if=/dev/zero bs=65536 count=32 2>/dev/null | tr '\\0' L; echo; echo LOCAL-$((40+2))\r".to_vec(),
-        },
-    );
+    c.send(&ClientMsg::Rtt { rtt_us: 1_000 });
+    c.send(&ClientMsg::Input {
+        session: id,
+        data: b"dd if=/dev/zero bs=65536 count=32 2>/dev/null | tr '\\0' L; echo; echo LOCAL-$((40+2))\r".to_vec(),
+    });
 
     let t = term();
     let mut delivered = 0u64;
@@ -285,7 +325,7 @@ fn local_connection_keeps_fixed_local_window() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !screen_text(&t).contains("LOCAL-42") {
         assert!(Instant::now() < deadline, "timed out waiting for LOCAL-42");
-        let msg = read_msg::<_, ServerMsg>(&mut c).unwrap();
+        let msg = c.read_msg();
         let slen = msg.stream_len() as u64;
         consumed += slen;
         unacked += slen;
@@ -305,45 +345,80 @@ fn local_connection_keeps_fixed_local_window() {
         }
         if unacked >= 256 << 10 {
             std::thread::sleep(Duration::from_millis(60));
-            send(&mut c, &ClientMsg::Ack { session: id, consumed });
+            c.send(&ClientMsg::Ack { session: id, consumed });
             unacked = 0;
         }
     }
     assert!(delivered >= 2_000_000, "expected full 2 MiB delivered, got {delivered}");
+
+    // Drain through a Ping/Pong barrier so any queued server notification is observed.
+    c.send(&ClientMsg::Ack { session: id, consumed });
+    c.send(&ClientMsg::Ping { nonce: 77 });
+    loop {
+        match c.read_msg() {
+            ServerMsg::FlowWindow { window } => panic!("LOCAL subscription must not emit FlowWindow({window})"),
+            ServerMsg::Pong { nonce: 77 } => break,
+            _ => {}
+        }
+    }
 }
 
 #[test]
-fn pre_v15_client_never_receives_flow_window() {
+fn pre_v15_client_never_receives_flow_window_or_sub_256k_floor() {
     let d = start_daemon();
     let mut c = connect_version(&d.sock, FLOW_CONTROL_SINCE - 1);
-    let (id, mut consumed) = create_raw(&mut c, StreamOpts::REMOTE);
-    send(&mut c, &ClientMsg::Ack { session: id, consumed });
+    // Even if a pre-v15 peer requests a smaller 128 KiB starting window, the
+    // daemon enforces at least `StreamOpts::REMOTE.window` (256 KiB) and never
+    // sends `FlowWindow` (including during Create).
+    let (id, mut consumed) = create_raw(&mut c, StreamOpts { window: 128 << 10, history: 0 }, false);
+    c.send(&ClientMsg::Ack { session: id, consumed });
 
-    send(
-        &mut c,
-        &ClientMsg::Input {
-            session: id,
-            data: b"dd if=/dev/zero bs=65536 count=160 2>/dev/null | tr '\\0' O; echo; echo OLD-$((40+2))\r".to_vec(),
-        },
-    );
-
+    // A 192 KiB unacked burst exceeds 128 KiB but stays below the 256 KiB
+    // legacy floor, so it must arrive losslessly without triggering `Resync`.
+    c.send(&ClientMsg::Input {
+        session: id,
+        data: b"dd if=/dev/zero bs=4096 count=48 2>/dev/null | tr '\\0' F; echo; echo FLOOR-$((40+2))\r".to_vec(),
+    });
     let t = term();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !screen_text(&t).contains("FLOOR-42") {
+        assert!(Instant::now() < deadline, "timed out waiting for FLOOR-42");
+        let msg = c.read_msg();
+        consumed += msg.stream_len() as u64;
+        match msg {
+            ServerMsg::FlowWindow { .. } => panic!("daemon must not send FlowWindow to pre-v15 client"),
+            ServerMsg::Resync { .. } => panic!("192 KiB burst must stay lossless under pre-v15 256 KiB floor"),
+            ServerMsg::Output { data, .. } => {
+                t.feed(&data);
+            }
+            ServerMsg::Process { .. }
+            | ServerMsg::Cwd { .. }
+            | ServerMsg::TopLine { .. }
+            | ServerMsg::SizeControl { .. }
+            | ServerMsg::Pong { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    c.send(&ClientMsg::Ack { session: id, consumed });
+
+    // Now drive a slow 10 MB flood and verify `FlowWindow` is still never sent.
+    c.send(&ClientMsg::Input {
+        session: id,
+        data: b"dd if=/dev/zero bs=65536 count=160 2>/dev/null | tr '\\0' O; echo; echo OLD-$((40+2))\r".to_vec(),
+    });
+
     let mut unacked = 0u64;
     let deadline = Instant::now() + Duration::from_secs(15);
-    c.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    c.set_read_timeout(Some(Duration::from_millis(100)));
     while !screen_text(&t).contains("OLD-42") {
         assert!(Instant::now() < deadline, "timed out waiting for OLD-42");
-        let msg = match read_msg::<_, ServerMsg>(&mut c) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                if unacked > 0 {
-                    std::thread::sleep(Duration::from_millis(80));
-                    send(&mut c, &ClientMsg::Ack { session: id, consumed });
-                    unacked = 0;
-                }
-                continue;
+        let Some(msg) = c.try_read_msg().unwrap() else {
+            if unacked > 0 {
+                std::thread::sleep(Duration::from_millis(80));
+                c.send(&ClientMsg::Ack { session: id, consumed });
+                unacked = 0;
             }
-            Err(e) => panic!("read_msg failed: {e}"),
+            continue;
         };
         let slen = msg.stream_len() as u64;
         consumed += slen;
@@ -355,7 +430,7 @@ fn pre_v15_client_never_receives_flow_window() {
             }
             ServerMsg::Resync { snapshot, .. } => {
                 t.feed(&snapshot);
-                send(&mut c, &ClientMsg::Ack { session: id, consumed });
+                c.send(&ClientMsg::Ack { session: id, consumed });
                 unacked = 0;
             }
             ServerMsg::Process { .. }
@@ -367,8 +442,21 @@ fn pre_v15_client_never_receives_flow_window() {
         }
         if unacked >= 64 << 10 {
             std::thread::sleep(Duration::from_millis(120));
-            send(&mut c, &ClientMsg::Ack { session: id, consumed });
+            c.send(&ClientMsg::Ack { session: id, consumed });
             unacked = 0;
+        }
+    }
+
+    // Protocol barrier: send final Ack + Ping and wait for Pong so any pending
+    // notification produced by the flood is observed before the test exits.
+    c.set_read_timeout(Some(Duration::from_secs(5)));
+    c.send(&ClientMsg::Ack { session: id, consumed });
+    c.send(&ClientMsg::Ping { nonce: 99 });
+    loop {
+        match c.read_msg() {
+            ServerMsg::FlowWindow { .. } => panic!("daemon must not send FlowWindow to pre-v15 client"),
+            ServerMsg::Pong { nonce: 99 } => break,
+            _ => {}
         }
     }
 }

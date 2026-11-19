@@ -1,6 +1,7 @@
 //! One shell session: its PTY, its authoritative terminal, and the
 //! connections subscribed to its output (with per-subscriber flow control).
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -23,6 +24,95 @@ use crate::systemd::StoredPty;
 /// thread leaks if a slow or unavailable mount stalls filesystem resolution).
 const MAX_OSC_CWD_WORKERS: usize = 4;
 
+/// Per-subscriber adapter onto the connection's shared [`FlowControl`].
+///
+/// Tracks this subscriber's own `sent`/`acked` watermarks and unacknowledged
+/// zstd-compressed snapshot byte ranges so:
+/// * compressed bytes stay attributed to their exact stream positions until
+///   acknowledged or released (even across interleaved panes and epochs), and
+/// * releasing remaining `in_flight` bytes on session exit or subscriber drop
+///   is atomic and idempotent.
+struct SubFlow {
+    fc: Arc<FlowControl>,
+    state: Mutex<SubFlowState>,
+}
+
+#[derive(Default)]
+struct SubFlowState {
+    released: bool,
+    sent: u64,
+    acked: u64,
+    compressed_ranges: VecDeque<(u64, u64)>,
+}
+
+impl SubFlow {
+    fn new(fc: Arc<FlowControl>) -> Self {
+        Self { fc, state: Mutex::new(SubFlowState::default()) }
+    }
+
+    fn window(&self) -> u64 {
+        self.fc.window()
+    }
+
+    fn on_send(&self, stream_len: u64, compressed: bool) {
+        let mut st = self.state.lock();
+        if st.released {
+            return;
+        }
+        let start = st.sent;
+        let end = start.saturating_add(stream_len);
+        st.sent = end;
+        if compressed {
+            st.compressed_ranges.push_back((start, end));
+        }
+        self.fc.on_send(stream_len);
+    }
+
+    fn on_ack(&self, consumed: u64, lagged: bool) -> Option<u32> {
+        let mut st = self.state.lock();
+        if st.released {
+            return None;
+        }
+        let prev = st.acked;
+        let next = consumed.min(st.sent);
+        if next <= prev {
+            return None;
+        }
+        let delta = next - prev;
+        let mut compressed_delta = 0u64;
+        while let Some(&(start, end)) = st.compressed_ranges.front() {
+            if end <= prev {
+                st.compressed_ranges.pop_front();
+                continue;
+            }
+            if start >= next {
+                break;
+            }
+            let overlap_start = start.max(prev);
+            let overlap_end = end.min(next);
+            compressed_delta = compressed_delta.saturating_add(overlap_end.saturating_sub(overlap_start));
+            if end <= next {
+                st.compressed_ranges.pop_front();
+            } else {
+                break;
+            }
+        }
+        st.acked = next;
+        self.fc.on_ack(delta, compressed_delta, lagged)
+    }
+
+    fn release(&self) {
+        let mut st = self.state.lock();
+        if st.released {
+            return;
+        }
+        st.released = true;
+        let remaining = st.sent.saturating_sub(st.acked);
+        st.compressed_ranges.clear();
+        self.fc.on_drop_in_flight(remaining);
+    }
+}
+
 /// One connection's subscription to one session.
 ///
 /// Flow control: `sent` counts stream bytes queued for this subscriber,
@@ -35,7 +125,7 @@ pub(crate) struct Subscriber {
     conn: u64,
     tx: flume::Sender<Outbound>,
     fixed_window: u64,
-    flow: Option<Arc<FlowControl>>,
+    flow: Option<SubFlow>,
     sent: AtomicU64,
     acked: AtomicU64,
     lagging: AtomicBool,
@@ -76,15 +166,19 @@ pub(crate) struct SubConn<'a> {
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        if let Some(flow) = &self.flow {
-            flow.on_drop_in_flight(self.in_flight());
-        }
+        self.release_flow();
     }
 }
 
 impl Subscriber {
     fn window(&self) -> u64 {
-        self.flow.as_ref().map_or(self.fixed_window, |f| f.window())
+        self.flow.as_ref().map_or(self.fixed_window, SubFlow::window)
+    }
+
+    fn release_flow(&self) {
+        if let Some(flow) = &self.flow {
+            flow.release();
+        }
     }
 
     fn push(&self, frame: Frame, stream_len: usize) -> bool {
@@ -100,7 +194,11 @@ impl Subscriber {
             }
             self.sent.fetch_add(stream_len as u64, Ordering::AcqRel);
         }
-        self.tx.send(Outbound::from(frame)).is_ok()
+        let ok = self.tx.send(Outbound::from(frame)).is_ok();
+        if !ok {
+            self.release_flow();
+        }
+        ok
     }
 
     fn in_flight(&self) -> u64 {
@@ -609,7 +707,14 @@ impl Session {
     pub(crate) fn subscribe(&self, sub_conn: SubConn<'_>, req: ReqId, size: WinSize, opts: StreamOpts) -> Arc<Subscriber> {
         let SubConn { id: conn, features, flow: conn_flow, tx } = sub_conn;
         let mut subs = self.subs.lock();
-        subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
+        subs.retain(|s| {
+            if s.conn == conn {
+                s.release_flow();
+                false
+            } else {
+                true
+            }
+        }); // re-attach on the same connection replaces
         {
             let mut controller = self.controller.lock();
             // The connection that created the session gets it, even if
@@ -640,9 +745,15 @@ impl Session {
             (u64::from(opts.window), None)
         } else {
             let initial = u64::from(opts.window.max(StreamOpts::MIN_WINDOW));
-            let min_w = if features.flow_control { u64::from(StreamOpts::MIN_WINDOW) } else { initial };
+            let min_w = if features.flow_control {
+                u64::from(StreamOpts::MIN_WINDOW)
+            } else {
+                // Pre-v15 peers never receive `FlowWindow` and ack every
+                // `REMOTE.window / 4`, so never let their floor drop below 256 KiB.
+                initial.max(u64::from(StreamOpts::REMOTE.window))
+            };
             conn_flow.init_if_needed(initial, min_w, features.flow_control);
-            (initial, Some(conn_flow.clone()))
+            (initial, Some(SubFlow::new(conn_flow.clone())))
         };
         let sub = Arc::new(Subscriber {
             conn,
@@ -685,7 +796,14 @@ impl Session {
 
     pub(crate) fn unsubscribe(&self, conn: u64) {
         let mut subs = self.subs.lock();
-        subs.retain(|s| s.conn != conn);
+        subs.retain(|s| {
+            if s.conn == conn {
+                s.release_flow();
+                false
+            } else {
+                true
+            }
+        });
         let mut creator = self.creator.lock();
         if *creator == Some(conn) {
             *creator = None;
@@ -703,21 +821,32 @@ impl Session {
         let clamped = consumed.min(sent);
         let prev = sub.acked.fetch_max(clamped, Ordering::AcqRel);
         let delta = clamped.saturating_sub(prev);
-        let lagged = sub.lagging.load(Ordering::Acquire);
-        let notify = if delta > 0
-            && let Some(flow) = &sub.flow
-        {
-            flow.on_ack(delta, lagged)
-        } else {
-            None
-        };
-        if lagged && sub.in_flight() == 0 {
-            let _subs = self.subs.lock(); // order against the output pump
-            if sub.lagging.load(Ordering::Acquire) && sub.in_flight() == 0 {
+        let mut lagged = sub.lagging.load(Ordering::Acquire);
+        if sub.in_flight() == 0 {
+            let subs = self.subs.lock(); // order against the output pump
+            // Recheck under `subs`: the pump may have read pre-Ack `in_flight`
+            // and set `lagging` right as this Ack emptied the pane.
+            let should_resync = sub.lagging.load(Ordering::Acquire) && sub.in_flight() == 0;
+            lagged |= should_resync;
+            let notify = if delta > 0
+                && let Some(flow) = &sub.flow
+            {
+                flow.on_ack(clamped, lagged)
+            } else {
+                None
+            };
+            if should_resync && subs.iter().any(|s| std::ptr::eq(Arc::as_ptr(s), sub)) {
                 self.resync(sub);
             }
+            return notify;
         }
-        notify
+        if delta > 0
+            && let Some(flow) = &sub.flow
+        {
+            flow.on_ack(clamped, lagged)
+        } else {
+            None
+        }
     }
 
     /// Caller holds `subs`.
@@ -740,6 +869,10 @@ impl Session {
             if let Some(f) = &exited {
                 let _ = sub.tx.send(Outbound::from(f.clone()));
             }
+            // Debit any unacknowledged bytes immediately; `client.rs` may keep
+            // `Arc<Subscriber>` until `Detach` or disconnect, and `Drop` skips
+            // already-released subscribers.
+            sub.release_flow();
         }
     }
 }
@@ -982,5 +1115,40 @@ mod tests {
         release.wait();
         wait_workers_idle(&coord);
         assert_eq!(coord.current().as_deref(), Some("/tmp/fallback"));
+    }
+
+    #[test]
+    fn sub_flow_release_is_idempotent_and_tracks_compressed_ranges() {
+        let fc = Arc::new(FlowControl::new());
+        fc.init_if_needed(u64::from(StreamOpts::REMOTE.window), u64::from(StreamOpts::MIN_WINDOW), true);
+
+        let sub_a = SubFlow::new(fc.clone());
+        let sub_b = SubFlow::new(fc.clone());
+
+        // Sub A sends 64 KiB plain + 128 KiB compressed + 64 KiB plain;
+        // Sub B sends 32 KiB plain.
+        sub_a.on_send(64 << 10, false);
+        sub_a.on_send(128 << 10, true);
+        sub_a.on_send(64 << 10, false);
+        sub_b.on_send(32 << 10, false);
+        assert_eq!(fc.in_flight(), 288 << 10);
+
+        // Partial Ack on Sub A spans plain + half of compressed range.
+        sub_a.on_ack(128 << 10, false);
+        assert_eq!(fc.in_flight(), 160 << 10);
+
+        // Session::finish releases Sub A's remaining 128 KiB immediately,
+        // without touching Sub B's 32 KiB.
+        sub_a.release();
+        assert_eq!(fc.in_flight(), 32 << 10);
+
+        // Subsequent Drop release and late Ack on Sub A are both no-ops.
+        sub_a.release();
+        assert_eq!(sub_a.on_ack(256 << 10, false), None);
+        assert_eq!(fc.in_flight(), 32 << 10);
+
+        // Releasing Sub B drains the rest cleanly.
+        sub_b.release();
+        assert_eq!(fc.in_flight(), 0);
     }
 }
