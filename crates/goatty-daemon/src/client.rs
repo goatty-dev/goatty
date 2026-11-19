@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use goatty_proto::{
-    ClientMsg, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId, encode, encode_server,
-    read_msg,
+    ClientMsg, FLOW_CONTROL_SINCE, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId,
+    encode, encode_server, read_msg,
 };
 use goatty_term::Palette;
 
+use crate::flow::FlowControl;
 use crate::server::Daemon;
-use crate::session::{Session, SubFeatures, Subscriber};
+use crate::session::{Session, SubConn, SubFeatures, Subscriber};
 
 /// Max concurrent `StatPath` worker threads per connection (bounds thread
 /// leaks if a remote mount stalls `stat`).
@@ -260,6 +261,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // The protocol version agreed in the handshake.
     let mut agreed_version = 0;
     let mut features = SubFeatures::default();
+    let flow = Arc::new(FlowControl::new());
     let stat_workers = Arc::new(AtomicUsize::new(0));
     let file_workers = Arc::new(AtomicUsize::new(0));
     let file_queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -287,6 +289,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     features.lines = agreed >= HISTORY_SINCE;
                     features.cwd = agreed >= REMOTE_FILES_SINCE;
                     features.size_ctl = agreed >= SIZE_CONTROL_SINCE;
+                    features.flow_control = agreed >= FLOW_CONTROL_SINCE;
                     reply(ServerMsg::Hello { version: agreed, daemon_pid, host });
                 }
                 ClientMsg::ListSessions { req } => reply(ServerMsg::Sessions { req, list: daemon.list() }),
@@ -302,7 +305,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientMsg::Create { req, size, cwd, opts } => {
                     match daemon.create(conn, size, cwd, agreed_version >= goatty_proto::SHELL_SINCE) {
                         Ok(s) => {
-                            let sub = s.subscribe(conn, req, size, opts, features, &tx);
+                            let sub = s.subscribe(SubConn { id: conn, features, flow: &flow, tx: &tx }, req, size, opts);
                             subs.insert(s.id, (s, sub));
                         }
                         Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
@@ -310,14 +313,14 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientMsg::Run { req, size, cwd, argv, opts } => match daemon.run(conn, size, cwd, argv) {
                     Ok(s) => {
-                        let sub = s.subscribe(conn, req, size, opts, features, &tx);
+                        let sub = s.subscribe(SubConn { id: conn, features, flow: &flow, tx: &tx }, req, size, opts);
                         subs.insert(s.id, (s, sub));
                     }
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                 },
                 ClientMsg::Attach { req, session, size, opts } => match daemon.get(session) {
                     Some(s) => {
-                        let sub = s.subscribe(conn, req, size, opts, features, &tx);
+                        let sub = s.subscribe(SubConn { id: conn, features, flow: &flow, tx: &tx }, req, size, opts);
                         subs.insert(s.id, (s, sub));
                     }
                     None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
@@ -340,8 +343,10 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     }
                 }
                 ClientMsg::Ack { session, consumed } => {
-                    if let Some((s, sub)) = subs.get(&session) {
-                        s.ack(sub, consumed);
+                    if let Some((s, sub)) = subs.get(&session)
+                        && let Some(window) = s.ack(sub, consumed)
+                    {
+                        reply(ServerMsg::FlowWindow { window });
                     }
                 }
                 ClientMsg::Ping { nonce } => reply(ServerMsg::Pong { nonce }),
@@ -509,6 +514,11 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     });
                     if let Err(e) = spawned {
                         reply(ServerMsg::Error { req: Some(req), message: format!("couldn't read file: {e}") });
+                    }
+                }
+                ClientMsg::Rtt { rtt_us } => {
+                    if let Some(window) = flow.on_rtt(rtt_us) {
+                        reply(ServerMsg::FlowWindow { window });
                     }
                 }
             }

@@ -16,6 +16,7 @@ use goatty_term::{TermSize, Terminal, UiEvent};
 use parking_lot::{Condvar, Mutex};
 
 use crate::client::{Outbound, try_acquire_worker};
+use crate::flow::FlowControl;
 use crate::systemd::StoredPty;
 
 /// Max concurrent OSC 7 `canonicalize` worker threads per session (bounds
@@ -26,13 +27,15 @@ const MAX_OSC_CWD_WORKERS: usize = 4;
 ///
 /// Flow control: `sent` counts stream bytes queued for this subscriber,
 /// `acked` what the client reported as consumed. When `sent - acked` would
-/// exceed `window`, the subscriber goes `lagging`: raw output is skipped
-/// (counted in `skipped`) until the client has consumed everything, then it
-/// gets one `Resync` snapshot of the current screen and streaming resumes.
+/// exceed the active window (`flow`, or `fixed_window` for local sockets), the
+/// subscriber goes `lagging`: raw output is skipped (counted in `skipped`)
+/// until the client has consumed everything, then it gets one `Resync`
+/// snapshot of the current screen and streaming resumes.
 pub(crate) struct Subscriber {
     conn: u64,
     tx: flume::Sender<Outbound>,
-    window: u64,
+    fixed_window: u64,
+    flow: Option<Arc<FlowControl>>,
     sent: AtomicU64,
     acked: AtomicU64,
     lagging: AtomicBool,
@@ -59,11 +62,44 @@ pub(crate) struct SubFeatures {
     pub(crate) zstd: bool,
     pub(crate) cwd: bool,
     pub(crate) size_ctl: bool,
+    pub(crate) flow_control: bool,
+}
+
+/// Connection-level context passed to [`Session::subscribe`].
+#[derive(Clone, Copy)]
+pub(crate) struct SubConn<'a> {
+    pub(crate) id: u64,
+    pub(crate) features: SubFeatures,
+    pub(crate) flow: &'a Arc<FlowControl>,
+    pub(crate) tx: &'a flume::Sender<Outbound>,
+}
+
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        if let Some(flow) = &self.flow {
+            flow.on_drop_in_flight(self.in_flight());
+        }
+    }
 }
 
 impl Subscriber {
+    fn window(&self) -> u64 {
+        self.flow.as_ref().map_or(self.fixed_window, |f| f.window())
+    }
+
     fn push(&self, frame: Frame, stream_len: usize) -> bool {
-        self.sent.fetch_add(stream_len as u64, Ordering::AcqRel);
+        self.push_stream(frame, stream_len, false)
+    }
+
+    fn push_stream(&self, frame: Frame, stream_len: usize, compressed: bool) -> bool {
+        if stream_len > 0 {
+            // Update `flow` before publishing `sent` so any `Ack` clamped to
+            // `sent` always observes the corresponding `on_send`.
+            if let Some(flow) = &self.flow {
+                flow.on_send(stream_len as u64, compressed);
+            }
+            self.sent.fetch_add(stream_len as u64, Ordering::AcqRel);
+        }
         self.tx.send(Outbound::from(frame)).is_ok()
     }
 
@@ -73,8 +109,11 @@ impl Subscriber {
 
     /// A snapshot message, compressed if the client asked for it.
     fn push_snapshot(&self, msg: &ServerMsg) {
-        if let Ok(f) = encode_server(msg, self.zstd.load(Ordering::Relaxed)) {
-            self.push(f, msg.stream_len());
+        let zstd = self.zstd.load(Ordering::Relaxed);
+        if let Ok(f) = encode_server(msg, zstd) {
+            let stream_len = msg.stream_len();
+            let compressed = zstd && f.len() < stream_len;
+            self.push_stream(f, stream_len, compressed);
         }
     }
 }
@@ -567,15 +606,8 @@ impl Session {
     /// subscriber takes control of the session's size when nobody has it
     /// (or it had it already, or it predates v14); then the snapshot already
     /// has its geometry (reflowed by the VT core). Returns the subscriber.
-    pub(crate) fn subscribe(
-        &self,
-        conn: u64,
-        req: ReqId,
-        size: WinSize,
-        opts: StreamOpts,
-        features: SubFeatures,
-        tx: &flume::Sender<Outbound>,
-    ) -> Arc<Subscriber> {
+    pub(crate) fn subscribe(&self, sub_conn: SubConn<'_>, req: ReqId, size: WinSize, opts: StreamOpts) -> Arc<Subscriber> {
+        let SubConn { id: conn, features, flow: conn_flow, tx } = sub_conn;
         let mut subs = self.subs.lock();
         subs.retain(|s| s.conn != conn); // re-attach on the same connection replaces
         {
@@ -601,10 +633,22 @@ impl Session {
                 self.push_resized(&subs, changed, None);
             }
         }
+        // Local links (`StreamOpts::LOCAL`, 8 MiB) stay fixed lossless with
+        // zero per-chunk overhead. Smaller (remote) windows share the
+        // connection's adaptive `FlowControl`.
+        let (fixed_window, flow) = if opts.window >= StreamOpts::MAX_WINDOW {
+            (u64::from(opts.window), None)
+        } else {
+            let initial = u64::from(opts.window.max(StreamOpts::MIN_WINDOW));
+            let min_w = if features.flow_control { u64::from(StreamOpts::MIN_WINDOW) } else { initial };
+            conn_flow.init_if_needed(initial, min_w, features.flow_control);
+            (initial, Some(conn_flow.clone()))
+        };
         let sub = Arc::new(Subscriber {
             conn,
             tx: tx.clone(),
-            window: opts.window.max(64 << 10) as u64,
+            fixed_window,
+            flow,
             sent: AtomicU64::new(0),
             acked: AtomicU64::new(0),
             lagging: AtomicBool::new(false),
@@ -652,14 +696,28 @@ impl Session {
 
     /// Client acknowledged `consumed` bytes. If it was lagging and has now
     /// caught up completely, send the current screen and resume streaming.
-    pub(crate) fn ack(&self, sub: &Subscriber, consumed: u64) {
-        sub.acked.fetch_max(consumed, Ordering::AcqRel);
-        if sub.lagging.load(Ordering::Acquire) && sub.in_flight() == 0 {
+    /// Returns a new flow-control window to advertise via `ServerMsg::FlowWindow`
+    /// when the connection's adaptive window changed materially.
+    pub(crate) fn ack(&self, sub: &Subscriber, consumed: u64) -> Option<u32> {
+        let sent = sub.sent.load(Ordering::Acquire);
+        let clamped = consumed.min(sent);
+        let prev = sub.acked.fetch_max(clamped, Ordering::AcqRel);
+        let delta = clamped.saturating_sub(prev);
+        let lagged = sub.lagging.load(Ordering::Acquire);
+        let notify = if delta > 0
+            && let Some(flow) = &sub.flow
+        {
+            flow.on_ack(delta, lagged)
+        } else {
+            None
+        };
+        if lagged && sub.in_flight() == 0 {
             let _subs = self.subs.lock(); // order against the output pump
             if sub.lagging.load(Ordering::Acquire) && sub.in_flight() == 0 {
                 self.resync(sub);
             }
         }
+        notify
     }
 
     /// Caller holds `subs`.
@@ -730,7 +788,7 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
                             return true;
                         }
                         let in_flight = sub.in_flight();
-                        if in_flight > 0 && in_flight + n as u64 > sub.window {
+                        if in_flight > 0 && in_flight + n as u64 > sub.window() {
                             sub.lagging.store(true, Ordering::Release);
                             sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
                             return true;
@@ -768,7 +826,8 @@ mod tests {
         let sub = Arc::new(Subscriber {
             conn: 1,
             tx,
-            window: 64 << 10,
+            fixed_window: 64 << 10,
+            flow: None,
             sent: AtomicU64::new(0),
             acked: AtomicU64::new(0),
             lagging: AtomicBool::new(false),

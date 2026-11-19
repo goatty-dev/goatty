@@ -1,6 +1,6 @@
 # Remote goattyd: architecture and plan
 
-**Date:** 2026-11-07, updated 2026-11-09 · **Status:** R0 implemented (protocol v2, SSH/stdio transports, flow control, reconnect). R1 in progress: version negotiation, goattyd auto-install, plain SSH fallback, SSH prompts in the GUI, the systemd user service, lazy history and compression are done (§4a, §5a, §5b).
+**Date:** 2026-11-07, updated 2026-11-19 · **Status:** R0 implemented (protocol v2, SSH/stdio transports, flow control, reconnect). R1 in progress: version negotiation, goattyd auto-install, plain SSH fallback, SSH prompts in the GUI, the systemd user service, lazy history, compression, size policy, and adaptive flow control (§4, §4a, §4c, §5a, §5b) are done.
 
 **Goal:** the GUI connects to *any* goattyd: on this machine, on a home server over Tailscale, on a cloud box over SSH, or in a container. Rendering stays local on the GPU. Sessions live on the host and survive the client. Local performance must not regress, and remote must stay usable on poor links.
 
@@ -71,7 +71,7 @@ Framing: `u32` LE length + postcard. Byte payloads use `serde_bytes`, so a 64 Ki
 - **Client → daemon stream control:** `Input`, `Resize`, `Detach`, `Ack{consumed}` (cumulative stream bytes), `Ping{nonce}` → `Pong`.
 - `StreamOpts{window, history}` per subscription: `LOCAL = 8 MiB / 5000 lines`, `REMOTE = 256 KiB / 2000 lines`.
 
-### Flow control in detail
+### Flow control in detail (adaptive in v15, #9)
 
 Per subscriber, the daemon tracks `sent` (stream bytes queued) and `acked`.
 
@@ -80,14 +80,25 @@ Per subscriber, the daemon tracks `sent` (stream bytes queued) and `acked`.
 3. The client acks **whenever its transport read buffer is empty** and in between every `window/4`. The "buffer empty" rule guarantees the final partial window is acked, so a lagging subscriber can never deadlock waiting for an ack.
 4. When `acked == sent` while lagging: send `Resync` (one screen + modes, about 2–20 KB) and resume streaming.
 
+**Adaptive window (`goatty-daemon/src/flow.rs`, v15, #9):** remote connections start at `StreamOpts::REMOTE` (256 KiB) and adapt per connection across `StreamOpts::MIN_WINDOW..=StreamOpts::MAX_WINDOW` (64 KiB..=8 MiB):
+
+- **Delivery rate** is measured on the daemon from `Ack` progress while bytes are in flight (`in_flight > 0`), plus a wall-clock accumulator spanning brief `in_flight == 0` drains so fast LAN/loopback links still observe sustained throughput.
+- **Propagation delay (`min_rtt`)** comes from the client's `Ping`/`Pong` heartbeat (sent immediately on remote connect/reconnect and every 5 s thereafter) reported via `ClientMsg::Rtt { rtt_us }`. A 60 s rolling minimum keeps self-inflicted queuing delay (bufferbloat) from inflating the window.
+- **Target window:** `clamp(rate × (50 ms + min(min_rtt, 200 ms)), 64 KiB, 8 MiB)`. Adding `min_rtt` keeps high-RTT fast WAN links above 1 BDP instead of stalling on a fixed 256 KiB cap.
+- **Guards:** upward growth requires sustained delivery over ≥50 ms and slow-starts at ≤2× per 50 ms epoch (preventing token-bucket or kernel-buffer bursts from overshooting on throttled links). App-limited interactive periods never shrink the window (downward updates require backpressure: `lagged` or `peak_in_flight ≥ window/2`). Zstd-compressed snapshots do not inflate uncompressed live-stream bandwidth estimates.
+- **Client cadence:** when the window changes materially (≥25% or hitting a bound), the daemon sends `ServerMsg::FlowWindow { window }` so the client updates its `window/4` ack interval. Pre-v15 remote clients receive no `FlowWindow` and never shrink below their initial 256 KiB floor (they can still grow up to 8 MiB).
+- **Local bypass:** local Unix socket subscriptions (`StreamOpts::LOCAL`, 8 MiB) do not attach a `FlowControl` instance at all, keeping zero overhead on the local hot path.
+
 Effects:
-- **Local:** the client parses at ≥175 MB/s with an 8 MiB window, so it never lags. Lossless, same as before.
-- **Remote flood** (`cat 1GB.log` over a 2 MB/s link): bandwidth use is bounded, the screen shows current output every round, and **Ctrl+C → prompt visible ≈ window / bandwidth + RTT** (256 KiB at 2 MB/s ≈ 130 ms). With unbounded forwarding (plain ssh, or our Stage 0 queues) that is "after the whole backlog drained".
+- **Local:** fixed 8 MiB window, zero adaptive overhead, lossless.
+- **Fast LAN / loopback proxy:** ramps from 256 KiB up to 8 MiB within ~250 ms and streams at local speed.
+- **High-RTT fast WAN** (e.g. 100 Mbps at 80 ms RTT): grows past the 1 MiB BDP (~1.6 MiB) instead of stalling at 256 KiB.
+- **Slow remote flood** (`cat 1GB.log` over a 500 KB/s–2 MB/s link): shrinks quickly to 64–100 KiB so skip-and-resync triggers early and **Ctrl+C → prompt visible ≈ 50 ms + RTT** (64 KiB at 500 KB/s ≈ 130 ms vs >500 ms at fixed 256 KiB).
 - **Many panes on one link:** worst-case head-of-line delay ≈ Σ windows / bandwidth. Bounded, and see R1 "interactive priority".
 - **Memory:** daemon queues are bounded by Σ windows. Stage 0 had unbounded per-client queues, which a stalled SSH client could grow to gigabytes.
 - **Cost of skipping:** lines skipped during a flood are missing from the *client's* scrollback until the user scrolls up to the gap; then the client fetches them from the daemon (§4a).
 
-Covered by `slow_client_is_skipped_forward_with_resync`: an 8 MB flood to a non-acking client delivers < 1 MB, and the subsequent `Resync` shows the final screen.
+Covered by `goatty-daemon`'s `flow::tests`, `crates/goatty-daemon/tests/flow_control.rs`, and `slow_client_is_skipped_forward_with_resync`.
 
 ## 4a. Scrollback on demand and compression (v11, #10, #11)
 
@@ -219,11 +230,12 @@ Headless client feeding a real mirror VT (the GUI's work minus rendering), 200×
 
 | Endpoint | Echo p50 / p90 | 200 MB flood | Delivered | Resyncs |
 |---|---|---|---|---|
-| Local Unix socket (8 MiB window) | 0.57 / 0.99 ms | 0.83 s (242 MB/s) | 200.0 MB, lossless | 0 |
-| `goattyd proxy` over stdio (256 KiB window: the remote code path) | 0.49 / 0.76 ms | 0.89 s (224 MB/s) | 199.9 MB | 1 |
-| Same, throttled to **2 MB/s** with `pv -L` | 0.75 / 1.28 ms | **0.74 s** | 3.0 MB | 5 (197 MB skipped) |
+| Local Unix socket (fixed 8 MiB window) | 0.27 / 0.77 ms | 0.77 s (261 MB/s) | 200.0 MB, lossless | 0 |
+| `goattyd proxy` over stdio (adaptive 256 KiB → 8 MiB) | 0.26 / 0.51 ms | 0.76–0.79 s (254–262 MB/s) | 199.7–200.0 MB | 0–1 |
+| Same, throttled to **2 MB/s** with `pv -L` (256 → 64 KiB) | 0.26 / 0.74 ms | **0.65–0.74 s** | 2.9–3.2 MB | 14–21 (197 MB skipped) |
+| Same, throttled to **500 KB/s** with `pv -L` (256 → 64 KiB) | 0.26 / 1.00 ms | **0.65–0.75 s** | 0.7–0.8 MB | 3–5 (199 MB skipped) |
 
-Echo latency includes the PTY round trip and the benchmark's 0.2 ms polling. On the throttled link, naive forwarding would need ~100 s to drain the flood before the prompt (or a Ctrl+C) became visible. With skip-and-resync the prompt shows when the command finishes, and keystrokes stay fast during the flood. Local throughput is lossless and well above what the GUI renders (~100 MB/s end to end in Stage 0), so the protocol is not the bottleneck.
+Echo latency includes the PTY round trip and the benchmark's 0.2 ms polling. On the throttled links, naive forwarding would need ~100–400 s to drain the flood before the prompt (or a Ctrl+C) became visible. With adaptive flow control and skip-and-resync the prompt shows as soon as the command finishes (and ~25% faster at 500 KB/s than the old fixed 256 KiB window), while a fast proxy link ramps to 8 MiB and matches local throughput. Local throughput is lossless and well above what the GUI renders (~100 MB/s end to end in Stage 0), so the protocol is not the bottleneck.
 
 ### Snapshots and history (`cargo run --release -p goatty-daemon --example snapbench [FILE]`)
 
@@ -245,7 +257,7 @@ Compression costs far less than sending the bytes over any remote link (25 KB le
 | Local keystroke → PTY | < 0.2 ms added | Writer thread flushes as soon as its queue is empty |
 | Remote keystroke echo | RTT + ~1 ms; shown at once with prediction | R3 local echo prediction above 30 ms RTT |
 | Remote attach | ≤ 2000 lines of history | ~100 KB of source code, 25 KB with zstd (§7 snapbench); older lines on scroll-up |
-| Remote flood: Ctrl+C visible | ≈ window/bandwidth + RTT | 256 KiB window |
+| Remote flood: Ctrl+C visible | ≈ window/bandwidth + RTT | Adaptive 64 KiB–8 MiB window (≈ 50 ms + RTT) |
 | Daemon memory per subscriber | ≤ window | Was unbounded |
 | Idle | 0 wakeups locally, 1 ping per 5 s remote | |
 
@@ -265,7 +277,7 @@ Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow con
 3. ✅ **SSH prompts in the GUI** through goatty as `SSH_ASKPASS` (§5b).
 4. ✅ **Daemon as systemd user service** (opt-in, socket-activated) with linger guidance (§5b). FDSTORE: #131.
 5. **Interactive priority in the daemon writer**: small frames (echo, prompts) jump ahead of bulk frames from flooding panes. This removes most cross-pane head-of-line delay on one link.
-6. **Adaptive window**: measure delivery rate from acks and RTT from pings, then set `window ≈ max(64 KiB, rate × 50 ms)`. A fast LAN streams losslessly, a slow link skips early.
+6. ✅ **Adaptive window** (#9, protocol v15, §4): measure delivery rate from acks and propagation `min_rtt` from pings (`ClientMsg::Rtt`), set `window = clamp(rate × (50 ms + min(min_rtt, 200 ms)), 64 KiB, 8 MiB)`, and notify the client via `ServerMsg::FlowWindow`. Fast LANs ramp to 8 MiB, high-RTT WANs exceed 1 BDP, slow links shrink to 64 KiB and skip early.
 7. ✅ **Lazy history**: `FetchHistory` fills the client's scrollback on demand, for the trimmed attach snapshot and for lines skipped by resync, with stable host line numbers (§4a).
 8. ✅ **Compression** for snapshots and history (zstd, negotiated per connection; §4a). Live output stays uncompressed (it's small, and latency matters more).
 9. ✅ **Size policy for multiple clients**: one *controlling* client per session sets the PTY size. Others watch (letterboxed) or take over explicitly (§4c, protocol v14).

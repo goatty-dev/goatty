@@ -157,7 +157,12 @@ fn main() -> anyhow::Result<()> {
     let flood = t2.elapsed();
     let received = sink.bytes.load(Ordering::Relaxed) - before;
 
-    println!("endpoint            {label} (window {} KiB, history {})", opts.window >> 10, opts.history);
+    let active_window = conn.flow_window();
+    if active_window != opts.window {
+        println!("endpoint            {label} (window {} → {} KiB, history {})", opts.window >> 10, active_window >> 10, opts.history);
+    } else {
+        println!("endpoint            {label} (window {} KiB, history {})", opts.window >> 10, opts.history);
+    }
     println!("connect             {:>8.2} ms", connect.as_secs_f64() * 1e3);
     println!("create+snapshot     {:>8.2} ms", attach.as_secs_f64() * 1e3);
     println!(
