@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
-use goatty_client::Connection;
+use goatty_client::{Connection, ReplyLost};
 use goatty_proto::{LayoutId, SessionId};
 use goatty_term::TermSize;
 use gpui::{WindowBounds, px, size};
@@ -195,13 +195,16 @@ pub fn prune(saved: SavedWorkspace, alive: &HashSet<SessionId>) -> Option<(Vec<R
 /// (the caller then reattaches a single session as before). Blocks.
 /// What a window attached to `conn` starts with: the last window's saved
 /// layout when attaching automatically, else a single session.
-pub fn startup(conn: &Arc<Connection>, size: TermSize, mode: crate::session::AttachMode) -> Result<Startup> {
-    use crate::session::AttachMode;
+pub fn startup(conn: &Arc<Connection>, size: TermSize, mode: AttachMode) -> Result<Startup> {
     let restored = match mode {
-        AttachMode::Auto => restore(conn, size).unwrap_or_else(|e| {
-            log::warn!("restoring the last window: {e:#}");
-            None
-        }),
+        AttachMode::Auto => match restore(conn, size) {
+            Ok(r) => r,
+            Err(e) if e.downcast_ref::<ReplyLost>().is_some() || !conn.is_connected() => return Err(e),
+            Err(e) => {
+                log::warn!("restoring the last window: {e:#}");
+                None
+            }
+        },
         _ => None,
     };
     Ok(match restored {
@@ -222,15 +225,30 @@ pub fn restore(conn: &Arc<Connection>, size: TermSize) -> Result<Option<Restored
     let window = saved.window;
     let alive: HashSet<SessionId> = info.sessions.iter().copied().collect();
     let Some((tabs, _)) = prune(saved.clone(), &alive) else { return Ok(None) };
-    let mut sessions = HashMap::new();
-    for id in tabs.iter().flat_map(|t| t.tree.leaves()) {
-        match Session::daemon(conn.clone(), size, AttachMode::Id(id), None) {
+    let ids: Vec<SessionId> = tabs.iter().flat_map(|t| t.tree.leaves()).collect();
+    let mut sessions = HashMap::with_capacity(ids.len());
+    let mut link_err = None;
+    for (id, res) in Session::daemon_attach_many(conn, size, &ids) {
+        match res {
             Ok(s) => {
                 sessions.insert(id, s);
+            }
+            Err(e) if e.downcast_ref::<ReplyLost>().is_some() || !conn.is_connected() => {
+                if link_err.is_none() {
+                    link_err = Some(e);
+                }
             }
             // Ended since the claim.
             Err(e) => log::info!("not restoring session {id}: {e:#}"),
         }
+    }
+    if let Some(err) = link_err {
+        // Don't open a truncated window and overwrite the saved layout when
+        // the link dropped mid-restore; detach any panes that did attach.
+        for &id in sessions.keys() {
+            conn.detach(id);
+        }
+        return Err(err);
     }
     let attached: HashSet<SessionId> = sessions.keys().copied().collect();
     let Some((tabs, active)) = prune(saved, &attached) else { return Ok(None) };

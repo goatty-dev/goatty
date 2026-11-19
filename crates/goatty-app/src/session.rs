@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use goatty_client::{Connection, History, PaneEvent, PaneSink, TopLineCause};
+use goatty_client::{AttachRequest, Connection, History, PaneEvent, PaneSink, TopLineCause};
 use goatty_config::LocalEcho;
 use goatty_proto::WinSize;
 use goatty_shell::HostService;
@@ -386,6 +386,32 @@ impl Session {
         Ok(s)
     }
 
+    fn daemon_host_meta(conn: &Connection) -> (Option<String>, Option<String>) {
+        if conn.endpoint().is_local() {
+            return (None, None);
+        }
+        let h = conn.host();
+        let host_label = Some(format!("{}@{}", h.user, h.hostname));
+        let ssh_host = conn.ssh_host();
+        (host_label, ssh_host)
+    }
+
+    fn new_daemon(
+        conn: &Arc<Connection>,
+        size: TermSize,
+        id: u64,
+        host_label: Option<String>,
+        ssh_host: Option<String>,
+    ) -> (Arc<Self>, Arc<Sink>) {
+        // Client-side terminal never answers queries; the daemon's does.
+        let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
+        let s =
+            Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(id) }, host_label, ssh_host));
+        *s.view.lock() = size;
+        let sink = Arc::new(Sink(Arc::downgrade(&s)));
+        (s, sink)
+    }
+
     /// Attach to (or create) a session on the daemon behind `conn`.
     /// New sessions start in `cwd` (a path on the daemon's host); without
     /// one, a local daemon uses this process's directory.
@@ -395,17 +421,8 @@ impl Session {
             AttachMode::Id(id) => Some(id),
             AttachMode::Auto => conn.list_sessions()?.iter().filter(|s| s.attached == 0).map(|s| s.id).max(),
         };
-        let host_label = (!conn.endpoint().is_local()).then(|| {
-            let h = conn.host();
-            format!("{}@{}", h.user, h.hostname)
-        });
-        let ssh_host = (!conn.endpoint().is_local()).then(|| conn.ssh_host()).flatten();
-        // Client-side terminal never answers queries; the daemon's does.
-        let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
-        let s =
-            Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, host_label, ssh_host));
-        *s.view.lock() = size;
-        let sink = Arc::new(Sink(Arc::downgrade(&s)));
+        let (host_label, ssh_host) = Self::daemon_host_meta(&conn);
+        let (s, sink) = Self::new_daemon(&conn, size, target.unwrap_or(0), host_label, ssh_host);
         let id = match target {
             Some(id) => {
                 conn.attach(id, win(size), sink)?;
@@ -424,6 +441,36 @@ impl Session {
             slot.store(id, Ordering::Relaxed);
         }
         Ok(s)
+    }
+
+    /// Attach to every session in `ids` on `conn` in one pipelined burst
+    /// (used when restoring a saved window layout). Returns one `(id, result)`
+    /// per requested id, in order.
+    pub fn daemon_attach_many(conn: &Arc<Connection>, size: TermSize, ids: &[u64]) -> Vec<(u64, Result<Arc<Self>>)> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let (host_label, ssh_host) = Self::daemon_host_meta(conn);
+        let ws = win(size);
+        let mut sessions = Vec::with_capacity(ids.len());
+        let mut requests = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let (s, sink) = Self::new_daemon(conn, size, id, host_label.clone(), ssh_host.clone());
+            sessions.push((id, s));
+            requests.push(AttachRequest { session: id, size: ws, sink });
+        }
+        let replies = conn.attach_many(requests);
+        sessions
+            .into_iter()
+            .zip(replies)
+            .map(|((id, s), res)| {
+                let res = res.map(|()| {
+                    log::info!("attached to session {id}");
+                    s
+                });
+                (id, res)
+            })
+            .collect()
     }
 
     /// Run `argv` in a new session on the daemon behind `conn` (plain SSH:

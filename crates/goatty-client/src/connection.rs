@@ -1,6 +1,6 @@
 //! [`Connection`]: a reconnecting, multiplexed link to one goattyd.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -45,6 +45,7 @@ impl std::error::Error for ReplyLost {}
 enum WriterCmd {
     Frame(Frame),
     Replace(Box<dyn Write + Send>),
+    Close,
 }
 
 struct Pane {
@@ -76,6 +77,14 @@ pub struct HostSettingsApplied {
     pub diff: Vec<FileDiff>,
     pub applied: bool,
     pub generation: Option<u32>,
+}
+
+/// One session to attach in [`Connection::attach_many`].
+#[derive(Clone)]
+pub struct AttachRequest {
+    pub session: SessionId,
+    pub size: WinSize,
+    pub sink: Arc<dyn PaneSink>,
 }
 
 enum Pending {
@@ -425,15 +434,150 @@ impl Connection {
     pub fn attach(&self, session: SessionId, size: WinSize, sink: Arc<dyn PaneSink>) -> Result<()> {
         // Refused here, not by goattyd: a refused replacement attach would
         // leave the pane that stays with output decoded at the old size.
-        ensure_sane(size)?;
-        let opts = self.shared.opts;
-        match self.request(
-            |tx| Pending::Attach { tx, sink, size, session: Some(session) },
-            |req| ClientMsg::Attach { req, session, size, opts },
-        )? {
-            ServerMsg::Attached { .. } => Ok(()),
-            other => bail!("unexpected reply {other:?}"),
+        self.attach_many(vec![AttachRequest { session, size, sink }]).pop().expect("one attach request yields one result")
+    }
+
+    /// Attach to every session in `requests` in one pipelined burst: all
+    /// `Attach` messages go out before waiting for any `Attached` reply, so
+    /// restoring a window with N panes costs one round trip instead of N over
+    /// any remote transport (SSH, Tailnet, or `--via`).
+    ///
+    /// Returns one result per request, in input order. An invalid size,
+    /// duplicate session in the same batch, or missing session fails only its
+    /// own entry; a dropped link or idle timeout fails every entry whose reply
+    /// has not arrived yet with [`ReplyLost`].
+    pub fn attach_many(&self, requests: Vec<AttachRequest>) -> Vec<Result<()>> {
+        self.attach_many_within(requests, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::attach_many`], failing remaining entries if no reply
+    /// arrives for `timeout`.
+    pub fn attach_many_within(&self, requests: Vec<AttachRequest>, timeout: Duration) -> Vec<Result<()>> {
+        if requests.is_empty() {
+            return Vec::new();
         }
+        let n = requests.len();
+        let mut results: Vec<Option<Result<()>>> = (0..n).map(|_| None).collect();
+        let mut seen = HashSet::with_capacity(n);
+        let mut to_send: Vec<(usize, AttachRequest)> = Vec::with_capacity(n);
+
+        for (i, req) in requests.into_iter().enumerate() {
+            // Refused here, not by goattyd: a refused replacement attach would
+            // leave the pane that stays with output decoded at the old size.
+            if let Err(e) = ensure_sane(req.size) {
+                results[i] = Some(Err(e));
+                continue;
+            }
+            if !seen.insert(req.session) {
+                results[i] = Some(Err(anyhow!("duplicate attach for session {}", req.session)));
+                continue;
+            }
+            to_send.push((i, req));
+        }
+
+        if to_send.is_empty() {
+            return results.into_iter().map(|r| r.expect("every attach entry resolved")).collect();
+        }
+
+        let opts = self.shared.opts;
+        let (tx, rx) = flume::bounded(to_send.len());
+        let mut in_flight: HashMap<ReqId, (usize, SessionId)> = HashMap::with_capacity(to_send.len());
+        let mut msgs: Vec<ClientMsg> = Vec::with_capacity(to_send.len());
+
+        {
+            // Checked under the lock the disconnect drain takes: every request
+            // registered here is either drained (closing `rx`) or sent on a
+            // live link.
+            let mut map = self.shared.pending.lock();
+            if !self.is_connected() {
+                for (i, _) in to_send {
+                    results[i] = Some(Err(anyhow!("not connected to goattyd")));
+                }
+                return results.into_iter().map(|r| r.expect("every attach entry resolved")).collect();
+            }
+            for (i, r) in to_send {
+                let req = self.shared.req_id();
+                map.insert(req, Pending::Attach { tx: tx.clone(), sink: r.sink, size: r.size, session: Some(r.session) });
+                in_flight.insert(req, (i, r.session));
+                msgs.push(ClientMsg::Attach { req, session: r.session, size: r.size, opts });
+            }
+        }
+        // Drop the local sender so `rx` closes as soon as every pending entry
+        // is answered or drained on disconnect.
+        drop(tx);
+
+        // Queue every frame back-to-back so the writer batches and flushes
+        // them together instead of one RTT at a time.
+        for msg in &msgs {
+            self.shared.send(msg);
+        }
+
+        let apply_reply = |msg: ServerMsg, in_flight: &mut HashMap<ReqId, (usize, SessionId)>, results: &mut [Option<Result<()>>]| {
+            let Some(req) = msg.reply_to() else {
+                log::warn!("attach_many received message without req id: {msg:?}");
+                return;
+            };
+            let Some((i, _)) = in_flight.remove(&req) else {
+                return;
+            };
+            results[i] = Some(match msg {
+                ServerMsg::Attached { .. } => Ok(()),
+                ServerMsg::Error { message, .. } => Err(anyhow!("goattyd: {message}")),
+                other => Err(anyhow!("unexpected reply {other:?}")),
+            });
+        };
+
+        while !in_flight.is_empty() {
+            match rx.recv_timeout(timeout) {
+                Ok(msg) => apply_reply(msg, &mut in_flight, &mut results),
+                Err(_) => break,
+            }
+        }
+
+        if !in_flight.is_empty() {
+            let mut timed_out_sessions = Vec::new();
+            {
+                let mut map = self.shared.pending.lock();
+                in_flight.retain(|&req, &mut (i, session)| {
+                    if map.remove(&req).is_some() {
+                        results[i] = Some(Err(ReplyLost.into()));
+                        timed_out_sessions.push(session);
+                        false
+                    } else {
+                        // Already taken by `dispatch` (currently delivering the
+                        // reply) or drained on disconnect (will close `rx`).
+                        true
+                    }
+                });
+            }
+            // Recover any reply that raced in just before we locked `pending`,
+            // so an installed pane is never reported as failed (and leaked).
+            while !in_flight.is_empty() {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(msg) => apply_reply(msg, &mut in_flight, &mut results),
+                    Err(_) => break,
+                }
+            }
+            for (_, (i, session)) in in_flight {
+                results[i] = Some(Err(ReplyLost.into()));
+                timed_out_sessions.push(session);
+            }
+            if !timed_out_sessions.is_empty() {
+                // Keep lock acquisition flat (never nest `panes` and `early_size`).
+                let unattached: Vec<SessionId> = {
+                    let panes = self.shared.panes.lock();
+                    timed_out_sessions.into_iter().filter(|id| !panes.contains_key(id)).collect()
+                };
+                if !unattached.is_empty() {
+                    let mut early = self.shared.early_size.lock();
+                    for id in unattached {
+                        early.remove(&id);
+                    }
+                }
+            }
+        }
+
+        results.into_iter().map(|r| r.expect("every attach entry resolved")).collect()
     }
 
     /// Ask for up to `count` rows of `session`'s history before host line
@@ -708,6 +852,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
+        let _ = self.shared.out.send(WriterCmd::Close);
         self.shared.close_transport();
     }
 }
@@ -732,6 +877,7 @@ fn writer_loop(rx: flume::Receiver<WriterCmd>) {
                     w = None; // the reader notices too and reconnects
                 }
             }
+            WriterCmd::Close => break,
         }
         // Batch under load, flush as soon as the queue is idle (keystrokes
         // go out immediately).
@@ -993,11 +1139,23 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 // Comes before the `Attached` that adds the pane.
                 // Or after we detached: keep such leftovers bounded.
                 None => {
-                    let mut early = s.early_size.lock();
-                    if early.len() >= 64 {
-                        early.clear();
+                    let overflow = {
+                        let mut early = s.early_size.lock();
+                        early.insert(session, ev);
+                        early.len() > 64
+                    };
+                    if overflow {
+                        let pending_sessions: HashSet<SessionId> = s
+                            .pending
+                            .lock()
+                            .values()
+                            .filter_map(|p| match p {
+                                Pending::Attach { session: Some(id), .. } => Some(*id),
+                                _ => None,
+                            })
+                            .collect();
+                        s.early_size.lock().retain(|id, _| *id == session || pending_sessions.contains(id));
                     }
-                    early.insert(session, ev);
                 }
             }
         }
@@ -1201,5 +1359,242 @@ mod tests {
         assert_eq!(conn.rtt(), None, "disconnect must clear stale RTT");
         drop(client_w);
         server.join().unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecSink {
+        fed: Mutex<Vec<u8>>,
+        events: Mutex<Vec<String>>,
+        top_lines: Mutex<Vec<(u64, goatty_proto::TopLineCause)>>,
+    }
+
+    impl PaneSink for RecSink {
+        fn feed(&self, bytes: &[u8]) {
+            self.fed.lock().extend_from_slice(bytes);
+        }
+        fn event(&self, ev: PaneEvent) {
+            self.events.lock().push(format!("{ev:?}"));
+        }
+        fn top_line(&self, line: u64, cause: goatty_proto::TopLineCause) {
+            self.top_lines.lock().push((line, cause));
+        }
+    }
+
+    fn mock_connection(
+        server_fn: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>, std::os::unix::net::UnixStream) + Send + 'static,
+    ) -> (Connection, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+        let (client_w, server_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut server_w, client_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let hello = ServerMsg::Hello {
+                version: PROTOCOL_VERSION,
+                daemon_pid: 1,
+                host: HostInfo { hostname: "h".into(), user: "u".into(), os: "linux".into(), daemon_version: "0".into() },
+            };
+            server_w.write_all(&encode(&hello).unwrap()).unwrap();
+            server_fn(std::io::BufReader::new(server_r), server_w);
+        });
+        let (out, out_rx) = flume::unbounded();
+        let _ = out.send(WriterCmd::Replace(Box::new(client_w.try_clone().unwrap())));
+        let (reconnect_tx, reconnect_rx) = flume::bounded(1);
+        let shared = Arc::new(Shared {
+            endpoint: Endpoint::command_line("false").unwrap(),
+            opts: StreamOpts::REMOTE,
+            flow_window: AtomicU32::new(StreamOpts::REMOTE.window),
+            client_name: "test".into(),
+            auto_reconnect: false,
+            out,
+            panes: Mutex::new(HashMap::new()),
+            layout: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            early_size: Mutex::new(HashMap::new()),
+            next_req: AtomicU32::new(1),
+            host: Mutex::new(HostInfo::default()),
+            announce: AtomicU32::new(PROTOCOL_VERSION),
+            version: AtomicU32::new(PROTOCOL_VERSION),
+            daemon_pid: AtomicU32::new(1),
+            connected: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            closer: Mutex::new(Some(Closer(Arc::new(Mutex::new(Some(crate::transport::CloseHandle::Socket(client_w))))))),
+            epoch: Instant::now(),
+            last_rx_us: AtomicU64::new(0),
+            rtt_us: AtomicU64::new(0),
+            reconnect_tx,
+            reconnect_rx,
+        });
+        std::thread::spawn(move || writer_loop(out_rx));
+        let mut reader = std::io::BufReader::new(Box::new(client_r) as Box<dyn Read + Send>);
+        assert!(matches!(read_msg::<_, ServerMsg>(&mut reader).unwrap(), ServerMsg::Hello { .. }));
+        let s = shared.clone();
+        let reader_handle = std::thread::spawn(move || reader_main(s, reader));
+        (Connection { shared }, reader_handle, server)
+    }
+
+    #[test]
+    fn attach_many_pipelines_all_requests_before_any_reply() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            // Read all 8 Attach requests BEFORE answering a single one: a
+            // sequential implementation would deadlock here.
+            let mut reqs = Vec::new();
+            for _ in 0..8 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::Attach { req, session, .. } => reqs.push((req, session)),
+                    other => panic!("unexpected client msg: {other:?}"),
+                }
+            }
+            // Answer in reverse order to prove replies are matched by `req`.
+            for (req, session) in reqs.into_iter().rev() {
+                let sz = ServerMsg::SizeControl { session, size, controlling: session.is_multiple_of(2) };
+                let att = ServerMsg::Attached { req, session, snapshot: format!("snap-{session}").into_bytes() };
+                let top = ServerMsg::TopLine { session, line: session * 10, cause: goatty_proto::TopLineCause::Attach };
+                let cwd = ServerMsg::Cwd { session, cwd: Some(format!("/dir/{session}")) };
+                for m in [sz, att, top, cwd] {
+                    w.write_all(&encode(&m).unwrap()).unwrap();
+                }
+            }
+            w.flush().unwrap();
+            // Keep stream open until client finishes reading follow-up frames.
+            let _ = read_msg::<_, ClientMsg>(&mut r);
+        });
+
+        let sinks: Vec<Arc<RecSink>> = (0..8).map(|_| Arc::new(RecSink::default())).collect();
+        let requests: Vec<AttachRequest> =
+            (10u64..18).zip(sinks.iter().cloned()).map(|(session, sink)| AttachRequest { session, size, sink }).collect();
+        let results = conn.attach_many_within(requests, Duration::from_secs(5));
+        assert_eq!(results.len(), 8);
+        for (i, res) in results.into_iter().enumerate() {
+            res.unwrap_or_else(|e| panic!("entry {i} failed: {e:#}"));
+            let session = 10 + i as u64;
+            assert_eq!(String::from_utf8_lossy(&sinks[i].fed.lock()), format!("snap-{session}"));
+            assert!(
+                sinks[i]
+                    .events
+                    .lock()
+                    .iter()
+                    .any(|e| e.contains("SizeControl") && e.contains(&format!("controlling: {}", session.is_multiple_of(2)))),
+                "missing SizeControl for {session}: {:?}",
+                sinks[i].events.lock()
+            );
+        }
+        // Wait briefly for follow-up TopLine/Cwd frames pushed right after Attached.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sinks.iter().any(|s| s.top_lines.lock().is_empty() || !s.events.lock().iter().any(|e| e.contains("Cwd"))) {
+            assert!(Instant::now() < deadline, "follow-up frames did not arrive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_handles_partial_errors_invalid_sizes_and_duplicates() {
+        let ok_size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let bad_size = WinSize { cols: 9999, rows: 9999, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            // Only 3 valid unique requests (sessions 1, 3, 4) should hit the wire.
+            let mut reqs = Vec::new();
+            for _ in 0..3 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::Attach { req, session, .. } => reqs.push((req, session)),
+                    other => panic!("unexpected client msg: {other:?}"),
+                }
+            }
+            for (req, session) in reqs {
+                let msg = if session == 3 {
+                    ServerMsg::Error { req: Some(req), message: "no session 3".into() }
+                } else {
+                    ServerMsg::Attached { req, session, snapshot: format!("ok-{session}").into_bytes() }
+                };
+                w.write_all(&encode(&msg).unwrap()).unwrap();
+            }
+            w.flush().unwrap();
+            let _ = read_msg::<_, ClientMsg>(&mut r);
+        });
+
+        let sinks: Vec<Arc<RecSink>> = (0..5).map(|_| Arc::new(RecSink::default())).collect();
+        let requests = vec![
+            AttachRequest { session: 1, size: ok_size, sink: sinks[0].clone() },
+            AttachRequest { session: 2, size: bad_size, sink: sinks[1].clone() },
+            AttachRequest { session: 1, size: ok_size, sink: sinks[2].clone() },
+            AttachRequest { session: 3, size: ok_size, sink: sinks[3].clone() },
+            AttachRequest { session: 4, size: ok_size, sink: sinks[4].clone() },
+        ];
+        let results = conn.attach_many_within(requests, Duration::from_secs(5));
+        assert!(results[0].is_ok());
+        assert!(results[1].as_ref().unwrap_err().to_string().contains("too large"));
+        assert!(results[2].as_ref().unwrap_err().to_string().contains("duplicate"));
+        assert!(results[3].as_ref().unwrap_err().to_string().contains("no session 3"));
+        assert!(results[4].is_ok());
+        assert_eq!(String::from_utf8_lossy(&sinks[0].fed.lock()), "ok-1");
+        assert_eq!(String::from_utf8_lossy(&sinks[4].fed.lock()), "ok-4");
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_disconnect_mid_batch_fails_remaining_immediately() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let mut reqs = Vec::new();
+            for _ in 0..4 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::Attach { req, session, .. } => reqs.push((req, session)),
+                    other => panic!("unexpected client msg: {other:?}"),
+                }
+            }
+            // Answer only the first two, then drop the link.
+            for (req, session) in &reqs[..2] {
+                let msg = ServerMsg::Attached { req: *req, session: *session, snapshot: b"hi".to_vec() };
+                w.write_all(&encode(&msg).unwrap()).unwrap();
+            }
+            w.flush().unwrap();
+            drop(w);
+        });
+
+        let start = Instant::now();
+        let requests: Vec<AttachRequest> =
+            (1u64..=4).map(|session| AttachRequest { session, size, sink: Arc::new(RecSink::default()) }).collect();
+        let results = conn.attach_many_within(requests, Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(results[2].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(results[3].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_timeout_cleans_pending_and_early_size() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (tx_done, rx_done) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            for _ in 0..2 {
+                let _ = read_msg::<_, ClientMsg>(&mut r).unwrap();
+            }
+            // Send SizeControl for session 1, then stall without sending Attached.
+            let sz = ServerMsg::SizeControl { session: 1, size, controlling: true };
+            w.write_all(&encode(&sz).unwrap()).unwrap();
+            w.flush().unwrap();
+            let _ = rx_done.recv_timeout(Duration::from_secs(2));
+        });
+
+        let requests = vec![
+            AttachRequest { session: 1, size, sink: Arc::new(RecSink::default()) },
+            AttachRequest { session: 2, size, sink: Arc::new(RecSink::default()) },
+        ];
+        let results = conn.attach_many_within(requests, Duration::from_millis(80));
+        assert!(results[0].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(results[1].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(conn.shared.pending.lock().is_empty(), "timed-out pending entries must be removed");
+        assert!(conn.shared.early_size.lock().is_empty(), "stale early_size entries must be removed");
+        let _ = tx_done.send(());
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
     }
 }

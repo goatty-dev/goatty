@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use goatty_client::tailnet::{self, Pairing};
-use goatty_client::{Connection, Control, Endpoint, PaneEvent, PaneSink, TailnetTarget};
+use goatty_client::{AttachRequest, Connection, Control, Endpoint, PaneEvent, PaneSink, TailnetTarget};
 use goatty_net::Paths;
 use goatty_net::api::{NetStatus, Reply, Request, RouteStatus};
 use goatty_net::tailscale::{State, Tailscale};
@@ -174,15 +174,29 @@ fn pair_and_run_a_session_over_the_tailnet() {
     let sink = Arc::new(Sink { term: Mutex::new(Terminal::new(tsize, false, Arc::new(Palette::default())).0), events: Mutex::default() });
     let id = conn.create(size, None, sink.clone()).unwrap();
     conn.input(id, b"echo over-the-$((40+2))-tailnet\r");
+    let sink2 = Arc::new(Sink { term: Mutex::new(Terminal::new(tsize, false, Arc::new(Palette::default())).0), events: Mutex::default() });
+    let id2 = conn.create(size, None, sink2.clone()).unwrap();
+    conn.input(id2, b"echo second-$((20+1))-pane\r");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !sink.screen().contains("over-the-42-tailnet") {
-        assert!(Instant::now() < deadline, "no output; screen:\n{}\nevents: {:?}", sink.screen(), sink.events.lock());
+    while !sink.screen().contains("over-the-42-tailnet") || !sink2.screen().contains("second-21-pane") {
+        assert!(Instant::now() < deadline, "no output; screen:\n{}\n{}", sink.screen(), sink2.screen());
         std::thread::sleep(Duration::from_millis(20));
     }
     // The host's goattyd can be managed over the same link.
     let reply: Reply = serde_json::from_str(&conn.net(serde_json::to_string(&Request::Status).unwrap()).unwrap()).unwrap();
     assert!(reply.into_result().unwrap().available);
     drop(conn);
+
+    // Reopen over the tailnet and reattach both panes in one pipelined burst.
+    let conn2 = Connection::open(Endpoint::Tailnet(target.clone()), "test-restore").unwrap();
+    let r1 = Arc::new(Sink { term: Mutex::new(Terminal::new(tsize, false, Arc::new(Palette::default())).0), events: Mutex::default() });
+    let r2 = Arc::new(Sink { term: Mutex::new(Terminal::new(tsize, false, Arc::new(Palette::default())).0), events: Mutex::default() });
+    let results = conn2
+        .attach_many(vec![AttachRequest { session: id, size, sink: r1.clone() }, AttachRequest { session: id2, size, sink: r2.clone() }]);
+    assert!(results.iter().all(Result::is_ok), "tailnet attach_many failed: {results:?}");
+    assert!(r1.screen().contains("over-the-42-tailnet"), "pane 1 missing output:\n{}", r1.screen());
+    assert!(r2.screen().contains("second-21-pane"), "pane 2 missing output:\n{}", r2.screen());
+    drop(conn2);
 
     // Revoked on the host: refused again.
     net(&mut c, &Request::Revoke { key: goatty_net::identity::Identity::load_or_create(&paths.key()).unwrap().public()[..8].into() })
