@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use goatty_client::{Connection, Control, Endpoint, History, PaneEvent, PaneSink, TopLineCause};
+use goatty_client::{AttachRequest, Connection, Control, Endpoint, History, PaneEvent, PaneSink, TopLineCause};
 use goatty_proto::{ClientMsg, PROTOCOL_VERSION, ServerMsg, SessionId, StreamOpts, WinSize, encode, read_msg};
 use goatty_term::{Frame, Palette, TermSize, Terminal};
 use parking_lot::Mutex;
@@ -620,4 +620,67 @@ fn unhandled_osc_is_silenced_by_default() {
     child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
     assert!(stderr.contains("goattyd"), "expected info logs with RUST_LOG unset; stderr:\n{stderr}");
     assert!(!stderr.contains("unhandled osc_dispatch"), "rio_vt warning should be silenced by default; stderr:\n{stderr}");
+}
+
+#[test]
+fn attach_many_restores_multiple_panes_over_proxy() {
+    let d = start_daemon();
+    let a = Connection::open(proxy_endpoint(&d), "window a").unwrap();
+    let mut ids = Vec::new();
+    let mut setup_sinks = Vec::new();
+    for i in 0..8usize {
+        let sink = Arc::new(TestSink::default());
+        let id = a.create(SIZE, None, sink.clone()).unwrap();
+        a.input(id, format!("echo PANE-{i}-READY-$((1+1))\r").as_bytes());
+        ids.push(id);
+        setup_sinks.push(sink);
+    }
+    for (i, sink) in setup_sinks.iter().enumerate() {
+        let marker = format!("PANE-{i}-READY-2");
+        eventually(&format!("pane {i} ready"), || sink.screen().contains(&marker));
+    }
+    a.save_layout(42, ids.clone(), r#"{"version":1,"tabs":[],"active":0}"#.into());
+    // `save_layout` is asynchronous: round-trip once so it reaches goattyd
+    // before `drop(a)` closes the proxy.
+    a.list_sessions().unwrap();
+    drop(a);
+
+    // A fresh window over the remote proxy path claims the layout and attaches
+    // all 8 live sessions (plus a missing id) in one pipelined batch.
+    let b = Connection::open(proxy_endpoint(&d), "window b").unwrap();
+    let mut claimed = None;
+    eventually("window b claims layout", || {
+        claimed = b.claim_layout().unwrap();
+        claimed.is_some()
+    });
+    let claimed = claimed.unwrap();
+    assert_eq!(claimed.sessions, ids);
+
+    let mut restored_sinks = Vec::new();
+    let mut requests = Vec::new();
+    for &id in &ids {
+        let sink = Arc::new(TestSink::default());
+        requests.push(AttachRequest { session: id, size: SIZE, sink: sink.clone() });
+        restored_sinks.push(sink);
+    }
+    let missing_sink = Arc::new(TestSink::default());
+    requests.push(AttachRequest { session: 999_999, size: SIZE, sink: missing_sink });
+
+    let results = b.attach_many(requests);
+    assert_eq!(results.len(), 9);
+    for (i, res) in results[..8].iter().enumerate() {
+        res.as_ref().unwrap_or_else(|e| panic!("pane {i} failed to attach: {e:#}"));
+        let marker = format!("PANE-{i}-READY-2");
+        assert!(restored_sinks[i].screen().contains(&marker), "pane {i} snapshot missing {marker}:\n{}", restored_sinks[i].screen());
+    }
+    assert!(results[8].as_ref().unwrap_err().to_string().contains("no session 999999"));
+
+    // Live input still works on every attached pane after the batch attach.
+    for (i, &id) in ids.iter().enumerate() {
+        b.input(id, format!("echo LIVE-{i}-$((2+2))\r").as_bytes());
+    }
+    for (i, sink) in restored_sinks.iter().enumerate() {
+        let marker = format!("LIVE-{i}-4");
+        eventually(&format!("pane {i} live echo"), || sink.screen().contains(&marker));
+    }
 }

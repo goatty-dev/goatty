@@ -1,9 +1,9 @@
 //! [`Connection`]: a reconnecting, multiplexed link to one goattyd.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,7 @@ impl std::error::Error for ReplyLost {}
 enum WriterCmd {
     Frame(Frame),
     Replace(Box<dyn Write + Send>),
+    Close,
 }
 
 struct Pane {
@@ -78,6 +79,18 @@ pub struct HostSettingsApplied {
     pub generation: Option<u32>,
 }
 
+/// One session to attach in [`Connection::attach_many`].
+#[derive(Clone)]
+pub struct AttachRequest {
+    pub session: SessionId,
+    pub size: WinSize,
+    pub sink: Arc<dyn PaneSink>,
+}
+
+const ATTACH_ACTIVE: u8 = 0;
+const ATTACH_CANCELLED: u8 = 1;
+const ATTACH_FINISHING: u8 = 2;
+
 enum Pending {
     Reply(flume::Sender<ServerMsg>),
     Attach {
@@ -86,6 +99,8 @@ enum Pending {
         size: WinSize,
         /// The session, for `Attach` (`Create` and `Run` learn it from the reply).
         session: Option<SessionId>,
+        /// Coordinates `attach_many_within` timeout cancellation with `dispatch`.
+        state: Option<Arc<AtomicU8>>,
     },
     Reattach(SessionId),
     /// `fetch_history`: the answer goes to the pane's sink.
@@ -93,6 +108,22 @@ enum Pending {
 }
 
 type Reader = std::io::BufReader<Box<dyn Read + Send>>;
+
+/// Layouts claimed on the current live link and any returned by a failed
+/// restore so a retry on the same pooled connection can reclaim them.
+/// Cleared when the link drops (the daemon releases claims on disconnect).
+#[derive(Default)]
+struct ClaimedLayouts {
+    gens: HashMap<LayoutId, u64>,
+    unclaimed: VecDeque<(u64, LayoutInfo)>,
+}
+
+impl ClaimedLayouts {
+    fn clear(&mut self) {
+        self.gens.clear();
+        self.unclaimed.clear();
+    }
+}
 
 struct Shared {
     endpoint: Endpoint,
@@ -107,6 +138,7 @@ struct Shared {
     /// The window's last saved layout, saved again after a reconnect (the
     /// daemon frees a layout when its connection drops).
     layout: Mutex<Option<ClientMsg>>,
+    claimed_layouts: Mutex<ClaimedLayouts>,
     pending: Mutex<HashMap<ReqId, Pending>>,
     /// `SizeControl` that came before the `Attached` of a session we don't
     /// have a pane for yet (v14 sends it first); delivered before its snapshot.
@@ -120,6 +152,9 @@ struct Shared {
     version: AtomicU32,
     /// The daemon's pid on the current link.
     daemon_pid: AtomicU32,
+    /// Incremented on every disconnect so state bound to one daemon connection
+    /// (such as layout claims) cannot bleed across a reconnect.
+    link_gen: AtomicU64,
     connected: AtomicBool,
     closed: AtomicBool,
     closer: Mutex<Option<Closer>>,
@@ -256,6 +291,7 @@ impl Connection {
             out,
             panes: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
+            claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -263,6 +299,7 @@ impl Connection {
             announce: AtomicU32::new(PROTOCOL_VERSION),
             version: AtomicU32::new(0),
             daemon_pid: AtomicU32::new(0),
+            link_gen: AtomicU64::new(1),
             connected: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             closer: Mutex::new(None),
@@ -368,23 +405,35 @@ impl Connection {
         pending: impl FnOnce(flume::Sender<ServerMsg>) -> Pending,
         msg: impl FnOnce(ReqId) -> ClientMsg,
     ) -> Result<ServerMsg> {
+        self.request_with_gen(timeout, pending, msg).map(|(_, m)| m)
+    }
+
+    fn request_with_gen(
+        &self,
+        timeout: Duration,
+        pending: impl FnOnce(flume::Sender<ServerMsg>) -> Pending,
+        msg: impl FnOnce(ReqId) -> ClientMsg,
+    ) -> Result<(u64, ServerMsg)> {
         let req = self.shared.req_id();
         let (tx, rx) = flume::bounded(1);
-        {
+        let link_gen = {
             // Checked under the lock the disconnect drain takes: a request
-            // registered here is either drained (waking `rx`) or goes out on a live link.
+            // registered here is either drained (waking `rx`) or goes out on a
+            // live link with this exact `link_gen`.
             let mut map = self.shared.pending.lock();
             if !self.is_connected() {
                 bail!("not connected to goattyd");
             }
+            let link_gen = self.shared.link_gen.load(Ordering::Acquire);
             map.insert(req, pending(tx));
-        }
+            link_gen
+        };
         self.shared.send(&msg(req));
         let reply = rx.recv_timeout(timeout);
         self.shared.pending.lock().remove(&req);
         match reply {
             Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
-            Ok(m) => Ok(m),
+            Ok(m) => Ok((link_gen, m)),
             Err(_) => Err(ReplyLost.into()),
         }
     }
@@ -401,7 +450,10 @@ impl Connection {
     pub fn create(&self, size: WinSize, cwd: Option<String>, sink: Arc<dyn PaneSink>) -> Result<SessionId> {
         ensure_sane(size)?;
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Create { req, size, cwd, opts })? {
+        match self.request(
+            |tx| Pending::Attach { tx, sink, size, session: None, state: None },
+            |req| ClientMsg::Create { req, size, cwd, opts },
+        )? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -416,7 +468,10 @@ impl Connection {
             bail!("goattyd via {} is too old to run commands in sessions (protocol v{version}); restart it", self.endpoint().label());
         }
         let opts = self.shared.opts;
-        match self.request(|tx| Pending::Attach { tx, sink, size, session: None }, |req| ClientMsg::Run { req, size, cwd, argv, opts })? {
+        match self.request(
+            |tx| Pending::Attach { tx, sink, size, session: None, state: None },
+            |req| ClientMsg::Run { req, size, cwd, argv, opts },
+        )? {
             ServerMsg::Attached { session, .. } => Ok(session),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -425,15 +480,177 @@ impl Connection {
     pub fn attach(&self, session: SessionId, size: WinSize, sink: Arc<dyn PaneSink>) -> Result<()> {
         // Refused here, not by goattyd: a refused replacement attach would
         // leave the pane that stays with output decoded at the old size.
-        ensure_sane(size)?;
-        let opts = self.shared.opts;
-        match self.request(
-            |tx| Pending::Attach { tx, sink, size, session: Some(session) },
-            |req| ClientMsg::Attach { req, session, size, opts },
-        )? {
-            ServerMsg::Attached { .. } => Ok(()),
-            other => bail!("unexpected reply {other:?}"),
+        self.attach_many(vec![AttachRequest { session, size, sink }]).pop().expect("one attach request yields one result")
+    }
+
+    /// Attach to every session in `requests` in one pipelined burst: all
+    /// `Attach` messages go out before waiting for any `Attached` reply, so
+    /// restoring a window with N panes costs one round trip instead of N over
+    /// any remote transport (SSH, Tailnet, or `--via`).
+    ///
+    /// Returns one result per request, in input order. An invalid size,
+    /// duplicate session in the same batch, or missing session fails only its
+    /// own entry; a dropped link or idle timeout fails every entry whose reply
+    /// has not arrived yet with [`ReplyLost`].
+    pub fn attach_many(&self, requests: Vec<AttachRequest>) -> Vec<Result<()>> {
+        self.attach_many_within(requests, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::attach_many`], failing remaining entries if no reply
+    /// arrives for `timeout`.
+    pub fn attach_many_within(&self, requests: Vec<AttachRequest>, timeout: Duration) -> Vec<Result<()>> {
+        if requests.is_empty() {
+            return Vec::new();
         }
+        let n = requests.len();
+        let mut results: Vec<Option<Result<()>>> = (0..n).map(|_| None).collect();
+        let mut seen = HashSet::with_capacity(n);
+        let mut to_send: Vec<(usize, AttachRequest)> = Vec::with_capacity(n);
+
+        for (i, req) in requests.into_iter().enumerate() {
+            // Refused here, not by goattyd: a refused replacement attach would
+            // leave the pane that stays with output decoded at the old size.
+            if let Err(e) = ensure_sane(req.size) {
+                results[i] = Some(Err(e));
+                continue;
+            }
+            if !seen.insert(req.session) {
+                results[i] = Some(Err(anyhow!("duplicate attach for session {}", req.session)));
+                continue;
+            }
+            to_send.push((i, req));
+        }
+
+        if to_send.is_empty() {
+            return results.into_iter().map(|r| r.expect("every attach entry resolved")).collect();
+        }
+
+        let opts = self.shared.opts;
+        let (tx, rx) = flume::bounded(to_send.len());
+        let mut in_flight: HashMap<ReqId, (usize, SessionId, Arc<AtomicU8>)> = HashMap::with_capacity(to_send.len());
+        let mut msgs: Vec<ClientMsg> = Vec::with_capacity(to_send.len());
+
+        let link_gen = {
+            // Checked under the lock the disconnect drain takes: every request
+            // registered here is either drained (closing `rx`) or sent on a
+            // live link with this exact `link_gen`.
+            let mut map = self.shared.pending.lock();
+            if !self.is_connected() {
+                for (i, _) in to_send {
+                    results[i] = Some(Err(ReplyLost.into()));
+                }
+                return results.into_iter().map(|r| r.expect("every attach entry resolved")).collect();
+            }
+            let link_gen = self.shared.link_gen.load(Ordering::Acquire);
+            for (i, r) in to_send {
+                let req = self.shared.req_id();
+                let state = Arc::new(AtomicU8::new(ATTACH_ACTIVE));
+                map.insert(
+                    req,
+                    Pending::Attach { tx: tx.clone(), sink: r.sink, size: r.size, session: Some(r.session), state: Some(state.clone()) },
+                );
+                in_flight.insert(req, (i, r.session, state));
+                msgs.push(ClientMsg::Attach { req, session: r.session, size: r.size, opts });
+            }
+            link_gen
+        };
+        // Drop the local sender so `rx` closes as soon as every pending entry
+        // is answered or drained on disconnect.
+        drop(tx);
+
+        // Queue every frame back-to-back so the writer batches and flushes
+        // them together instead of one RTT at a time.
+        for msg in &msgs {
+            self.shared.send(msg);
+        }
+
+        let apply_reply =
+            |msg: ServerMsg, in_flight: &mut HashMap<ReqId, (usize, SessionId, Arc<AtomicU8>)>, results: &mut [Option<Result<()>>]| {
+                let Some(req) = msg.reply_to() else {
+                    log::warn!("attach_many received message without req id: {msg:?}");
+                    return;
+                };
+                let Some((i, _, _)) = in_flight.remove(&req) else {
+                    return;
+                };
+                results[i] = Some(match msg {
+                    ServerMsg::Attached { .. } => Ok(()),
+                    ServerMsg::Error { message, .. } => Err(anyhow!("goattyd: {message}")),
+                    other => Err(anyhow!("unexpected reply {other:?}")),
+                });
+            };
+
+        while !in_flight.is_empty() {
+            match rx.recv_timeout(timeout) {
+                Ok(msg) => apply_reply(msg, &mut in_flight, &mut results),
+                Err(_) => break,
+            }
+        }
+
+        if !in_flight.is_empty() {
+            while let Ok(msg) = rx.try_recv() {
+                apply_reply(msg, &mut in_flight, &mut results);
+            }
+        }
+
+        if !in_flight.is_empty() {
+            let mut timed_out_sessions = Vec::new();
+            {
+                let mut map = self.shared.pending.lock();
+                in_flight.retain(|&req, &mut (i, session, ref state)| {
+                    if map.remove(&req).is_some()
+                        || state.compare_exchange(ATTACH_ACTIVE, ATTACH_CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                    {
+                        // Cancelled before `dispatch` committed to installing
+                        // the pane (or already drained on disconnect).
+                        results[i] = Some(Err(ReplyLost.into()));
+                        timed_out_sessions.push(session);
+                        false
+                    } else {
+                        // `dispatch` already transitioned to `ATTACH_FINISHING`
+                        // and is installing the pane / sending the reply.
+                        true
+                    }
+                });
+            }
+            // Wait for any reply that `dispatch` already committed to
+            // installing before we locked `pending`, so an installed pane is
+            // never reported as failed (and leaked).
+            while !in_flight.is_empty() {
+                match rx.recv() {
+                    Ok(msg) => apply_reply(msg, &mut in_flight, &mut results),
+                    Err(_) => break,
+                }
+            }
+            for (_, (i, session, _)) in in_flight {
+                results[i] = Some(Err(ReplyLost.into()));
+                timed_out_sessions.push(session);
+            }
+            if !timed_out_sessions.is_empty() {
+                // Keep lock acquisition flat (never nest `panes` and `early_size`).
+                let unattached: Vec<SessionId> = {
+                    let panes = self.shared.panes.lock();
+                    timed_out_sessions.into_iter().filter(|id| !panes.contains_key(id)).collect()
+                };
+                if !unattached.is_empty() {
+                    {
+                        let mut early = self.shared.early_size.lock();
+                        for &id in &unattached {
+                            early.remove(&id);
+                        }
+                    }
+                    // If we are still on the same live link, unsubscribe any
+                    // late `Attach` the daemon may still finish processing.
+                    if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
+                        for id in unattached {
+                            self.shared.send(&ClientMsg::Detach { session: id });
+                        }
+                    }
+                }
+            }
+        }
+
+        results.into_iter().map(|r| r.expect("every attach entry resolved")).collect()
     }
 
     /// Ask for up to `count` rows of `session`'s history before host line
@@ -622,6 +839,11 @@ impl Connection {
     /// client's format) on the host, so a later window can restore it. No
     /// `sessions`: forget it. Never blocks; saved again after a reconnect.
     pub fn save_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
+        {
+            let mut claimed = self.shared.claimed_layouts.lock();
+            claimed.gens.remove(&id);
+            claimed.unclaimed.retain(|(_, info)| info.id != id);
+        }
         let msg = ClientMsg::SaveLayout { id, sessions, json };
         if self.is_connected() {
             self.shared.send(&msg);
@@ -632,9 +854,41 @@ impl Connection {
     /// Take over the newest layout no window holds (see
     /// `ClientMsg::ClaimLayout`). Blocks: call off the UI thread.
     pub fn claim_layout(&self) -> Result<Option<LayoutInfo>> {
-        match self.request(Pending::Reply, |req| ClientMsg::ClaimLayout { req })? {
-            ServerMsg::Layout { layout, .. } => Ok(layout),
+        {
+            let mut claimed = self.shared.claimed_layouts.lock();
+            let cur = self.shared.link_gen.load(Ordering::Acquire);
+            while let Some((g, info)) = claimed.unclaimed.pop_front() {
+                if g == cur && self.is_connected() {
+                    claimed.gens.insert(info.id, cur);
+                    return Ok(Some(info));
+                }
+            }
+        }
+        let (link_gen, reply) = self.request_with_gen(REQUEST_TIMEOUT, Pending::Reply, |req| ClientMsg::ClaimLayout { req })?;
+        match reply {
+            ServerMsg::Layout { layout, .. } => {
+                if let Some(info) = &layout {
+                    let mut claimed = self.shared.claimed_layouts.lock();
+                    if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
+                        claimed.gens.insert(info.id, link_gen);
+                    }
+                }
+                Ok(layout)
+            }
             other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
+    /// Return a layout previously obtained from [`Self::claim_layout`] when
+    /// restoring it fails on a still-live link (for example, after an attach
+    /// timeout on a pooled connection). The next [`Self::claim_layout`] on
+    /// this connection can reclaim it; if the link drops, the daemon releases
+    /// the claim automatically and the stashed entry is discarded.
+    pub fn release_claimed_layout(&self, info: LayoutInfo) {
+        let mut claimed = self.shared.claimed_layouts.lock();
+        let cur = self.shared.link_gen.load(Ordering::Acquire);
+        if claimed.gens.remove(&info.id) == Some(cur) && self.is_connected() {
+            claimed.unclaimed.push_back((cur, info));
         }
     }
 
@@ -708,6 +962,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
+        let _ = self.shared.out.send(WriterCmd::Close);
         self.shared.close_transport();
     }
 }
@@ -732,6 +987,7 @@ fn writer_loop(rx: flume::Receiver<WriterCmd>) {
                     w = None; // the reader notices too and reconnects
                 }
             }
+            WriterCmd::Close => break,
         }
         // Batch under load, flush as soon as the queue is idle (keystrokes
         // go out immediately).
@@ -769,6 +1025,7 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
     loop {
         let err = read_loop(&s, &mut reader);
         s.connected.store(false, Ordering::Release);
+        s.link_gen.fetch_add(1, Ordering::AcqRel);
         s.rtt_us.store(0, Ordering::Relaxed);
         s.close_transport();
         if s.closed.load(Ordering::Acquire) {
@@ -777,8 +1034,9 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
         log::warn!("link to goattyd lost: {err}");
         // Fail in-flight requests; keep panes for reattach.
         let failed: Vec<Pending> = s.pending.lock().drain().map(|(_, p)| p).collect();
-        // Geometry from the old link is no one's on the next.
+        // Geometry and layout claims from the old link are released on disconnect.
         s.early_size.lock().clear();
+        s.claimed_layouts.lock().clear();
         for p in failed {
             if let Pending::History(session) = p
                 && let Some(sink) = s.panes.lock().get(&session).map(|p| p.sink.clone())
@@ -933,11 +1191,20 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         ServerMsg::Attached { req, session, snapshot } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, sink, size, .. }) => {
+                Some(Pending::Attach { tx, sink, size, state, .. }) => {
+                    if state.as_ref().is_some_and(|st| st.load(Ordering::Acquire) == ATTACH_CANCELLED) {
+                        return;
+                    }
                     if let Some(ev) = s.early_size.lock().remove(&session) {
                         sink.event(ev);
                     }
                     sink.feed(&snapshot);
+                    let committed = state
+                        .as_ref()
+                        .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                    if !committed {
+                        return;
+                    }
                     let n = snapshot.len() as u64;
                     s.panes.lock().insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None, linked: true });
                     let _ = tx.send(ServerMsg::Attached { req, session, snapshot: Vec::new() });
@@ -993,11 +1260,23 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 // Comes before the `Attached` that adds the pane.
                 // Or after we detached: keep such leftovers bounded.
                 None => {
-                    let mut early = s.early_size.lock();
-                    if early.len() >= 64 {
-                        early.clear();
+                    let overflow = {
+                        let mut early = s.early_size.lock();
+                        early.insert(session, ev);
+                        early.len() > 64
+                    };
+                    if overflow {
+                        let pending_sessions: HashSet<SessionId> = s
+                            .pending
+                            .lock()
+                            .values()
+                            .filter_map(|p| match p {
+                                Pending::Attach { session: Some(id), .. } => Some(*id),
+                                _ => None,
+                            })
+                            .collect();
+                        s.early_size.lock().retain(|id, _| *id == session || pending_sessions.contains(id));
                     }
-                    early.insert(session, ev);
                 }
             }
         }
@@ -1042,15 +1321,24 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::Shell { req, .. }
         | ServerMsg::Net { req, .. }
         | ServerMsg::PathStat { req, .. }
-        | ServerMsg::FileData { req, .. } => {
-            if let Some(Pending::Reply(tx) | Pending::Attach { tx, .. }) = s.pending.lock().remove(&req) {
+        | ServerMsg::FileData { req, .. } => match s.pending.lock().remove(&req) {
+            Some(Pending::Reply(tx)) => {
                 let _ = tx.send(msg);
             }
-        }
+            Some(Pending::Attach { tx, state, .. }) => {
+                let committed = state
+                    .as_ref()
+                    .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                if committed {
+                    let _ = tx.send(msg);
+                }
+            }
+            _ => {}
+        },
         ServerMsg::Error { req: Some(req), ref message } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, session, .. }) => {
+                Some(Pending::Attach { tx, session, state, .. }) => {
                     // A refused replacement attach: a live size change held
                     // for it belongs to the pane that stays.
                     if let Some(session) = session {
@@ -1061,7 +1349,12 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                             sink.event(ev);
                         }
                     }
-                    let _ = tx.send(msg);
+                    let committed = state
+                        .as_ref()
+                        .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                    if committed {
+                        let _ = tx.send(msg);
+                    }
                 }
                 Some(Pending::Reply(tx)) => {
                     let _ = tx.send(msg);
@@ -1162,6 +1455,7 @@ mod tests {
             out,
             panes: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
+            claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -1169,6 +1463,7 @@ mod tests {
             announce: AtomicU32::new(PROTOCOL_VERSION),
             version: AtomicU32::new(PROTOCOL_VERSION),
             daemon_pid: AtomicU32::new(1),
+            link_gen: AtomicU64::new(1),
             connected: AtomicBool::new(true),
             closed: AtomicBool::new(false),
             closer: Mutex::new(None),
@@ -1201,5 +1496,362 @@ mod tests {
         assert_eq!(conn.rtt(), None, "disconnect must clear stale RTT");
         drop(client_w);
         server.join().unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecSink {
+        fed: Mutex<Vec<u8>>,
+        events: Mutex<Vec<String>>,
+        top_lines: Mutex<Vec<(u64, goatty_proto::TopLineCause)>>,
+    }
+
+    impl PaneSink for RecSink {
+        fn feed(&self, bytes: &[u8]) {
+            self.fed.lock().extend_from_slice(bytes);
+        }
+        fn event(&self, ev: PaneEvent) {
+            self.events.lock().push(format!("{ev:?}"));
+        }
+        fn top_line(&self, line: u64, cause: goatty_proto::TopLineCause) {
+            self.top_lines.lock().push((line, cause));
+        }
+    }
+
+    fn mock_connection(
+        server_fn: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>, std::os::unix::net::UnixStream) + Send + 'static,
+    ) -> (Connection, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+        let (client_w, server_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut server_w, client_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let hello = ServerMsg::Hello {
+                version: PROTOCOL_VERSION,
+                daemon_pid: 1,
+                host: HostInfo { hostname: "h".into(), user: "u".into(), os: "linux".into(), daemon_version: "0".into() },
+            };
+            server_w.write_all(&encode(&hello).unwrap()).unwrap();
+            server_fn(std::io::BufReader::new(server_r), server_w);
+        });
+        let (out, out_rx) = flume::unbounded();
+        let _ = out.send(WriterCmd::Replace(Box::new(client_w.try_clone().unwrap())));
+        let (reconnect_tx, reconnect_rx) = flume::bounded(1);
+        let shared = Arc::new(Shared {
+            endpoint: Endpoint::command_line("false").unwrap(),
+            opts: StreamOpts::REMOTE,
+            flow_window: AtomicU32::new(StreamOpts::REMOTE.window),
+            client_name: "test".into(),
+            auto_reconnect: false,
+            out,
+            panes: Mutex::new(HashMap::new()),
+            layout: Mutex::new(None),
+            claimed_layouts: Mutex::new(ClaimedLayouts::default()),
+            pending: Mutex::new(HashMap::new()),
+            early_size: Mutex::new(HashMap::new()),
+            next_req: AtomicU32::new(1),
+            host: Mutex::new(HostInfo::default()),
+            announce: AtomicU32::new(PROTOCOL_VERSION),
+            version: AtomicU32::new(PROTOCOL_VERSION),
+            daemon_pid: AtomicU32::new(1),
+            link_gen: AtomicU64::new(1),
+            connected: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            closer: Mutex::new(Some(Closer(Arc::new(Mutex::new(Some(crate::transport::CloseHandle::Socket(client_w))))))),
+            epoch: Instant::now(),
+            last_rx_us: AtomicU64::new(0),
+            rtt_us: AtomicU64::new(0),
+            reconnect_tx,
+            reconnect_rx,
+        });
+        std::thread::spawn(move || writer_loop(out_rx));
+        let mut reader = std::io::BufReader::new(Box::new(client_r) as Box<dyn Read + Send>);
+        assert!(matches!(read_msg::<_, ServerMsg>(&mut reader).unwrap(), ServerMsg::Hello { .. }));
+        let s = shared.clone();
+        let reader_handle = std::thread::spawn(move || reader_main(s, reader));
+        (Connection { shared }, reader_handle, server)
+    }
+
+    #[test]
+    fn attach_many_pipelines_all_requests_before_any_reply() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            // Read all 8 Attach requests BEFORE answering a single one: a
+            // sequential implementation would deadlock here.
+            let mut reqs = Vec::new();
+            for _ in 0..8 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::Attach { req, session, .. } => reqs.push((req, session)),
+                    other => panic!("unexpected client msg: {other:?}"),
+                }
+            }
+            // Answer in reverse order to prove replies are matched by `req`.
+            for (req, session) in reqs.into_iter().rev() {
+                let sz = ServerMsg::SizeControl { session, size, controlling: session.is_multiple_of(2) };
+                let att = ServerMsg::Attached { req, session, snapshot: format!("snap-{session}").into_bytes() };
+                let top = ServerMsg::TopLine { session, line: session * 10, cause: goatty_proto::TopLineCause::Attach };
+                let cwd = ServerMsg::Cwd { session, cwd: Some(format!("/dir/{session}")) };
+                for m in [sz, att, top, cwd] {
+                    w.write_all(&encode(&m).unwrap()).unwrap();
+                }
+            }
+            w.flush().unwrap();
+            // Keep stream open until client finishes reading follow-up frames.
+            let _ = read_msg::<_, ClientMsg>(&mut r);
+        });
+
+        let sinks: Vec<Arc<RecSink>> = (0..8).map(|_| Arc::new(RecSink::default())).collect();
+        let requests: Vec<AttachRequest> =
+            (10u64..18).zip(sinks.iter().cloned()).map(|(session, sink)| AttachRequest { session, size, sink }).collect();
+        let results = conn.attach_many_within(requests, Duration::from_secs(5));
+        assert_eq!(results.len(), 8);
+        for (i, res) in results.into_iter().enumerate() {
+            res.unwrap_or_else(|e| panic!("entry {i} failed: {e:#}"));
+            let session = 10 + i as u64;
+            assert_eq!(String::from_utf8_lossy(&sinks[i].fed.lock()), format!("snap-{session}"));
+            assert!(
+                sinks[i]
+                    .events
+                    .lock()
+                    .iter()
+                    .any(|e| e.contains("SizeControl") && e.contains(&format!("controlling: {}", session.is_multiple_of(2)))),
+                "missing SizeControl for {session}: {:?}",
+                sinks[i].events.lock()
+            );
+        }
+        // Wait briefly for follow-up TopLine/Cwd frames pushed right after Attached.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sinks.iter().any(|s| s.top_lines.lock().is_empty() || !s.events.lock().iter().any(|e| e.contains("Cwd"))) {
+            assert!(Instant::now() < deadline, "follow-up frames did not arrive");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_handles_partial_errors_invalid_sizes_and_duplicates() {
+        let ok_size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let bad_size = WinSize { cols: 9999, rows: 9999, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            // Only 3 valid unique requests (sessions 1, 3, 4) should hit the wire.
+            let mut reqs = Vec::new();
+            for _ in 0..3 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::Attach { req, session, .. } => reqs.push((req, session)),
+                    other => panic!("unexpected client msg: {other:?}"),
+                }
+            }
+            for (req, session) in reqs {
+                let msg = if session == 3 {
+                    ServerMsg::Error { req: Some(req), message: "no session 3".into() }
+                } else {
+                    ServerMsg::Attached { req, session, snapshot: format!("ok-{session}").into_bytes() }
+                };
+                w.write_all(&encode(&msg).unwrap()).unwrap();
+            }
+            w.flush().unwrap();
+            let _ = read_msg::<_, ClientMsg>(&mut r);
+        });
+
+        let sinks: Vec<Arc<RecSink>> = (0..5).map(|_| Arc::new(RecSink::default())).collect();
+        let requests = vec![
+            AttachRequest { session: 1, size: ok_size, sink: sinks[0].clone() },
+            AttachRequest { session: 2, size: bad_size, sink: sinks[1].clone() },
+            AttachRequest { session: 1, size: ok_size, sink: sinks[2].clone() },
+            AttachRequest { session: 3, size: ok_size, sink: sinks[3].clone() },
+            AttachRequest { session: 4, size: ok_size, sink: sinks[4].clone() },
+        ];
+        let results = conn.attach_many_within(requests, Duration::from_secs(5));
+        assert!(results[0].is_ok());
+        assert!(results[1].as_ref().unwrap_err().to_string().contains("too large"));
+        assert!(results[2].as_ref().unwrap_err().to_string().contains("duplicate"));
+        assert!(results[3].as_ref().unwrap_err().to_string().contains("no session 3"));
+        assert!(results[4].is_ok());
+        assert_eq!(String::from_utf8_lossy(&sinks[0].fed.lock()), "ok-1");
+        assert_eq!(String::from_utf8_lossy(&sinks[4].fed.lock()), "ok-4");
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_disconnect_mid_batch_fails_remaining_immediately() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let mut reqs = Vec::new();
+            for _ in 0..4 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::Attach { req, session, .. } => reqs.push((req, session)),
+                    other => panic!("unexpected client msg: {other:?}"),
+                }
+            }
+            // Answer only the first two, then drop the link.
+            for (req, session) in &reqs[..2] {
+                let msg = ServerMsg::Attached { req: *req, session: *session, snapshot: b"hi".to_vec() };
+                w.write_all(&encode(&msg).unwrap()).unwrap();
+            }
+            w.flush().unwrap();
+            drop(w);
+        });
+
+        let start = Instant::now();
+        let requests: Vec<AttachRequest> =
+            (1u64..=4).map(|session| AttachRequest { session, size, sink: Arc::new(RecSink::default()) }).collect();
+        let results = conn.attach_many_within(requests, Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(results[2].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(results[3].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_timeout_cleans_pending_and_early_size() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (tx_done, rx_done) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            for _ in 0..2 {
+                let _ = read_msg::<_, ClientMsg>(&mut r).unwrap();
+            }
+            // Send SizeControl for session 1, then stall without sending Attached.
+            let sz = ServerMsg::SizeControl { session: 1, size, controlling: true };
+            w.write_all(&encode(&sz).unwrap()).unwrap();
+            w.flush().unwrap();
+            let _ = rx_done.recv_timeout(Duration::from_secs(2));
+        });
+
+        let requests = vec![
+            AttachRequest { session: 1, size, sink: Arc::new(RecSink::default()) },
+            AttachRequest { session: 2, size, sink: Arc::new(RecSink::default()) },
+        ];
+        let results = conn.attach_many_within(requests, Duration::from_millis(80));
+        assert!(results[0].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(results[1].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(conn.shared.pending.lock().is_empty(), "timed-out pending entries must be removed");
+        assert!(conn.shared.early_size.lock().is_empty(), "stale early_size entries must be removed");
+        let _ = tx_done.send(());
+        drop(conn);
+        reader_h.join().unwrap();
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_when_disconnected_returns_reply_lost() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (conn, reader_h, server_h) = mock_connection(move |_r, w| {
+            drop(w);
+        });
+        reader_h.join().unwrap();
+        assert!(!conn.is_connected());
+
+        let results = conn.attach_many_within(
+            vec![
+                AttachRequest { session: 1, size, sink: Arc::new(RecSink::default()) },
+                AttachRequest { session: 2, size, sink: Arc::new(RecSink::default()) },
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results[0].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert!(results[1].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn release_claimed_layout_allows_retry_on_live_link_and_clears_on_disconnect() {
+        let layout = LayoutInfo { id: 0x42, sessions: vec![1, 2], json: r#"{"version":1}"#.into(), saved_unix: 10 };
+        let server_layout = layout.clone();
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            // Answer only ONE ClaimLayout from the wire: the retry must come
+            // from the stashed layout on the live connection.
+            match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::ClaimLayout { req } => {
+                    let msg = ServerMsg::Layout { req, layout: Some(server_layout) };
+                    w.write_all(&encode(&msg).unwrap()).unwrap();
+                    w.flush().unwrap();
+                }
+                other => panic!("unexpected client msg: {other:?}"),
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(2));
+            drop(w);
+        });
+
+        let first = conn.claim_layout().unwrap().expect("initial claim");
+        assert_eq!(first, layout);
+
+        // Returning the claim while the link is still live makes it reclaimable
+        // on the next `claim_layout` call without hitting the daemon again.
+        conn.release_claimed_layout(first.clone());
+        let retry = conn.claim_layout().unwrap().expect("retry claim on same live link");
+        assert_eq!(retry, layout);
+
+        // Once the link drops, releasing a claim from the old link must not
+        // stash it (the daemon releases claims automatically on disconnect).
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        assert!(!conn.is_connected());
+        conn.release_claimed_layout(retry);
+        assert!(conn.shared.claimed_layouts.lock().unclaimed.is_empty());
+
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn attach_many_timeout_during_slow_sink_feed_does_not_leak_pane() {
+        struct SlowSink {
+            entered: flume::Sender<()>,
+            release: flume::Receiver<()>,
+        }
+        impl PaneSink for SlowSink {
+            fn feed(&self, _bytes: &[u8]) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+            }
+            fn event(&self, _ev: PaneEvent) {}
+        }
+
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (entered_tx, entered_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (detach_tx, detach_rx) = flume::bounded::<SessionId>(1);
+        let (tx_done, rx_done) = flume::bounded::<()>(1);
+
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let req = match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::Attach { req, session: 1, .. } => req,
+                other => panic!("unexpected client msg: {other:?}"),
+            };
+            let att = ServerMsg::Attached { req, session: 1, snapshot: b"slow-snapshot".to_vec() };
+            w.write_all(&encode(&att).unwrap()).unwrap();
+            w.flush().unwrap();
+
+            if let Ok(ClientMsg::Detach { session }) = read_msg::<_, ClientMsg>(&mut r) {
+                let _ = detach_tx.send(session);
+            }
+            let _ = rx_done.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        let sink = Arc::new(SlowSink { entered: entered_tx, release: release_rx });
+        let start = Instant::now();
+        let results = conn.attach_many_within(vec![AttachRequest { session: 1, size, sink }], Duration::from_millis(120));
+        assert!(start.elapsed() < Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(entered_rx.recv_timeout(Duration::from_secs(1)).is_ok(), "sink.feed should have started before timeout");
+        assert!(results[0].as_ref().unwrap_err().downcast_ref::<ReplyLost>().is_some());
+        assert_eq!(detach_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+
+        // Allow `sink.feed` to finish; the cancelled attach must not install a pane.
+        let shared = conn.shared.clone();
+        let _ = release_tx.send(());
+        let _ = tx_done.send(());
+        drop(conn);
+        reader_h.join().unwrap();
+        assert!(shared.panes.lock().is_empty(), "cancelled attach must not leak pane");
+        server_h.join().unwrap();
     }
 }

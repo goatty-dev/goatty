@@ -224,7 +224,7 @@ Covered by `client_over_proxy_reconnects_and_reattaches`: kill the proxy mid-ses
 
 ## 7. Performance
 
-### Measured (`cargo run --release -p goatty-daemon --example netbench -- [proxy | slow RATE | ssh HOST]`)
+### Measured (`cargo run --release -p goatty-daemon --example netbench -- [proxy | delay RTT_MS | slow RATE | ssh HOST | tailnet DNS]`)
 
 Headless client feeding a real mirror VT (the GUI's work minus rendering), 200×50, `/bin/sh`, same machine as Stage 0:
 
@@ -236,6 +236,24 @@ Headless client feeding a real mirror VT (the GUI's work minus rendering), 200×
 | Same, throttled to **500 KB/s** with `pv -L` (256 → 64 KiB) | 0.26 / 1.00 ms | **0.65–0.75 s** | 0.7–0.8 MB | 3–5 (199 MB skipped) |
 
 Echo latency includes the PTY round trip and the benchmark's 0.2 ms polling. On the throttled links, naive forwarding would need ~100–400 s to drain the flood before the prompt (or a Ctrl+C) became visible. With adaptive flow control and skip-and-resync the prompt shows as soon as the command finishes (and ~25% faster at 500 KB/s than the old fixed 256 KiB window), while a fast proxy link ramps to 8 MiB and matches local throughput. Local throughput is lossless and well above what the GUI renders (~100 MB/s end to end in Stage 0), so the protocol is not the bottleneck.
+
+### Restoring a multi-pane window (`Connection::attach_many`, #127)
+
+Restoring a saved layout (`workspace::saved::restore`) pipelines every pane's `ClientMsg::Attach` in one burst through `Connection::attach_many` instead of waiting for each `Attached` reply in turn (`claim_layout` + N × `attach` = 1 + N RTTs → `claim_layout` + `attach_many` = 2 RTTs, with no protocol change because `Attach` already carries a `ReqId` and works across SSH, tailnet, `--via` commands, and local sockets).
+
+Measured with `FLOOD_MB=0 RESTORE_PANES=8` (with `RESTORE_LINES=0` and `RESTORE_LINES=2000`, zstd-compressed snapshots on remote links) via `netbench`:
+
+| Endpoint | 8 panes, empty (`claim`+attach) | 8 panes, empty (attach only) | 8 panes, 2000 lines/pane (`claim`+attach) | 8 panes, 2000 lines/pane (attach only) |
+|---|---|---|---|---|
+| Local Unix socket | 1.29 → 0.49 ms (2.66×) | 1.24 → 0.31 ms (3.98×) | 39.78 → 15.22 ms (2.61×) | 39.73 → 14.59 ms (2.72×) |
+| `goattyd proxy` (0 ms RTT) | 1.58 → 0.67 ms (2.37×) | 1.52 → 0.35 ms (4.37×) | 39.91 → 15.76 ms (2.53×) | 39.69 → 15.01 ms (2.65×) |
+| `delay 20` (20 ms RTT) | 189.28 → 42.38 ms (4.47×) | 168.62 → 21.16 ms (7.97×) | 216.60 → 59.65 ms (3.63×) | 195.56 → 38.34 ms (5.10×) |
+| `delay 50` (50 ms RTT) | 459.76 → 101.67 ms (4.52×) | 408.56 → 50.73 ms (8.05×) | 492.46 → 116.73 ms (4.22×) | 441.59 → 65.39 ms (6.75×) |
+| `delay 100` (100 ms RTT) | 908.90 → 202.32 ms (4.49×) | 808.00 → 101.20 ms (7.98×) | 937.90 → 216.44 ms (4.33×) | 836.80 → 114.98 ms (7.28×) |
+| `slow 2m` (2 MB/s) | — | — | 34.22 → 15.70 ms (2.18×) | 34.15 → 14.89 ms (2.29×) |
+| `slow 500k` (500 KB/s) | — | — | 38.08 → 16.90 ms (2.25×) | 38.00 → 16.47 ms (2.31×) |
+
+Over simulated WAN links, the attach phase scales with 1 RTT instead of N (~8× faster for 8 panes, ~4.5× including `claim_layout`). Even at 0 ms RTT with 2000 lines per pane, pipelining is ~2.6× faster because the client parses snapshot *i* on the reader thread while the daemon serializes and compresses snapshot *i + 1*.
 
 ### Snapshots and history (`cargo run --release -p goatty-daemon --example snapbench [FILE]`)
 
@@ -256,7 +274,7 @@ Compression costs far less than sending the bytes over any remote link (25 KB le
 | Local flood throughput | ≥ Stage 0 | One encode per chunk shared by all subscribers, batched writes with flush-on-idle, acks only every ≥2 MiB or per drained read. Still to do: re-run the GUI `scripts/bench.sh` |
 | Local keystroke → PTY | < 0.2 ms added | Writer thread flushes as soon as its queue is empty |
 | Remote keystroke echo | RTT + ~1 ms; shown at once with prediction | R3 local echo prediction above 30 ms RTT |
-| Remote attach | ≤ 2000 lines of history | ~100 KB of source code, 25 KB with zstd (§7 snapbench); older lines on scroll-up |
+| Remote attach | 1 RTT for N panes (`attach_many`, #127); ≤ 2000 lines/pane | ~100 KB of source code, 25 KB with zstd (§7 snapbench); older lines on scroll-up |
 | Remote flood: Ctrl+C visible | ≈ window/bandwidth + RTT | Adaptive 64 KiB–8 MiB window (≈ 50 ms + RTT) |
 | Daemon memory per subscriber | ≤ window | Was unbounded |
 | Idle | 0 wakeups locally, 1 ping per 5 s remote | |
