@@ -393,6 +393,7 @@ impl StartLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
