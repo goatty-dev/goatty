@@ -106,14 +106,23 @@ pub fn backfill(dirs: &Dirs) {
 
 /// What `exe args…` prints on stdout, within [`TIMEOUT`].
 fn generate(exe: &Path, args: &[String]) -> Result<String> {
-    let mut child =
-        Command::new(exe).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().context("start it")?;
+    let deadline = Instant::now() + TIMEOUT;
+    // Another thread forking while `exe` was just written holds that writable
+    // fd until its exec; retry ETXTBSY ("text file busy").
+    let mut child = loop {
+        match Command::new(exe).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+            Ok(child) => break child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(e).context("start it"),
+        }
+    };
     let mut stdout = child.stdout.take().context("no stdout")?;
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         stdout.read_to_end(&mut buf).map(|_| buf)
     });
-    let deadline = Instant::now() + TIMEOUT;
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
@@ -194,5 +203,24 @@ mod tests {
         assert!(for_package(&dirs, "bad", sh, &args("echo nope")).is_err());
         assert!(for_package(&dirs, "bad", sh, &args("exit 3")).unwrap_err().to_string().contains("sh -c exit 3"));
         assert!(!file(&dirs, "bad").exists());
+    }
+
+    #[test]
+    fn a_program_busy_for_writing_is_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let path = tmp.path().join("demo");
+        std::fs::write(&path, "#!/bin/sh\nprintf '#compdef demo\\n'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Open for writing: exec fails with ETXTBSY on Linux until it is closed.
+        let writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        assert!(for_package(&dirs, "demo", &path, &[]).unwrap());
+        closer.join().unwrap();
+        assert_eq!(std::fs::read_to_string(file(&dirs, "demo")).unwrap(), "#compdef demo\n");
     }
 }
