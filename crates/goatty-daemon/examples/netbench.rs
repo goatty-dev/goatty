@@ -175,6 +175,33 @@ fn wait_all_detached(observer: &Connection, ids: &[SessionId]) -> anyhow::Result
     }
 }
 
+struct RestoreCleanup<'a> {
+    setup_endpoint: &'a Endpoint,
+    conn: Option<Arc<Connection>>,
+    ids: Vec<SessionId>,
+    layout_saved: bool,
+}
+
+impl Drop for RestoreCleanup<'_> {
+    fn drop(&mut self) {
+        if self.ids.is_empty() && !self.layout_saved {
+            return;
+        }
+        let conn = self.conn.take().or_else(|| Connection::open(self.setup_endpoint.clone(), "netbench-cleanup").ok());
+        let Some(conn) = conn else { return };
+        if self.layout_saved {
+            conn.save_layout(0x127, Vec::new(), String::new());
+        }
+        for &id in &self.ids {
+            let _ = conn.kill(id);
+        }
+        if self.layout_saved {
+            // Ensure the daemon processed `save_layout` before disconnecting.
+            let _ = conn.list_sessions();
+        }
+    }
+}
+
 fn bench_restore(
     endpoint: &Endpoint,
     setup_endpoint: &Endpoint,
@@ -183,15 +210,20 @@ fn bench_restore(
     size: TermSize,
     ws: WinSize,
 ) -> anyhow::Result<RestoreMetrics> {
+    // Declared first so LIFO drop order tears down `setup`/`c_seq`/`c_pipe`
+    // before cleanup runs, on both normal return and every early `?` error
+    // (important for real ssh/tailnet hosts).
+    let mut cleanup = RestoreCleanup { setup_endpoint, conn: None, ids: Vec::with_capacity(panes), layout_saved: false };
+
     // Create and seed the panes on a setup connection (local Unix socket for
     // private daemons so setup itself doesn't pay simulated latency), save a
     // layout, then drop the setup connection so the layout is claimable.
     let setup = Connection::open(setup_endpoint.clone(), "netbench-setup")?;
-    let mut ids = Vec::with_capacity(panes);
     let mut sinks = Vec::with_capacity(panes);
     for i in 0..panes {
         let sink = Sink::new(size);
         let id = setup.create(ws, None, sink.clone())?;
+        cleanup.ids.push(id);
         if lines > 0 {
             let cmd = format!(
                 "awk -v p={i} -v n={lines} 'BEGIN{{for(j=0;j<n;j++) printf \"pane %d line %04d: the quick brown fox jumps over the lazy dog 0123456789\\n\", p, j}}'; echo PANE-{i}-READY-$((1+1))\r"
@@ -200,20 +232,21 @@ fn bench_restore(
         } else {
             setup.input(id, format!("echo PANE-{i}-READY-$((1+1))\r").as_bytes());
         }
-        ids.push(id);
         sinks.push(sink);
     }
     for (i, sink) in sinks.iter().enumerate() {
         let marker = format!("PANE-{i}-READY-2");
         anyhow::ensure!(sink.wait_tail(marker.as_bytes(), Duration::from_secs(30)), "pane {i} did not finish setup");
     }
-    setup.save_layout(0x127, ids.clone(), r#"{"version":1,"tabs":[],"active":0}"#.into());
+    setup.save_layout(0x127, cleanup.ids.clone(), r#"{"version":1,"tabs":[],"active":0}"#.into());
+    cleanup.layout_saved = true;
     // Ensure the daemon processed `save_layout` before we disconnect.
     let _ = setup.list_sessions()?;
     drop(setup);
 
     let observer = Connection::open(setup_endpoint.clone(), "netbench-obs")?;
-    wait_all_detached(&observer, &ids)?;
+    cleanup.conn = Some(observer.clone());
+    wait_all_detached(&observer, &cleanup.ids)?;
 
     // 1) Sequential restore: `claim_layout` + N sequential `attach` calls.
     let c_seq = Connection::open(endpoint.clone(), "netbench-seq")?;
@@ -221,21 +254,22 @@ fn bench_restore(
     let layout = c_seq.claim_layout()?.ok_or_else(|| anyhow::anyhow!("layout missing for sequential restore"))?;
     anyhow::ensure!(layout.sessions.len() == panes, "expected {panes} sessions in layout, got {}", layout.sessions.len());
     let t_seq_attach = Instant::now();
-    for &id in &ids {
+    for &id in &cleanup.ids {
         c_seq.attach(id, ws, Sink::new(size))?;
     }
     let seq_attach = t_seq_attach.elapsed();
     let seq_total = t_seq.elapsed();
     drop(c_seq);
 
-    wait_all_detached(&observer, &ids)?;
+    wait_all_detached(&observer, &cleanup.ids)?;
 
     // 2) Pipelined restore: `claim_layout` + one `attach_many` burst.
     let c_pipe = Connection::open(endpoint.clone(), "netbench-pipe")?;
     let t_pipe = Instant::now();
     let layout = c_pipe.claim_layout()?.ok_or_else(|| anyhow::anyhow!("layout missing for pipelined restore"))?;
     anyhow::ensure!(layout.sessions.len() == panes, "expected {panes} sessions in layout, got {}", layout.sessions.len());
-    let requests: Vec<AttachRequest> = ids.iter().map(|&session| AttachRequest { session, size: ws, sink: Sink::new(size) }).collect();
+    let requests: Vec<AttachRequest> =
+        cleanup.ids.iter().map(|&session| AttachRequest { session, size: ws, sink: Sink::new(size) }).collect();
     let t_pipe_attach = Instant::now();
     let results = c_pipe.attach_many(requests);
     let pipe_attach = t_pipe_attach.elapsed();
@@ -243,14 +277,6 @@ fn bench_restore(
     for (i, r) in results.into_iter().enumerate() {
         r.map_err(|e| anyhow::anyhow!("pipelined attach pane {i} failed: {e:#}"))?;
     }
-
-    // Clean up temporary sessions (matters for real ssh/tailnet hosts too).
-    c_pipe.save_layout(0x127, Vec::new(), String::new());
-    for &id in &ids {
-        let _ = observer.kill(id);
-    }
-    drop(c_pipe);
-    drop(observer);
 
     Ok(RestoreMetrics { panes, lines, seq_total, seq_attach, pipe_total, pipe_attach })
 }

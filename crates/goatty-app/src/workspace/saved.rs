@@ -244,10 +244,13 @@ pub fn restore(conn: &Arc<Connection>, size: TermSize) -> Result<Option<Restored
     }
     if let Some(err) = link_err {
         // Don't open a truncated window and overwrite the saved layout when
-        // the link dropped mid-restore; detach any panes that did attach.
+        // the link dropped or timed out mid-restore; detach any panes that did
+        // attach and return the layout claim so a retry on a live connection
+        // can reclaim it.
         for &id in sessions.keys() {
             conn.detach(id);
         }
+        conn.release_claimed_layout(info);
         return Err(err);
     }
     let attached: HashSet<SessionId> = sessions.keys().copied().collect();
