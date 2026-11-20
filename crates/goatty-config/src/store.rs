@@ -516,10 +516,10 @@ mod tests {
     fn bad_values_fall_back_one_by_one() {
         let l = parse::<ClientSettings>(
             r##"{
-                "version": 1,
+                "version": 2,
                 "font": { "size": "big", "line_height": 1.5, "family": "Iosevka" },
                 "terminal": { "renderer": "fancy", "padding": 10 },
-                "theme": { "name": "nord", "overrides": { "background": "blue", "ansi": [null, "#ff0000", 7] } }
+                "theme": { "name": "nord", "overrides": { "nord": { "background": "blue", "ansi": [null, "#ff0000", 7] } } }
             }"##,
         );
         let v = &l.value;
@@ -529,10 +529,10 @@ mod tests {
         assert_eq!(v.terminal.renderer, Renderer::Glyphs);
         assert_eq!(v.terminal.padding, crate::client::Padding::all(10.0));
         assert_eq!(v.theme.name, "nord");
-        assert_eq!(v.theme.overrides.background, None);
-        assert_eq!(v.theme.overrides.ansi, vec![None, Some(crate::Color(0xff0000)), None]);
+        assert_eq!(v.theme.overrides["nord"].background, None);
+        assert_eq!(v.theme.overrides["nord"].ansi, vec![None, Some(crate::Color(0xff0000)), None]);
         let paths: Vec<_> = l.issues.iter().map(|i| i.path.as_str()).collect();
-        for p in ["font.size", "terminal.renderer", "theme.overrides.background", "theme.overrides.ansi.2"] {
+        for p in ["font.size", "terminal.renderer", "theme.overrides.nord.background", "theme.overrides.nord.ansi.2"] {
             assert!(paths.contains(&p), "{p} missing from {paths:?}");
         }
     }
@@ -561,7 +561,7 @@ mod tests {
         assert_eq!(out["future"]["x"], 1);
         assert_eq!(out["font"]["kerning"], true);
         assert_eq!(out["font"]["size"], 15.0);
-        assert_eq!(out["version"], 1);
+        assert_eq!(out["version"], ClientSettings::VERSION);
         assert!(out.get("terminal").is_none(), "defaults aren't written: {out}");
     }
 
@@ -639,7 +639,7 @@ mod tests {
         assert!(save(&path, &s, &[]).unwrap());
         assert_eq!(backups(&path).len(), 1);
         assert_eq!(load::<ClientSettings>(&path).value.font.size, 18.0);
-        assert_eq!(std::fs::read_to_string(&backups(&path)[0]).unwrap(), "{\n  \"version\": 1\n}\n");
+        assert_eq!(std::fs::read_to_string(&backups(&path)[0]).unwrap(), format!("{{\n  \"version\": {}\n}}\n", ClientSettings::VERSION));
         for i in 0..(BACKUPS_KEPT + 5) {
             s.font.size = 10.0 + i as f32;
             save(&path, &s, &[]).unwrap();

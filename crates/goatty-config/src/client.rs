@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::keys;
 use crate::store::{Document, Issue, Migration};
-use crate::theme::ThemeSettings;
+use crate::theme::{DEFAULT_LIGHT_THEME, DEFAULT_THEME, ThemeSettings};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -938,11 +938,11 @@ pub struct DebugSettings {
 
 impl Document for ClientSettings {
     const NAME: &'static str = "settings";
-    const VERSION: u32 = 1;
-    const OPEN_MAPS: &'static [&'static str] = &["keybindings"];
+    const VERSION: u32 = 2;
+    const OPEN_MAPS: &'static [&'static str] = &["keybindings", "theme.overrides"];
 
     fn migrations() -> &'static [Migration] {
-        &[]
+        &[(1, global_theme_overrides_became_per_theme)]
     }
 
     fn validate(&mut self) -> Vec<Issue> {
@@ -971,10 +971,13 @@ impl Document for ClientSettings {
         clamp(&mut self.terminal.opacity, TerminalSettings::MIN_OPACITY, 1.0, "terminal.opacity", &mut issues);
         // Theme names are checked against the theme library (user themes
         // live in their own files): `ThemeLibrary::resolve`.
-        if self.theme.overrides.ansi.len() > 16 {
-            issues.push(Issue::new("theme.overrides.ansi", "only 16 ANSI colors exist; the rest are ignored"));
-            self.theme.overrides.ansi.truncate(16);
+        for (id, overrides) in &mut self.theme.overrides {
+            if overrides.ansi.len() > 16 {
+                issues.push(Issue::new(format!("theme.overrides.{id}.ansi"), "only 16 ANSI colors exist; the rest are ignored"));
+                overrides.ansi.truncate(16);
+            }
         }
+        self.theme.overrides.retain(|_, o| !o.is_empty());
         // Old spellings (`ctrl-shift-+`) become the ones GPUI reports (`ctrl-+`).
         if let Some(opener) = &self.links.file_opener {
             if opener.trim().is_empty() {
@@ -1034,6 +1037,43 @@ impl Document for ClientSettings {
         }
         issues
     }
+}
+
+/// Version 1 → 2 (#246): `theme.overrides` became a map keyed by theme id
+/// instead of one global override applied to whichever theme is active.
+fn global_theme_overrides_became_per_theme(doc: &mut serde_json::Value) {
+    use serde_json::{Map, Value};
+    const V1_SLOTS: &[&str] = &["foreground", "background", "cursor", "selection_foreground", "selection_background", "accent", "ansi"];
+    let Some(theme) = doc.as_object_mut().and_then(|m| m.get_mut("theme")).and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(Value::Object(old)) = theme.get("overrides").cloned() else {
+        return;
+    };
+    if old.is_empty() {
+        theme.remove("overrides");
+        return;
+    }
+    // Only migrate flat v1 overrides; leave already-nested objects alone.
+    let looks_like_v1 = old.iter().any(|(k, v)| V1_SLOTS.contains(&k.as_str()) || !v.is_object());
+    if !looks_like_v1 {
+        return;
+    }
+    let follow = theme.get("follow_system").and_then(Value::as_bool).unwrap_or(false);
+    let pick_id = |key: &str, default: &str| {
+        theme.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default).to_string()
+    };
+    let mut per_theme = Map::new();
+    if follow {
+        let dark = pick_id("dark", DEFAULT_THEME);
+        let light = pick_id("light", DEFAULT_LIGHT_THEME);
+        per_theme.insert(dark, Value::Object(old.clone()));
+        per_theme.entry(light).or_insert_with(|| Value::Object(old));
+    } else {
+        let name = pick_id("name", DEFAULT_THEME);
+        per_theme.insert(name, Value::Object(old));
+    }
+    theme.insert("overrides".into(), Value::Object(per_theme));
 }
 
 /// Clamp `v` into `[lo, hi]`, reporting a change. NaN becomes `lo`.
@@ -1202,22 +1242,43 @@ mod tests {
     fn theme_colors_take_css_and_are_written_as_hex() {
         use crate::store;
         use crate::theme::{Color, ColorSlot};
-        let l = store::set_key::<ClientSettings>("", "theme.overrides.foreground", "rgb(255 128 0)").unwrap();
-        assert_eq!(l.value.theme.overrides.get(ColorSlot::Foreground), Some(Color(0xff8000)));
+        let l = store::set_key::<ClientSettings>("", "theme.overrides.nord.foreground", "rgb(255 128 0)").unwrap();
+        assert_eq!(l.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Foreground)), Some(Color(0xff8000)));
         assert!(store::to_json(&l.value, &l.unknown).contains("\"#ff8000\""));
-        let l = store::set_key::<ClientSettings>("", "theme.overrides.background", "oklch(0 0 0)").unwrap();
-        assert_eq!(l.value.theme.overrides.get(ColorSlot::Background), Some(Color(0)));
-        assert!(store::set_key::<ClientSettings>("", "theme.overrides.background", "255 128 0").is_err(), "bare numbers are ambiguous");
-        assert!(store::set_key::<ClientSettings>("", "theme.overrides.background", "reddish").is_err());
+        let l = store::set_key::<ClientSettings>("", "theme.overrides.nord.background", "oklch(0 0 0)").unwrap();
+        assert_eq!(l.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Background)), Some(Color(0)));
+        assert!(
+            store::set_key::<ClientSettings>("", "theme.overrides.nord.background", "255 128 0").is_err(),
+            "bare numbers are ambiguous"
+        );
+        assert!(store::set_key::<ClientSettings>("", "theme.overrides.nord.background", "reddish").is_err());
 
-        let text =
-            r##"{"theme": {"overrides": {"foreground": "#ff800080", "cursor": "hsl(30, 100%, 50%)", "ansi": ["oklch(0.7 0.4 150)"]}}}"##;
+        let text = r##"{"theme": {"overrides": {"nord": {"foreground": "#ff800080", "cursor": "hsl(30, 100%, 50%)", "ansi": ["oklch(0.7 0.4 150)"]}}}}"##;
         let l = store::parse::<ClientSettings>(text);
         assert!(l.issues.is_empty(), "{:?}", l.issues);
-        assert_eq!(l.value.theme.overrides.get(ColorSlot::Cursor), Some(Color(0xff8000)));
+        assert_eq!(l.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Cursor)), Some(Color(0xff8000)));
         let mut lossy: Vec<String> = ClientSettings::lossy_colors(text).into_iter().map(|i| i.path).collect();
         lossy.sort();
-        assert_eq!(lossy, ["theme.overrides.ansi.0", "theme.overrides.foreground"]);
+        assert_eq!(lossy, ["theme.overrides.nord.ansi.0", "theme.overrides.nord.foreground"]);
+    }
+
+    #[test]
+    fn version_1_theme_overrides_migrate_to_per_theme() {
+        use crate::store;
+        use crate::theme::{Color, ColorSlot};
+        let v1 = r##"{"version": 1, "theme": {"name": "nord", "overrides": {"background": "#112233", "ansi": [null, "#445566"]}}}"##;
+        let loaded = store::parse::<ClientSettings>(v1);
+        assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+        let nord = loaded.value.theme.overrides_for("nord").expect("migrated to nord");
+        assert_eq!(nord.get(ColorSlot::Background), Some(Color(0x112233)));
+        assert_eq!(nord.get(ColorSlot::Ansi(1)), Some(Color(0x445566)));
+        assert!(loaded.value.theme.overrides_for("dracula").is_none());
+
+        let v1_follow = r##"{"version": 1, "theme": {"follow_system": true, "light": "solarized-light", "dark": "dracula", "overrides": {"accent": "#abcdef"}}}"##;
+        let loaded = store::parse::<ClientSettings>(v1_follow);
+        assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+        assert_eq!(loaded.value.theme.overrides_for("dracula").and_then(|o| o.get(ColorSlot::Accent)), Some(Color(0xabcdef)));
+        assert_eq!(loaded.value.theme.overrides_for("solarized-light").and_then(|o| o.get(ColorSlot::Accent)), Some(Color(0xabcdef)));
     }
 
     fn with(vars: &[(&str, &str)]) -> ClientSettings {

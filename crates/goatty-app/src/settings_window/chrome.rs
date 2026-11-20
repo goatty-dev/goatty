@@ -576,6 +576,8 @@ impl SettingsWindow {
             } else if self.drawer {
                 self.drawer = false;
                 window.focus(&self.nav_focus, cx);
+            } else if self.create_theme_open {
+                self.close_create_theme_modal(cx);
             } else if self.aliases_modal_open() {
                 self.close_alias_form(true, cx);
             } else if self.snippets_modal_open() {
@@ -614,7 +616,13 @@ impl Render for SettingsWindow {
         let ui = Ui::get(cx);
         self.take_pending_snippet(window, cx);
         focus::begin(cx, window, &self.scroll, &self.menu_scroll);
-        if let Some(back) = self.aliases.restore.take().or_else(|| self.snippets.restore.take()).or_else(|| self.prompt.restore.take()) {
+        if let Some(back) = self
+            .create_theme_restore
+            .take()
+            .or_else(|| self.aliases.restore.take())
+            .or_else(|| self.snippets.restore.take())
+            .or_else(|| self.prompt.restore.take())
+        {
             window.focus(&back, cx);
         }
         let focus_row = self.highlighted(cx);
@@ -648,7 +656,11 @@ impl Render for SettingsWindow {
         };
         let bar = self.bottom_bar(ui, cx);
         focus::bar(bar.is_some().then_some(&self.bar_scroll));
-        let modal = self.alias_modal(ui, window, cx).or_else(|| self.snippet_modal(ui, cx)).or_else(|| self.module_modal(ui, cx));
+        let modal = self
+            .create_theme_modal(ui, cx)
+            .or_else(|| self.alias_modal(ui, window, cx))
+            .or_else(|| self.snippet_modal(ui, cx))
+            .or_else(|| self.module_modal(ui, cx));
         let compact = f32::from(window.viewport_size().width) < RAIL_BELOW;
         let gutter = if compact { 24. } else { 40. };
         let nav = if compact {

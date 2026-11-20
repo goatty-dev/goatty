@@ -76,11 +76,16 @@ fn settings_set_show_validate() {
 
     ok(goatty(home, &["settings", "set", "font.size", "16"]));
     ok(goatty(home, &["settings", "set", "font.ui_family", TEST_FONT]));
-    ok(goatty(home, &["settings", "set", "theme.overrides.accent", "#98c379"]));
+    ok(goatty(home, &["settings", "set", "theme.overrides.goatty-night.accent", "#98c379"]));
+    ok(goatty(home, &["settings", "set", "theme.overrides.nord.background", "#112233"]));
+    ok(goatty(home, &["theme", "set", "dracula"]));
     ok(goatty(home, &["settings", "set", "keybindings.ctrl-k", "paste"]));
     assert_eq!(out(&ok(goatty(home, &["settings", "show", "font.size"]))).trim(), "16.0");
     assert_eq!(out(&ok(goatty(home, &["settings", "show", "font.ui_family"]))).trim(), format!("{TEST_FONT:?}"));
-    assert_eq!(out(&ok(goatty(home, &["settings", "show", "theme.overrides.accent"]))).trim(), "\"#98c379\"");
+    assert_eq!(out(&ok(goatty(home, &["settings", "show", "theme.overrides.goatty-night.accent"]))).trim(), "\"#98c379\"");
+    assert_eq!(out(&ok(goatty(home, &["settings", "show", "theme.overrides.nord.background"]))).trim(), "\"#112233\"");
+    ok(goatty(home, &["settings", "unset", "theme.overrides.nord.background"]));
+    assert!(!out(&ok(goatty(home, &["settings", "show", "theme.overrides"]))).contains("nord"));
     let stored = out(&ok(goatty(home, &["settings", "show"])));
     assert!(
         stored.contains("\"size\": 16.0")

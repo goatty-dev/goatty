@@ -1,5 +1,6 @@
 //! Color themes: built-in palettes plus per-color overrides.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -397,8 +398,19 @@ pub struct ThemeSettings {
     pub dark: String,
     /// Render bold text in the bright variant of colors 0–7 (xterm behavior).
     pub bold_is_bright: bool,
-    /// Colors replacing the active theme's.
-    pub overrides: ThemeOverrides,
+    /// Per-theme color overrides, keyed by theme id.
+    #[serde(serialize_with = "serialize_non_empty_overrides")]
+    pub overrides: BTreeMap<String, ThemeOverrides>,
+}
+
+fn serialize_non_empty_overrides<S: Serializer>(map: &BTreeMap<String, ThemeOverrides>, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let non_empty: Vec<_> = map.iter().filter(|(_, v)| !v.is_empty()).collect();
+    let mut m = s.serialize_map(Some(non_empty.len()))?;
+    for (k, v) in non_empty {
+        m.serialize_entry(k, v)?;
+    }
+    m.end()
 }
 
 impl Default for ThemeSettings {
@@ -409,7 +421,7 @@ impl Default for ThemeSettings {
             light: DEFAULT_LIGHT_THEME.into(),
             dark: DEFAULT_THEME.into(),
             bold_is_bright: true,
-            overrides: ThemeOverrides::default(),
+            overrides: BTreeMap::new(),
         }
     }
 }
@@ -418,13 +430,20 @@ impl Default for ThemeSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground: Option<Color>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<Color>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<Color>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_foreground: Option<Color>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selection_background: Option<Color>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub accent: Option<Color>,
     /// Index `i` replaces ANSI color `i` (0–15); `null` keeps the theme's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ansi: Vec<Option<Color>>,
 }
 
@@ -488,12 +507,43 @@ impl ThemeSettings {
         }
     }
 
+    /// Overrides stored for `id`, if any color is overridden.
+    pub fn overrides_for(&self, id: &str) -> Option<&ThemeOverrides> {
+        self.overrides.get(id).filter(|o| !o.is_empty())
+    }
+
+    /// Overrides stored for the active theme, if any color is overridden.
+    pub fn active_overrides(&self, system_dark: bool) -> Option<&ThemeOverrides> {
+        self.overrides_for(self.active_id(system_dark))
+    }
+
+    /// Set (or with `None` clear) one overridden color for `id`, dropping
+    /// the entry once no colors remain overridden.
+    pub fn set_override(&mut self, id: &str, slot: ColorSlot, color: Option<Color>) {
+        if let Some(c) = color {
+            self.overrides.entry(id.to_string()).or_default().set(slot, Some(c));
+        } else if let Some(entry) = self.overrides.get_mut(id) {
+            entry.set(slot, None);
+            if entry.is_empty() {
+                self.overrides.remove(id);
+            }
+        }
+    }
+
+    /// Drop every overridden color for `id`, leaving other themes intact.
+    pub fn clear_overrides(&mut self, id: &str) {
+        self.overrides.remove(id);
+    }
+
     /// Built-in themes only (no user themes, fixed theme): the colors with
     /// overrides. Unknown names fall back to the default theme. The app
     /// uses [`crate::themes::ThemeLibrary::resolve`].
     pub fn colors(&self) -> ThemeColors {
         let base = find_theme(&self.name).or_else(|| find_theme(DEFAULT_THEME)).expect("default theme exists").colors;
-        self.overrides.apply(base)
+        match self.overrides_for(&self.name) {
+            Some(o) => o.apply(base),
+            None => base,
+        }
     }
 }
 
@@ -541,8 +591,8 @@ mod tests {
     #[test]
     fn overrides_apply() {
         let mut s = ThemeSettings::default();
-        s.overrides.background = Some(Color(0x000000));
-        s.overrides.ansi = vec![None, Some(Color(0xff0000))];
+        s.set_override(DEFAULT_THEME, ColorSlot::Background, Some(Color(0x000000)));
+        s.set_override(DEFAULT_THEME, ColorSlot::Ansi(1), Some(Color(0xff0000)));
         let c = s.colors();
         assert_eq!(c.background, Color(0));
         assert_eq!(c.ansi[1], Color(0xff0000));
@@ -553,12 +603,28 @@ mod tests {
         assert_eq!(round, c);
         assert_eq!(ThemeSettings { name: "nope".into(), ..Default::default() }.colors(), ThemeSettings::default().colors());
 
-        s.overrides.set(ColorSlot::Accent, Some(Color(0x98c379)));
+        s.set_override(DEFAULT_THEME, ColorSlot::Accent, Some(Color(0x98c379)));
         let c = s.colors();
         assert_eq!(c.accent, Some(Color(0x98c379)));
         assert_eq!(c.accent(), Color(0x98c379));
         assert_eq!(c.get(ColorSlot::Accent), Color(0x98c379));
         assert_eq!(c.ansi[4], find_theme(DEFAULT_THEME).unwrap().colors.ansi[4]);
+
+        // Switching themes keeps per-theme overrides isolated and preserved.
+        s.name = "nord".into();
+        assert_eq!(s.colors(), find_theme("nord").unwrap().colors, "nord has no overrides");
+        s.set_override("nord", ColorSlot::Foreground, Some(Color(0x123456)));
+        assert_eq!(s.colors().foreground, Color(0x123456));
+        s.name = DEFAULT_THEME.into();
+        assert_eq!(s.colors().background, Color(0));
+        assert_eq!(s.colors().foreground, find_theme(DEFAULT_THEME).unwrap().colors.foreground);
+
+        // Clearing or reverting one theme leaves other themes intact.
+        s.set_override("nord", ColorSlot::Foreground, None);
+        assert!(s.overrides_for("nord").is_none());
+        assert!(s.overrides_for(DEFAULT_THEME).is_some());
+        s.clear_overrides(DEFAULT_THEME);
+        assert!(s.overrides.is_empty());
     }
 
     #[test]
