@@ -983,6 +983,11 @@ impl Document for ClientSettings {
         &[(1, global_theme_overrides_became_per_theme)]
     }
 
+    fn default_version(user: &serde_json::Value) -> u32 {
+        let has_v1_overrides = user.pointer("/theme/overrides").and_then(serde_json::Value::as_object).is_some_and(looks_like_v1_overrides);
+        if has_v1_overrides { 1 } else { Self::VERSION }
+    }
+
     fn validate(&mut self) -> Vec<Issue> {
         let mut issues = Vec::new();
         let f = &mut self.font;
@@ -1077,11 +1082,17 @@ impl Document for ClientSettings {
     }
 }
 
+const V1_OVERRIDE_SLOTS: &[&str] =
+    &["foreground", "background", "cursor", "selection_foreground", "selection_background", "accent", "ansi"];
+
+fn looks_like_v1_overrides(overrides: &serde_json::Map<String, serde_json::Value>) -> bool {
+    !overrides.is_empty() && overrides.iter().any(|(k, v)| V1_OVERRIDE_SLOTS.contains(&k.as_str()) || !v.is_object())
+}
+
 /// Version 1 → 2 (#246): `theme.overrides` became a map keyed by theme id
 /// instead of one global override applied to whichever theme is active.
 fn global_theme_overrides_became_per_theme(doc: &mut serde_json::Value) {
     use serde_json::{Map, Value};
-    const V1_SLOTS: &[&str] = &["foreground", "background", "cursor", "selection_foreground", "selection_background", "accent", "ansi"];
     let Some(theme) = doc.as_object_mut().and_then(|m| m.get_mut("theme")).and_then(Value::as_object_mut) else {
         return;
     };
@@ -1093,8 +1104,7 @@ fn global_theme_overrides_became_per_theme(doc: &mut serde_json::Value) {
         return;
     }
     // Only migrate flat v1 overrides; leave already-nested objects alone.
-    let looks_like_v1 = old.iter().any(|(k, v)| V1_SLOTS.contains(&k.as_str()) || !v.is_object());
-    if !looks_like_v1 {
+    if !looks_like_v1_overrides(&old) {
         return;
     }
     let follow = theme.get("follow_system").and_then(Value::as_bool).unwrap_or(false);
@@ -1317,6 +1327,24 @@ mod tests {
         assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
         assert_eq!(loaded.value.theme.overrides_for("dracula").and_then(|o| o.get(ColorSlot::Accent)), Some(Color(0xabcdef)));
         assert_eq!(loaded.value.theme.overrides_for("solarized-light").and_then(|o| o.get(ColorSlot::Accent)), Some(Color(0xabcdef)));
+
+        // Unversioned files with flat v1 overrides still take the v1 migration path,
+        // while unversioned per-theme overrides load directly.
+        let unversioned_v1 = r##"{"theme": {"overrides": {"background": "#112233"}}}"##;
+        let loaded = store::parse::<ClientSettings>(unversioned_v1);
+        assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+        assert_eq!(loaded.value.theme.overrides_for(DEFAULT_THEME).and_then(|o| o.get(ColorSlot::Background)), Some(Color(0x112233)));
+
+        // set_key / unset_key migrate v1 files before applying edits.
+        let edited = store::set_key::<ClientSettings>(v1, "theme.overrides.nord.background", "#445566").unwrap();
+        assert!(edited.issues.is_empty(), "{:?}", edited.issues);
+        assert_eq!(edited.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Background)), Some(Color(0x445566)));
+        assert_eq!(edited.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Ansi(1))), Some(Color(0x445566)));
+
+        let unset = store::unset_key::<ClientSettings>(v1, "theme.overrides.nord.background").unwrap();
+        assert!(unset.issues.is_empty(), "{:?}", unset.issues);
+        assert_eq!(unset.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Background)), None);
+        assert_eq!(unset.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Ansi(1))), Some(Color(0x445566)));
     }
 
     fn with(vars: &[(&str, &str)]) -> ClientSettings {

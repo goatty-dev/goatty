@@ -146,6 +146,14 @@ pub fn open_plugin_updates(cx: &mut App, link: HostLink) {
     }
 }
 
+/// Open Settings → Appearance and show the "Create custom theme" modal.
+pub fn open_create_custom_theme(cx: &mut App) {
+    open_at(cx, Some(Page::Appearance));
+    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        let _ = handle.update(cx, |view, window, cx| view.open_create_theme_modal(window, cx));
+    }
+}
+
 /// Open the settings window at `page` (or where it was).
 pub fn open_at(cx: &mut App, page: Option<Page>) {
     if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
@@ -899,6 +907,9 @@ impl SettingsWindow {
     fn save_current_colors_as_theme(&mut self, name: &str, cx: &mut Context<'_, Self>) -> std::io::Result<std::path::PathBuf> {
         self.flush_color(cx);
         let app = cx.global::<AppSettings>();
+        if app.env_overrides.contains(&"GOATTY_THEME") {
+            return Err(std::io::Error::other("GOATTY_THEME is set for this run; unset it to switch to a new custom theme"));
+        }
         let (lib, colors) = (app.themes.clone(), app.colors);
         let source_id = active_theme_id(cx);
         let system_dark = app.system_dark;
@@ -924,6 +935,15 @@ impl SettingsWindow {
     /// Save the colors on screen as a new user theme and switch to it.
     pub fn save_theme_as(&mut self, cx: &mut Context<'_, Self>) {
         self.flush_color(cx);
+        if cx.global::<AppSettings>().env_overrides.contains(&"GOATTY_THEME") {
+            toast::show(
+                cx,
+                Toast::info("Active theme is set by GOATTY_THEME")
+                    .body("Unset GOATTY_THEME to switch to and edit a new custom theme.")
+                    .key("theme.save"),
+            );
+            return;
+        }
         let name = self.theme_name.read(cx).text().trim().to_string();
         if name.is_empty() {
             toast::show(cx, Toast::warning("Give the new theme a name first").key("theme.save"));
@@ -946,6 +966,16 @@ impl SettingsWindow {
     /// Open the dialog to create a new custom theme from the current colors.
     pub fn open_create_theme_modal(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.flush_color(cx);
+        if cx.global::<AppSettings>().env_overrides.contains(&"GOATTY_THEME") {
+            toast::show_in(
+                window,
+                cx,
+                Toast::info("Active theme is set by GOATTY_THEME")
+                    .body("Unset GOATTY_THEME to create and edit a custom theme.")
+                    .key("theme.save"),
+            );
+            return;
+        }
         self.create_theme_opener = window.focused(cx);
         self.create_theme_error = None;
         self.create_theme_name.update(cx, |i, cx| i.set_text("", cx));

@@ -208,7 +208,13 @@ fn friendly(problem: &str, s: &Snippet) -> String {
 impl SettingsWindow {
     /// A line from "Save the last command as a snippet" opens the editor.
     pub(super) fn take_pending_snippet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        if self.page != Page::Snippets || self.host_value().is_none() || self.snippets.form.is_some() {
+        if self.page != Page::Snippets
+            || self.host_value().is_none()
+            || self.snippets.form.is_some()
+            || self.create_theme_open
+            || self.aliases_modal_open()
+            || self.prompt_modal_open()
+        {
             return;
         }
         let Some(line) = cx.try_global::<Pending>().and_then(|p| p.0.clone()) else { return };
