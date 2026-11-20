@@ -1530,7 +1530,8 @@ impl Workspace {
                 let command = command.clone();
                 // Focus the terminal first: actions go to the focused element.
                 this.close_palette(window, cx);
-                command.run(window, cx);
+                // After this update: commands may read or update the workspace.
+                window.defer(cx, move |window, cx| command.run(window, cx));
             }
         });
         self.palette = Some((palette, sub));
