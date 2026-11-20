@@ -296,7 +296,8 @@ impl Workspace {
     /// many tabs it holds and their activity. Click: fold or unfold;
     /// right-click: the group's menu.
     fn sidebar_group(&self, g: Group, first: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
-        let (key, menu_key, new_key) = (g.key.clone(), g.key.clone(), g.key.clone());
+        let (key, menu_key, new_key, detach_key) = (g.key.clone(), g.key.clone(), g.key.clone(), g.key.clone());
+        let can_detach = self.cannot_detach_tabs(&g.ids, cx).is_none();
         let folded = g.folded;
         let id = g.ids[0];
         let hover_group = SharedString::from(format!("tab-group-{id}"));
@@ -327,6 +328,23 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 this.new_tab_in_group(&new_key, window, cx);
+            }));
+        let detach = div()
+            .id(gpui::ElementId::NamedInteger("tab-group-detach".into(), id))
+            .flex_none()
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(radius::SMALL))
+            .invisible()
+            .group_hover(hover_group.clone(), |s| s.visible())
+            .hover(|s| s.bg(c.ui.text.opacity(0.1)))
+            .tooltip(tooltip(format!("Detach from {}", g.label)))
+            .child(Icon::Unlink.svg().size(px(12.)).text_color(c.ui.muted))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.detach_group(&detach_key, window, cx);
             }));
         let detail = g.detail.clone().filter(|_| !folded);
         div()
@@ -370,7 +388,14 @@ impl Workspace {
             .children(count)
             // A connecting tab has no host to open another tab on yet.
             .when(!matches!(g.key, super::groups::HostKey::Connecting(_)), |d| d.child(plus))
-            .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
+            .when(can_detach, |d| d.child(detach))
+            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                if ev.modifiers().shift {
+                    this.detach_group(&key, window, cx);
+                } else {
+                    this.fold_group(&key, !folded, window, cx);
+                }
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
@@ -396,7 +421,13 @@ impl Workspace {
             .cursor_pointer()
             .rounded(px(radius::CONTROL))
             .tooltip(tooltip(super::tab_bar::group_tooltip(&g)))
-            .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
+            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                if ev.modifiers().shift {
+                    this.detach_group(&key, window, cx);
+                } else {
+                    this.fold_group(&key, !folded, window, cx);
+                }
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {

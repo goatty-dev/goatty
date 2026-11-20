@@ -696,6 +696,24 @@ impl Session {
         }
     }
 
+    /// Whether this session is kept by a `goattyd` and can be detached
+    /// without ending its shell.
+    pub fn can_detach(&self) -> bool {
+        self.daemon_id().is_some()
+    }
+
+    /// Unsubscribe from the session on `goattyd` without ending its shell.
+    /// Returns `false` for a window-owned local PTY (`--local`).
+    pub fn detach(&self) -> bool {
+        match &self.backend {
+            Backend::Local(_) => false,
+            Backend::Daemon { conn, id } => {
+                conn.detach(id.load(Ordering::Relaxed));
+                true
+            }
+        }
+    }
+
     /// The goattyd session id; `None` for local PTYs.
     pub fn daemon_id(&self) -> Option<u64> {
         match &self.backend {

@@ -128,11 +128,11 @@ impl Workspace {
             Item::new("Rename…", on(|this, i, w, cx| this.start_rename(i, w, cx))).icon(Icon::Pencil).into(),
             Item::new("Duplicate", on(|this, i, w, cx| this.duplicate_tab_at(i, w, cx))).icon(Icon::Copy).into(),
         ];
+        // The keys act on the active tab, so they're shown on its menu only.
+        let keys = |name| (index == self.active).then(|| context_menu::shortcut(name, cx)).flatten();
         if self.tabs.len() > 1 {
             let (back, on_back) = if vertical { ("Move up", "This is the first tab") } else { ("Move left", "This is the first tab") };
             let (fwd, on_fwd) = if vertical { ("Move down", "This is the last tab") } else { ("Move right", "This is the last tab") };
-            // The keys move the active tab, so they're shown on its menu only.
-            let keys = |name| (index == self.active).then(|| context_menu::shortcut(name, cx)).flatten();
             let mut item = Item::new(back, on(|this, i, w, cx| this.move_tab_to(this.tabs[i].id, i.saturating_sub(1), w, cx)))
                 .icon(if vertical { Icon::ArrowUp } else { Icon::ArrowLeft })
                 .disabled((index == 0).then_some(on_back));
@@ -158,12 +158,42 @@ impl Workspace {
             }
             entries.push(Item::submenu("Move into tab", targets).icon(Icon::SquareArrowOutUpRight).into());
         }
-        entries.extend([
-            Entry::Separator,
-            Item::new("Close tab", on(|this, i, w, cx| this.close_tab_at(i, w, cx))).icon(Icon::Close).into(),
-            Item::new("Close other tabs", on(|this, i, w, cx| this.close_tabs(this.other_tabs(i), w, cx)))
-                .disabled((self.tabs.len() < 2).then_some("This is the only tab"))
-                .into(),
+        entries.push(Entry::Separator);
+        let mut detach_tab = Item::new("Detach tab", on(|this, i, w, cx| this.detach_tab_at(i, w, cx)))
+            .icon(Icon::Unlink)
+            .disabled(self.cannot_detach_tab(index, cx));
+        detach_tab.shortcut = keys("detach_tab");
+        entries.push(detach_tab.into());
+        let others = self.other_tabs(index);
+        let cannot_detach_others = if self.tabs.len() < 2 { Some("This is the only tab") } else { self.cannot_detach_tabs(&others, cx) };
+        let mut detach_others =
+            Item::new("Detach other tabs", on(|this, i, w, cx| this.detach_tabs(this.other_tabs(i), w, cx))).disabled(cannot_detach_others);
+        detach_others.shortcut = keys("detach_other_tabs");
+        entries.push(detach_others.into());
+        if self.groups_shown(cx) {
+            let key = self.host_key(&self.tabs[index]);
+            if let Some(g) = self.groups(cx).into_iter().find(|g| g.key == key) {
+                let mut detach_host = Item::new(
+                    format!("Detach from {}", g.label),
+                    on(|this, i, w, cx| {
+                        let key = this.host_key(&this.tabs[i]);
+                        this.detach_group(&key, w, cx);
+                    }),
+                )
+                .disabled(self.cannot_detach_tabs(&g.ids, cx));
+                detach_host.shortcut = keys("detach_host");
+                entries.push(detach_host.into());
+            }
+        }
+        entries.push(Entry::Separator);
+        let mut close_tab = Item::new("Close tab", on(|this, i, w, cx| this.close_tab_at(i, w, cx))).icon(Icon::Close);
+        close_tab.shortcut = keys("close_tab");
+        entries.push(close_tab.into());
+        let mut close_others = Item::new("Close other tabs", on(|this, i, w, cx| this.close_tabs(this.other_tabs(i), w, cx)))
+            .disabled((self.tabs.len() < 2).then_some("This is the only tab"));
+        close_others.shortcut = keys("close_other_tabs");
+        entries.push(close_others.into());
+        entries.push(
             Item::new(
                 if vertical { "Close tabs below" } else { "Close tabs to the right" },
                 on(|this, i, w, cx| {
@@ -173,7 +203,7 @@ impl Workspace {
             )
             .disabled(last.then_some(if vertical { "No tabs below this one" } else { "No tabs to the right" }))
             .into(),
-        ]);
+        );
         self.open_menu(MenuOwner::Tab(tab), entries, at, false, window, cx);
     }
 
@@ -227,6 +257,8 @@ impl Workspace {
         pane_items.push(Entry::Separator);
         pane_items.push(Item::action("New tab", "new_tab", cx).icon(Icon::Plus).into());
         pane_items.push(Entry::Separator);
+        pane_items
+            .push(Item::action("Detach the pane", "detach_pane", cx).icon(Icon::Unlink).disabled(self.cannot_detach_pane(pane, cx)).into());
         pane_items.push(Item::action("Close the pane", "close_pane", cx).icon(Icon::Close).danger().into());
         entries.push(Item::submenu("Pane", pane_items).icon(Icon::AppWindow).into());
 
@@ -357,6 +389,13 @@ impl Workspace {
             .into(),
         );
         entries.push(Entry::Separator);
+        let mut detach = Item::new(format!("Detach from {}", g.label), on(Box::new(|this, k, w, cx| this.detach_group(k, w, cx))))
+            .icon(Icon::Unlink)
+            .disabled(self.cannot_detach_tabs(&g.ids, cx));
+        if g.active {
+            detach.shortcut = crate::ui::context_menu::shortcut("detach_host", cx);
+        }
+        entries.push(detach.into());
         let ids = g.ids.clone();
         let close_label = if n == 1 { "Close its tab".to_string() } else { format!("Close its {n} tabs") };
         entries.push(

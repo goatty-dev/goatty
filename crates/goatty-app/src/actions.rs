@@ -90,7 +90,11 @@ actions!(
         NewTab,
         /// Close the focused pane (the tab with its last pane).
         ClosePane,
+        /// Detach the focused pane (the tab with its last pane) without ending its shell.
+        DetachPane,
         CloseTab,
+        /// Detach the active tab without ending its shells.
+        DetachTab,
         NextTab,
         PreviousTab,
         MoveTabLeft,
@@ -108,6 +112,10 @@ actions!(
         /// A new tab on the same host, in the same directory.
         DuplicateTab,
         CloseOtherTabs,
+        /// Detach every tab except the active one without ending their shells.
+        DetachOtherTabs,
+        /// Detach every tab on the active tab's host without ending their shells.
+        DetachHost,
         /// Fold the vertical tab sidebar into a rail of icons, or unfold it.
         ToggleTabSidebar,
         /// Switch `tabs.style` between vertical and horizontal.
@@ -192,7 +200,9 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "show_recent_notifications" => Box::new(ShowRecentNotifications),
         "new_tab" => Box::new(NewTab),
         "close_pane" => Box::new(ClosePane),
+        "detach_pane" => Box::new(DetachPane),
         "close_tab" => Box::new(CloseTab),
+        "detach_tab" => Box::new(DetachTab),
         "next_tab" => Box::new(NextTab),
         "previous_tab" => Box::new(PreviousTab),
         "move_tab_left" => Box::new(MoveTabLeft),
@@ -209,6 +219,8 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "rename_tab" => Box::new(RenameTab),
         "duplicate_tab" => Box::new(DuplicateTab),
         "close_other_tabs" => Box::new(CloseOtherTabs),
+        "detach_other_tabs" => Box::new(DetachOtherTabs),
+        "detach_host" => Box::new(DetachHost),
         "toggle_tab_sidebar" => Box::new(ToggleTabSidebar),
         "toggle_vertical_tabs" => Box::new(ToggleVerticalTabs),
         "next_host" => Box::new(NextHost),

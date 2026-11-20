@@ -39,15 +39,26 @@ pub enum Closing {
     },
 }
 
+/// What the user chose in the close confirmation dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseChoice {
+    Cancel,
+    /// Detach without ending the running program(s).
+    Detach,
+    /// Close and end the running program(s).
+    Close,
+}
+
 pub enum CloseConfirmEvent {
-    /// `true`: close it.
-    Done(bool),
+    Done(CloseChoice),
 }
 
 pub struct CloseConfirm {
     closing: Closing,
     /// The running programs (not shells), one per busy pane.
     programs: Vec<String>,
+    /// Whether the target is backed by `goattyd` and can be detached instead.
+    can_detach: bool,
     dont_ask: bool,
     focus: FocusHandle,
 }
@@ -79,31 +90,31 @@ pub fn describe(closing: Closing, programs: &[String]) -> (String, String) {
 }
 
 impl CloseConfirm {
-    pub fn new(closing: Closing, programs: Vec<String>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+    pub fn new(closing: Closing, programs: Vec<String>, can_detach: bool, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        Self { closing, programs, dont_ask: false, focus }
+        Self { closing, programs, can_detach, dont_ask: false, focus }
     }
 
-    fn finish(&mut self, close: bool, cx: &mut Context<'_, Self>) {
-        if close && self.dont_ask {
+    fn finish(&mut self, choice: CloseChoice, cx: &mut Context<'_, Self>) {
+        if choice == CloseChoice::Close && self.dont_ask {
             AppSettings::update(cx, |s| s.panes.confirm_close = false);
         }
-        cx.emit(CloseConfirmEvent::Done(close));
+        cx.emit(CloseConfirmEvent::Done(choice));
     }
 
     fn confirm(&mut self, _: &Confirm, _window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.finish(true, cx);
+        self.finish(CloseChoice::Close, cx);
     }
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.finish(false, cx);
+        self.finish(CloseChoice::Cancel, cx);
     }
 
-    fn done(&self, cx: &mut Context<'_, Self>, close: bool) -> impl Fn(&mut Window, &mut App) + 'static {
+    fn done(&self, cx: &mut Context<'_, Self>, choice: CloseChoice) -> impl Fn(&mut Window, &mut App) + 'static {
         let this = cx.entity().downgrade();
         move |_, cx| {
-            let _ = this.update(cx, |this, cx| this.finish(close, cx));
+            let _ = this.update(cx, |this, cx| this.finish(choice, cx));
         }
     }
 }
@@ -112,11 +123,20 @@ impl Render for CloseConfirm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
         let ui_font = cx.global::<AppSettings>().ui_font.clone();
-        let (title, body) = describe(self.closing, &self.programs);
+        let (title, mut body) = describe(self.closing, &self.programs);
+        if self.can_detach {
+            let pron = if self.programs.len() > 1 { "them" } else { "it" };
+            body.push_str(&format!(" Detaching keeps {pron} running in the background."));
+        }
         let label = match self.closing {
             Closing::Pane => "Close pane",
             Closing::Tab { .. } => "Close tab",
             Closing::Tabs { .. } => "Close tabs",
+        };
+        let detach_label = match self.closing {
+            Closing::Pane => "Detach pane",
+            Closing::Tab { .. } => "Detach tab",
+            Closing::Tabs { .. } => "Detach tabs",
         };
         let this = cx.entity().downgrade();
         let flip = move |_: &mut Window, cx: &mut App| {
@@ -131,7 +151,7 @@ impl Render for CloseConfirm {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish(false, cx)))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish(CloseChoice::Cancel, cx)))
             .occlude()
             .w(px(WIDTH))
             .max_w_full()
@@ -169,8 +189,11 @@ impl Render for CloseConfirm {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(button("close-cancel", "Cancel", ButtonKind::Normal, ui, self.done(cx, false)))
-                    .child(button("close-ok", label, ButtonKind::Danger, ui, self.done(cx, true))),
+                    .child(button("close-cancel", "Cancel", ButtonKind::Normal, ui, self.done(cx, CloseChoice::Cancel)))
+                    .when(self.can_detach, |d| {
+                        d.child(button("close-detach", detach_label, ButtonKind::Normal, ui, self.done(cx, CloseChoice::Detach)))
+                    })
+                    .child(button("close-ok", label, ButtonKind::Danger, ui, self.done(cx, CloseChoice::Close))),
             )
     }
 }

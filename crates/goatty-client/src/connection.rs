@@ -675,6 +675,7 @@ impl Connection {
 
     pub fn detach(&self, session: SessionId) {
         self.shared.panes.lock().remove(&session);
+        self.shared.early_size.lock().remove(&session);
         self.shared.send(&ClientMsg::Detach { session });
     }
 
@@ -892,6 +893,29 @@ impl Connection {
         }
     }
 
+    /// Release a saved layout (`id`, `sessions`, `json`) without deleting it
+    /// on `goattyd`, so the next [`Self::claim_layout`] (on this connection if
+    /// it stays pooled, or on a new connection once this one closes) can
+    /// restore it.
+    pub fn detach_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
+        {
+            let mut saved = self.shared.layout.lock();
+            if matches!(&*saved, Some(ClientMsg::SaveLayout { id: saved_id, .. }) if *saved_id == id) {
+                *saved = None;
+            }
+        }
+        if sessions.is_empty() || json.is_empty() {
+            return;
+        }
+        let mut claimed = self.shared.claimed_layouts.lock();
+        let cur = self.shared.link_gen.load(Ordering::Acquire);
+        claimed.gens.remove(&id);
+        claimed.unclaimed.retain(|(_, info)| info.id != id);
+        if self.is_connected() {
+            claimed.unclaimed.push_front((cur, LayoutInfo { id, json, sessions, saved_unix: 0 }));
+        }
+    }
+
     /// Reconnect now, with prompts (password, passphrase) if ssh needs them.
     /// Automatic retries never prompt; this is the explicit way to.
     pub fn reconnect(&self) {
@@ -987,7 +1011,12 @@ fn writer_loop(rx: flume::Receiver<WriterCmd>) {
                     w = None; // the reader notices too and reconnects
                 }
             }
-            WriterCmd::Close => break,
+            WriterCmd::Close => {
+                if let Some(ww) = &mut w {
+                    let _ = ww.flush();
+                }
+                break;
+            }
         }
         // Batch under load, flush as soon as the queue is idle (keystrokes
         // go out immediately).
@@ -1852,6 +1881,39 @@ mod tests {
         drop(conn);
         reader_h.join().unwrap();
         assert!(shared.panes.lock().is_empty(), "cancelled attach must not leak pane");
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn detach_layout_allows_reclaim_on_live_link_and_clears_reconnect_layout() {
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, w| {
+            // Drain the initial SaveLayout frame.
+            match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::SaveLayout { id: 99, ref sessions, ref json } => {
+                    assert_eq!(sessions, &[10, 20]);
+                    assert_eq!(json, "{\"version\":1}");
+                }
+                other => panic!("unexpected msg: {other:?}"),
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        conn.save_layout(99, vec![10, 20], "{\"version\":1}".into());
+        assert!(conn.shared.layout.lock().is_some());
+
+        conn.detach_layout(99, vec![10, 20], "{\"version\":1}".into());
+        assert!(conn.shared.layout.lock().is_none(), "detached layout should not be re-claimed on reconnect");
+
+        let reclaimed = conn.claim_layout().unwrap().expect("detached layout should be claimable on live link");
+        assert_eq!(reclaimed.id, 99);
+        assert_eq!(reclaimed.sessions, vec![10, 20]);
+        assert_eq!(reclaimed.json, "{\"version\":1}");
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
         server_h.join().unwrap();
     }
 }

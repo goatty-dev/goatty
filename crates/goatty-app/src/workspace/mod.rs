@@ -71,8 +71,8 @@ use std::rc::Rc;
 
 use crate::actions::*;
 use crate::app::Initial;
-use crate::close_confirm::{CloseConfirm, CloseConfirmEvent, Closing};
-use crate::command_palette::{CommandPalette, PaletteEvent, Scope};
+use crate::close_confirm::{CloseChoice, CloseConfirm, CloseConfirmEvent, Closing};
+use crate::command_palette::{Ask, CommandPalette, Field, PaletteEvent, Scope};
 use crate::connect::{ConnectEvent, ConnectPlan, ConnectView};
 use crate::hosts::HostRef;
 use crate::paste_confirm::{PasteConfirm, PasteConfirmEvent};
@@ -607,7 +607,8 @@ impl Workspace {
         self.tab_scroll.scroll_to_item(self.strip_index(index, cx));
         self.focus_active(window, cx);
         self.update_window_title(window, cx);
-        if window.is_window_active() {
+        let is_last_workspace = cx.try_global::<crate::hosts::LastWorkspace>().is_some_and(|w| w.0 == window.window_handle());
+        if window.is_window_active() || is_last_workspace {
             // None while the tab connects (see `window_activated`).
             crate::settings_window::set_host_link(cx, self.tabs[index].host.as_ref().map(Spawner::host_link));
         }
@@ -877,7 +878,9 @@ impl Workspace {
         cx.notify();
     }
 
-    fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Remove the tab at `index` and clean up overlays/notices for it,
+    /// adjusting `self.active` without activating or saving the layout yet.
+    fn take_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
         if let Some(id) = self.tabs.get(index).map(|t| t.id) {
             self.close_menu_of_tab(id, window, cx);
         }
@@ -899,17 +902,47 @@ impl Workspace {
         }) {
             self.close = None;
         }
+        if index < self.active || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    fn finish_removing_tabs(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.home.as_ref().is_some_and(|h| !self.tabs.iter().any(|t| t.host.as_ref().is_some_and(|th| th.same_host(h)))) {
+            self.home = self.tabs.get(self.active).or_else(|| self.tabs.first()).and_then(|t| t.host.clone());
+        }
         if self.tabs.is_empty() {
             log::info!("last session ended");
             self.forget_layouts();
+            if cx.try_global::<crate::hosts::LastWorkspace>().is_some_and(|w| w.0 == window.window_handle()) {
+                crate::settings_window::set_host_link(cx, None);
+            }
             // The last window closing quits the app (see `app::run`).
             window.remove_window();
             return;
         }
-        if index < self.active || self.active >= self.tabs.len() {
-            self.active = self.active.saturating_sub(1);
-        }
         self.activate(self.active, window, cx);
+    }
+
+    fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.take_tab(index, window, cx);
+        self.finish_removing_tabs(window, cx);
+    }
+
+    fn remove_tabs(&mut self, ids: &[u64], window: &mut Window, cx: &mut Context<'_, Self>) {
+        let mut removed = false;
+        for &id in ids {
+            if let Some(index) = self.tab_index(id) {
+                self.take_tab(index, window, cx);
+                removed = true;
+            }
+        }
+        if removed {
+            self.finish_removing_tabs(window, cx);
+        }
     }
 
     /// End the shells of `panes` (off the UI thread: the daemon answers).
@@ -1012,14 +1045,286 @@ impl Workspace {
                     self.remove_tab(index, window, cx);
                 }
             }
-            CloseTarget::Tabs(ids) => {
-                for id in ids {
-                    if let Some(index) = self.tab_index(id) {
-                        self.remove_tab(index, window, cx);
-                    }
+            CloseTarget::Tabs(ids) => self.remove_tabs(&ids, window, cx),
+        }
+    }
+
+    // ---- detaching panes, tabs and hosts ------------------------------------
+
+    /// Why pane `id` cannot be detached, or `None` when it can.
+    fn cannot_detach_pane(&self, id: PaneId, cx: &gpui::App) -> Option<&'static str> {
+        let (_, pane) = self.find_pane(id)?;
+        (!pane.view.read(cx).session().can_detach()).then_some("No goattyd (--local)")
+    }
+
+    /// Why the tab at `index` cannot be detached, or `None` when it can.
+    fn cannot_detach_tab(&self, index: usize, cx: &gpui::App) -> Option<&'static str> {
+        let tab = self.tabs.get(index)?;
+        if tab.connecting.is_some() {
+            return Some("Still connecting");
+        }
+        if tab.panes.iter().any(|p| p.view.read(cx).session().can_detach()) { None } else { Some("No goattyd (--local)") }
+    }
+
+    /// Why none of the tabs in `ids` can be detached, or `None` when at least
+    /// one can.
+    fn cannot_detach_tabs(&self, ids: &[u64], cx: &gpui::App) -> Option<&'static str> {
+        let mut any_connecting = false;
+        for (i, t) in self.tabs.iter().enumerate().filter(|(_, t)| ids.contains(&t.id)) {
+            self.cannot_detach_tab(i, cx)?;
+            any_connecting |= t.connecting.is_some();
+        }
+        if any_connecting { Some("Still connecting") } else { Some("No goattyd (--local)") }
+    }
+
+    fn can_detach_target(&self, target: &CloseTarget, cx: &gpui::App) -> bool {
+        match target {
+            CloseTarget::Pane(id) => self.cannot_detach_pane(*id, cx).is_none(),
+            CloseTarget::Tab(id) => self.tab_index(*id).is_some_and(|i| self.cannot_detach_tab(i, cx).is_none()),
+            CloseTarget::Tabs(ids) => self.cannot_detach_tabs(ids, cx).is_none(),
+        }
+    }
+
+    /// Before detaching `leaving_tabs`, release the `HostLayout` of any
+    /// `goattyd` connection that will have no tabs left in this window, so
+    /// `save_layout` / `forget_layouts` does not delete the saved layout on
+    /// that `goattyd`.
+    fn detach_host_layouts_for(&mut self, leaving_tabs: &[u64], cx: &mut Context<'_, Self>) {
+        self.save_layout(cx);
+        let tabs = &self.tabs;
+        self.layouts.retain_mut(|layout| {
+            let still_has_tabs = tabs.iter().any(|t| {
+                !leaving_tabs.contains(&t.id) && t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, &layout.conn))
+            });
+            if still_has_tabs {
+                return true;
+            }
+            let sessions: Vec<goatty_proto::SessionId> = tabs
+                .iter()
+                .filter(|t| t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, &layout.conn)))
+                .flat_map(|t| t.panes.iter())
+                .filter_map(|p| p.view.read(cx).session().daemon_id())
+                .collect();
+            layout.conn.detach_layout(layout.id, sessions, std::mem::take(&mut layout.json));
+            false
+        });
+    }
+
+    /// Unsubscribe the sessions of `leaving_panes` on their `goattyd` unless
+    /// another remaining pane in this window is still attached to the same
+    /// session.
+    fn detach_panes_by_id(&self, leaving_panes: &[PaneId], cx: &gpui::App) {
+        let mut sessions = Vec::new();
+        for t in &self.tabs {
+            for p in &t.panes {
+                if leaving_panes.contains(&p.id) {
+                    sessions.push(p.view.read(cx).session().clone());
                 }
             }
         }
+        for s in sessions {
+            let (Some(conn), Some(sid)) = (s.connection(), s.daemon_id()) else { continue };
+            let still_shown = self.tabs.iter().flat_map(|t| t.panes.iter()).any(|p| {
+                if leaving_panes.contains(&p.id) {
+                    return false;
+                }
+                let other = p.view.read(cx).session();
+                other.daemon_id() == Some(sid) && other.connection().is_some_and(|c| Arc::ptr_eq(c, conn))
+            });
+            if !still_shown {
+                s.detach();
+            }
+        }
+    }
+
+    /// Detach pane `id` without ending its shell.
+    fn detach_pane_by_id(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some((index, pane)) = self.find_pane(id) else { return };
+        if !pane.view.read(cx).session().can_detach() {
+            let toast = Toast::info("Can't detach a local shell")
+                .body("This shell isn't running in goattyd (--local), so it can't keep running without the window.")
+                .key("workspace.detach");
+            toast::show_in(window, cx, toast);
+            return;
+        }
+        let label = pane_label(pane.view.read(cx));
+        let only_pane = self.tabs[index].tree == Node::Leaf(id);
+        if only_pane {
+            let tab_id = self.tabs[index].id;
+            self.detach_host_layouts_for(&[tab_id], cx);
+        }
+        self.detach_panes_by_id(&[id], cx);
+        self.remove_pane(id, window, cx);
+        if !self.tabs.is_empty() {
+            let toast =
+                Toast::info(format!("Detached {label}")).body("Its session keeps running in the background.").key("workspace.detach");
+            toast::show_in(window, cx, toast);
+        }
+    }
+
+    /// Detach the tab at `index` without ending its shells.
+    fn detach_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        if tab.connecting.is_some() {
+            let toast = Toast::info("Still connecting").body("This tab doesn't have a session to detach from yet.").key("workspace.detach");
+            toast::show_in(window, cx, toast);
+            return;
+        }
+        self.detach_tabs(vec![tab.id], window, cx);
+    }
+
+    /// Detach the tabs `ids` (by id) without ending their shells.
+    fn detach_tabs(&mut self, ids: Vec<u64>, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut detachable_ids = Vec::new();
+        let mut pane_ids = Vec::new();
+        let mut single_label = None;
+        let mut any_connecting = false;
+        for (i, t) in self.tabs.iter().enumerate().filter(|(_, t)| ids.contains(&t.id)) {
+            if t.connecting.is_some() {
+                any_connecting = true;
+                continue;
+            }
+            let tab_panes: Vec<PaneId> = t.panes.iter().filter(|p| p.view.read(cx).session().can_detach()).map(|p| p.id).collect();
+            if !tab_panes.is_empty() {
+                if detachable_ids.is_empty() {
+                    single_label = Some(self.tab_label(t, cx));
+                }
+                detachable_ids.push(self.tabs[i].id);
+                pane_ids.extend(tab_panes);
+            }
+        }
+        if detachable_ids.is_empty() {
+            let toast = if any_connecting {
+                Toast::info("Still connecting").body("This tab doesn't have a session to detach from yet.")
+            } else {
+                Toast::info("Can't detach a local shell")
+                    .body("This shell isn't running in goattyd (--local), so it can't keep running without the window.")
+            };
+            toast::show_in(window, cx, toast.key("workspace.detach"));
+            return;
+        }
+        let n_tabs = detachable_ids.len();
+        let n_sessions = pane_ids.len();
+        self.detach_host_layouts_for(&detachable_ids, cx);
+        self.detach_panes_by_id(&pane_ids, cx);
+        self.remove_tabs(&detachable_ids, window, cx);
+        if !self.tabs.is_empty() {
+            let title = match (n_tabs, single_label) {
+                (1, Some(label)) => format!("Detached {label}"),
+                (n, _) => format!("Detached {n} tabs"),
+            };
+            let body = if n_sessions == 1 {
+                "Its session keeps running in the background.".to_string()
+            } else {
+                format!("Their {n_sessions} sessions keep running in the background.")
+            };
+            toast::show_in(window, cx, Toast::info(title).body(body).key("workspace.detach"));
+        }
+    }
+
+    /// Detach all tabs of host group `key` without ending their shells.
+    fn detach_group(&mut self, key: &groups::HostKey, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(g) = self.groups(cx).into_iter().find(|g| g.key == *key) else { return };
+        if let Some(why) = self.cannot_detach_tabs(&g.ids, cx) {
+            let toast = if matches!(key, groups::HostKey::Connecting(_)) {
+                Toast::info("Still connecting").body("This tab doesn't have a session to detach from yet.")
+            } else {
+                Toast::info(format!("Can't detach from {}", g.label)).body(why)
+            };
+            toast::show_in(window, cx, toast.key("workspace.detach"));
+            return;
+        }
+        let label = g.label.to_string();
+        let detachable_ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| g.ids.contains(&t.id) && self.cannot_detach_tab(*i, cx).is_none())
+            .map(|(_, t)| t.id)
+            .collect();
+        let pane_ids: Vec<PaneId> = self
+            .tabs
+            .iter()
+            .filter(|t| detachable_ids.contains(&t.id))
+            .flat_map(|t| t.panes.iter())
+            .filter(|p| p.view.read(cx).session().can_detach())
+            .map(|p| p.id)
+            .collect();
+        let n_sessions = pane_ids.len();
+        self.detach_host_layouts_for(&detachable_ids, cx);
+        self.detach_panes_by_id(&pane_ids, cx);
+        self.remove_tabs(&detachable_ids, window, cx);
+        if !self.tabs.is_empty() {
+            let body = if n_sessions == 1 {
+                "Its session keeps running in the background.".to_string()
+            } else {
+                format!("Its {n_sessions} sessions keep running in the background.")
+            };
+            toast::show_in(window, cx, Toast::info(format!("Detached from {label}")).body(body).key("workspace.detach"));
+        }
+    }
+
+    fn detach_target(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<'_, Self>) {
+        match target {
+            CloseTarget::Pane(id) => self.detach_pane_by_id(id, window, cx),
+            CloseTarget::Tab(id) => {
+                if let Some(index) = self.tab_index(id) {
+                    self.detach_tab_at(index, window, cx);
+                }
+            }
+            CloseTarget::Tabs(ids) => self.detach_tabs(ids, window, cx),
+        }
+    }
+
+    /// "Tabs: Detach from a host…": pick which host in this window to detach from.
+    pub fn ask_detach_host(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let groups: Vec<groups::Group> = self.groups(cx).into_iter().filter(|g| self.cannot_detach_tabs(&g.ids, cx).is_none()).collect();
+        if groups.is_empty() {
+            let any_connecting = self.tabs.iter().any(|t| t.connecting.is_some());
+            let toast = if any_connecting {
+                Toast::info("Still connecting").body("No connected host to detach from yet.")
+            } else {
+                Toast::info("Can't detach a local shell")
+                    .body("This window's shells aren't running in goattyd (--local), so they can't keep running without the window.")
+            };
+            toast::show_in(window, cx, toast.key("workspace.detach"));
+            return;
+        }
+        // When the active tab is on this computer and another host is open,
+        // pre-select the other host so Enter detaches that server right away.
+        let default_ix = groups
+            .iter()
+            .position(|g| g.active && !g.local)
+            .or_else(|| groups.iter().position(|g| !g.local))
+            .or_else(|| groups.iter().position(|g| g.active))
+            .unwrap_or(0);
+        let default_id = default_ix.to_string();
+        let keys: Vec<groups::HostKey> = groups.iter().map(|g| g.key.clone()).collect();
+        let choices: Vec<(String, String, String)> = groups
+            .into_iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let n = g.tabs.len();
+                let tabs = if n == 1 { "1 tab".to_string() } else { format!("{n} tabs") };
+                let help = match g.detail {
+                    Some(d) => format!("{d} · {tabs} (sessions keep running)"),
+                    None => format!("{tabs} (sessions keep running)"),
+                };
+                (i.to_string(), g.label.to_string(), help)
+            })
+            .collect();
+        let mut field = Field::choice("host", "Which host?", choices);
+        field.spec.default = Some(default_id);
+        let me = cx.entity().downgrade();
+        let ask = Ask::new("Detach from a host", vec![field], move |answers, window, cx| {
+            let Some(ix) = answers.get("host").and_then(|v| v.parse::<usize>().ok()) else { return };
+            let Some(key) = keys.get(ix).cloned() else { return };
+            let _ = me.update(cx, |this, cx| this.detach_group(&key, window, cx));
+        });
+        self.open_ask(ask, window, cx);
     }
 
     fn on_terminal_event(&mut self, id: PaneId, ev: &TerminalEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1134,8 +1439,22 @@ impl Workspace {
         }
     }
 
+    fn detach_pane(&mut self, _: &DetachPane, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        if tab.connecting.is_some() {
+            let toast = Toast::info("Still connecting").body("This tab doesn't have a session to detach from yet.").key("workspace.detach");
+            toast::show_in(window, cx, toast);
+            return;
+        }
+        self.detach_pane_by_id(tab.focused, window, cx);
+    }
+
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_tab_at(self.active, window, cx);
+    }
+
+    fn detach_tab(&mut self, _: &DetachTab, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.detach_tab_at(self.active, window, cx);
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1196,6 +1515,21 @@ impl Workspace {
 
     fn close_other_tabs(&mut self, _: &CloseOtherTabs, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_tabs(self.other_tabs(self.active), window, cx);
+    }
+
+    fn detach_other_tabs(&mut self, _: &DetachOtherTabs, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.tabs.len() < 2 {
+            let toast = Toast::info("No other tabs to detach").body("This is the only tab in the window.").key("workspace.detach");
+            toast::show_in(window, cx, toast);
+            return;
+        }
+        self.detach_tabs(self.other_tabs(self.active), window, cx);
+    }
+
+    fn detach_host(&mut self, _: &DetachHost, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        let key = self.host_key(tab);
+        self.detach_group(&key, window, cx);
     }
 
     /// Ctrl+Shift+B: fold or unfold the vertical sidebar. With horizontal
@@ -1317,12 +1651,15 @@ impl Workspace {
     fn confirm_close(&mut self, target: CloseTarget, closing: Closing, busy: Vec<String>, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_palette(window, cx);
         self.close_recent(window, cx);
-        let dialog = cx.new(|cx| CloseConfirm::new(closing, busy, window, cx));
+        let can_detach = self.can_detach_target(&target, cx);
+        let dialog = cx.new(|cx| CloseConfirm::new(closing, busy, can_detach, window, cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, ev: &CloseConfirmEvent, window, cx| {
-            let CloseConfirmEvent::Done(close) = *ev;
+            let CloseConfirmEvent::Done(choice) = *ev;
             let Some((_, target, _)) = this.close.take() else { return };
-            if close {
-                this.force_close(target, window, cx);
+            match choice {
+                CloseChoice::Close => this.force_close(target, window, cx),
+                CloseChoice::Detach => this.detach_target(target, window, cx),
+                CloseChoice::Cancel => {}
             }
             this.focus_active(window, cx);
             cx.notify();
@@ -1784,7 +2121,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::list_sessions))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_pane))
+            .on_action(cx.listener(Self::detach_pane))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::detach_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::move_tab_left))
@@ -1801,6 +2140,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::rename_tab))
             .on_action(cx.listener(Self::duplicate_tab))
             .on_action(cx.listener(Self::close_other_tabs))
+            .on_action(cx.listener(Self::detach_other_tabs))
+            .on_action(cx.listener(Self::detach_host))
             .on_action(cx.listener(Self::toggle_tab_sidebar))
             .on_action(cx.listener(Self::toggle_vertical_tabs))
             .on_action(cx.listener(|this, _: &SplitRight, w, cx| this.split(Direction::Right, w, cx)))
