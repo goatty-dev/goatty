@@ -883,12 +883,13 @@ impl Connection {
             claimed.gens.remove(&id);
             claimed.unclaimed.retain(|(_, info)| info.id != id);
         }
+        let mut layout = self.shared.layout.lock();
         let connected = self.is_connected();
         let sent_gen = connected.then(|| self.shared.link_gen.load(Ordering::Acquire));
         if connected {
             self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
         }
-        *self.shared.layout.lock() = Some(SavedLayoutState { id, sessions, json, sent_gen, detached: false });
+        *layout = Some(SavedLayoutState { id, sessions, json, sent_gen, detached: false });
     }
 
     /// Take over the newest layout no window holds (see
@@ -1188,11 +1189,12 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                         s.send(&ClientMsg::Attach { req, session, size: p.size, opts: s.opts });
                     }
                     drop(panes);
-                    let saved = s.layout.lock().take();
-                    if let Some(mut saved) = saved {
+                    let mut layout = s.layout.lock();
+                    if let Some(mut saved) = layout.take() {
                         let cur = s.link_gen.load(Ordering::Acquire);
                         s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
                         if saved.detached {
+                            drop(layout);
                             let mut claimed = s.claimed_layouts.lock();
                             claimed.gens.remove(&saved.id);
                             claimed.unclaimed.retain(|(_, info)| info.id != saved.id);
@@ -1201,8 +1203,11 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                                 .push_front((cur, LayoutInfo { id: saved.id, json: saved.json, sessions: saved.sessions, saved_unix: 0 }));
                         } else {
                             saved.sent_gen = Some(cur);
-                            *s.layout.lock() = Some(saved);
+                            *layout = Some(saved);
+                            drop(layout);
                         }
+                    } else {
+                        drop(layout);
                     }
                     break;
                 }
