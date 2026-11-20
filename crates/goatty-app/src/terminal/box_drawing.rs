@@ -56,21 +56,28 @@ pub struct CellGrid {
     pub light: i32,
     /// Heavy box-drawing stroke width in device pixels (>= 2 * light).
     pub heavy: i32,
+    /// Nominal Braille dot size in device pixels (consistent across columns
+    /// even when fractional cell widths alternate between rounded widths).
+    pub braille_dot: i32,
 }
 
 impl CellGrid {
     pub fn new(origin: Point<Pixels>, cell_w: Pixels, line_height: Pixels, font_size: Pixels, scale: f32) -> Self {
         let scale = scale.max(0.01);
+        let cell_w_dp = f32::from(cell_w) * scale;
+        let cell_h_dp = f32::from(line_height) * scale;
         let light = (f32::from(font_size) * scale * 0.085).round().max(1.0) as i32;
         let heavy = light * 2;
+        let braille_dot = ((cell_w_dp * 0.28).round() as i32).min((cell_h_dp * 0.15).round() as i32).max(1);
         Self {
             origin_x_dp: f32::from(origin.x) * scale,
             origin_y_dp: f32::from(origin.y) * scale,
-            cell_w_dp: f32::from(cell_w) * scale,
-            cell_h_dp: f32::from(line_height) * scale,
+            cell_w_dp,
+            cell_h_dp,
             scale,
             light,
             heavy,
+            braille_dot,
         }
     }
 
@@ -130,6 +137,20 @@ fn push_rect(out: &mut Vec<DpRect>, x0: i32, y0: i32, x1: i32, y1: i32, color: H
     out.push(DpRect { x0, y0, x1, y1, color });
 }
 
+/// A vector path paired with its color and optional snapped cell clip bounds
+/// (used to clip stroked glyphs so half-stroke overhangs never bleed into
+/// neighboring rows or columns).
+pub struct PathDraw {
+    pub path: Path<Pixels>,
+    pub color: Hsla,
+    pub clip: Option<Bounds<Pixels>>,
+}
+
+/// Unicode Symbols for Legacy Computing upper/right eighth blocks omit 4/8
+/// (already covered by `▀` U+2580 and `▐` U+2590), so the 5 code points map
+/// to 2, 3, 5, 6, 7 eighths.
+const LEGACY_EIGHTHS: [i32; 5] = [2, 3, 5, 6, 7];
+
 /// Whether `ch` is drawn geometrically instead of via the font rasterizer.
 pub fn is_custom(ch: char) -> bool {
     matches!(
@@ -146,19 +167,12 @@ pub fn is_custom(ch: char) -> bool {
 
 /// Emit quads and/or vector paths for `ch` inside `cell`. Returns `true` if
 /// `ch` was handled (including empty Braille `U+2800` which draws nothing).
-pub fn draw(
-    ch: char,
-    cell: CellRect,
-    grid: &CellGrid,
-    color: Hsla,
-    rects: &mut Vec<DpRect>,
-    paths: &mut Vec<(Path<Pixels>, Hsla)>,
-) -> bool {
+pub fn draw(ch: char, cell: CellRect, grid: &CellGrid, color: Hsla, rects: &mut Vec<DpRect>, paths: &mut Vec<PathDraw>) -> bool {
     let cp = ch as u32;
     match cp {
         0x2500..=0x257F => draw_box_drawing(cp, cell, grid, color, rects, paths),
         0x2580..=0x259F => draw_block_element(cp, cell, color, rects),
-        0x2800..=0x28FF => draw_braille((cp - 0x2800) as u8, cell, color, rects),
+        0x2800..=0x28FF => draw_braille((cp - 0x2800) as u8, cell, grid, color, rects),
         0xE0B0..=0xE0BF => draw_powerline(cp, cell, grid, color, paths),
         0x1FB00..=0x1FB3B => draw_sextant(cp - 0x1FB00, cell, color, rects),
         0x1FB70..=0x1FB75 => {
@@ -176,14 +190,14 @@ pub fn draw(
             push_rect(rects, cell.x0, y0, cell.x1, y1, color);
         }
         0x1FB82..=0x1FB86 => {
-            // Upper 2/8..6/8 blocks.
-            let eighths = (cp - 0x1FB82 + 2) as i32;
+            // Upper 2/8, 3/8, 5/8, 6/8, 7/8 blocks.
+            let eighths = LEGACY_EIGHTHS[(cp - 0x1FB82) as usize];
             let y1 = frac(cell.y0, cell.y1, eighths, 8);
             push_rect(rects, cell.x0, cell.y0, cell.x1, y1, color);
         }
         0x1FB87..=0x1FB8B => {
-            // Right 2/8..6/8 blocks.
-            let eighths = (cp - 0x1FB87 + 2) as i32;
+            // Right 2/8, 3/8, 5/8, 6/8, 7/8 blocks.
+            let eighths = LEGACY_EIGHTHS[(cp - 0x1FB87) as usize];
             let x0 = frac(cell.x0, cell.x1, 8 - eighths, 8);
             push_rect(rects, x0, cell.y0, cell.x1, cell.y1, color);
         }
@@ -293,7 +307,7 @@ fn draw_sextant(offset: u32, cell: CellRect, color: Hsla, rects: &mut Vec<DpRect
 // Braille Patterns (U+2800..=U+28FF)
 // ---------------------------------------------------------------------------
 
-fn draw_braille(bits: u8, cell: CellRect, color: Hsla, rects: &mut Vec<DpRect>) {
+fn draw_braille(bits: u8, cell: CellRect, grid: &CellGrid, color: Hsla, rects: &mut Vec<DpRect>) {
     if bits == 0 {
         return;
     }
@@ -302,11 +316,10 @@ fn draw_braille(bits: u8, cell: CellRect, color: Hsla, rects: &mut Vec<DpRect>) 
     if w == 0 || h == 0 {
         return;
     }
-    // Keep dots square and uniformly pitched across cell boundaries so
-    // braille graphs (btop, bottom, nvtop) form an even dot matrix.
-    let dot = ((w as f32 * 0.28).round() as i32).min((h as f32 * 0.15).round() as i32).max(1);
-    let dot_w = dot.min((w / 2).max(1));
-    let dot_h = dot.min((h / 4).max(1));
+    // Use the grid's nominal dot size so adjacent cells keep identical dot
+    // weight even when fractional cell widths alternate between rounded widths.
+    let dot_w = grid.braille_dot.min((w / 2).max(1));
+    let dot_h = grid.braille_dot.min((h / 4).max(1));
 
     // Bit index for (row, col) in the standard 2×4 Braille layout.
     const MAP: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
@@ -477,7 +490,7 @@ fn orthogonal_arms(cp: u32) -> Option<Arms> {
     })
 }
 
-fn draw_box_drawing(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, rects: &mut Vec<DpRect>, paths: &mut Vec<(Path<Pixels>, Hsla)>) {
+fn draw_box_drawing(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, rects: &mut Vec<DpRect>, paths: &mut Vec<PathDraw>) {
     if let Some(a) = orthogonal_arms(cp) {
         draw_orthogonal(a, cell, grid, color, rects);
         return;
@@ -771,7 +784,7 @@ fn stroke_builder(width_dp: f32, scale: f32) -> PathBuilder {
     PathBuilder::default().with_style(PathStyle::Stroke(StrokeOptions::default().with_line_width(width).with_miter_limit(1.5)))
 }
 
-fn draw_rounded_corner(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<(Path<Pixels>, Hsla)>) {
+fn draw_rounded_corner(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<PathDraw>) {
     let w = cell.width();
     let h = cell.height();
     if w == 0 || h == 0 {
@@ -820,11 +833,11 @@ fn draw_rounded_corner(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, pa
         _ => return,
     }
     if let Ok(path) = b.build() {
-        paths.push((path, color));
+        paths.push(PathDraw { path, color, clip: Some(cell.to_bounds(s)) });
     }
 }
 
-fn draw_diagonal(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<(Path<Pixels>, Hsla)>) {
+fn draw_diagonal(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<PathDraw>) {
     let s = grid.scale;
     let t = grid.light as f32;
     let (x0, x1, y0, y1) = (cell.x0 as f32, cell.x1 as f32, cell.y0 as f32, cell.y1 as f32);
@@ -840,7 +853,7 @@ fn draw_diagonal(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &
         b.line_to(dp_point(x1, y1, s));
     }
     if let Ok(path) = b.build() {
-        paths.push((path, color));
+        paths.push(PathDraw { path, color, clip: Some(cell.to_bounds(s)) });
     }
 }
 
@@ -848,7 +861,7 @@ fn draw_diagonal(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &
 // Powerline Separators (U+E0B0..=U+E0BF)
 // ---------------------------------------------------------------------------
 
-fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<(Path<Pixels>, Hsla)>) {
+fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<PathDraw>) {
     let s = grid.scale;
     let t = grid.light as f32;
     let (x0, x1, y0, y1) = (cell.x0 as f32, cell.x1 as f32, cell.y0 as f32, cell.y1 as f32);
@@ -857,7 +870,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
     let ry = (y1 - y0) * 0.5;
     let inset = (t * 0.5).min(rx * 0.25);
 
-    let builder = match cp {
+    let (builder, stroked) = match cp {
         //  filled right-pointing triangle
         0xE0B0 => {
             let mut b = PathBuilder::fill();
@@ -865,7 +878,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.line_to(dp_point(x1, mid_y, s));
             b.line_to(dp_point(x0, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //  thin right-pointing chevron
         0xE0B1 => {
@@ -873,7 +886,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.move_to(dp_point(x0, y0, s));
             b.line_to(dp_point(x1 - inset, mid_y, s));
             b.line_to(dp_point(x0, y1, s));
-            b
+            (b, true)
         }
         //  filled left-pointing triangle
         0xE0B2 => {
@@ -882,7 +895,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.line_to(dp_point(x0, mid_y, s));
             b.line_to(dp_point(x1, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //  thin left-pointing chevron
         0xE0B3 => {
@@ -890,7 +903,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.move_to(dp_point(x1, y0, s));
             b.line_to(dp_point(x0 + inset, mid_y, s));
             b.line_to(dp_point(x1, y1, s));
-            b
+            (b, true)
         }
         //  filled right semicircle
         0xE0B4 => {
@@ -899,7 +912,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.cubic_bezier_to(dp_point(x1, mid_y, s), dp_point(x0 + rx * KAPPA, y0, s), dp_point(x1, mid_y - ry * KAPPA, s));
             b.cubic_bezier_to(dp_point(x0, y1, s), dp_point(x1, mid_y + ry * KAPPA, s), dp_point(x0 + rx * KAPPA, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //  thin right semicircle
         0xE0B5 => {
@@ -909,7 +922,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.move_to(dp_point(x0, y0, s));
             b.cubic_bezier_to(dp_point(ax, mid_y, s), dp_point(x0 + arx * KAPPA, y0, s), dp_point(ax, mid_y - ry * KAPPA, s));
             b.cubic_bezier_to(dp_point(x0, y1, s), dp_point(ax, mid_y + ry * KAPPA, s), dp_point(x0 + arx * KAPPA, y1, s));
-            b
+            (b, true)
         }
         //  filled left semicircle
         0xE0B6 => {
@@ -918,7 +931,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.cubic_bezier_to(dp_point(x0, mid_y, s), dp_point(x1 - rx * KAPPA, y0, s), dp_point(x0, mid_y - ry * KAPPA, s));
             b.cubic_bezier_to(dp_point(x1, y1, s), dp_point(x0, mid_y + ry * KAPPA, s), dp_point(x1 - rx * KAPPA, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //  thin left semicircle
         0xE0B7 => {
@@ -928,7 +941,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.move_to(dp_point(x1, y0, s));
             b.cubic_bezier_to(dp_point(ax, mid_y, s), dp_point(x1 - arx * KAPPA, y0, s), dp_point(ax, mid_y - ry * KAPPA, s));
             b.cubic_bezier_to(dp_point(x1, y1, s), dp_point(ax, mid_y + ry * KAPPA, s), dp_point(x1 - arx * KAPPA, y1, s));
-            b
+            (b, true)
         }
         //  filled lower-left triangle
         0xE0B8 => {
@@ -937,14 +950,14 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.line_to(dp_point(x1, y1, s));
             b.line_to(dp_point(x0, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //   thin backslash diagonal
         0xE0B9 | 0xE0BF => {
             let mut b = stroke_builder(t, s);
             b.move_to(dp_point(x0, y0, s));
             b.line_to(dp_point(x1, y1, s));
-            b
+            (b, true)
         }
         //  filled lower-right triangle
         0xE0BA => {
@@ -953,14 +966,14 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.line_to(dp_point(x1, y1, s));
             b.line_to(dp_point(x0, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //   thin slash diagonal
         0xE0BB | 0xE0BD => {
             let mut b = stroke_builder(t, s);
             b.move_to(dp_point(x0, y1, s));
             b.line_to(dp_point(x1, y0, s));
-            b
+            (b, true)
         }
         //  filled upper-left triangle
         0xE0BC => {
@@ -969,7 +982,7 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.line_to(dp_point(x1, y0, s));
             b.line_to(dp_point(x0, y1, s));
             b.close();
-            b
+            (b, false)
         }
         //  filled upper-right triangle
         0xE0BE => {
@@ -978,12 +991,13 @@ fn draw_powerline(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: 
             b.line_to(dp_point(x1, y0, s));
             b.line_to(dp_point(x1, y1, s));
             b.close();
-            b
+            (b, false)
         }
         _ => return,
     };
     if let Ok(path) = builder.build() {
-        paths.push((path, color));
+        let clip = stroked.then(|| cell.to_bounds(s));
+        paths.push(PathDraw { path, color, clip });
     }
 }
 
@@ -1100,6 +1114,67 @@ mod tests {
         let vertical_stems: Vec<_> = rects.iter().filter(|r| r.y1 == cell.y1).collect();
         assert_eq!(vertical_stems.len(), 1);
         assert!(vertical_stems[0].y0 > top_bar_y, "single stem in ╤ starts at lower bar");
+    }
+
+    #[test]
+    fn legacy_upper_and_right_blocks_use_unicode_eighth_fractions() {
+        let g = test_grid(16.0, 16.0, 16.0, 1.0);
+        let cell = g.cell(0, 0);
+        let c = gpui::white();
+        let expected_px = [4, 6, 10, 12, 14]; // 2/8, 3/8, 5/8, 6/8, 7/8 of 16px
+
+        for (i, &px_len) in expected_px.iter().enumerate() {
+            let upper = char::from_u32(0x1FB82 + i as u32).unwrap();
+            let (mut rects, mut paths) = (Vec::new(), Vec::new());
+            assert!(draw(upper, cell, &g, c, &mut rects, &mut paths));
+            assert_eq!(rects.len(), 1);
+            assert_eq!(rects[0].y0, cell.y0);
+            assert_eq!(rects[0].y1 - rects[0].y0, px_len, "upper U+{:04X}", upper as u32);
+
+            let right = char::from_u32(0x1FB87 + i as u32).unwrap();
+            let (mut rects, mut paths) = (Vec::new(), Vec::new());
+            assert!(draw(right, cell, &g, c, &mut rects, &mut paths));
+            assert_eq!(rects.len(), 1);
+            assert_eq!(rects[0].x1, cell.x1);
+            assert_eq!(rects[0].x1 - rects[0].x0, px_len, "right U+{:04X}", right as u32);
+        }
+    }
+
+    #[test]
+    fn braille_dots_keep_uniform_size_across_fractional_columns() {
+        // 8.4px cell width alternates 8px and 9px rounded cell widths; dot size must stay identical.
+        let g = test_grid(8.4, 18.0, 14.0, 1.0);
+        let c = gpui::white();
+        assert_ne!(g.cell(0, 0).width(), g.cell(1, 0).width());
+        let (mut r0, mut r1, mut paths) = (Vec::new(), Vec::new(), Vec::new());
+        draw('⣿', g.cell(0, 0), &g, c, &mut r0, &mut paths);
+        draw('⣿', g.cell(1, 0), &g, c, &mut r1, &mut paths);
+        assert_eq!(r0.len(), 8);
+        assert_eq!(r1.len(), 8);
+        let size0 = (r0[0].x1 - r0[0].x0, r0[0].y1 - r0[0].y0);
+        for r in r0.iter().chain(&r1) {
+            assert_eq!((r.x1 - r.x0, r.y1 - r.y0), size0, "braille dot size drifted across columns");
+        }
+    }
+
+    #[test]
+    fn stroked_paths_carry_cell_clip_bounds() {
+        let g = test_grid(8.4, 18.0, 14.0, 1.0);
+        let cell = g.cell(2, 1);
+        let c = gpui::white();
+        for ch in ['╭', '╱', '\u{E0B1}', '\u{E0B5}', '\u{E0B9}'] {
+            let (mut rects, mut paths) = (Vec::new(), Vec::new());
+            assert!(draw(ch, cell, &g, c, &mut rects, &mut paths));
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].clip, Some(cell.to_bounds(g.scale)), "stroked U+{:04X} must be clipped to cell", ch as u32);
+        }
+        // Filled Powerline shapes stay strictly inside the cell and need no clip.
+        for ch in ['\u{E0B0}', '\u{E0B4}', '\u{E0B8}'] {
+            let (mut rects, mut paths) = (Vec::new(), Vec::new());
+            assert!(draw(ch, cell, &g, c, &mut rects, &mut paths));
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].clip, None);
+        }
     }
 
     #[test]

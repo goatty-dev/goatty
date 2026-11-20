@@ -19,12 +19,12 @@ use std::time::Instant;
 use goatty_term::{CellFlags, CursorKind, Frame, LinkSpan, Rgb, TermSize};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, Path, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
-    TextRun, UnderlineStyle, Window, fill, point, px, relative, size,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun,
+    UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::box_drawing::{self, CellGrid, DpRect};
+use super::box_drawing::{self, CellGrid, DpRect, PathDraw};
 use super::glyphs::{Glyph, GlyphCache};
 use super::stats::Stats;
 use super::view::TerminalView;
@@ -149,13 +149,13 @@ struct CursorLayout {
     line: Option<ShapedLine>,
     glyphs: Vec<GlyphDraw>,
     rects: Vec<(Bounds<Pixels>, Hsla)>,
-    paths: Vec<(Path<Pixels>, Hsla)>,
+    paths: Vec<PathDraw>,
 }
 
 pub struct Layout {
     rects: Vec<(Bounds<Pixels>, Hsla)>,
     fg_rects: Vec<(Bounds<Pixels>, Hsla)>,
-    paths: Vec<(Path<Pixels>, Hsla)>,
+    paths: Vec<PathDraw>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     glyphs: Vec<GlyphDraw>,
     decos: Vec<Deco>,
@@ -306,7 +306,7 @@ impl Element for TerminalElement {
         let mut decos: Vec<Deco> = Vec::new();
         let mut rects = Vec::new();
         let mut fg_dp_rects: Vec<DpRect> = Vec::new();
-        let mut paths: Vec<(Path<Pixels>, Hsla)> = Vec::new();
+        let mut paths: Vec<PathDraw> = Vec::new();
         let mut lines = Vec::with_capacity(frame.rows * 2);
         let mut seg_text = String::with_capacity(frame.cols);
         let mut runs: Vec<TextRun> = Vec::new();
@@ -338,7 +338,7 @@ impl Element for TerminalElement {
                         Some((_, fg, f)) if f == deco_flags && fg == cell.fg => {}
                         _ => {
                             if let Some((start, fg, f)) = deco_run.take() {
-                                push_deco(&mut decos, origin.x, cell_w, baseline, &cache, start, col, fg, f);
+                                push_deco(&mut decos, &grid, baseline, &cache, start, col, fg, f);
                             }
                             if deco_flags != CellFlags::empty() {
                                 deco_run = Some((col, cell.fg, deco_flags));
@@ -371,13 +371,14 @@ impl Element for TerminalElement {
                     }
                 }
                 if let Some((start, fg, f)) = deco_run.take() {
-                    push_deco(&mut decos, origin.x, cell_w, baseline, &cache, start, row.len(), fg, f);
+                    push_deco(&mut decos, &grid, baseline, &cache, start, row.len(), fg, f);
                 }
                 continue;
             }
 
             // Text segments.
             let baseline = y + (line_height - cache.ascent - cache.descent) / 2.0 + cache.ascent;
+            let mut geom_deco_run: Option<(usize, Rgb, CellFlags)> = None;
             let mut seg_start = 0usize;
             let mut cur: Option<RunStyle> = None;
             let mut run_len = 0usize;
@@ -417,6 +418,9 @@ impl Element for TerminalElement {
 
             for (col, cell) in row.iter().enumerate() {
                 if cell.flags.contains(CellFlags::SPACER) {
+                    if let Some((start, fg, f)) = geom_deco_run.take() {
+                        push_deco(&mut decos, &grid, baseline, &cache, start, col, fg, f);
+                    }
                     flush(&mut seg_text, &mut runs, &mut cur, &mut run_len, seg_start, &mut lines);
                     continue;
                 }
@@ -427,10 +431,21 @@ impl Element for TerminalElement {
                     flush(&mut seg_text, &mut runs, &mut cur, &mut run_len, seg_start, &mut lines);
                     box_drawing::draw(cell.ch, grid.cell(col, r), &grid, hsla(cell.fg), &mut fg_dp_rects, &mut paths);
                     let deco_flags = deco_bits(cell.flags);
-                    if deco_flags != CellFlags::empty() {
-                        push_deco(&mut decos, origin.x, cell_w, baseline, &cache, col, col + 1, cell.fg, deco_flags);
+                    match geom_deco_run {
+                        Some((_, fg, f)) if f == deco_flags && fg == cell.fg => {}
+                        _ => {
+                            if let Some((start, fg, f)) = geom_deco_run.take() {
+                                push_deco(&mut decos, &grid, baseline, &cache, start, col, fg, f);
+                            }
+                            if deco_flags != CellFlags::empty() {
+                                geom_deco_run = Some((col, cell.fg, deco_flags));
+                            }
+                        }
                     }
                     continue;
+                }
+                if let Some((start, fg, f)) = geom_deco_run.take() {
+                    push_deco(&mut decos, &grid, baseline, &cache, start, col, fg, f);
                 }
                 if wide || !extra.is_empty() {
                     // Complex cell: shape alone, anchored at its column.
@@ -467,6 +482,9 @@ impl Element for TerminalElement {
                 }
                 seg_text.push(cell.ch);
                 run_len += cell.ch.len_utf8();
+            }
+            if let Some((start, fg, f)) = geom_deco_run.take() {
+                push_deco(&mut decos, &grid, baseline, &cache, start, row.len(), fg, f);
             }
             flush(&mut seg_text, &mut runs, &mut cur, &mut run_len, seg_start, &mut lines);
         }
@@ -612,8 +630,12 @@ impl TerminalElement {
         for (b, color) in layout.fg_rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
-        for (path, color) in layout.paths.drain(..) {
-            window.paint_path(path, color);
+        let paint_path = |p: PathDraw, window: &mut Window| {
+            let mask = p.clip.map(|bounds| ContentMask { bounds });
+            window.with_content_mask(mask, |window| window.paint_path(p.path, p.color));
+        };
+        for p in layout.paths.drain(..) {
+            paint_path(p, window);
         }
         for (origin, line) in &layout.lines {
             let _ = line.paint(*origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
@@ -647,8 +669,8 @@ impl TerminalElement {
                     for (r, color) in cur.rects {
                         window.paint_quad(fill(r, color));
                     }
-                    for (path, color) in cur.paths {
-                        window.paint_path(path, color);
+                    for p in cur.paths {
+                        paint_path(p, window);
                     }
                     if let Some(g) = cur.line {
                         let _ = g.paint(b.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
@@ -693,8 +715,7 @@ fn deco_bits(f: CellFlags) -> CellFlags {
 #[allow(clippy::too_many_arguments)]
 fn push_deco(
     decos: &mut Vec<Deco>,
-    x0: Pixels,
-    cell_w: Pixels,
+    grid: &CellGrid,
     baseline: Pixels,
     cache: &GlyphCache,
     start: usize,
@@ -703,8 +724,10 @@ fn push_deco(
     f: CellFlags,
 ) {
     let color = Some(hsla(fg));
-    let x = x0 + cell_w * start as f32;
-    let w = cell_w * (end - start) as f32;
+    let x0 = grid.col_x(start);
+    let x1 = grid.col_x(end);
+    let x = px(x0 as f32 / grid.scale);
+    let w = px((x1 - x0) as f32 / grid.scale);
     if f.contains(CellFlags::UNDERLINE) {
         let wavy = f.contains(CellFlags::UNDERCURL);
         decos.push(Deco::Underline(point(x, baseline + cache.descent * 0.618), w, UnderlineStyle { thickness: px(1.0), color, wavy }));
