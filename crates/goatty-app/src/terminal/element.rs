@@ -19,11 +19,12 @@ use std::time::Instant;
 use goatty_term::{CellFlags, CursorKind, Frame, LinkSpan, Rgb, TermSize};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun,
-    UnderlineStyle, Window, fill, point, px, relative, size,
+    Hsla, InspectorElementId, IntoElement, LayoutId, Path, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style,
+    TextRun, UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use unicode_width::UnicodeWidthStr;
 
+use super::box_drawing::{self, CellGrid, DpRect};
 use super::glyphs::{Glyph, GlyphCache};
 use super::stats::Stats;
 use super::view::TerminalView;
@@ -141,11 +142,20 @@ enum Deco {
     Strike(Point<Pixels>, Pixels, StrikethroughStyle),
 }
 
-/// Cursor bounds, shape, and the glyph under a block cursor (shaped or cached).
-type CursorLayout = (Bounds<Pixels>, CursorKind, Option<ShapedLine>, Vec<GlyphDraw>);
+/// Cursor bounds, shape, and the glyph under a block cursor (shaped, cached, or geometric).
+struct CursorLayout {
+    bounds: Bounds<Pixels>,
+    shape: CursorKind,
+    line: Option<ShapedLine>,
+    glyphs: Vec<GlyphDraw>,
+    rects: Vec<(Bounds<Pixels>, Hsla)>,
+    paths: Vec<(Path<Pixels>, Hsla)>,
+}
 
 pub struct Layout {
     rects: Vec<(Bounds<Pixels>, Hsla)>,
+    fg_rects: Vec<(Bounds<Pixels>, Hsla)>,
+    paths: Vec<(Path<Pixels>, Hsla)>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     glyphs: Vec<GlyphDraw>,
     decos: Vec<Deco>,
@@ -287,12 +297,16 @@ impl Element for TerminalElement {
         let geom = Geom { origin, cell: size(cell_w, line_height), cols: frame.cols, rows: frame.rows, caret, visible };
         self.geom.set(geom);
 
+        let scale = window.scale_factor();
+        let grid = CellGrid::new(origin, cell_w, line_height, self.font_size, scale);
         let default_bg = frame.background;
         let mut cache = self.glyphs.borrow_mut();
         cache.ensure(&ts, &self.font, self.font_size);
         let mut glyph_draws: Vec<GlyphDraw> = Vec::new();
         let mut decos: Vec<Deco> = Vec::new();
         let mut rects = Vec::new();
+        let mut fg_dp_rects: Vec<DpRect> = Vec::new();
+        let mut paths: Vec<(Path<Pixels>, Hsla)> = Vec::new();
         let mut lines = Vec::with_capacity(frame.rows * 2);
         let mut seg_text = String::with_capacity(frame.cols);
         let mut runs: Vec<TextRun> = Vec::new();
@@ -310,10 +324,7 @@ impl Element for TerminalElement {
                     c += 1;
                 }
                 if bg != default_bg {
-                    rects.push((
-                        Bounds::new(point(origin.x + cell_w * start as f32, y), size(cell_w * (c - start) as f32, line_height)),
-                        hsla(bg),
-                    ));
+                    rects.push((grid.span_bounds(start, c, r), hsla(bg)));
                 }
             }
 
@@ -337,9 +348,15 @@ impl Element for TerminalElement {
                     if cell.flags.contains(CellFlags::SPACER) || cell.ch == ' ' {
                         continue;
                     }
-                    let x = origin.x + cell_w * col as f32;
                     let color = hsla(cell.fg);
                     let extra = frame.extra(cell);
+                    if extra.is_empty()
+                        && !cell.flags.contains(CellFlags::WIDE)
+                        && box_drawing::draw(cell.ch, grid.cell(col, r), &grid, color, &mut fg_dp_rects, &mut paths)
+                    {
+                        continue;
+                    }
+                    let x = origin.x + cell_w * col as f32;
                     if extra.is_empty() {
                         if let Some(g) = cache.simple(&ts, cell.ch, cell.flags) {
                             glyph_draws.push(GlyphDraw { origin: point(x + g.x, baseline), glyph: g, color });
@@ -360,6 +377,7 @@ impl Element for TerminalElement {
             }
 
             // Text segments.
+            let baseline = y + (line_height - cache.ascent - cache.descent) / 2.0 + cache.ascent;
             let mut seg_start = 0usize;
             let mut cur: Option<RunStyle> = None;
             let mut run_len = 0usize;
@@ -405,6 +423,15 @@ impl Element for TerminalElement {
                 let extra = frame.extra(cell);
                 let wide = cell.flags.contains(CellFlags::WIDE);
                 let st = RunStyle { fg: cell.fg, flags: style_bits(cell.flags) };
+                if !wide && extra.is_empty() && box_drawing::is_custom(cell.ch) {
+                    flush(&mut seg_text, &mut runs, &mut cur, &mut run_len, seg_start, &mut lines);
+                    box_drawing::draw(cell.ch, grid.cell(col, r), &grid, hsla(cell.fg), &mut fg_dp_rects, &mut paths);
+                    let deco_flags = deco_bits(cell.flags);
+                    if deco_flags != CellFlags::empty() {
+                        push_deco(&mut decos, origin.x, cell_w, baseline, &cache, col, col + 1, cell.fg, deco_flags);
+                    }
+                    continue;
+                }
                 if wide || !extra.is_empty() {
                     // Complex cell: shape alone, anchored at its column.
                     flush(&mut seg_text, &mut runs, &mut cur, &mut run_len, seg_start, &mut lines);
@@ -444,6 +471,8 @@ impl Element for TerminalElement {
             flush(&mut seg_text, &mut runs, &mut cur, &mut run_len, seg_start, &mut lines);
         }
 
+        let fg_rects = fg_dp_rects.into_iter().map(|r| (r.to_bounds(scale), r.color)).collect();
+
         // Hovered link: underline in each stretch's text color.
         for span in &self.link_spans {
             if span.row >= frame.rows || span.cols.start >= frame.cols {
@@ -462,39 +491,44 @@ impl Element for TerminalElement {
 
         // Cursor.
         let cursor = frame.cursor.map(|cur| {
-            let w = if cur.wide { cell_w * 2.0 } else { cell_w };
-            let b = Bounds::new(point(origin.x + cell_w * cur.col as f32, origin.y + line_height * cur.row as f32), size(w, line_height));
+            let end_col = cur.col + if cur.wide { 2 } else { 1 };
+            let b = grid.span_bounds(cur.col, end_col, cur.row);
             let mut cursor_glyphs = Vec::new();
-            if self.glyph_mode && self.focused && cur.shape == CursorKind::Block {
+            let mut cursor_dp_rects = Vec::new();
+            let mut cursor_paths = Vec::new();
+            let mut cursor_line = None;
+            if self.focused && cur.shape == CursorKind::Block {
                 let cell = frame.row(cur.row)[cur.col];
                 if cell.ch != ' ' {
-                    let baseline = b.origin.y + (line_height - cache.ascent - cache.descent) / 2.0 + cache.ascent;
-                    let mut text = String::new();
-                    text.push(cell.ch);
-                    text.extend(frame.extra(&cell));
-                    for g in cache.complex(&ts, &text, cell.flags) {
-                        cursor_glyphs.push(GlyphDraw {
-                            origin: point(b.origin.x + g.x, baseline),
-                            glyph: *g,
-                            color: hsla(frame.background),
-                        });
+                    let extra = frame.extra(&cell);
+                    let fg = hsla(frame.background);
+                    if extra.is_empty()
+                        && !cell.flags.contains(CellFlags::WIDE)
+                        && box_drawing::draw(cell.ch, grid.cell(cur.col, cur.row), &grid, fg, &mut cursor_dp_rects, &mut cursor_paths)
+                    {
+                        // Painted geometrically over the block cursor.
+                    } else if self.glyph_mode {
+                        let y = origin.y + line_height * cur.row as f32;
+                        let baseline = y + (line_height - cache.ascent - cache.descent) / 2.0 + cache.ascent;
+                        let x = origin.x + cell_w * cur.col as f32;
+                        let mut text = String::new();
+                        text.push(cell.ch);
+                        text.extend(extra);
+                        for g in cache.complex(&ts, &text, cell.flags) {
+                            cursor_glyphs.push(GlyphDraw { origin: point(x + g.x, baseline), glyph: *g, color: fg });
+                        }
+                    } else {
+                        let mut text = String::new();
+                        text.push(cell.ch);
+                        text.extend(extra);
+                        let st = RunStyle { fg: frame.background, flags: style_bits(cell.flags) };
+                        let run = self.text_run(text.len(), st);
+                        cursor_line = Some(ts.shape_line(SharedString::from(text), self.font_size, &[run], None));
                     }
                 }
             }
-            let glyph = if !self.glyph_mode && self.focused && cur.shape == CursorKind::Block {
-                let cell = frame.row(cur.row)[cur.col];
-                (cell.ch != ' ').then(|| {
-                    let mut text = String::new();
-                    text.push(cell.ch);
-                    text.extend(frame.extra(&cell));
-                    let st = RunStyle { fg: frame.background, flags: style_bits(cell.flags) };
-                    let run = self.text_run(text.len(), st);
-                    ts.shape_line(SharedString::from(text), self.font_size, &[run], None)
-                })
-            } else {
-                None
-            };
-            (b, cur.shape, glyph, cursor_glyphs)
+            let cursor_rects = cursor_dp_rects.into_iter().map(|r| (r.to_bounds(scale), r.color)).collect();
+            CursorLayout { bounds: b, shape: cur.shape, line: cursor_line, glyphs: cursor_glyphs, rects: cursor_rects, paths: cursor_paths }
         });
 
         let preedit = (!self.preedit.is_empty()).then(|| {
@@ -513,6 +547,8 @@ impl Element for TerminalElement {
         self.stats.borrow_mut().shaped_segments += if self.glyph_mode { glyph_draws.len() } else { lines.len() } as u64;
         Layout {
             rects,
+            fg_rects,
+            paths,
             lines,
             glyphs: glyph_draws,
             decos,
@@ -573,6 +609,12 @@ impl TerminalElement {
         for (b, color) in layout.rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
+        for (b, color) in layout.fg_rects.drain(..) {
+            window.paint_quad(fill(b, color));
+        }
+        for (path, color) in layout.paths.drain(..) {
+            window.paint_path(path, color);
+        }
         for (origin, line) in &layout.lines {
             let _ = line.paint(*origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
         }
@@ -595,16 +637,23 @@ impl TerminalElement {
         }
         // While composing, the composition stands where the cursor is.
         let cursor = layout.cursor.take().filter(|_| (self.cursor_visible || !self.focused) && layout.preedit.is_none());
-        if let Some((b, shape, glyph, cursor_glyphs)) = cursor {
+        if let Some(cur) = cursor {
+            let b = cur.bounds;
             let c = layout.cursor_color;
             let t = px(2.0);
-            match (shape, self.focused) {
+            match (cur.shape, self.focused) {
                 (CursorKind::Block, true) => {
                     window.paint_quad(fill(b, c));
-                    if let Some(g) = glyph {
+                    for (r, color) in cur.rects {
+                        window.paint_quad(fill(r, color));
+                    }
+                    for (path, color) in cur.paths {
+                        window.paint_path(path, color);
+                    }
+                    if let Some(g) = cur.line {
                         let _ = g.paint(b.origin, layout.line_height, gpui::TextAlign::Left, None, window, cx);
                     }
-                    for d in &cursor_glyphs {
+                    for d in &cur.glyphs {
                         paint_glyph(d, window);
                     }
                 }
