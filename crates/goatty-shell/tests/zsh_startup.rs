@@ -1289,18 +1289,28 @@ fn expansions_rewrite_words_on_space_and_enter() {
     assert!(last_output(&sh).contains("sortedx"), "{:?}", last_output(&sh));
 
     // Ctrl+Backspace (^H and Esc+Backspace) and Ctrl+Delete (^[[3;5~) kill words
-    // even with expansions active (#248).
-    sh.run("echo one two\x08");
+    // in both emacs and viins even with expansions active (#248).
+    sh.run("for km in emacs viins; do for k in '^H' '^[^?' '^[[3;5~'; do bindkey -M $km $k; done; done");
     let out = last_output(&sh);
-    assert!(out.contains("one") && !out.contains("two"), "Ctrl+Backspace (^H) kills a word: {out:?}");
+    assert!(
+        !out.contains("goatty-expand-backspace")
+            && !out.contains("undefined-key")
+            && out.contains("backward-kill-word")
+            && out.contains("kill-word"),
+        "expected word-kill bindings in emacs and viins: {out:?}"
+    );
 
-    sh.run("echo three four\x1b\x7f");
+    sh.run("echo one zzzz\x08");
     let out = last_output(&sh);
-    assert!(out.contains("three") && !out.contains("four"), "Ctrl+Backspace (Esc+Backspace) kills a word: {out:?}");
+    assert!(out.contains("one\r") && !out.contains("zz"), "Ctrl+Backspace (^H) kills a word: {out:?}");
 
-    sh.run("echo alpha beta\x1b[D\x1b[D\x1b[D\x1b[D\x1b[3;5~");
+    sh.run("echo three yyyy\x1b\x7f");
     let out = last_output(&sh);
-    assert!(out.contains("alpha") && !out.contains("beta"), "Ctrl+Delete kills a word forward: {out:?}");
+    assert!(out.contains("three\r") && !out.contains("yy"), "Ctrl+Backspace (Esc+Backspace) kills a word: {out:?}");
+
+    sh.run("echo alpha qqqq\x1b[D\x1b[D\x1b[D\x1b[D\x1b[3;5~");
+    let out = last_output(&sh);
+    assert!(out.contains("alpha\r") && !out.contains("qq"), "Ctrl+Delete kills a word forward: {out:?}");
 
     // Inside quotes nothing changes.
     sh.run("echo 'a | first 2 lines b'");
