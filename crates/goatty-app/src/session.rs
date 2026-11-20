@@ -61,7 +61,7 @@ pub enum LinkStatus {
 
 enum Backend {
     Local(Mutex<Pty>),
-    Daemon { conn: Arc<Connection>, id: AtomicU64 },
+    Daemon { conn: Arc<Connection>, id: AtomicU64, sink: Arc<dyn PaneSink> },
 }
 
 pub struct Session {
@@ -402,14 +402,17 @@ impl Session {
         id: u64,
         host_label: Option<String>,
         ssh_host: Option<String>,
-    ) -> (Arc<Self>, Arc<Sink>) {
+    ) -> (Arc<Self>, Arc<dyn PaneSink>) {
         // Client-side terminal never answers queries; the daemon's does.
         let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
-        let s =
-            Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(id) }, host_label, ssh_host));
+        let mut sink_out: Option<Arc<dyn PaneSink>> = None;
+        let s = Arc::new_cyclic(|weak| {
+            let sink: Arc<dyn PaneSink> = Arc::new(Sink(weak.clone()));
+            sink_out = Some(sink.clone());
+            Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(id), sink }, host_label, ssh_host)
+        });
         *s.view.lock() = size;
-        let sink = Arc::new(Sink(Arc::downgrade(&s)));
-        (s, sink)
+        (s, sink_out.expect("initialized in new_cyclic"))
     }
 
     /// Attach to (or create) a session on the daemon behind `conn`.
@@ -476,10 +479,7 @@ impl Session {
     /// Run `argv` in a new session on the daemon behind `conn` (plain SSH:
     /// `ssh host` in a session of the local daemon).
     pub fn daemon_run(conn: Arc<Connection>, size: TermSize, argv: Vec<String>) -> Result<Arc<Self>> {
-        let (terminal, chans) = Terminal::new(size, false, Arc::new(Palette::default()));
-        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Daemon { conn: conn.clone(), id: AtomicU64::new(0) }, None, None));
-        *s.view.lock() = size;
-        let sink = Arc::new(Sink(Arc::downgrade(&s)));
+        let (s, sink) = Self::new_daemon(&conn, size, 0, None, None);
         let cwd = conn.endpoint().is_local().then(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())).flatten();
         let id = conn.run(win(size), cwd, argv, sink)?;
         log::info!("running in session {id}");
@@ -517,7 +517,7 @@ impl Session {
                     fg.poke();
                 }
             }
-            Backend::Daemon { conn, id } => {
+            Backend::Daemon { conn, id, .. } => {
                 if *self.status.lock() == LinkStatus::NeedsReconnect {
                     // The link is down: input has nowhere to go. Enter asks ssh
                     // to reconnect, with prompts.
@@ -598,7 +598,7 @@ impl Session {
     /// viewport is near it (older lines, or what a resync skipped). Cheap;
     /// call it whenever the view is scrolled up. Never blocks.
     pub fn fill_history(&self) {
-        let Backend::Daemon { conn, id } = &self.backend else { return };
+        let Backend::Daemon { conn, id, .. } = &self.backend else { return };
         if self.fetching.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -626,7 +626,7 @@ impl Session {
     /// False when the request couldn't be sent (the link is down).
     pub fn take_size(&self) -> bool {
         match &self.backend {
-            Backend::Daemon { conn, id } => conn.take_size(id.load(Ordering::Relaxed)),
+            Backend::Daemon { conn, id, .. } => conn.take_size(id.load(Ordering::Relaxed)),
             Backend::Local(_) => false,
         }
     }
@@ -643,7 +643,7 @@ impl Session {
             self.predictor.lock().reset();
             self.terminal.resize(view);
         }
-        if let Backend::Daemon { conn, id } = &self.backend {
+        if let Backend::Daemon { conn, id, .. } = &self.backend {
             conn.resize(id.load(Ordering::Relaxed), win(view));
         }
     }
@@ -669,7 +669,7 @@ impl Session {
             Backend::Local(pty) => {
                 let _ = pty.lock().resize(size);
             }
-            Backend::Daemon { conn, id } => conn.resize(id.load(Ordering::Relaxed), win(size)),
+            Backend::Daemon { conn, id, .. } => conn.resize(id.load(Ordering::Relaxed), win(size)),
         }
     }
 
@@ -678,7 +678,7 @@ impl Session {
     pub fn set_palette(&self, palette: Palette) {
         let colors = palette_list(&palette);
         self.terminal.set_palette(Arc::new(palette));
-        if let Backend::Daemon { conn, id } = &self.backend {
+        if let Backend::Daemon { conn, id, .. } = &self.backend {
             conn.set_palette(id.load(Ordering::Relaxed), colors);
         }
     }
@@ -688,10 +688,28 @@ impl Session {
     pub fn kill(&self) {
         match &self.backend {
             Backend::Local(pty) => pty.lock().kill(),
-            Backend::Daemon { conn, id } => {
+            Backend::Daemon { conn, id, .. } => {
                 if let Err(e) = conn.kill(id.load(Ordering::Relaxed)) {
                     log::warn!("closing session: {e:#}");
                 }
+            }
+        }
+    }
+
+    /// Whether this session is kept by a `goattyd` and can be detached
+    /// without ending its shell.
+    pub fn can_detach(&self) -> bool {
+        self.daemon_id().is_some()
+    }
+
+    /// Unsubscribe from the session on `goattyd` without ending its shell.
+    /// Returns `false` for a window-owned local PTY (`--local`).
+    pub fn detach(&self) -> bool {
+        match &self.backend {
+            Backend::Local(_) => false,
+            Backend::Daemon { conn, id, sink } => {
+                conn.detach_sink(id.load(Ordering::Relaxed), sink);
+                true
             }
         }
     }

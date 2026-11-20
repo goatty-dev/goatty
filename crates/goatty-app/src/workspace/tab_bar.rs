@@ -554,10 +554,11 @@ impl Workspace {
     }
 
     /// The close button, `size` px: always on the active tab, on hover on
-    /// the others.
+    /// the others. Shift+click detaches the tab instead of closing it.
     pub(super) fn close_button(&self, t: &TabView, size: f32, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
         let index = t.index;
         let group = SharedString::from(format!("tab-{}", t.id));
+        let tip = if self.cannot_detach_tab(index, cx).is_none() { "Close tab (Shift+click: detach)" } else { "Close tab" };
         div()
             .id(gpui::ElementId::NamedInteger("tab-close".into(), t.id))
             .flex_none()
@@ -567,10 +568,16 @@ impl Workspace {
             .items_center()
             .justify_center()
             .hover(|s| s.bg(c.ui.text.opacity(0.1)))
-            .tooltip(tooltip("Close tab"))
+            .tooltip(tooltip(tip))
             .child(Icon::Close.svg().size(px(size * 0.66)).text_color(c.ui.muted))
             .when(!t.active, |d| d.invisible().group_hover(group, |s| s.visible()))
-            .on_click(cx.listener(move |this, _, window, cx| this.close_tab_at(index, window, cx)))
+            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                if ev.modifiers().shift {
+                    this.detach_tab_at(index, window, cx);
+                } else {
+                    this.close_tab_at(index, window, cx);
+                }
+            }))
             .into_any_element()
     }
 
@@ -670,7 +677,13 @@ impl Workspace {
             .child(div().min_w_0().truncate().child(g.label.clone()))
             .children(count)
             .children(mark)
-            .on_click(cx.listener(move |this, _, window, cx| this.fold_group(&key, !folded, window, cx)))
+            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                if ev.modifiers().shift {
+                    this.detach_group(&key, window, cx);
+                } else {
+                    this.fold_group(&key, !folded, window, cx);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &gpui::MouseDownEvent, window, cx| {
@@ -695,7 +708,7 @@ pub(super) fn group_tooltip(g: &Group) -> String {
     let n = g.tabs.len();
     let tabs = if n == 1 { "1 tab".to_string() } else { format!("{n} tabs") };
     let click = if g.folded { "click to show them" } else { "click to fold them" };
-    format!("{tip}\n{tabs} · {click} · right-click for more")
+    format!("{tip}\n{tabs} · {click} · Shift+click to detach · right-click for more")
 }
 
 /// The line in a host group's color on a tab: across the top of the active

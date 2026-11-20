@@ -44,7 +44,7 @@ pub(super) enum HostKey {
 }
 
 impl HostKey {
-    fn of(spawner: &Spawner) -> Self {
+    pub(super) fn of(spawner: &Spawner) -> Self {
         match spawner {
             Spawner::Local(_) => HostKey::Local,
             Spawner::Daemon(conn) => HostKey::Daemon(std::sync::Arc::as_ptr(conn) as usize),

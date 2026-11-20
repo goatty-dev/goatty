@@ -403,6 +403,14 @@ pub fn builtins() -> Vec<Command> {
         ]),
         Command::action("tab.new", "Tabs", "New tab", "new_tab").keywords(&["open", "create", "session"]),
         Command::action("tab.close", "Tabs", "Close the tab", "close_tab").keywords(&["kill", "exit"]),
+        Command::action("tab.detach", "Tabs", "Detach the tab", "detach_tab").keywords(&[
+            "background",
+            "keep running",
+            "disconnect",
+            "unattach",
+            "leave",
+            "session",
+        ]),
         Command::action("tab.next", "Tabs", "Next tab", "next_tab").keywords(&["switch"]),
         Command::action("tab.previous", "Tabs", "Previous tab", "previous_tab").keywords(&["switch", "back"]),
         Command::action("tab.move_left", "Tabs", "Move the tab left", "move_tab_left").keywords(&["reorder"]),
@@ -410,6 +418,32 @@ pub fn builtins() -> Vec<Command> {
         Command::action("tab.rename", "Tabs", "Rename the tab", "rename_tab").keywords(&["title", "name", "label"]),
         Command::action("tab.duplicate", "Tabs", "Duplicate the tab", "duplicate_tab").keywords(&["copy", "clone", "same directory"]),
         Command::action("tab.close_others", "Tabs", "Close the other tabs", "close_other_tabs").keywords(&["kill", "only", "rest"]),
+        Command::action("tab.detach_others", "Tabs", "Detach the other tabs", "detach_other_tabs").keywords(&[
+            "background",
+            "keep running",
+            "disconnect",
+            "only",
+            "rest",
+            "leave",
+        ]),
+        Command::action("tab.detach_host", "Tabs", "Detach from this host", "detach_host").keywords(&[
+            "server",
+            "remote",
+            "group",
+            "disconnect",
+            "keep running",
+            "background",
+            "close",
+            "leave",
+        ]),
+        Command::handler("tab.detach_host_pick", "Tabs", "Detach from a host…", |window, cx| {
+            window.defer(cx, |window, cx| {
+                if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {
+                    ws.update(cx, |ws, cx| ws.ask_detach_host(window, cx));
+                }
+            });
+        })
+        .keywords(&["server", "remote", "group", "disconnect", "keep running", "background", "close", "leave", "choose", "pick"]),
         Command::action("tab.toggle_sidebar", "Tabs", "Fold or unfold the tab sidebar", "toggle_tab_sidebar")
             .keywords(&["vertical", "collapse", "expand", "rail", "hide", "panel"]),
         Command::action("tab.toggle_vertical", "Tabs", "Switch between vertical and horizontal tabs", "toggle_vertical_tabs")
@@ -436,6 +470,14 @@ pub fn builtins() -> Vec<Command> {
         Command::action("pane.split_left", "Panes", "Split left", "split_left").keywords(&["vertical", "side by side", "new pane"]),
         Command::action("pane.split_up", "Panes", "Split up", "split_up").keywords(&["horizontal", "above", "new pane"]),
         Command::action("pane.close", "Panes", "Close the pane", "close_pane").keywords(&["kill", "exit"]),
+        Command::action("pane.detach", "Panes", "Detach the pane", "detach_pane").keywords(&[
+            "background",
+            "keep running",
+            "disconnect",
+            "unattach",
+            "leave",
+            "session",
+        ]),
         Command::action("pane.focus_left", "Panes", "Focus the pane on the left", "focus_pane_left").keywords(&["move", "go"]),
         Command::action("pane.focus_right", "Panes", "Focus the pane on the right", "focus_pane_right").keywords(&["move", "go"]),
         Command::action("pane.focus_up", "Panes", "Focus the pane above", "focus_pane_up").keywords(&["move", "go"]),

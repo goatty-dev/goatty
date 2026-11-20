@@ -27,6 +27,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PLUGIN_TIMEOUT: Duration = Duration::from_secs(600);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 const DEAD_AFTER: Duration = Duration::from_secs(20);
+/// How long [`Connection::drop`] waits for the writer thread to flush queued
+/// frames before tearing down the transport.
+const WRITER_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A request was sent to `goattyd`, but the link dropped or timed out before a
 /// reply arrived. For state-changing requests, the daemon may still have applied
@@ -45,7 +48,7 @@ impl std::error::Error for ReplyLost {}
 enum WriterCmd {
     Frame(Frame),
     Replace(Box<dyn Write + Send>),
-    Close,
+    Close(flume::Sender<()>),
 }
 
 struct Pane {
@@ -97,8 +100,8 @@ enum Pending {
         tx: flume::Sender<ServerMsg>,
         sink: Arc<dyn PaneSink>,
         size: WinSize,
-        /// The session, for `Attach` (`Create` and `Run` learn it from the reply).
-        session: Option<SessionId>,
+        /// `(link_gen, session)` for `Attach` (`Create` and `Run` learn it from the reply).
+        session: Option<(u64, SessionId)>,
         /// Coordinates `attach_many_within` timeout cancellation with `dispatch`.
         state: Option<Arc<AtomicU8>>,
     },
@@ -110,8 +113,8 @@ enum Pending {
 type Reader = std::io::BufReader<Box<dyn Read + Send>>;
 
 /// Layouts claimed on the current live link and any returned by a failed
-/// restore so a retry on the same pooled connection can reclaim them.
-/// Cleared when the link drops (the daemon releases claims on disconnect).
+/// restore or detached workspace so a retry on the same pooled connection can
+/// reclaim them.
 #[derive(Default)]
 struct ClaimedLayouts {
     gens: HashMap<LayoutId, u64>,
@@ -125,6 +128,21 @@ impl ClaimedLayouts {
     }
 }
 
+/// A saved layout remembered on the connection for reconnect recovery.
+struct SavedLayoutState {
+    id: LayoutId,
+    sessions: Vec<SessionId>,
+    json: String,
+    /// `Some(link_gen)` when this exact `SaveLayout` was already queued on
+    /// `link_gen`; `None` when saved while offline and still waiting to be
+    /// sent on the next reconnect.
+    sent_gen: Option<u64>,
+    /// True once the workspace detached this layout: an unsent offline save is
+    /// still sent on reconnect and then moved into `claimed_layouts.unclaimed`
+    /// instead of remaining owned by the connection.
+    detached: bool,
+}
+
 struct Shared {
     endpoint: Endpoint,
     opts: StreamOpts,
@@ -135,9 +153,12 @@ struct Shared {
     auto_reconnect: bool,
     out: flume::Sender<WriterCmd>,
     panes: Mutex<HashMap<SessionId, Pane>>,
+    /// Number of in-flight `ClientMsg::Attach` requests per `(link_gen, session)`,
+    /// used to serialize `detach_sink` against replacement attaches on a pooled link.
+    attaching: Mutex<HashMap<(u64, SessionId), usize>>,
     /// The window's last saved layout, saved again after a reconnect (the
     /// daemon frees a layout when its connection drops).
-    layout: Mutex<Option<ClientMsg>>,
+    layout: Mutex<Option<SavedLayoutState>>,
     claimed_layouts: Mutex<ClaimedLayouts>,
     pending: Mutex<HashMap<ReqId, Pending>>,
     /// `SizeControl` that came before the `Attached` of a session we don't
@@ -290,6 +311,7 @@ impl Connection {
             auto_reconnect,
             out,
             panes: Mutex::new(HashMap::new()),
+            attaching: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
             claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
@@ -542,27 +564,34 @@ impl Connection {
                 return results.into_iter().map(|r| r.expect("every attach entry resolved")).collect();
             }
             let link_gen = self.shared.link_gen.load(Ordering::Acquire);
+            let mut attaching = self.shared.attaching.lock();
             for (i, r) in to_send {
                 let req = self.shared.req_id();
                 let state = Arc::new(AtomicU8::new(ATTACH_ACTIVE));
                 map.insert(
                     req,
-                    Pending::Attach { tx: tx.clone(), sink: r.sink, size: r.size, session: Some(r.session), state: Some(state.clone()) },
+                    Pending::Attach {
+                        tx: tx.clone(),
+                        sink: r.sink,
+                        size: r.size,
+                        session: Some((link_gen, r.session)),
+                        state: Some(state.clone()),
+                    },
                 );
                 in_flight.insert(req, (i, r.session, state));
+                *attaching.entry((link_gen, r.session)).or_insert(0) += 1;
                 msgs.push(ClientMsg::Attach { req, session: r.session, size: r.size, opts });
+            }
+            // Queue every frame back-to-back while holding `attaching` so they
+            // batch together and serialize against `detach_sink`.
+            for msg in &msgs {
+                self.shared.send(msg);
             }
             link_gen
         };
         // Drop the local sender so `rx` closes as soon as every pending entry
         // is answered or drained on disconnect.
         drop(tx);
-
-        // Queue every frame back-to-back so the writer batches and flushes
-        // them together instead of one RTT at a time.
-        for msg in &msgs {
-            self.shared.send(msg);
-        }
 
         let apply_reply =
             |msg: ServerMsg, in_flight: &mut HashMap<ReqId, (usize, SessionId, Arc<AtomicU8>)>, results: &mut [Option<Result<()>>]| {
@@ -598,13 +627,15 @@ impl Connection {
             {
                 let mut map = self.shared.pending.lock();
                 in_flight.retain(|&req, &mut (i, session, ref state)| {
-                    if map.remove(&req).is_some()
-                        || state.compare_exchange(ATTACH_ACTIVE, ATTACH_CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok()
-                    {
+                    let removed = map.remove(&req).is_some();
+                    let cancelled = state.compare_exchange(ATTACH_ACTIVE, ATTACH_CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok();
+                    if removed || cancelled {
                         // Cancelled before `dispatch` committed to installing
                         // the pane (or already drained on disconnect).
                         results[i] = Some(Err(ReplyLost.into()));
-                        timed_out_sessions.push(session);
+                        if cancelled {
+                            timed_out_sessions.push(session);
+                        }
                         false
                     } else {
                         // `dispatch` already transitioned to `ATTACH_FINISHING`
@@ -622,29 +653,24 @@ impl Connection {
                     Err(_) => break,
                 }
             }
-            for (_, (i, session, _)) in in_flight {
+            for (_, (i, session, state)) in in_flight {
                 results[i] = Some(Err(ReplyLost.into()));
-                timed_out_sessions.push(session);
+                if state.compare_exchange(ATTACH_ACTIVE, ATTACH_CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    timed_out_sessions.push(session);
+                }
             }
             if !timed_out_sessions.is_empty() {
-                // Keep lock acquisition flat (never nest `panes` and `early_size`).
-                let unattached: Vec<SessionId> = {
-                    let panes = self.shared.panes.lock();
-                    timed_out_sessions.into_iter().filter(|id| !panes.contains_key(id)).collect()
-                };
-                if !unattached.is_empty() {
-                    {
-                        let mut early = self.shared.early_size.lock();
-                        for &id in &unattached {
-                            early.remove(&id);
-                        }
-                    }
-                    // If we are still on the same live link, unsubscribe any
-                    // late `Attach` the daemon may still finish processing.
-                    if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
-                        for id in unattached {
-                            self.shared.send(&ClientMsg::Detach { session: id });
-                        }
+                let panes = self.shared.panes.lock();
+                let mut attaching = self.shared.attaching.lock();
+                let live_link = self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected();
+                let mut early = self.shared.early_size.lock();
+                for id in timed_out_sessions {
+                    // Hold `attaching` and `early_size` through the `Detach`
+                    // enqueue so a replacement cannot register or stash its
+                    // `SizeControl` in between.
+                    if finish_attaching(&mut attaching, link_gen, id) && live_link && !panes.contains_key(&id) {
+                        early.remove(&id);
+                        self.shared.send(&ClientMsg::Detach { session: id });
                     }
                 }
             }
@@ -675,7 +701,30 @@ impl Connection {
 
     pub fn detach(&self, session: SessionId) {
         self.shared.panes.lock().remove(&session);
+        self.shared.early_size.lock().remove(&session);
         self.shared.send(&ClientMsg::Detach { session });
+    }
+
+    /// Unsubscribe `sink` from `session` only if `sink` still owns the active
+    /// subscription for `session` on this connection. If another window on the
+    /// same pooled connection reattached `session` (or has an `Attach` for it
+    /// in flight), its sink and daemon subscription are left intact.
+    pub fn detach_sink(&self, session: SessionId, sink: &Arc<dyn PaneSink>) -> bool {
+        let mut panes = self.shared.panes.lock();
+        let Some(current) = panes.get(&session) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&current.sink, sink) {
+            return false;
+        }
+        panes.remove(&session);
+        let attaching = self.shared.attaching.lock();
+        let cur = self.shared.link_gen.load(Ordering::Acquire);
+        if attaching.get(&(cur, session)).copied().unwrap_or(0) == 0 {
+            self.shared.early_size.lock().remove(&session);
+            self.shared.send(&ClientMsg::Detach { session });
+        }
+        true
     }
 
     pub fn kill(&self, session: SessionId) -> Result<()> {
@@ -839,27 +888,33 @@ impl Connection {
     /// client's format) on the host, so a later window can restore it. No
     /// `sessions`: forget it. Never blocks; saved again after a reconnect.
     pub fn save_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
+        let mut layout = self.shared.layout.lock();
         {
             let mut claimed = self.shared.claimed_layouts.lock();
             claimed.gens.remove(&id);
             claimed.unclaimed.retain(|(_, info)| info.id != id);
         }
-        let msg = ClientMsg::SaveLayout { id, sessions, json };
-        if self.is_connected() {
-            self.shared.send(&msg);
+        let connected = self.is_connected();
+        let sent_gen = connected.then(|| self.shared.link_gen.load(Ordering::Acquire));
+        if connected {
+            self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
         }
-        *self.shared.layout.lock() = Some(msg);
+        *layout = Some(SavedLayoutState { id, sessions, json, sent_gen, detached: false });
     }
 
     /// Take over the newest layout no window holds (see
     /// `ClientMsg::ClaimLayout`). Blocks: call off the UI thread.
     pub fn claim_layout(&self) -> Result<Option<LayoutInfo>> {
         {
+            let mut layout = self.shared.layout.lock();
             let mut claimed = self.shared.claimed_layouts.lock();
             let cur = self.shared.link_gen.load(Ordering::Acquire);
             while let Some((g, info)) = claimed.unclaimed.pop_front() {
                 if g == cur && self.is_connected() {
                     claimed.gens.insert(info.id, cur);
+                    if layout.as_ref().is_some_and(|s| s.id == info.id && s.detached) {
+                        *layout = None;
+                    }
                     return Ok(Some(info));
                 }
             }
@@ -868,9 +923,13 @@ impl Connection {
         match reply {
             ServerMsg::Layout { layout, .. } => {
                 if let Some(info) = &layout {
+                    let mut saved = self.shared.layout.lock();
                     let mut claimed = self.shared.claimed_layouts.lock();
                     if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
                         claimed.gens.insert(info.id, link_gen);
+                        if saved.as_ref().is_some_and(|s| s.id == info.id && s.detached) {
+                            *saved = None;
+                        }
                     }
                 }
                 Ok(layout)
@@ -890,6 +949,37 @@ impl Connection {
         if claimed.gens.remove(&info.id) == Some(cur) && self.is_connected() {
             claimed.unclaimed.push_back((cur, info));
         }
+    }
+
+    /// Release a saved layout (`id`, `sessions`, `json`) without deleting it
+    /// on `goattyd`, so the next [`Self::claim_layout`] (on this connection if
+    /// it stays pooled, or on a new connection once this one closes) can
+    /// restore it. If the latest layout changes have not been sent to `goattyd`
+    /// yet (for example, while the link is offline), they stay queued for
+    /// reconnect recovery as well as in the local reclaim queue.
+    pub fn detach_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
+        let mut saved = self.shared.layout.lock();
+        if sessions.is_empty() || json.is_empty() {
+            if saved.as_ref().is_some_and(|s| s.id == id) {
+                *saved = None;
+            }
+            return;
+        }
+        let connected = self.is_connected();
+        let cur = self.shared.link_gen.load(Ordering::Acquire);
+        let already_queued =
+            saved.as_ref().is_some_and(|s| s.id == id && connected && s.sent_gen == Some(cur) && s.json == json && s.sessions == sessions);
+        let sent_gen = connected.then_some(cur);
+        if connected && !already_queued {
+            self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
+        }
+        // Keep the detached record replayable across a link drop until a claim
+        // (or a newer save) takes ownership of it.
+        *saved = Some(SavedLayoutState { id, sessions: sessions.clone(), json: json.clone(), sent_gen, detached: true });
+        let mut claimed = self.shared.claimed_layouts.lock();
+        claimed.gens.remove(&id);
+        claimed.unclaimed.retain(|(_, info)| info.id != id);
+        claimed.unclaimed.push_front((cur, LayoutInfo { id, json, sessions, saved_unix: 0 }));
     }
 
     /// Reconnect now, with prompts (password, passphrase) if ssh needs them.
@@ -962,7 +1052,10 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
-        let _ = self.shared.out.send(WriterCmd::Close);
+        let (done_tx, done_rx) = flume::bounded(1);
+        if self.shared.out.send(WriterCmd::Close(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(WRITER_CLOSE_TIMEOUT);
+        }
         self.shared.close_transport();
     }
 }
@@ -973,6 +1066,23 @@ fn ensure_sane(size: WinSize) -> Result<()> {
         bail!("the pane is too large ({}×{} cells)", size.cols, size.rows);
     }
     Ok(())
+}
+
+/// Decrement the in-flight attach count for `(link_gen, session)` while the
+/// caller holds `attaching`; returns `true` when no in-flight `Attach` remains
+/// for `(link_gen, session)`.
+fn finish_attaching(attaching: &mut HashMap<(u64, SessionId), usize>, link_gen: u64, session: SessionId) -> bool {
+    let key = (link_gen, session);
+    let Some(count) = attaching.get_mut(&key) else {
+        return true;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        attaching.remove(&key);
+        true
+    } else {
+        false
+    }
 }
 
 fn writer_loop(rx: flume::Receiver<WriterCmd>) {
@@ -987,7 +1097,13 @@ fn writer_loop(rx: flume::Receiver<WriterCmd>) {
                     w = None; // the reader notices too and reconnects
                 }
             }
-            WriterCmd::Close => break,
+            WriterCmd::Close(done) => {
+                if let Some(ww) = &mut w {
+                    let _ = ww.flush();
+                }
+                let _ = done.send(());
+                break;
+            }
         }
         // Batch under load, flush as soon as the queue is idle (keystrokes
         // go out immediately).
@@ -1035,6 +1151,7 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
         // Fail in-flight requests; keep panes for reattach.
         let failed: Vec<Pending> = s.pending.lock().drain().map(|(_, p)| p).collect();
         // Geometry and layout claims from the old link are released on disconnect.
+        s.attaching.lock().clear();
         s.early_size.lock().clear();
         s.claimed_layouts.lock().clear();
         for p in failed {
@@ -1100,9 +1217,23 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                         s.send(&ClientMsg::Attach { req, session, size: p.size, opts: s.opts });
                     }
                     drop(panes);
-                    if let Some(layout) = &*s.layout.lock() {
-                        s.send(layout);
+                    let mut layout = s.layout.lock();
+                    if let Some(mut saved) = layout.take() {
+                        let cur = s.link_gen.load(Ordering::Acquire);
+                        s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
+                        saved.sent_gen = Some(cur);
+                        if saved.detached {
+                            let mut claimed = s.claimed_layouts.lock();
+                            claimed.gens.remove(&saved.id);
+                            claimed.unclaimed.retain(|(_, info)| info.id != saved.id);
+                            claimed.unclaimed.push_front((
+                                cur,
+                                LayoutInfo { id: saved.id, json: saved.json.clone(), sessions: saved.sessions.clone(), saved_unix: 0 },
+                            ));
+                        }
+                        *layout = Some(saved);
                     }
+                    drop(layout);
                     break;
                 }
                 Err(e) => {
@@ -1191,7 +1322,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         ServerMsg::Attached { req, session, snapshot } => {
             let pending = s.pending.lock().remove(&req);
             match pending {
-                Some(Pending::Attach { tx, sink, size, state, .. }) => {
+                Some(Pending::Attach { tx, sink, size, session: target, state }) => {
                     if state.as_ref().is_some_and(|st| st.load(Ordering::Acquire) == ATTACH_CANCELLED) {
                         return;
                     }
@@ -1199,14 +1330,21 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                         sink.event(ev);
                     }
                     sink.feed(&snapshot);
-                    let committed = state
-                        .as_ref()
-                        .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
-                    if !committed {
-                        return;
-                    }
                     let n = snapshot.len() as u64;
-                    s.panes.lock().insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None, linked: true });
+                    {
+                        let mut panes = s.panes.lock();
+                        let mut attaching = s.attaching.lock();
+                        let committed = state.as_ref().is_none_or(|st| {
+                            st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                        });
+                        if !committed {
+                            return;
+                        }
+                        if let Some((link_gen, id)) = target {
+                            finish_attaching(&mut attaching, link_gen, id);
+                        }
+                        panes.insert(session, Pane { sink, size, consumed: n, acked: 0, palette: None, linked: true });
+                    }
                     let _ = tx.send(ServerMsg::Attached { req, session, snapshot: Vec::new() });
                 }
                 Some(Pending::Reattach(_)) => {
@@ -1253,7 +1391,8 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             let ev = PaneEvent::SizeControl { cols: size.cols, rows: size.rows, controlling };
             // Before an `Attached` we're waiting for, it's for the sink that
             // attach installs, not a pane the session may still have here.
-            let attaching = s.pending.lock().values().any(|p| matches!(p, Pending::Attach { session: Some(id), .. } if *id == session));
+            let attaching =
+                s.pending.lock().values().any(|p| matches!(p, Pending::Attach { session: Some((_, id)), .. } if *id == session));
             let sink = if attaching { None } else { s.panes.lock().get(&session).map(|p| p.sink.clone()) };
             match sink {
                 Some(sink) => sink.event(ev),
@@ -1271,7 +1410,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                             .lock()
                             .values()
                             .filter_map(|p| match p {
-                                Pending::Attach { session: Some(id), .. } => Some(*id),
+                                Pending::Attach { session: Some((_, id)), .. } => Some(*id),
                                 _ => None,
                             })
                             .collect();
@@ -1325,11 +1464,20 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             Some(Pending::Reply(tx)) => {
                 let _ = tx.send(msg);
             }
-            Some(Pending::Attach { tx, state, .. }) => {
+            Some(Pending::Attach { tx, session, state, .. }) => {
                 let committed = state
                     .as_ref()
                     .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
                 if committed {
+                    if let Some((link_gen, session)) = session {
+                        let panes = s.panes.lock();
+                        let mut attaching = s.attaching.lock();
+                        let live_link = s.link_gen.load(Ordering::Acquire) == link_gen && s.connected.load(Ordering::Acquire);
+                        if finish_attaching(&mut attaching, link_gen, session) && live_link && !panes.contains_key(&session) {
+                            s.early_size.lock().remove(&session);
+                            s.send(&ClientMsg::Detach { session });
+                        }
+                    }
                     let _ = tx.send(msg);
                 }
             }
@@ -1339,19 +1487,35 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
             let pending = s.pending.lock().remove(&req);
             match pending {
                 Some(Pending::Attach { tx, session, state, .. }) => {
-                    // A refused replacement attach: a live size change held
-                    // for it belongs to the pane that stays.
-                    if let Some(session) = session {
-                        let sink = s.panes.lock().get(&session).map(|p| p.sink.clone());
-                        if let Some(sink) = sink
-                            && let Some(ev) = s.early_size.lock().remove(&session)
-                        {
-                            sink.event(ev);
-                        }
-                    }
                     let committed = state
                         .as_ref()
                         .is_none_or(|st| st.compare_exchange(ATTACH_ACTIVE, ATTACH_FINISHING, Ordering::AcqRel, Ordering::Acquire).is_ok());
+                    // A refused replacement attach: a live size change held
+                    // for it belongs to the pane that stays.
+                    if let Some((link_gen, session)) = session {
+                        let deliver = {
+                            let panes = s.panes.lock();
+                            let mut attaching = s.attaching.lock();
+                            let live_link = s.link_gen.load(Ordering::Acquire) == link_gen && s.connected.load(Ordering::Acquire);
+                            let still_attaching = if committed {
+                                !finish_attaching(&mut attaching, link_gen, session)
+                            } else {
+                                attaching.get(&(link_gen, session)).copied().unwrap_or(0) > 0
+                            };
+                            if let Some(sink) = panes.get(&session).map(|p| p.sink.clone()) {
+                                s.early_size.lock().remove(&session).map(|ev| (sink, ev))
+                            } else {
+                                if !still_attaching && live_link {
+                                    s.early_size.lock().remove(&session);
+                                    s.send(&ClientMsg::Detach { session });
+                                }
+                                None
+                            }
+                        };
+                        if let Some((sink, ev)) = deliver {
+                            sink.event(ev);
+                        }
+                    }
                     if committed {
                         let _ = tx.send(msg);
                     }
@@ -1454,6 +1618,7 @@ mod tests {
             auto_reconnect: false,
             out,
             panes: Mutex::new(HashMap::new()),
+            attaching: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
             claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
@@ -1542,6 +1707,7 @@ mod tests {
             auto_reconnect: false,
             out,
             panes: Mutex::new(HashMap::new()),
+            attaching: Mutex::new(HashMap::new()),
             layout: Mutex::new(None),
             claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
@@ -1852,6 +2018,199 @@ mod tests {
         drop(conn);
         reader_h.join().unwrap();
         assert!(shared.panes.lock().is_empty(), "cancelled attach must not leak pane");
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn detach_layout_allows_reclaim_on_live_link_and_clears_reconnect_layout() {
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, w| {
+            // Drain the initial SaveLayout frame.
+            match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::SaveLayout { id: 99, ref sessions, ref json } => {
+                    assert_eq!(sessions, &[10, 20]);
+                    assert_eq!(json, "{\"version\":1}");
+                }
+                other => panic!("unexpected msg: {other:?}"),
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        conn.save_layout(99, vec![10, 20], "{\"version\":1}".into());
+        assert!(conn.shared.layout.lock().is_some());
+
+        conn.detach_layout(99, vec![10, 20], "{\"version\":1}".into());
+        assert!(conn.shared.layout.lock().as_ref().is_some_and(|s| s.detached), "detached layout stays replayable until claimed");
+
+        let reclaimed = conn.claim_layout().unwrap().expect("detached layout should be claimable on live link");
+        assert!(conn.shared.layout.lock().is_none(), "claiming the detached layout clears the replay record");
+        assert_eq!(reclaimed.id, 99);
+        assert_eq!(reclaimed.sessions, vec![10, 20]);
+        assert_eq!(reclaimed.json, "{\"version\":1}");
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn detach_layout_while_offline_preserves_unsent_layout_for_recovery() {
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, w| {
+            let _ = read_msg::<_, ClientMsg>(&mut r);
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        // Initial online save.
+        conn.save_layout(77, vec![1, 2], "{\"version\":1,\"old\":true}".into());
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        assert!(!conn.is_connected());
+
+        // User edits layout (e.g. renames a tab) while offline, then detaches.
+        conn.save_layout(77, vec![1, 2], "{\"version\":1,\"renamed\":true}".into());
+        conn.detach_layout(77, vec![1, 2], "{\"version\":1,\"renamed\":true}".into());
+
+        let pending = conn.shared.layout.lock();
+        let saved = pending.as_ref().expect("offline unsent layout must be preserved for reconnect");
+        assert_eq!(saved.id, 77);
+        assert_eq!(saved.json, "{\"version\":1,\"renamed\":true}");
+        assert!(saved.detached);
+        assert!(saved.sent_gen.is_none());
+        drop(pending);
+
+        let unclaimed = conn.shared.claimed_layouts.lock();
+        assert_eq!(unclaimed.unclaimed.front().map(|(_, i)| i.json.as_str()), Some("{\"version\":1,\"renamed\":true}"));
+        drop(unclaimed);
+
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn detach_sink_only_unsubscribes_matching_owner() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (detach_tx, detach_rx) = flume::bounded::<SessionId>(2);
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                match msg {
+                    ClientMsg::Attach { req, session, .. } => {
+                        let reply = ServerMsg::Attached { req, session, snapshot: b"hi".to_vec() };
+                        w.write_all(&encode(&reply).unwrap()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    ClientMsg::Detach { session } => {
+                        let _ = detach_tx.send(session);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        let sink_a: Arc<dyn PaneSink> = Arc::new(RecSink::default());
+        let sink_b: Arc<dyn PaneSink> = Arc::new(RecSink::default());
+        conn.attach(5, size, sink_a.clone()).unwrap();
+        // Second window attaches to the same session on the pooled connection.
+        conn.attach(5, size, sink_b.clone()).unwrap();
+
+        // Detaching the old pane must not remove `sink_b` or send `Detach`.
+        assert!(!conn.detach_sink(5, &sink_a));
+        assert!(conn.shared.panes.lock().contains_key(&5));
+        assert!(detach_rx.try_recv().is_err());
+
+        // Detaching the current owner unsubscribes normally.
+        assert!(conn.detach_sink(5, &sink_b));
+        assert!(!conn.shared.panes.lock().contains_key(&5));
+        assert_eq!(detach_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 5);
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn detach_sink_during_pending_replacement_attach_keeps_replacement_subscribed() {
+        let size = WinSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
+        let (second_attach_seen_tx, second_attach_seen_rx) = flume::bounded::<()>(1);
+        let (allow_second_reply_tx, allow_second_reply_rx) = flume::bounded::<()>(1);
+        let (marker_seen_tx, marker_seen_rx) = flume::bounded::<()>(1);
+        let (detach_tx, detach_rx) = flume::bounded::<SessionId>(2);
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let mut attaches = 0;
+            let mut marker_seen = false;
+            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                match msg {
+                    ClientMsg::Attach { req, session, .. } => {
+                        attaches += 1;
+                        if attaches == 2 {
+                            let _ = second_attach_seen_tx.send(());
+                            let _ = allow_second_reply_rx.recv_timeout(Duration::from_secs(5));
+                        }
+                        let reply = ServerMsg::Attached { req, session, snapshot: b"hi".to_vec() };
+                        w.write_all(&encode(&reply).unwrap()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    ClientMsg::Input { session: 5, ref data } if data == b"marker" => {
+                        marker_seen = true;
+                        let _ = marker_seen_tx.send(());
+                    }
+                    ClientMsg::Detach { session } => {
+                        assert!(marker_seen, "premature Detach frame arrived before post-attach marker");
+                        let _ = detach_tx.send(session);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+
+        let conn = Arc::new(conn);
+        let sink_a: Arc<dyn PaneSink> = Arc::new(RecSink::default());
+        let sink_b: Arc<dyn PaneSink> = Arc::new(RecSink::default());
+        conn.attach(5, size, sink_a.clone()).unwrap();
+
+        let conn_b = conn.clone();
+        let sink_b_thread = sink_b.clone();
+        let attach_b = std::thread::spawn(move || conn_b.attach(5, size, sink_b_thread));
+
+        second_attach_seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // `sink_a` detaches while `sink_b`'s replacement `Attach` is in flight:
+        // `sink_a` is removed locally, but `Detach` is suppressed so it cannot
+        // unsubscribe `sink_b` after its `Attach`.
+        assert!(conn.detach_sink(5, &sink_a));
+        assert!(detach_rx.try_recv().is_err());
+
+        let _ = allow_second_reply_tx.send(());
+        attach_b.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&conn.shared.panes.lock().get(&5).unwrap().sink, &sink_b));
+
+        // Send an ordered marker on the same writer stream and wait for the
+        // server to observe it before detaching `sink_b`, proving no premature
+        // `Detach` was queued ahead of the marker.
+        conn.input(5, b"marker");
+        marker_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(detach_rx.try_recv().is_err());
+
+        // Detaching `sink_b` now sends `Detach`.
+        assert!(conn.detach_sink(5, &sink_b));
+        assert_eq!(detach_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 5);
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
         server_h.join().unwrap();
     }
 }
