@@ -97,9 +97,23 @@ impl Control {
         }
     }
 
-    /// Connect to this user's daemon (`goatty_proto::socket_path`).
+    /// Connect to this user's daemon (`goatty_proto::socket_path`), falling back
+    /// to a pre-upgrade macOS daemon on `goatty_proto::legacy_socket_path` when
+    /// nothing listens on the default path.
     pub fn connect_local(client: &str) -> Result<Self> {
-        Self::connect(&goatty_proto::socket_path(), client)
+        let primary = goatty_proto::socket_path();
+        match Self::connect(&primary, client) {
+            Ok(c) => Ok(c),
+            Err(err) => {
+                if UnixStream::connect(&primary).is_err()
+                    && let Some(legacy) = goatty_proto::legacy_socket_path()
+                    && UnixStream::connect(&legacy).is_ok()
+                {
+                    return Self::connect(&legacy, client);
+                }
+                Err(err)
+            }
+        }
     }
 
     pub fn host(&self) -> &HostInfo {

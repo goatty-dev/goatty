@@ -134,6 +134,9 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
 
     // An update replaces the file the daemon runs.
     install_goattyd(&exe);
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert!(goatty_client::local::outdated_than(daemon.0.id(), exe.clone()).is_some(), "rebuilt binary should be outdated");
+    }
     if cfg!(target_os = "linux") {
         let running = std::fs::read_link(format!("/proc/{}/exe", daemon.0.id())).unwrap();
         assert!(running.to_string_lossy().ends_with(" (deleted)"));
@@ -146,6 +149,9 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
 
     let mut c = Control::connect(&sock, "test").unwrap();
     assert_eq!(c.pid(), daemon.0.id(), "same process");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        assert_eq!(goatty_client::local::outdated_than(daemon.0.id(), exe.clone()), None, "after execve restart it runs the new build");
+    }
     if cfg!(target_os = "linux") {
         let running = std::fs::read_link(format!("/proc/{}/exe", daemon.0.id())).unwrap();
         assert!(!running.to_string_lossy().ends_with(" (deleted)"), "runs the new build: {}", running.display());
@@ -249,7 +255,7 @@ fn ptys_from_the_systemd_fd_store_come_back() {
             Ok(())
         });
     }
-    let _daemon = Daemon(c.spawn().unwrap());
+    let mut daemon = Daemon(c.spawn().unwrap());
     drop(master);
     drop(listener);
 
@@ -278,6 +284,16 @@ fn ptys_from_the_systemd_fd_store_come_back() {
     send(&mut s, &ClientMsg::Kill { req: 4, session: 7 });
     assert_eq!(wait_exited(&mut s, 7), None);
     assert!(!state.exists(), "the saved state is gone");
+
+    // Shutting down a socket-activated daemon must leave the supervisor's
+    // socket file intact so the next connection can activate it again.
+    Control::connect(&sock, "test").unwrap().shutdown().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while daemon.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "socket-activated daemon did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sock.exists(), "socket-activated shutdown must not unlink supervisor socket");
     drop(pty);
 }
 

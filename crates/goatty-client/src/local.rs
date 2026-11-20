@@ -17,8 +17,8 @@ use anyhow::Result;
 use crate::{Control, VersionMismatch, service};
 
 /// The goattyd a fresh start of the local daemon runs
-/// ([`crate::connect_or_spawn_daemon`]): the systemd service's when its
-/// units serve this socket, else `goattyd` next to the current binary.
+/// ([`crate::connect_or_spawn_daemon`]): the user service's (systemd/launchd)
+/// when it serves this socket, else `goattyd` next to the current binary.
 pub fn installed_daemon() -> Option<PathBuf> {
     let path = goatty_proto::socket_path();
     if service::unit_socket_path().is_some_and(|p| p == path) && service::installed() {
@@ -31,7 +31,7 @@ pub fn installed_daemon() -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outdated {
     pub pid: u32,
-    /// What it runs, as `/proc` says (` (deleted)` once the file was replaced).
+    /// What it runs (on Linux, `/proc/<pid>/exe`, with ` (deleted)` once replaced).
     pub running: PathBuf,
     pub installed: PathBuf,
     /// Identifies the installed build, for [`decline`].
@@ -61,19 +61,155 @@ fn is_newer(running: Build, installed: Build) -> bool {
 }
 
 /// `Some` when the local daemon with `pid` (from its `Hello`) runs an older
-/// build than a restart would start. Cheap: a readlink and two stats.
+/// build than a restart would start.
 pub fn outdated(pid: u32) -> Option<Outdated> {
     outdated_than(pid, installed_daemon()?)
 }
 
-/// [`outdated`] against a given `installed` goattyd. Linux only (it stats
-/// the running file through `/proc/<pid>/exe`); `None` elsewhere.
+/// [`outdated`] against a given `installed` goattyd.
+///
+/// * **Linux:** stats the running binary through `/proc/<pid>/exe`.
+/// * **macOS:** inspects the process's mapped executable vnode via
+///   `PROC_PIDREGIONPATHINFO` (which stays accurate even across in-place
+///   `execve` restarts), falling back to comparing the process start time
+///   (`PROC_PIDTBSDINFO`) with `installed`'s mtime.
 pub fn outdated_than(pid: u32, installed: PathBuf) -> Option<Outdated> {
-    let exe = PathBuf::from(format!("/proc/{pid}/exe"));
-    let running = std::fs::read_link(&exe).ok()?;
-    // stat follows /proc's link to the file the process runs, even deleted.
-    let (old, new) = (Build::of(&exe)?, Build::of(&installed)?);
-    is_newer(old, new).then_some(Outdated { pid, running, installed, installed_ino: new.ino })
+    #[cfg(target_os = "linux")]
+    {
+        let exe = PathBuf::from(format!("/proc/{pid}/exe"));
+        let running = std::fs::read_link(&exe).ok()?;
+        // stat follows /proc's link to the file the process runs, even deleted.
+        let (old, new) = (Build::of(&exe)?, Build::of(&installed)?);
+        is_newer(old, new).then_some(Outdated { pid, running, installed, installed_ino: new.ino })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let new = Build::of(&installed)?;
+        if let Some((old, running)) = macos_running_build(pid) {
+            return is_newer(old, new).then_some(Outdated { pid, running, installed, installed_ino: new.ino });
+        }
+        let started = macos_process_start(pid)?;
+        let running = macos_pid_path(pid).unwrap_or_else(|| installed.clone());
+        (new.modified > started).then_some(Outdated { pid, running, installed, installed_ino: new.ino })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (pid, installed);
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pid_path(pid: u32) -> Option<PathBuf> {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes.
+    let n = unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    let len = (n as usize).min(buf.len());
+    let s = std::str::from_utf8(&buf[..len]).ok()?;
+    (!s.is_empty()).then(|| PathBuf::from(s))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start(pid: u32) -> Option<SystemTime> {
+    // SAFETY: `proc_bsdinfo` is plain data; zeroed bytes are valid.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` points to `size` writable bytes.
+    let ret = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if ret != size {
+        return None;
+    }
+    let nanos = (info.pbi_start_tvusec.min(999_999) as u32) * 1_000;
+    Some(SystemTime::UNIX_EPOCH + Duration::new(info.pbi_start_tvsec, nanos))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_running_build(pid: u32) -> Option<(Build, PathBuf)> {
+    // From Apple's `<sys/proc_info.h>` (stable public Darwin ABI since 10.5).
+    const PROC_PIDREGIONPATHINFO: libc::c_int = 8;
+    const VM_PROT_EXECUTE: u32 = 4;
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct ProcRegionInfo {
+        pri_protection: u32,
+        pri_max_protection: u32,
+        pri_inheritance: u32,
+        pri_flags: u32,
+        pri_offset: u64,
+        pri_behavior: u32,
+        pri_user_wired_count: u32,
+        pri_user_tag: u32,
+        pri_pages_resident: u32,
+        pri_pages_shared_now_private: u32,
+        pri_pages_swapped_out: u32,
+        pri_pages_dirtied: u32,
+        pri_ref_count: u32,
+        pri_shadow_depth: u32,
+        pri_share_mode: u32,
+        pri_private_pages_resident: u32,
+        pri_shared_pages_resident: u32,
+        pri_obj_id: u32,
+        pri_depth: u32,
+        pri_address: u64,
+        pri_size: u64,
+    }
+
+    #[repr(C)]
+    struct ProcRegionWithPathInfo {
+        prp_prinfo: ProcRegionInfo,
+        prp_vip: libc::vnode_info_path,
+    }
+
+    let expected_path = macos_pid_path(pid);
+    let size = std::mem::size_of::<ProcRegionWithPathInfo>() as libc::c_int;
+    let mut addr: u64 = 0;
+    let mut fallback: Option<(Build, PathBuf)> = None;
+
+    for _ in 0..4096 {
+        // SAFETY: `ProcRegionWithPathInfo` is plain C data; all zeroes is valid.
+        let mut info: ProcRegionWithPathInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` points to `size` writable bytes.
+        let ret = unsafe { libc::proc_pidinfo(pid as libc::c_int, PROC_PIDREGIONPATHINFO, addr, (&raw mut info).cast(), size) };
+        if ret != size {
+            break;
+        }
+        let st = &info.prp_vip.vip_vi.vi_stat;
+        if st.vst_ino != 0 && (info.prp_prinfo.pri_protection & VM_PROT_EXECUTE) != 0 {
+            let raw_bytes: &[u8] =
+                // SAFETY: `vip_path` is a contiguous `[c_char; 1024]` array inside `info`.
+                unsafe { std::slice::from_raw_parts(info.prp_vip.vip_path.as_ptr().cast::<u8>(), std::mem::size_of_val(&info.prp_vip.vip_path)) };
+            let nul = raw_bytes.iter().position(|&b| b == 0).unwrap_or(raw_bytes.len());
+            let vpath = String::from_utf8_lossy(&raw_bytes[..nul]);
+            let is_runtime_lib = vpath == "/usr/lib/dyld" || vpath.contains("dyld_shared_cache") || vpath.ends_with(".dylib");
+            if !is_runtime_lib {
+                let secs = u64::try_from(st.vst_mtime).unwrap_or(0);
+                let nanos = u32::try_from(st.vst_mtimensec.clamp(0, 999_999_999)).unwrap_or(0);
+                // Match `MetadataExt::dev()` on macOS (`stat.st_dev: i32` widened to `u64`).
+                let build = Build {
+                    dev: (st.vst_dev as i32) as u64,
+                    ino: st.vst_ino,
+                    modified: SystemTime::UNIX_EPOCH + Duration::new(secs, nanos),
+                };
+                let running = expected_path.clone().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from(vpath.as_ref()));
+                if expected_path.as_deref().is_some_and(|p| p == Path::new(vpath.as_ref())) || st.vst_nlink == 0 {
+                    return Some((build, running));
+                }
+                if fallback.is_none() {
+                    fallback = Some((build, running));
+                }
+            }
+        }
+        let Some(next) = info.prp_prinfo.pri_address.checked_add(info.prp_prinfo.pri_size) else { break };
+        if next <= addr {
+            break;
+        }
+        addr = next;
+    }
+    fallback
 }
 
 fn declined_file() -> PathBuf {
@@ -152,14 +288,33 @@ pub fn can_keep_sessions(protocol: u32) -> bool {
 /// can do that (protocol v10 on). One that can't is stopped only with
 /// `force`, which ends its sessions; without it that's an error.
 pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
-    let mut control = match Control::connect_local("goatty-restart") {
+    let primary = goatty_proto::socket_path();
+    let mut sock = primary.clone();
+    let mut control = match Control::connect(&primary, "goatty-restart") {
         Ok(c) => c,
         Err(e) => {
-            if UnixStream::connect(goatty_proto::socket_path()).is_err() {
-                return Ok(Restarted::NotRunning);
+            if UnixStream::connect(&primary).is_err()
+                && let Some(legacy) = goatty_proto::legacy_socket_path()
+                && UnixStream::connect(&legacy).is_ok()
+            {
+                sock = legacy;
+                match Control::connect(&sock, "goatty-restart") {
+                    Ok(c) => c,
+                    Err(le) => {
+                        if UnixStream::connect(&sock).is_err() {
+                            return Ok(Restarted::NotRunning);
+                        }
+                        anyhow::ensure!(force, "{le:#}");
+                        return stop_daemon(true).map(Restarted::Stopped);
+                    }
+                }
+            } else {
+                if UnixStream::connect(&primary).is_err() {
+                    return Ok(Restarted::NotRunning);
+                }
+                anyhow::ensure!(force, "{e:#}");
+                return stop_daemon(true).map(Restarted::Stopped);
             }
-            anyhow::ensure!(force, "{e:#}");
-            return stop_daemon(true).map(Restarted::Stopped);
         }
     };
     if !can_keep_sessions(control.protocol_version()) {
@@ -176,11 +331,15 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     let pid = control.pid();
     let sessions = control.list_sessions()?.len();
     control.restart(exe)?;
-    // The new image accepts on the same socket once it took the sessions over.
+    // The new image accepts on the same socket once it took the sessions over
+    // (and may also bind `primary` if upgrading off the legacy macOS path).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(50));
-        match Control::connect_within(&goatty_proto::socket_path(), "goatty-restart", Some(left)) {
+        let attempt = Control::connect_within(&sock, "goatty-restart", Some(left)).or_else(|e| {
+            if sock != primary { Control::connect_within(&primary, "goatty-restart", Some(left)).map_err(|_| e) } else { Err(e) }
+        });
+        match attempt {
             Ok(c) if c.pid() == pid => return Ok(Restarted::Kept { sessions }),
             Ok(c) => anyhow::bail!("another goattyd (pid {}) answers now", c.pid()),
             Err(e) if Instant::now() > deadline => return Err(e.context("goattyd didn't come back after restarting")),
@@ -257,21 +416,66 @@ fn wait_gone(pid: u32, timeout: Duration) -> bool {
 /// only after the user agreed (or when it has none).
 ///
 /// It's asked first (`Shutdown`). With `force`, one that doesn't speak our
-/// protocol is stopped anyway: through systemd when the service runs it,
-/// else SIGTERM (SIGKILL after 5 s) to the socket's owner once it's checked
-/// to be a goattyd (`SO_PEERCRED`).
+/// protocol is stopped anyway: through systemd/launchd when the user service
+/// runs it, else SIGTERM (SIGKILL after 5 s) to the socket's owner once it's
+/// checked to be a goattyd (`SO_PEERCRED` / `LOCAL_PEERPID`).
 pub fn stop_daemon(force: bool) -> Result<Stopped> {
-    let path = goatty_proto::socket_path();
-    let err = match Control::connect_local("goatty-stop").and_then(|mut c| c.shutdown().map(|()| c.pid())) {
+    let mut path = goatty_proto::socket_path();
+    let mut is_service_socket = service::unit_socket_path().is_some_and(|p| p == path);
+    // Under socket activation, connecting to an idle listener would wake
+    // goattyd just to shut it down. If only the supervisor's socket is active,
+    // no daemon is running there (still check any pre-upgrade macOS socket).
+    if is_service_socket && service::installed() {
+        let st = service::status();
+        if st.socket_active && !st.service_active {
+            if let Some(legacy) = goatty_proto::legacy_socket_path()
+                && UnixStream::connect(&legacy).is_ok()
+            {
+                path = legacy;
+                is_service_socket = false;
+            } else {
+                return Ok(Stopped::NotRunning);
+            }
+        }
+    }
+    let connect_and_shutdown = |p: &Path| Control::connect(p, "goatty-stop").and_then(|mut c| c.shutdown().map(|()| c.pid()));
+    let err = match connect_and_shutdown(&path) {
         Ok(pid) => {
             if !wait_gone(pid, Duration::from_secs(5)) {
                 anyhow::bail!("goattyd (pid {pid}) is still running 5 s after it was asked to stop");
             }
             return Ok(Stopped::Asked);
         }
-        Err(e) if force => e,
-        Err(e) => return Err(e),
+        Err(e) => {
+            if UnixStream::connect(&path).is_err()
+                && let Some(legacy) = goatty_proto::legacy_socket_path()
+                && legacy != path
+                && UnixStream::connect(&legacy).is_ok()
+            {
+                path = legacy;
+                is_service_socket = false;
+                match connect_and_shutdown(&path) {
+                    Ok(pid) => {
+                        if !wait_gone(pid, Duration::from_secs(5)) {
+                            anyhow::bail!("goattyd (pid {pid}) is still running 5 s after it was asked to stop");
+                        }
+                        return Ok(Stopped::Asked);
+                    }
+                    Err(le) if force => le,
+                    Err(le) => return Err(le),
+                }
+            } else if force {
+                e
+            } else {
+                return Err(e);
+            }
+        }
     };
+    let why = format!("{err:#}");
+    if is_service_socket && service::service_active() {
+        service::stop_service()?;
+        return Ok(Stopped::Service { why });
+    }
     // Nothing listening: nothing to stop (remote updates run this blindly).
     if UnixStream::connect(&path).is_err() {
         if path.exists() {
@@ -279,14 +483,8 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
         }
         return Ok(Stopped::NotRunning);
     }
-    let why = format!("{err:#}");
-    if service::status().service_active {
-        let ok = std::process::Command::new("systemctl").args(["--user", "stop", service::SERVICE_UNIT]).status()?.success();
-        anyhow::ensure!(ok, "systemctl --user stop {} failed", service::SERVICE_UNIT);
-        return Ok(Stopped::Service { why });
-    }
     let pid = crate::control::socket_owner(&path)?;
-    // Under socket activation the listener belongs to systemd, never kill that.
+    // Under socket activation the listener belongs to systemd/launchd, never kill that.
     let comm = process_name(pid);
     anyhow::ensure!(comm.starts_with("goattyd"), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
     log::info!("stopping goattyd (pid {pid}): {why}");
@@ -322,12 +520,12 @@ mod tests {
         assert!(!is_newer(build(1, 20), build(2, 10)));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn this_process_is_not_outdated_against_itself() {
         // Our own exe vs itself: same file.
-        let me = Build::of(Path::new("/proc/self/exe")).unwrap();
-        assert!(!is_newer(me, Build::of(&std::env::current_exe().unwrap()).unwrap()));
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(outdated_than(std::process::id(), exe), None);
         assert!(alive(std::process::id()));
         assert!(!alive(u32::MAX >> 1));
     }
