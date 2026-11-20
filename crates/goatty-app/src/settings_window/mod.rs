@@ -423,10 +423,18 @@ pub struct SettingsWindow {
     /// The color being edited in the theme editor.
     pub edit_slot: ColorSlot,
     picker: Entity<ColorPicker>,
-    /// A color change applied live but not yet written to settings.json.
-    pending_color: Option<(ColorSlot, Color)>,
+    /// A color change applied live but not yet written to settings.json:
+    /// `(theme_id, slot, color)`.
+    pending_color: Option<(String, ColorSlot, Color)>,
     color_save_gen: u64,
     theme_name: Entity<TextInput>,
+    /// Modal to create a new custom theme from the current colors.
+    create_theme_open: bool,
+    create_theme_name: Entity<TextInput>,
+    create_theme_error: Option<String>,
+    create_theme_modal_focus: FocusHandle,
+    create_theme_opener: Option<FocusHandle>,
+    create_theme_restore: Option<FocusHandle>,
     /// Shortcut being recorded: the next keystroke binds to this action.
     recording: Option<String>,
     /// What the last recorded shortcut replaced or takes from the shell:
@@ -479,6 +487,8 @@ impl SettingsWindow {
         let path_entry = cx.new(|cx| TextInput::new("~/bin or /opt/tool/bin", "", cx).label("Folder to add to PATH"));
         let picker = cx.new(|cx| ColorPicker::new(cx.global::<AppSettings>().colors.get(ColorSlot::Background), cx));
         let theme_name = cx.new(|cx| TextInput::new("Name for a new theme", "", cx).label("Theme name"));
+        let create_theme_name = cx.new(|cx| TextInput::new("My theme", "", cx).label("Theme name"));
+        let create_theme_modal_focus = cx.focus_handle();
         let opener = cx.global::<AppSettings>().file.value.links.file_opener.clone().unwrap_or_default();
         let file_opener = cx.new(|cx| TextInput::new("code --goto {path}:{line}:{column}", opener, cx).label("Command to open files"));
         let last_remote_opener = cx.global::<AppSettings>().file.value.links.remote_file_opener.clone();
@@ -529,6 +539,14 @@ impl SettingsWindow {
                 if let TextInputEvent::Submitted(_) = ev {
                     this.save_theme_as(cx);
                 }
+            }),
+            cx.subscribe(&create_theme_name, |this, _, ev: &TextInputEvent, cx| match ev {
+                TextInputEvent::Changed(_) => {
+                    if this.create_theme_error.take().is_some() {
+                        cx.notify();
+                    }
+                }
+                TextInputEvent::Submitted(_) => this.submit_create_theme(cx),
             }),
             cx.subscribe(&file_opener, |_, _, ev: &TextInputEvent, cx| {
                 if let TextInputEvent::Submitted(text) = ev {
@@ -602,6 +620,12 @@ impl SettingsWindow {
             pending_color: None,
             color_save_gen: 0,
             theme_name,
+            create_theme_open: false,
+            create_theme_name,
+            create_theme_error: None,
+            create_theme_modal_focus,
+            create_theme_opener: None,
+            create_theme_restore: None,
             recording: None,
             shortcut_note: None,
             plugins: plugins::PluginsPage::default(),
@@ -831,8 +855,9 @@ impl SettingsWindow {
     /// The picker moved to `color`: show it live, and save it once the changes stop.
     fn color_changed(&mut self, color: Color, cx: &mut Context<'_, Self>) {
         let slot = self.edit_slot;
-        self.pending_color = Some((slot, color));
-        AppSettings::preview(cx, |s| s.theme.overrides.set(slot, Some(color)));
+        let theme_id = active_theme_id(cx);
+        self.pending_color = Some((theme_id.clone(), slot, color));
+        AppSettings::preview(cx, |s| s.theme.set_override(&theme_id, slot, Some(color)));
         self.color_save_gen += 1;
         let generation = self.color_save_gen;
         cx.spawn(async move |this, cx| {
@@ -849,22 +874,51 @@ impl SettingsWindow {
 
     /// Write a live color change to settings.json.
     fn flush_color(&mut self, cx: &mut App) {
-        if let Some((slot, color)) = self.pending_color.take() {
-            AppSettings::update(cx, |s| s.theme.overrides.set(slot, Some(color)));
+        if let Some((theme_id, slot, color)) = self.pending_color.take() {
+            AppSettings::update(cx, |s| s.theme.set_override(&theme_id, slot, Some(color)));
         }
     }
 
     pub fn revert_color(&mut self, cx: &mut Context<'_, Self>) {
         self.flush_color(cx);
         let slot = self.edit_slot;
-        AppSettings::update(cx, |s| s.theme.overrides.set(slot, None));
+        let theme_id = active_theme_id(cx);
+        AppSettings::update(cx, |s| s.theme.set_override(&theme_id, slot, None));
         self.select_slot(slot, cx);
     }
 
     pub fn reset_colors(&mut self, cx: &mut Context<'_, Self>) {
         self.flush_color(cx);
-        AppSettings::update(cx, |s| s.theme.overrides = Default::default());
+        let theme_id = active_theme_id(cx);
+        AppSettings::update(cx, |s| s.theme.clear_overrides(&theme_id));
         self.select_slot(self.edit_slot, cx);
+    }
+
+    /// Write `app.colors` as a new user theme named `name`, clear the source
+    /// theme's unsaved overrides, and switch the active theme slot to it.
+    fn save_current_colors_as_theme(&mut self, name: &str, cx: &mut Context<'_, Self>) -> std::io::Result<std::path::PathBuf> {
+        self.flush_color(cx);
+        let app = cx.global::<AppSettings>();
+        let (lib, colors) = (app.themes.clone(), app.colors);
+        let source_id = active_theme_id(cx);
+        let system_dark = app.system_dark;
+        let id = lib.unique_id(name);
+        let path = lib.save(&id, name, &colors)?;
+        AppSettings::reload_themes(cx);
+        let mut target = ThemeTarget::Fixed;
+        AppSettings::update(cx, |s| {
+            s.theme.clear_overrides(&source_id);
+            target =
+                if s.theme.follow_system { if system_dark { ThemeTarget::Dark } else { ThemeTarget::Light } } else { ThemeTarget::Fixed };
+            match target {
+                ThemeTarget::Fixed => s.theme.name = id.clone(),
+                ThemeTarget::Light => s.theme.light = id.clone(),
+                ThemeTarget::Dark => s.theme.dark = id.clone(),
+            }
+        });
+        self.theme_target = target;
+        self.select_slot(self.edit_slot, cx);
+        Ok(path)
     }
 
     /// Save the colors on screen as a new user theme and switch to it.
@@ -875,14 +929,8 @@ impl SettingsWindow {
             toast::show(cx, Toast::warning("Give the new theme a name first").key("theme.save"));
             return;
         }
-        let app = cx.global::<AppSettings>();
-        let (lib, colors) = (app.themes.clone(), app.colors);
-        let id = lib.unique_id(&name);
-        match lib.save(&id, &name, &colors) {
+        match self.save_current_colors_as_theme(&name, cx) {
             Ok(path) => {
-                AppSettings::reload_themes(cx);
-                AppSettings::update(cx, |s| s.theme.overrides = Default::default());
-                self.choose_theme(id, cx);
                 self.theme_name.update(cx, |i, cx| i.set_text("", cx));
                 toast::show(
                     cx,
@@ -891,6 +939,52 @@ impl SettingsWindow {
             }
             Err(e) => {
                 toast::show(cx, Toast::error("Couldn't save the theme").body(e.to_string()).key("theme.save"));
+            }
+        }
+    }
+
+    /// Open the dialog to create a new custom theme from the current colors.
+    pub fn open_create_theme_modal(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.flush_color(cx);
+        self.create_theme_opener = window.focused(cx);
+        self.create_theme_error = None;
+        self.create_theme_name.update(cx, |i, cx| i.set_text("", cx));
+        self.create_theme_open = true;
+        window.focus(&self.create_theme_name.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub fn close_create_theme_modal(&mut self, cx: &mut Context<'_, Self>) {
+        self.create_theme_open = false;
+        self.create_theme_error = None;
+        self.create_theme_restore = self.create_theme_opener.take();
+        cx.notify();
+    }
+
+    pub fn submit_create_theme(&mut self, cx: &mut Context<'_, Self>) {
+        self.flush_color(cx);
+        let name = self.create_theme_name.read(cx).text().trim().to_string();
+        if name.is_empty() {
+            self.create_theme_error = Some("Give the new theme a name.".into());
+            cx.notify();
+            return;
+        }
+        match self.save_current_colors_as_theme(&name, cx) {
+            Ok(path) => {
+                self.colors_open = true;
+                self.create_theme_open = false;
+                self.create_theme_error = None;
+                self.create_theme_name.update(cx, |i, cx| i.set_text("", cx));
+                self.create_theme_restore = self.create_theme_opener.take();
+                toast::show(
+                    cx,
+                    Toast::success(format!("Created the theme \u{201c}{name}\u{201d}")).body(path.display().to_string()).key("theme.save"),
+                );
+                cx.notify();
+            }
+            Err(e) => {
+                self.create_theme_error = Some(e.to_string());
+                cx.notify();
             }
         }
     }
@@ -904,7 +998,7 @@ impl SettingsWindow {
         match lib.save(&id, &entry.name, &colors) {
             Ok(_) => {
                 AppSettings::reload_themes(cx);
-                AppSettings::update(cx, |s| s.theme.overrides = Default::default());
+                AppSettings::update(cx, |s| s.theme.clear_overrides(&id));
                 toast::show(cx, Toast::success(format!("Updated the theme \u{201c}{}\u{201d}", entry.name)).key("theme.save"));
             }
             Err(e) => {
@@ -922,6 +1016,7 @@ impl SettingsWindow {
                 AppSettings::reload_themes(cx);
                 let d = goatty_config::ThemeSettings::default();
                 AppSettings::update(cx, |s| {
+                    s.theme.clear_overrides(&id);
                     // A user theme may have replaced a built-in of the same id:
                     // then the built-in is back and the setting can stay.
                     if goatty_config::find_theme(&id).is_none() {
@@ -1018,7 +1113,9 @@ impl SettingsWindow {
 
     /// Tab and Shift+Tab. A dialog, an open menu or the drawer keeps focus to itself.
     fn move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let trap = if self.aliases_modal_open() {
+        let trap = if self.create_theme_open {
+            Some(self.create_theme_modal_focus.clone())
+        } else if self.aliases_modal_open() {
             Some(self.aliases.modal_focus.clone())
         } else if self.snippets_modal_open() {
             Some(self.snippets.modal_focus.clone())
@@ -1058,7 +1155,7 @@ impl SettingsWindow {
     /// Ctrl+PageDown / Ctrl+PageUp: the next or previous page.
     fn step_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
         // The page behind a dialog isn't reachable.
-        if self.aliases_modal_open() || self.snippets_modal_open() || self.prompt_modal_open() {
+        if self.create_theme_open || self.aliases_modal_open() || self.snippets_modal_open() || self.prompt_modal_open() {
             return;
         }
         let at = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);
@@ -1424,6 +1521,11 @@ impl SettingsWindow {
             });
         })
     }
+}
+
+fn active_theme_id(cx: &App) -> String {
+    let app = cx.global::<AppSettings>();
+    app.client.theme.active_id(app.system_dark).to_string()
 }
 
 fn dirs_home() -> std::path::PathBuf {

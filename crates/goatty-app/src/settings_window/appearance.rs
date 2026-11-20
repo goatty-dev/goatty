@@ -7,11 +7,11 @@ use gpui::{
     prelude::*, px, rgb,
 };
 
-use super::kit::{self, Opt, chip, menu, menu_item, opt, row, search_field, section, select_trigger};
+use super::kit::{self, Opt, chip, field, menu, menu_item, modal, opt, row, search_field, section, select_trigger};
 use super::{SettingsWindow, ThemeTarget, client};
 use crate::settings::AppSettings;
 use crate::ui::controls::{
-    ButtonKind, Tone, badge, button, button_with, icon_button, icon_button_tinted, segmented, slider, stepper, toggle,
+    ButtonKind, Tone, badge, banner, button, button_with, icon_button, icon_button_tinted, segmented, slider, stepper, toggle,
 };
 use crate::ui::focus::{self, Ring, Scroller};
 use crate::ui::icons::Icon;
@@ -230,7 +230,11 @@ impl SettingsWindow {
                     tags.push("mine");
                 }
                 let sel = e.id == selected_id;
-                self.theme_card(ui, e, sel, tags, cx).into_any_element()
+                let mut entry = e;
+                if let Some(o) = t.overrides_for(&entry.id) {
+                    entry.colors = o.apply(entry.colors);
+                }
+                self.theme_card(ui, entry, sel, tags, cx).into_any_element()
             })
             .collect();
         let follow = row(ui, "Follow the system")
@@ -290,6 +294,14 @@ impl SettingsWindow {
                     .flex()
                     .gap(px(4.))
                     .child(button_with(
+                        "create-custom-theme",
+                        Some(Icon::Plus),
+                        "Create custom theme",
+                        ButtonKind::Normal,
+                        ui,
+                        self.act_window(cx, |v, window, cx| v.open_create_theme_modal(window, cx)),
+                    ))
+                    .child(button_with(
                         "import-theme",
                         Some(Icon::Download),
                         "Import…",
@@ -314,8 +326,14 @@ impl SettingsWindow {
 
     fn colors_row(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {
         let app = cx.global::<AppSettings>();
-        let changed = ColorSlot::all().into_iter().filter(|&s| app.file.value.theme.overrides.get(s).is_some()).count();
-        let active = app.themes.get(app.file.value.theme.active_id(app.system_dark)).map(|a| a.name).unwrap_or_default();
+        let active_id = app.client.theme.active_id(app.system_dark);
+        let changed = app
+            .file
+            .value
+            .theme
+            .overrides_for(active_id)
+            .map_or(0, |o| ColorSlot::all().into_iter().filter(|&s| o.get(s).is_some()).count());
+        let active = app.themes.get(active_id).map(|a| a.name).unwrap_or_default();
         let open = self.colors_open;
         let el = div()
             .id("colors-toggle")
@@ -358,9 +376,10 @@ impl SettingsWindow {
     fn color_editor(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {
         let app = cx.global::<AppSettings>();
         let t = &app.file.value.theme;
-        let overrides = t.overrides.clone();
+        let active_id = app.client.theme.active_id(app.system_dark);
+        let overrides = t.overrides_for(active_id).cloned().unwrap_or_default();
         let edit = self.edit_slot;
-        let active = app.themes.get(t.active_id(app.system_dark));
+        let active = app.themes.get(active_id);
         let colors: ThemeColors = app.colors;
         let swatch = |slot: ColorSlot, big: bool| {
             let color = colors.get(slot);
@@ -491,6 +510,34 @@ impl SettingsWindow {
             .child(self.picker.clone())
             .child(actions)
             .child(save)
+    }
+
+    pub(super) fn create_theme_modal(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        if !self.create_theme_open {
+            return None;
+        }
+        let app = cx.global::<AppSettings>();
+        let active_id = app.client.theme.active_id(app.system_dark);
+        let active_name = app.themes.get(active_id).map(|t| t.name).unwrap_or_else(|| active_id.to_string());
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(kit::hint(ui, format!("Starts from the current colors of {active_name} and opens them for editing.")))
+            .child(field(ui, "Theme name", self.create_theme_name.clone()))
+            .children(self.create_theme_error.clone().map(|e| banner(ui, Tone::Danger, e, Vec::new())));
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(button("create-theme-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.close_create_theme_modal(cx))))
+            .child(button("create-theme-submit", "Create theme", ButtonKind::Primary, ui, self.act(cx, |v, cx| v.submit_create_theme(cx))));
+        Some(
+            modal(ui, "create-theme-modal", "Create custom theme", body, footer)
+                .track_focus(&self.create_theme_modal_focus)
+                .on_mouse_down(MouseButton::Left, cx.listener(|v, _, _, cx| v.close_create_theme_modal(cx)))
+                .into_any_element(),
+        )
     }
 
     // ---- Text --------------------------------------------------------------------

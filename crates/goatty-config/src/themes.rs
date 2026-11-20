@@ -158,7 +158,11 @@ impl ThemeLibrary {
                 Some(Issue::new(field, format!("unknown theme {id:?}; using the default"))),
             ),
         };
-        (s.overrides.apply(base), issue)
+        let colors = match s.overrides_for(id) {
+            Some(o) => o.apply(base),
+            None => base,
+        };
+        (colors, issue)
     }
 
     /// Every theme `s` names that doesn't exist: `theme.name`, or both
@@ -222,7 +226,7 @@ impl ThemeLibrary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::theme::Color;
+    use crate::theme::{Color, ColorSlot};
 
     #[test]
     fn slugs() {
@@ -283,5 +287,27 @@ mod tests {
 
         assert!(lib.delete("my-nord").unwrap());
         assert!(!lib.delete("my-nord").unwrap());
+    }
+
+    #[test]
+    fn resolve_applies_overrides_per_theme() {
+        let lib = ThemeLibrary::default();
+        let mut s = ThemeSettings { follow_system: true, dark: "nord".into(), light: "solarized-light".into(), ..Default::default() };
+        s.set_override("nord", ColorSlot::Background, Some(Color(0x111111)));
+        s.set_override("solarized-light", ColorSlot::Accent, Some(Color(0x222222)));
+
+        let (dark, _) = lib.resolve(&s, true);
+        assert_eq!(dark.background, Color(0x111111));
+        assert_eq!(dark.accent, None);
+
+        let (light, _) = lib.resolve(&s, false);
+        assert_eq!(light.background, find_theme("solarized-light").unwrap().colors.background);
+        assert_eq!(light.accent, Some(Color(0x222222)));
+
+        // Switching fixed theme doesn't carry over nord's or solarized-light's overrides.
+        s.follow_system = false;
+        s.name = "dracula".into();
+        let (dracula, _) = lib.resolve(&s, true);
+        assert_eq!(dracula, find_theme("dracula").unwrap().colors);
     }
 }
