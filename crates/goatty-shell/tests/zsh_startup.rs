@@ -1288,6 +1288,20 @@ fn expansions_rewrite_words_on_space_and_enter() {
     sh.run("x");
     assert!(last_output(&sh).contains("sortedx"), "{:?}", last_output(&sh));
 
+    // Ctrl+Backspace (^H and Esc+Backspace) and Ctrl+Delete (^[[3;5~) kill words
+    // even with expansions active (#248).
+    sh.run("echo one two\x08");
+    let out = last_output(&sh);
+    assert!(out.contains("one") && !out.contains("two"), "Ctrl+Backspace (^H) kills a word: {out:?}");
+
+    sh.run("echo three four\x1b\x7f");
+    let out = last_output(&sh);
+    assert!(out.contains("three") && !out.contains("four"), "Ctrl+Backspace (Esc+Backspace) kills a word: {out:?}");
+
+    sh.run("echo alpha beta\x1b[D\x1b[D\x1b[D\x1b[D\x1b[3;5~");
+    let out = last_output(&sh);
+    assert!(out.contains("alpha") && !out.contains("beta"), "Ctrl+Delete kills a word forward: {out:?}");
+
     // Inside quotes nothing changes.
     sh.run("echo 'a | first 2 lines b'");
     assert!(last_output(&sh).contains("a | first 2 lines b"), "{:?}", last_output(&sh));

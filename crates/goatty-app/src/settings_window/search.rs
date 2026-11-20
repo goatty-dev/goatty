@@ -79,6 +79,8 @@ pub const INDEX: &[Entry] = &[
     e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),
     e(Page::Terminal, "Pasting", "Ask before pasting", "paste confirm protection bracketed multiline").keys(&["paste.confirm"]),
+    e(Page::Terminal, "Keyboard", "Ctrl+Backspace", "ctrl backspace delete word kill backward bash ssh").keys(&["keyboard.ctrl_backspace"]),
+    e(Page::Terminal, "Keyboard", "Ctrl+Delete", "ctrl delete del word kill forward bash ssh").keys(&["keyboard.ctrl_delete"]),
     e(Page::Workspace, "Startup", "When goatty starts", "restore reattach session launch open").keys(&["workspace.on_launch"]),
     e(Page::Workspace, "Tabs", "Style", "tab style modern compact vertical sidebar side arc zen").keys(&["tabs.style"]),
     e(Page::Workspace, "Tabs", "Show the tab bar", "hide tabs").keys(&["tabs.show"]),

@@ -26,6 +26,7 @@ pub struct ClientSettings {
     pub paste: PasteSettings,
     pub selection: SelectionSettings,
     pub mouse: MouseSettings,
+    pub keyboard: KeyboardSettings,
     pub ssh: SshSettings,
     pub tailnet: TailnetSettings,
     pub plugins: PluginNotifySettings,
@@ -768,6 +769,43 @@ impl RightClick {
 #[serde(default)]
 pub struct MouseSettings {
     pub right_click: RightClick,
+}
+
+/// What `Ctrl+Backspace` sends in legacy (non-kitty) mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CtrlBackspace {
+    /// Escape + DEL (`\x1b\x7f`): deletes a word backward in bash, zsh, fish,
+    /// readline, and over SSH without host-side shell configuration.
+    #[default]
+    EscBackspace,
+    /// `Ctrl+W` (`^W`): deletes whitespace-delimited words in shells, vim
+    /// insert mode, and raw TTY line input.
+    CtrlW,
+    /// `^H`: xterm default (deletes a word in goatty's managed zsh, one
+    /// character in bash and plain zsh).
+    CtrlH,
+}
+
+/// What `Ctrl+Delete` sends in legacy (non-kitty) mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CtrlDelete {
+    /// `CSI 3;5~`: xterm default (deletes a word forward in goatty's managed
+    /// zsh, fish, and most TUIs).
+    #[default]
+    Standard,
+    /// `Alt+D` (`\x1bd`): deletes a word forward in bash and plain zsh without
+    /// extra keybindings.
+    AltD,
+}
+
+/// Terminal key encoding options (applies locally and to SSH hosts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct KeyboardSettings {
+    pub ctrl_backspace: CtrlBackspace,
+    pub ctrl_delete: CtrlDelete,
 }
 
 /// The hosts goatty offers to connect to (command palette, settings).
@@ -1541,5 +1579,22 @@ mod tests {
         }
         let s: ClientSettings = serde_json::from_str(r#"{"mouse":{"right_click":"paste"}}"#).unwrap();
         assert_eq!(s.mouse.right_click, Paste);
+    }
+
+    #[test]
+    fn keyboard_word_delete_settings() {
+        use crate::store;
+        let def = ClientSettings::default();
+        assert_eq!(def.keyboard.ctrl_backspace, CtrlBackspace::EscBackspace);
+        assert_eq!(def.keyboard.ctrl_delete, CtrlDelete::Standard);
+
+        let l = store::parse::<ClientSettings>(r#"{"keyboard":{"ctrl_backspace":"ctrl_w","ctrl_delete":"alt_d"}}"#);
+        assert!(l.issues.is_empty(), "{:?}", l.issues);
+        assert_eq!(l.value.keyboard.ctrl_backspace, CtrlBackspace::CtrlW);
+        assert_eq!(l.value.keyboard.ctrl_delete, CtrlDelete::AltD);
+
+        let l = store::parse::<ClientSettings>(r#"{"keyboard":{"ctrl_backspace":"bogus"}}"#);
+        assert_eq!(l.value.keyboard.ctrl_backspace, CtrlBackspace::EscBackspace);
+        assert!(!l.issues.is_empty());
     }
 }

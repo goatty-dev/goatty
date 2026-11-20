@@ -78,26 +78,67 @@ impl<'a> KeyEvent<'a> {
     }
 }
 
+/// What `Ctrl+Backspace` sends in legacy (non-kitty) mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CtrlBackspace {
+    /// Escape + DEL (`\x1b\x7f`): deletes a word backward in bash, zsh, fish,
+    /// readline, and over SSH without host-side shell configuration.
+    #[default]
+    EscBackspace,
+    /// `Ctrl+W` (`0x17`): deletes whitespace-delimited words in shells, vim
+    /// insert mode, and raw TTY line input.
+    CtrlW,
+    /// `^H` (`0x08`): xterm default (deletes a word in goatty's managed zsh,
+    /// one character in bash and plain zsh).
+    CtrlH,
+}
+
+/// What `Ctrl+Delete` sends in legacy (non-kitty) mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CtrlDelete {
+    /// `CSI 3;5~` (`\x1b[3;5~`): xterm default (deletes a word forward in
+    /// goatty's managed zsh, fish, and most TUIs).
+    #[default]
+    Standard,
+    /// `Alt+D` (`\x1bd`): deletes a word forward in bash and plain zsh without
+    /// extra keybindings.
+    AltD,
+}
+
+/// Client-side options for legacy (non-kitty) key encoding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyOptions {
+    pub ctrl_backspace: CtrlBackspace,
+    pub ctrl_delete: CtrlDelete,
+}
+
 /// Encode a key press. `None` means "not something the terminal handles".
 pub fn encode_key(key: &Key<'_>, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
     encode_key_event(&KeyEvent::press(key.clone(), mods), mode)
 }
 
-/// Encode a key event. `None` means "nothing to send": not a key the
-/// terminal handles, or a repeat/release the application didn't ask for.
+/// Encode a key event with default [`KeyOptions`]. `None` means "nothing to
+/// send": not a key the terminal handles, or a repeat/release the application
+/// didn't ask for.
 pub fn encode_key_event(ev: &KeyEvent<'_>, mode: TermMode) -> Option<Vec<u8>> {
+    encode_key_event_with(ev, mode, KeyOptions::default())
+}
+
+/// Encode a key event using `opts`. `None` means "nothing to send": not a key
+/// the terminal handles, or a repeat/release the application didn't ask for.
+pub fn encode_key_event_with(ev: &KeyEvent<'_>, mode: TermMode, opts: KeyOptions) -> Option<Vec<u8>> {
     if mode.kitty_flags() != 0 {
-        return kitty::encode(ev, mode);
+        return kitty::encode(ev, mode, opts);
     }
     // Legacy: a repeat is another press; releases aren't reported.
     match ev.kind {
         KeyKind::Release => None,
-        KeyKind::Press | KeyKind::Repeat => encode_legacy(&ev.key, ev.mods, mode),
+        KeyKind::Press | KeyKind::Repeat => encode_legacy(&ev.key, ev.mods, mode, opts),
     }
 }
 
 /// The xterm encoding.
-fn encode_legacy(key: &Key<'_>, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
+fn encode_legacy(key: &Key<'_>, mods: Mods, mode: TermMode, opts: KeyOptions) -> Option<Vec<u8>> {
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
     let esc = |mut v: Vec<u8>| {
         if mods.alt {
@@ -128,7 +169,13 @@ fn encode_legacy(key: &Key<'_>, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
     Some(match key {
         Key::Enter => esc(vec![b'\r']),
         Key::Backspace => {
-            if mods.ctrl {
+            if mods.ctrl && !mods.alt && !mods.shift && !mods.logo {
+                match opts.ctrl_backspace {
+                    CtrlBackspace::EscBackspace => vec![0x1b, 0x7f],
+                    CtrlBackspace::CtrlW => vec![0x17],
+                    CtrlBackspace::CtrlH => vec![0x08],
+                }
+            } else if mods.ctrl {
                 esc(vec![0x08])
             } else {
                 esc(vec![0x7f])
@@ -158,7 +205,13 @@ fn encode_legacy(key: &Key<'_>, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
         Key::PageUp => csi_tilde(5),
         Key::PageDown => csi_tilde(6),
         Key::Insert => csi_tilde(2),
-        Key::Delete => csi_tilde(3),
+        Key::Delete => {
+            if mods.ctrl && !mods.alt && !mods.shift && !mods.logo && opts.ctrl_delete == CtrlDelete::AltD {
+                vec![0x1b, b'd']
+            } else {
+                csi_tilde(3)
+            }
+        }
         Key::F(n) => match n {
             1 => ss3_f(b'P'),
             2 => ss3_f(b'Q'),
@@ -215,7 +268,7 @@ mod kitty {
 
     use std::fmt::Write as _;
 
-    use super::{Key, KeyEvent, KeyKind, Mods, encode_legacy};
+    use super::{Key, KeyEvent, KeyKind, KeyOptions, Mods, encode_legacy};
     use crate::TermMode;
 
     const DISAMBIGUATE: u8 = 1;
@@ -261,7 +314,7 @@ mod kitty {
         })
     }
 
-    pub(super) fn encode(ev: &KeyEvent<'_>, mode: TermMode) -> Option<Vec<u8>> {
+    pub(super) fn encode(ev: &KeyEvent<'_>, mode: TermMode, opts: KeyOptions) -> Option<Vec<u8>> {
         let flags = mode.kitty_flags();
         let all_keys = flags & ALL_KEYS != 0;
         let disambiguate = flags & DISAMBIGUATE != 0 || all_keys;
@@ -294,7 +347,7 @@ mod kitty {
                 if !disambiguate && kind == KeyKind::Press {
                     // No disambiguation: presses stay legacy (a repeat
                     // carries its event type, so it can't).
-                    return encode_legacy(&ev.key, mods, TermMode::empty());
+                    return encode_legacy(&ev.key, mods, TermMode::empty(), opts);
                 }
             }
             let base = match ev.base {
@@ -321,7 +374,7 @@ mod kitty {
             // Only alternate keys or associated text, which change nothing
             // here: the legacy forms (SS3 arrows in DECCKM, SS3 F1-F4).
             // F13 and up have none.
-            if let Some(b) = encode_legacy(&ev.key, mods, mode & TermMode::APP_CURSOR) {
+            if let Some(b) = encode_legacy(&ev.key, mods, mode & TermMode::APP_CURSOR, opts) {
                 return Some(b);
             }
         }
@@ -330,7 +383,7 @@ mod kitty {
             // These keep their legacy bytes so a shell stays usable after a
             // program that set the flags dies (kitty does the same).
             Key::Enter | Key::Tab | Key::Backspace if legacy_ok => {
-                return (!release).then(|| encode_legacy(&ev.key, mods, TermMode::empty())).flatten();
+                return (!release).then(|| encode_legacy(&ev.key, mods, TermMode::empty(), opts)).flatten();
             }
             Key::Escape if legacy_ok && !disambiguate => {
                 return (!release).then(|| vec![0x1b]);
@@ -664,6 +717,74 @@ mod tests {
     fn paste_strips_injected_end_marker() {
         let out = encode_paste("rm -rf x\x1b[201~; echo pwned\n", TermMode::BRACKETED_PASTE);
         assert_eq!(out, b"\x1b[200~rm -rf x; echo pwned\n\x1b[201~");
+    }
+
+    #[test]
+    fn ctrl_backspace_and_ctrl_delete_options() {
+        let m = TermMode::empty();
+        assert_eq!(encode_key_event_with(&ev(Key::Backspace, CTRL, KeyKind::Press), m, KeyOptions::default()).unwrap(), b"\x1b\x7f");
+        assert_eq!(
+            encode_key_event_with(
+                &ev(Key::Backspace, CTRL, KeyKind::Press),
+                m,
+                KeyOptions { ctrl_backspace: CtrlBackspace::CtrlW, ..Default::default() },
+            )
+            .unwrap(),
+            b"\x17"
+        );
+        assert_eq!(
+            encode_key_event_with(
+                &ev(Key::Backspace, CTRL, KeyKind::Press),
+                m,
+                KeyOptions { ctrl_backspace: CtrlBackspace::CtrlH, ..Default::default() },
+            )
+            .unwrap(),
+            b"\x08"
+        );
+        let ctrl_alt = Mods { ctrl: true, alt: true, ..NONE };
+        assert_eq!(encode_key_event_with(&ev(Key::Backspace, ctrl_alt, KeyKind::Press), m, KeyOptions::default()).unwrap(), b"\x1b\x08");
+
+        assert_eq!(encode_key_event_with(&ev(Key::Delete, CTRL, KeyKind::Press), m, KeyOptions::default()).unwrap(), b"\x1b[3;5~");
+        assert_eq!(
+            encode_key_event_with(
+                &ev(Key::Delete, CTRL, KeyKind::Press),
+                m,
+                KeyOptions { ctrl_delete: CtrlDelete::AltD, ..Default::default() },
+            )
+            .unwrap(),
+            b"\x1bd"
+        );
+        let ctrl_shift = Mods { ctrl: true, shift: true, ..NONE };
+        assert_eq!(
+            encode_key_event_with(
+                &ev(Key::Delete, ctrl_shift, KeyKind::Press),
+                m,
+                KeyOptions { ctrl_delete: CtrlDelete::AltD, ..Default::default() },
+            )
+            .unwrap(),
+            b"\x1b[3;6~"
+        );
+
+        // Kitty disambiguate ignores legacy KeyOptions.
+        let km = kitty(1);
+        assert_eq!(
+            encode_key_event_with(
+                &ev(Key::Backspace, CTRL, KeyKind::Press),
+                km,
+                KeyOptions { ctrl_backspace: CtrlBackspace::EscBackspace, ctrl_delete: CtrlDelete::AltD },
+            )
+            .unwrap(),
+            b"\x1b[127;5u"
+        );
+        assert_eq!(
+            encode_key_event_with(
+                &ev(Key::Delete, CTRL, KeyKind::Press),
+                km,
+                KeyOptions { ctrl_backspace: CtrlBackspace::EscBackspace, ctrl_delete: CtrlDelete::AltD },
+            )
+            .unwrap(),
+            b"\x1b[3;5~"
+        );
     }
 
     #[test]

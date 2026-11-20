@@ -353,7 +353,7 @@ autoload -Uz up-line-or-beginning-search down-line-or-beginning-search
 zle -N up-line-or-beginning-search
 zle -N down-line-or-beginning-search
 () {
-  local key
+  local km key
   local -A keys=(
     '^[[A'    up-line-or-beginning-search    # Up: history matching what's typed
     '^[OA'    up-line-or-beginning-search
@@ -367,11 +367,14 @@ zle -N down-line-or-beginning-search
     '^[[1;5C' forward-word                   # Ctrl+Right
     '^[[1;5D' backward-word                  # Ctrl+Left
     '^[[3;5~' kill-word                      # Ctrl+Delete
-    '^H'      backward-kill-word             # Ctrl+Backspace
+    '^H'      backward-kill-word             # Ctrl+Backspace (^H)
+    '^[^?'    backward-kill-word             # Ctrl+Backspace (Esc+Backspace)
     '^[[Z'    reverse-menu-complete          # Shift+Tab
   )
-  for key in ${(k)keys}; do
-    bindkey -- $key ${keys[$key]}
+  for km in emacs viins; do
+    for key in ${(k)keys}; do
+      bindkey -M $km -- $key ${keys[$key]}
+    done
   done
 }
 # Word motions stop at path separators.

@@ -140,7 +140,7 @@ Colors are Starship colors: the theme's 16 by name (`bright-blue`) or number, 16
 
 Each plugin checks for its tool at shell startup and is skipped if the tool is missing. Binaries come from `$commands`, which sees the PATH after the user's `.zprofile` ran; zsh plugins come from their package's `system_paths` (distro/Homebrew/NixOS), then the managed copy. A system install always wins over a managed one.
 
-Defaults chosen here: emacs keymap; Up/Down search history by prefix; Home/End/Delete/Ctrl+arrows/Ctrl+Backspace/Shift+Tab bound to the sequences goatty sends; word motions stop at `/`; completion with case-insensitive matching, in fzf (fzf-tab; zsh's menu selection when fzf-tab is off or missing); `auto_cd`; 100k history entries, `extended_history`, `inc_append_history`, no duplicates; fzf on Ctrl+R/Ctrl+T/Alt+C.
+Defaults chosen here: emacs keymap (with navigation and word-deletion bindings in both `emacs` and `viins`); Up/Down search history by prefix; Home/End/Delete/Ctrl+arrows/Ctrl+Backspace/Ctrl+Delete/Shift+Tab bound to the sequences goatty sends; word motions stop at `/`; completion with case-insensitive matching, in fzf (fzf-tab; zsh's menu selection when fzf-tab is off or missing); `auto_cd`; 100k history entries, `extended_history`, `inc_append_history`, no duplicates; fzf on Ctrl+R/Ctrl+T/Alt+C.
 
 ## Completions for goatty and its tools
 
