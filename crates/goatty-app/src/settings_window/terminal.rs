@@ -2,8 +2,8 @@
 //! (startup, tabs, panes, notifications).
 
 use goatty_config::{
-    CopyOnSelect, LinkClick, LinkSettings, MiddleClick, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm, RemoteFileOpen, RightClick,
-    TabActivity, TabBarShow, TabSettings, TabStyle,
+    CopyOnSelect, CtrlBackspace, CtrlDelete, LinkClick, LinkSettings, MiddleClick, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm,
+    RemoteFileOpen, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -157,7 +157,41 @@ impl SettingsWindow {
                 cx,
                 |v, _, cx| AppSettings::update(cx, |s| s.paste.confirm = v),
             )));
-        div().flex().flex_col().gap(px(28.)).child(links).child(selection).child(mouse).child(pasting).into_any_element()
+        let keyboard = section(ui, "Keyboard")
+            .child(
+                row(ui, "Ctrl+Backspace")
+                    .desc("What Ctrl+Backspace sends to the shell or program")
+                    .control(self.select(
+                        "keyboard-ctrl-backspace",
+                        "Ctrl+Backspace",
+                        opts(&[
+                            (CtrlBackspace::EscBackspace, "Delete word (Esc+Backspace)", "Works in bash, zsh, fish and over SSH"),
+                            (CtrlBackspace::CtrlW, "Delete word (Ctrl+W)", "Deletes to the previous space in shells, vim and raw input"),
+                            (CtrlBackspace::CtrlH, "Standard (^H)", "xterm default; deletes a word in goatty's zsh, one character in bash"),
+                        ]),
+                        &s.keyboard.ctrl_backspace,
+                        cx,
+                        |v, _, cx| AppSettings::update(cx, |s| s.keyboard.ctrl_backspace = v),
+                    )),
+            )
+            .child(
+                row(ui, "Ctrl+Delete")
+                    .desc("What Ctrl+Delete sends to the shell or program")
+                    .control(self.select(
+                        "keyboard-ctrl-delete",
+                        "Ctrl+Delete",
+                        opts(&[
+                            (CtrlDelete::Standard, "Standard (CSI 3;5~)", "xterm default; works in goatty's zsh, fish and most TUIs"),
+                            (CtrlDelete::AltD, "Delete word (Alt+D)", "Works in bash and plain zsh without extra config"),
+                        ]),
+                        &s.keyboard.ctrl_delete,
+                        cx,
+                        |v, _, cx| AppSettings::update(cx, |s| s.keyboard.ctrl_delete = v),
+                    )),
+            )
+            .footer("Applies to local and SSH sessions alike. Programs that enable the kitty keyboard protocol still receive Ctrl+Backspace and Ctrl+Delete directly.");
+
+        div().flex().flex_col().gap(px(28.)).child(links).child(selection).child(mouse).child(pasting).child(keyboard).into_any_element()
     }
 
     fn tab_style_cards(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {

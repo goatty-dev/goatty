@@ -31,10 +31,11 @@ use std::time::{Duration, Instant};
 
 use goatty_client::RemotePathInfo;
 use goatty_config::{
-    ClientSettings, CopyOnSelect, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, RemoteFileOpen, Renderer, RightClick,
+    ClientSettings, CopyOnSelect, CtrlBackspace, CtrlDelete, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm,
+    RemoteFileOpen, Renderer, RightClick,
 };
 use goatty_term::input::{
-    Key, KeyKind, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event, encode_mouse, encode_paste,
+    Key, KeyKind, KeyOptions, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event_with, encode_mouse, encode_paste,
 };
 use goatty_term::paste::{self, PasteRisk};
 use goatty_term::{CursorKind, Frame, Link, LinkKind, ProgramStatus, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
@@ -312,6 +313,7 @@ pub struct TerminalView {
     exited: bool,
     // Links.
     link_click: LinkClick,
+    key_options: KeyOptions,
     /// The cell under the mouse, while it's over the pane.
     mouse_cell: Option<(usize, usize)>,
     modifiers: Modifiers,
@@ -455,6 +457,7 @@ impl TerminalView {
             status: initial_status,
             exited: false,
             link_click: settings.links.open_on,
+            key_options: KeyOptions::default(),
             mouse_cell: None,
             modifiers: Modifiers::default(),
             hover: None,
@@ -507,6 +510,17 @@ impl TerminalView {
             self.pending_open = None;
             self.pressed_pending_link = None;
         }
+        self.key_options = KeyOptions {
+            ctrl_backspace: match s.keyboard.ctrl_backspace {
+                CtrlBackspace::EscBackspace => goatty_term::input::CtrlBackspace::EscBackspace,
+                CtrlBackspace::CtrlW => goatty_term::input::CtrlBackspace::CtrlW,
+                CtrlBackspace::CtrlH => goatty_term::input::CtrlBackspace::CtrlH,
+            },
+            ctrl_delete: match s.keyboard.ctrl_delete {
+                CtrlDelete::Standard => goatty_term::input::CtrlDelete::Standard,
+                CtrlDelete::AltD => goatty_term::input::CtrlDelete::AltD,
+            },
+        };
     }
 
     /// The viewer draws the pane's font at the pane's (zoomed) size.
@@ -2000,7 +2014,7 @@ impl TerminalView {
         let kind = if ev.is_held { KeyKind::Repeat } else { KeyKind::Press };
         let Some(key) = terminal_key(&ev.keystroke, kind) else { return };
         let mode = self.session.terminal.mode();
-        if let Some(bytes) = encode_key_event(&key, mode) {
+        if let Some(bytes) = encode_key_event_with(&key, mode, self.key_options) {
             cx.stop_propagation();
             // A dead key's composition ends with the composed key itself,
             // which goes where the keyboard focus is.
@@ -2034,7 +2048,7 @@ impl TerminalView {
         let logo = std::mem::take(&mut ks.modifiers.platform);
         let Some(mut key) = terminal_key(&ks, KeyKind::Release) else { return };
         key.mods.logo = logo;
-        if let Some(bytes) = encode_key_event(&key, self.session.terminal.mode()) {
+        if let Some(bytes) = encode_key_event_with(&key, self.session.terminal.mode(), self.key_options) {
             self.session.write(&bytes);
             cx.notify();
         }

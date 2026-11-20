@@ -116,7 +116,7 @@ zle -N goatty-expand-backspace
   for km in emacs viins; do
     bindkey -M $km ' ' goatty-expand-space
     bindkey -M $km '^M' goatty-expand-accept
+    # Only plain Backspace (^?): ^H is Ctrl+Backspace (backward-kill-word).
     bindkey -M $km '^?' goatty-expand-backspace
-    bindkey -M $km '^H' goatty-expand-backspace
   done
 }

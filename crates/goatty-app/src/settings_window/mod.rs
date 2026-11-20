@@ -256,7 +256,7 @@ impl Page {
     pub fn summary(self) -> &'static str {
         match self {
             Page::Appearance => "Theme, font, cursor and window",
-            Page::Terminal => "Links, selection and pasting",
+            Page::Terminal => "Links, selection, pasting and keys",
             Page::Workspace => "Startup, tabs and split panes",
             Page::Shortcuts => "Keys for terminal windows",
             Page::Hosts => "Machines to open sessions on over SSH",
