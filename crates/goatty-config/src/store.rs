@@ -28,6 +28,10 @@ pub trait Document: Serialize + DeserializeOwned + Default + Clone {
     /// Dotted paths of maps whose keys are user-chosen (not unknown settings).
     const OPEN_MAPS: &'static [&'static str];
     fn migrations() -> &'static [Migration];
+    /// Version assumed when the document omits `"version"`.
+    fn default_version(_user: &Value) -> u32 {
+        Self::VERSION
+    }
     /// Semantic checks after parsing: clamp ranges, report unknown names.
     fn validate(&mut self) -> Vec<Issue>;
 }
@@ -131,28 +135,7 @@ pub fn parse<T: Document>(text: &str) -> Loaded<T> {
         Err(e) => return fail(format!("not valid JSON ({e}); using defaults")),
     };
     let mut user = Value::Object(user);
-
-    let version = match user.as_object_mut().and_then(|m| m.remove("version")) {
-        None => T::VERSION,
-        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|&n| n >= 1) {
-            Some(n) => n,
-            None => {
-                issues.push(Issue::new("version", format!("{v} is not a version number; reading it as version {}", T::VERSION)));
-                T::VERSION
-            }
-        },
-    };
-    if version > T::VERSION {
-        issues.push(Issue::new(
-            "version",
-            format!("written by a newer goatty (version {version}, this one knows {}); unknown settings are kept", T::VERSION),
-        ));
-    }
-    let mut migrations: Vec<&Migration> = T::migrations().iter().filter(|(from, _)| *from >= version && *from < T::VERSION).collect();
-    migrations.sort_by_key(|(from, _)| *from);
-    for (_, migrate) in migrations {
-        migrate(&mut user);
-    }
+    let _ = take_and_migrate::<T>(&mut user, &mut issues);
 
     let default = serde_json::to_value(T::default()).expect("defaults serialize");
     let mut unknown = Vec::new();
@@ -415,6 +398,34 @@ fn raw_object(text: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
+/// Extract `"version"` (defaulting via [`Document::default_version`]), report
+/// newer versions, and apply any pending [`Document::migrations`].
+fn take_and_migrate<T: Document>(user: &mut Value, issues: &mut Vec<Issue>) -> u32 {
+    let raw_version = user.as_object_mut().and_then(|m| m.remove("version"));
+    let version = match raw_version {
+        None => T::default_version(user),
+        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|&n| n >= 1) {
+            Some(n) => n,
+            None => {
+                issues.push(Issue::new("version", format!("{v} is not a version number; reading it as version {}", T::VERSION)));
+                T::VERSION
+            }
+        },
+    };
+    if version > T::VERSION {
+        issues.push(Issue::new(
+            "version",
+            format!("written by a newer goatty (version {version}, this one knows {}); unknown settings are kept", T::VERSION),
+        ));
+    }
+    let mut migrations: Vec<&Migration> = T::migrations().iter().filter(|(from, _)| *from >= version && *from < T::VERSION).collect();
+    migrations.sort_by_key(|(from, _)| *from);
+    for (_, migrate) in migrations {
+        migrate(user);
+    }
+    version
+}
+
 /// Parse after an edit, refusing the edit if `key` didn't take.
 fn reparse<T: Document>(root: Map<String, Value>, key: &str) -> Result<Loaded<T>, String> {
     let loaded = parse::<T>(&Value::Object(root).to_string());
@@ -425,6 +436,20 @@ fn reparse<T: Document>(root: Map<String, Value>, key: &str) -> Result<Loaded<T>
     }
 }
 
+fn migrated_root<T: Document>(text: &str) -> Result<Map<String, Value>, String> {
+    let mut user = Value::Object(raw_object(text)?);
+    let mut ignored = Vec::new();
+    let version = take_and_migrate::<T>(&mut user, &mut ignored);
+    let mut root = match user {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    if version > T::VERSION {
+        root.insert("version".into(), Value::from(version));
+    }
+    Ok(root)
+}
+
 /// Set `key` (dotted, e.g. `history.size`) in the document `text`. `raw`
 /// is read as JSON when it parses (`5000`, `true`, `null`, `[...]`), else
 /// as a string (`minimal`, `/bin/zsh`). Unknown keys and invalid values are
@@ -433,7 +458,7 @@ pub fn set_key<T: Document>(text: &str, key: &str, raw: &str) -> Result<Loaded<T
     if key == "version" || !is_known_key::<T>(key) {
         return Err(format!("unknown setting {key:?} (see `show --all` for the known ones)"));
     }
-    let mut root = raw_object(text)?;
+    let mut root = migrated_root::<T>(text)?;
     let value = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
     let parts: Vec<String> = key.split('.').map(str::to_owned).collect();
     let (last, parents) = parts.split_last().expect("non-empty key");
@@ -454,7 +479,7 @@ pub fn unset_key<T: Document>(text: &str, key: &str) -> Result<Loaded<T>, String
     if !is_known_key::<T>(key) {
         return Err(format!("unknown setting {key:?}"));
     }
-    let mut root = raw_object(text)?;
+    let mut root = migrated_root::<T>(text)?;
     let parts: Vec<&str> = key.split('.').collect();
     fn remove(m: &mut Map<String, Value>, parts: &[&str]) {
         match parts {

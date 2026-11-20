@@ -282,6 +282,10 @@ pub fn builtins() -> Vec<Command> {
         ]),
         Command::handler("themes.appearance", "Themes", "Dark, light or follow the system…", crate::pickers::switch_appearance)
             .keywords(&["dark mode", "light mode", "night", "day", "system", "appearance", "auto"]),
+        Command::handler("themes.create_custom", "Themes", "Create custom theme…", |_, cx| {
+            crate::settings_window::open_create_custom_theme(cx);
+        })
+        .keywords(&["new", "palette", "colors", "customize", "save"]),
         Command::action("snippets.find", "Snippets", "Find and fill in a command", "snippets").keywords(&[
             "cheatsheet",
             "how do i",
