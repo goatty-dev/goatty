@@ -1188,7 +1188,8 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                         s.send(&ClientMsg::Attach { req, session, size: p.size, opts: s.opts });
                     }
                     drop(panes);
-                    if let Some(mut saved) = s.layout.lock().take() {
+                    let saved = s.layout.lock().take();
+                    if let Some(mut saved) = saved {
                         let cur = s.link_gen.load(Ordering::Acquire);
                         s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
                         if saved.detached {

@@ -801,6 +801,10 @@ impl Workspace {
     /// Clean up a newly spawned `session` whose target host group or tab was
     /// detached or closed while the spawn was in flight.
     fn discard_spawned_session(&self, session: Arc<Session>, cx: &mut Context<'_, Self>) {
+        toast::show(
+            cx,
+            Toast::info("New session not opened").body("The tab or host it was started for was closed or detached.").key("workspace.spawn"),
+        );
         if !session.detach() {
             cx.background_executor().spawn(async move { session.kill() }).detach();
         }
