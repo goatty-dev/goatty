@@ -264,6 +264,9 @@ pub struct Workspace {
     folded: Vec<groups::HostKey>,
     /// The tab last active in each host's group (by id).
     group_focus: Vec<(groups::HostKey, u64)>,
+    /// Incremented per host group whenever that group is detached or loses all
+    /// its tabs, so an in-flight `spawn` for a departed group does not reopen it.
+    host_epochs: Vec<(groups::HostKey, u64)>,
     /// What panes told (toasts, desktop notifications; `notices`).
     notices: notices::Notices,
     _subscriptions: Vec<Subscription>,
@@ -337,6 +340,7 @@ impl Workspace {
             panes_bounds: Rc::default(),
             folded: Vec::new(),
             group_focus: Vec::new(),
+            host_epochs: Vec::new(),
             notices: Default::default(),
             _subscriptions: vec![appearance, button_layout, settings, activation, bounds],
         };
@@ -345,7 +349,7 @@ impl Workspace {
                 this.home = Some(spawner.clone());
                 crate::shell_sync::on_connect(spawner.host_link(), false, cx);
                 match startup {
-                    Startup::Session(session) => this.insert_pane(session, Placement::NewTab, spawner, window, cx),
+                    Startup::Session(session) => this.insert_pane(session, Placement::NewTab, spawner, None, window, cx),
                     Startup::Restore(r) => {
                         if let Some(w) = r.window {
                             w.apply(window);
@@ -730,6 +734,17 @@ impl Workspace {
 
     // ---- creating and closing panes -----------------------------------------
 
+    fn host_epoch(&self, key: &groups::HostKey) -> u64 {
+        self.host_epochs.iter().find(|(k, _)| k == key).map_or(0, |(_, e)| *e)
+    }
+
+    fn bump_host_epoch(&mut self, key: &groups::HostKey) {
+        match self.host_epochs.iter_mut().find(|(k, _)| k == key) {
+            Some((_, e)) => *e = e.wrapping_add(1),
+            None => self.host_epochs.push((key.clone(), 1)),
+        }
+    }
+
     /// Start a session in the background and put it at `placement`: on the
     /// active tab's host (the window's first host while it connects).
     fn spawn(&mut self, placement: Placement, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -744,6 +759,7 @@ impl Workspace {
             toast::show_in(window, cx, toast);
             return;
         };
+        let spawn_epoch = self.host_epoch(&groups::HostKey::of(&spawner));
         // Same size and directory as the focused pane; the new pane resizes
         // itself on its first layout.
         let (size, cwd) = match self.focused_view() {
@@ -761,7 +777,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(session) => this.insert_pane(session, placement, spawner, window, cx),
+                Ok(session) => this.insert_pane(session, placement, spawner, Some(spawn_epoch), window, cx),
                 Err(e) => {
                     let toast = Toast::error("Couldn't start a shell").body(format!("{e:#}")).key("workspace.spawn");
                     toast::show_in(window, cx, toast);
@@ -782,24 +798,42 @@ impl Workspace {
         Pane { id, view, seen: 0, _subscriptions: [events, focused] }
     }
 
+    /// Clean up a newly spawned `session` whose target host group or tab was
+    /// detached or closed while the spawn was in flight.
+    fn discard_spawned_session(&self, session: Arc<Session>, cx: &mut Context<'_, Self>) {
+        if !session.detach() {
+            cx.background_executor().spawn(async move { session.kill() }).detach();
+        }
+    }
+
     /// Put `session` (from `spawner`) at `placement`.
     fn insert_pane(
         &mut self,
         session: Arc<Session>,
         placement: Placement,
         spawner: Spawner,
+        spawn_epoch: Option<u64>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let host_key = groups::HostKey::of(&spawner);
+        if spawn_epoch.is_some_and(|e| self.host_epoch(&host_key) != e) {
+            self.discard_spawned_session(session, cx);
+            return;
+        }
         let min = self.min_pane_size(cx);
-        let pane = self.make_pane(session, window, cx);
-        let id = pane.id;
 
-        // A split whose pane went away, or no longer has room (another split
-        // finished first), while the shell started opens a tab.
+        // A split whose source tab still exists but no longer has room (or
+        // whose target pane was removed from that tab's split) opens a tab; a
+        // split whose source tab was closed or detached is discarded so it
+        // cannot reopen a departed tab or host group.
         let target = match placement {
             Placement::Split { tab, of, dir } => {
-                let found = self.tab_index(tab).filter(|&i| self.tabs[i].tree.contains(of));
+                let Some(tab_ix) = self.tab_index(tab) else {
+                    self.discard_spawned_session(session, cx);
+                    return;
+                };
+                let found = self.tabs[tab_ix].tree.contains(of).then_some(tab_ix);
                 let fits = found.filter(|&i| self.tabs[i].tree.can_split(of, dir, min));
                 if found.is_some() && fits.is_none() {
                     let toast = Toast::info("Opened in a new tab").body("There was no longer room for another pane there.");
@@ -809,6 +843,8 @@ impl Workspace {
             }
             Placement::NewTab => None,
         };
+        let pane = self.make_pane(session, window, cx);
+        let id = pane.id;
         let index = match target {
             Some((i, of, dir)) => {
                 let tab = &mut self.tabs[i];
@@ -885,6 +921,10 @@ impl Workspace {
             self.close_menu_of_tab(id, window, cx);
         }
         let tab = self.tabs.remove(index);
+        let key = self.host_key(&tab);
+        if !self.tabs.iter().any(|t| self.host_key(t) == key) {
+            self.bump_host_epoch(&key);
+        }
         for pane in &tab.panes {
             self.forget_notices(pane.id, cx);
         }
@@ -1077,42 +1117,106 @@ impl Workspace {
         if any_connecting { Some("Still connecting") } else { Some("No goattyd (--local)") }
     }
 
+    fn tab_all_panes_detachable(&self, index: usize, cx: &gpui::App) -> bool {
+        let Some(tab) = self.tabs.get(index) else { return false };
+        tab.connecting.is_none() && !tab.panes.is_empty() && tab.panes.iter().all(|p| p.view.read(cx).session().can_detach())
+    }
+
     fn can_detach_target(&self, target: &CloseTarget, cx: &gpui::App) -> bool {
         match target {
             CloseTarget::Pane(id) => self.cannot_detach_pane(*id, cx).is_none(),
-            CloseTarget::Tab(id) => self.tab_index(*id).is_some_and(|i| self.cannot_detach_tab(i, cx).is_none()),
-            CloseTarget::Tabs(ids) => self.cannot_detach_tabs(ids, cx).is_none(),
+            CloseTarget::Tab(id) => self.tab_index(*id).is_some_and(|i| self.tab_all_panes_detachable(i, cx)),
+            CloseTarget::Tabs(ids) => {
+                !ids.is_empty() && ids.iter().all(|id| self.tab_index(*id).is_some_and(|i| self.tab_all_panes_detachable(i, cx)))
+            }
         }
     }
 
-    /// Before detaching `leaving_tabs`, release the `HostLayout` of any
-    /// `goattyd` connection that will have no tabs left in this window, so
-    /// `save_layout` / `forget_layouts` does not delete the saved layout on
-    /// that `goattyd`.
-    fn detach_host_layouts_for(&mut self, leaving_tabs: &[u64], cx: &mut Context<'_, Self>) {
-        self.save_layout(cx);
-        let tabs = &self.tabs;
-        self.layouts.retain_mut(|layout| {
-            let still_has_tabs = tabs.iter().any(|t| {
-                !leaving_tabs.contains(&t.id) && t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, &layout.conn))
-            });
-            if still_has_tabs {
-                return true;
+    /// Serialize the subset of `self.tabs` matching `include` into a
+    /// [`SavedWorkspace`] `(sessions, json)`.
+    fn serialize_tabs_subset(&self, include: impl Fn(&Tab) -> bool, cx: &gpui::App) -> Option<(Vec<goatty_proto::SessionId>, String)> {
+        let mut sessions = Vec::new();
+        let mut tabs = Vec::new();
+        let mut before_active = 0;
+        for (i, t) in self.tabs.iter().enumerate() {
+            if !include(t) {
+                continue;
             }
-            let sessions: Vec<goatty_proto::SessionId> = tabs
+            let session_of = |id: PaneId| t.pane(id).and_then(|p| p.view.read(cx).session().daemon_id());
+            let Some(tree) = t.tree.map_leaves(&mut |id| session_of(id)) else { continue };
+            sessions.extend(tree.leaves());
+            let focused = session_of(t.focused).unwrap_or_else(|| tree.leaves()[0]);
+            tabs.push(SavedTab { name: t.name.clone(), tree, focused, zoomed: t.zoomed });
+            if i < self.active {
+                before_active += 1;
+            }
+        }
+        if tabs.is_empty() {
+            return None;
+        }
+        let active = before_active.min(tabs.len() - 1);
+        let saved = SavedWorkspace { version: saved::VERSION, tabs, active, window: Some(self.window) };
+        let json = serde_json::to_string(&saved).ok()?;
+        Some((sessions, json))
+    }
+
+    /// Release the saved layout of any host group that has no tabs left in
+    /// this window outside `leaving_tabs`.
+    ///
+    /// When a connection has no surviving tabs at all (and only one host group
+    /// on that connection is departing), its `HostLayout` entry is removed and
+    /// published via `Connection::detach_layout` so `save_layout` /
+    /// `forget_layouts` will not wipe it on `goattyd`. When a departing host
+    /// group shares its connection with another group (such as a plain SSH
+    /// group sharing the local daemon with local tabs), a separate reclaimable
+    /// layout is saved and detached for the departing group while the surviving
+    /// group keeps the window's `HostLayout`.
+    fn detach_host_layouts_for(&mut self, leaving_tabs: &[u64], cx: &mut Context<'_, Self>) {
+        let mut departing_groups: Vec<(groups::HostKey, Arc<Connection>)> = Vec::new();
+        for t in self.tabs.iter().filter(|t| leaving_tabs.contains(&t.id)) {
+            let Some(conn) = t.host.as_ref().and_then(Spawner::connection) else { continue };
+            let key = self.host_key(t);
+            if departing_groups.iter().any(|(k, _)| *k == key) {
+                continue;
+            }
+            let group_survives = self.tabs.iter().any(|other| !leaving_tabs.contains(&other.id) && self.host_key(other) == key);
+            if !group_survives {
+                departing_groups.push((key, conn.clone()));
+            }
+        }
+
+        for (key, conn) in departing_groups {
+            let conn_has_other_tabs = self
+                .tabs
                 .iter()
-                .filter(|t| t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, &layout.conn)))
-                .flat_map(|t| t.panes.iter())
-                .filter_map(|p| p.view.read(cx).session().daemon_id())
-                .collect();
-            layout.conn.detach_layout(layout.id, sessions, std::mem::take(&mut layout.json));
-            false
+                .any(|t| self.host_key(t) != key && t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, &conn)));
+            if !conn_has_other_tabs {
+                if let Some(pos) = self.layouts.iter().position(|l| Arc::ptr_eq(&l.conn, &conn)) {
+                    let layout = self.layouts.remove(pos);
+                    if let Some((sessions, json)) = self.serialize_tabs_subset(|t| self.host_key(t) == key, cx) {
+                        let json = if layout.json.is_empty() { json } else { layout.json };
+                        layout.conn.detach_layout(layout.id, sessions, json);
+                    }
+                }
+            } else if let Some((sessions, json)) = self.serialize_tabs_subset(|t| self.host_key(t) == key, cx) {
+                let id = saved::new_id();
+                conn.save_layout(id, sessions.clone(), json.clone());
+                conn.detach_layout(id, sessions, json);
+            }
+        }
+
+        // Remove any `HostLayout` whose connection has no surviving tabs left.
+        let tabs = &self.tabs;
+        self.layouts.retain(|layout| {
+            tabs.iter().any(|t| {
+                !leaving_tabs.contains(&t.id) && t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, &layout.conn))
+            })
         });
     }
 
-    /// Unsubscribe the sessions of `leaving_panes` on their `goattyd` unless
-    /// another remaining pane in this window is still attached to the same
-    /// session.
+    /// Unsubscribe the sessions of `leaving_panes` on their `goattyd` (unless
+    /// another remaining pane in this window still shares the same session, or
+    /// another window on the pooled connection took over the subscription).
     fn detach_panes_by_id(&self, leaving_panes: &[PaneId], cx: &gpui::App) {
         let mut sessions = Vec::new();
         for t in &self.tabs {
@@ -1124,14 +1228,14 @@ impl Workspace {
         }
         for s in sessions {
             let (Some(conn), Some(sid)) = (s.connection(), s.daemon_id()) else { continue };
-            let still_shown = self.tabs.iter().flat_map(|t| t.panes.iter()).any(|p| {
+            let still_shown_here = self.tabs.iter().flat_map(|t| t.panes.iter()).any(|p| {
                 if leaving_panes.contains(&p.id) {
                     return false;
                 }
                 let other = p.view.read(cx).session();
                 other.daemon_id() == Some(sid) && other.connection().is_some_and(|c| Arc::ptr_eq(c, conn))
             });
-            if !still_shown {
+            if !still_shown_here {
                 s.detach();
             }
         }
@@ -1150,10 +1254,13 @@ impl Workspace {
         let label = pane_label(pane.view.read(cx));
         let only_pane = self.tabs[index].tree == Node::Leaf(id);
         if only_pane {
+            self.save_layout(cx);
+        }
+        self.detach_panes_by_id(&[id], cx);
+        if only_pane {
             let tab_id = self.tabs[index].id;
             self.detach_host_layouts_for(&[tab_id], cx);
         }
-        self.detach_panes_by_id(&[id], cx);
         self.remove_pane(id, window, cx);
         if !self.tabs.is_empty() {
             let toast =
@@ -1208,8 +1315,9 @@ impl Workspace {
         }
         let n_tabs = detachable_ids.len();
         let n_sessions = pane_ids.len();
-        self.detach_host_layouts_for(&detachable_ids, cx);
+        self.save_layout(cx);
         self.detach_panes_by_id(&pane_ids, cx);
+        self.detach_host_layouts_for(&detachable_ids, cx);
         self.remove_tabs(&detachable_ids, window, cx);
         if !self.tabs.is_empty() {
             let title = match (n_tabs, single_label) {
@@ -1254,8 +1362,9 @@ impl Workspace {
             .map(|p| p.id)
             .collect();
         let n_sessions = pane_ids.len();
-        self.detach_host_layouts_for(&detachable_ids, cx);
+        self.save_layout(cx);
         self.detach_panes_by_id(&pane_ids, cx);
+        self.detach_host_layouts_for(&detachable_ids, cx);
         self.remove_tabs(&detachable_ids, window, cx);
         if !self.tabs.is_empty() {
             let body = if n_sessions == 1 {

@@ -437,9 +437,11 @@ pub fn builtins() -> Vec<Command> {
             "leave",
         ]),
         Command::handler("tab.detach_host_pick", "Tabs", "Detach from a host…", |window, cx| {
-            if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {
-                ws.update(cx, |ws, cx| ws.ask_detach_host(window, cx));
-            }
+            window.defer(cx, |window, cx| {
+                if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {
+                    ws.update(cx, |ws, cx| ws.ask_detach_host(window, cx));
+                }
+            });
         })
         .keywords(&["server", "remote", "group", "disconnect", "keep running", "background", "close", "leave", "choose", "pick"]),
         Command::action("tab.toggle_sidebar", "Tabs", "Fold or unfold the tab sidebar", "toggle_tab_sidebar")

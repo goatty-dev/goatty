@@ -18,11 +18,16 @@ pub const CONTEXT: &str = "CloseConfirm";
 
 const WIDTH: f32 = 460.;
 
-actions!(close_confirm, [Confirm, Cancel]);
+actions!(close_confirm, [Confirm, Cancel, Detach]);
 
 pub fn bindings() -> Vec<KeyBinding> {
     let c = Some(CONTEXT);
-    vec![KeyBinding::new("enter", Confirm, c), KeyBinding::new("escape", Cancel, c)]
+    vec![
+        KeyBinding::new("enter", Confirm, c),
+        KeyBinding::new("escape", Cancel, c),
+        KeyBinding::new("d", Detach, c),
+        KeyBinding::new("alt-d", Detach, c),
+    ]
 }
 
 /// What is being closed.
@@ -111,6 +116,12 @@ impl CloseConfirm {
         self.finish(CloseChoice::Cancel, cx);
     }
 
+    fn detach(&mut self, _: &Detach, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.can_detach {
+            self.finish(CloseChoice::Detach, cx);
+        }
+    }
+
     fn done(&self, cx: &mut Context<'_, Self>, choice: CloseChoice) -> impl Fn(&mut Window, &mut App) + 'static {
         let this = cx.entity().downgrade();
         move |_, cx| {
@@ -134,9 +145,9 @@ impl Render for CloseConfirm {
             Closing::Tabs { .. } => "Close tabs",
         };
         let detach_label = match self.closing {
-            Closing::Pane => "Detach pane",
-            Closing::Tab { .. } => "Detach tab",
-            Closing::Tabs { .. } => "Detach tabs",
+            Closing::Pane => "Detach pane (D)",
+            Closing::Tab { .. } => "Detach tab (D)",
+            Closing::Tabs { .. } => "Detach tabs (D)",
         };
         let this = cx.entity().downgrade();
         let flip = move |_: &mut Window, cx: &mut App| {
@@ -151,6 +162,7 @@ impl Render for CloseConfirm {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::detach))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish(CloseChoice::Cancel, cx)))
             .occlude()
             .w(px(WIDTH))

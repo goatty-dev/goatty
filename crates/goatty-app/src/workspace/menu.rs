@@ -257,8 +257,16 @@ impl Workspace {
         pane_items.push(Entry::Separator);
         pane_items.push(Item::action("New tab", "new_tab", cx).icon(Icon::Plus).into());
         pane_items.push(Entry::Separator);
-        pane_items
-            .push(Item::action("Detach the pane", "detach_pane", cx).icon(Icon::Unlink).disabled(self.cannot_detach_pane(pane, cx)).into());
+        {
+            let me = cx.entity().downgrade();
+            let mut item = Item::new("Detach the pane", move |window: &mut Window, cx: &mut gpui::App| {
+                let _ = me.update(cx, |this, cx| this.detach_pane_by_id(pane, window, cx));
+            })
+            .icon(Icon::Unlink)
+            .disabled(self.cannot_detach_pane(pane, cx));
+            item.shortcut = context_menu::shortcut("detach_pane", cx);
+            pane_items.push(item.into());
+        }
         pane_items.push(Item::action("Close the pane", "close_pane", cx).icon(Icon::Close).danger().into());
         entries.push(Item::submenu("Pane", pane_items).icon(Icon::AppWindow).into());
 
