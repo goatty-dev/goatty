@@ -346,19 +346,36 @@ pub fn start(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let fill = cmd.menu.as_ref().and_then(|m| m.fill.as_deref());
-    let selection = selection.map(selection_value);
     if cmd.inputs.is_empty() {
         run(cmd, origin, &Answers::new(), window, cx);
         return;
     }
-    // Sources run in the focused pane's directory (on the host it reports).
-    let cwd = window
-        .root::<crate::workspace::Workspace>()
-        .flatten()
-        .and_then(|ws| ws.read(cx).focused_terminal())
-        .and_then(|v| v.read(cx).cwd())
-        .map(|c| c.to_string_lossy().into_owned());
+    let (plugin_id, plugin, cmd, origin, selection) =
+        (plugin_id.to_string(), plugin.to_string(), cmd.clone(), origin.clone(), selection.map(str::to_string));
+    // Deferred: the palette runs commands from inside the workspace.
+    window.defer(cx, move |window, cx| {
+        // Sources run in the focused pane's directory (on the host it reports).
+        let cwd = window
+            .root::<crate::workspace::Workspace>()
+            .flatten()
+            .and_then(|ws| ws.read(cx).focused_terminal())
+            .and_then(|v| v.read(cx).cwd())
+            .map(|c| c.to_string_lossy().into_owned());
+        let a = ask_for(&plugin_id, &plugin, &cmd, &origin, selection.as_deref(), cwd);
+        ask(window, cx, a);
+    });
+}
+
+fn ask_for(
+    plugin_id: &str,
+    plugin: &str,
+    cmd: &Rc<PaletteCommand>,
+    origin: &HostLink,
+    selection: Option<&str>,
+    cwd: Option<String>,
+) -> Ask {
+    let fill = cmd.menu.as_ref().and_then(|m| m.fill.as_deref());
+    let selection = selection.map(selection_value);
     let fields = cmd
         .inputs
         .iter()
@@ -374,15 +391,14 @@ pub fn start(
     let id = command_id(plugin_id, &cmd.id);
     let (then, then_origin) = (cmd.clone(), origin.clone());
     let title = format!("{plugin}: {}", cmd.title);
-    let a = Ask::new(title, fields, move |answers, window, cx| {
+    Ask::new(title, fields, move |answers, window, cx| {
         if !can_submit(&id, &then, &then_origin, cx) {
             crate::toast::show_in(window, cx, unavailable_toast(&id, Some((&then, &then_origin)), true, cx));
             return;
         }
         run(&then, &then_origin, answers, window, cx);
     })
-    .remote(!origin.is_local());
-    ask(window, cx, a);
+    .remote(!origin.is_local())
 }
 
 /// Fetches `input`'s suggestions from the host (`CommandSuggest`) with the
@@ -594,5 +610,50 @@ run = ["docker", "ps"]
         assert!(should_report_issues(&mut state, &issues));
         assert!(!should_report_issues(&mut state, &[]));
         assert!(should_report_issues(&mut state, &issues));
+    }
+
+    #[test]
+    fn ask_for_builds_fields_with_source_loader_and_selection_fill() {
+        let m = goatty_plugin::manifest::parse(
+            r#"
+schema = 1
+id = "github"
+name = "GitHub CLI"
+version = "1.0.0"
+summary = "GitHub"
+publisher = "tests"
+
+[permissions]
+snippet-sources = "Lists pull requests."
+
+[requires]
+commands = ["gh"]
+
+[[command]]
+id = "pr-checkout"
+title = "Check out a pull request"
+run = ["gh", "pr", "checkout", "{pr}"]
+[command.menu]
+when = "selection"
+fill = "pr"
+
+[[command.input]]
+id = "pr"
+label = "Pull request"
+[command.input.source]
+run = ["gh", "pr", "list"]
+"#,
+            None,
+        )
+        .unwrap();
+        let cmd = Rc::new(m.commands[0].clone());
+        let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let ask = ask_for(&m.id, &m.name, &cmd, &link, Some("  245\nextra"), Some("/tmp/repo".into()));
+        assert_eq!(ask.title.as_ref(), "GitHub CLI: Check out a pull request");
+        assert!(ask.local);
+        assert_eq!(ask.fields.len(), 1);
+        assert_eq!(ask.fields[0].spec.id, "pr");
+        assert_eq!(ask.fields[0].spec.default.as_deref(), Some("245"));
+        assert!(ask.fields[0].loader.is_some());
     }
 }
