@@ -614,6 +614,15 @@ fn free_layouts_are_listed_and_claimed_by_id() {
     assert_eq!(c.claim_layout_id(1).unwrap(), None, "held now");
     assert_eq!(c.claim_layout_id(99).unwrap(), None);
     assert_eq!(c.claim_layout().unwrap().map(|l| l.id), Some(2));
+
+    // Tabs detached in one goatty are free for another right away (v16
+    // `ReleaseLayout`), while the first stays connected.
+    let s3 = c.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    c.save_layout(3, vec![s3], "detached".into());
+    c.detach_layout(3, vec![s3], "detached".into());
+    let other = Connection::open(proxy_endpoint(&d), "another goatty").unwrap();
+    eventually("the detached layout is listed elsewhere", || other.list_layouts().unwrap().iter().any(|l| l.id == 3));
+    assert_eq!(other.claim_layout_id(3).unwrap().map(|l| l.sessions), Some(vec![s3]));
 }
 
 #[test]

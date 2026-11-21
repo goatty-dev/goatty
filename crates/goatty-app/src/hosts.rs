@@ -68,15 +68,43 @@ pub mod pool {
         live.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade())
     }
 
+    /// Opens in progress, per key: a second caller waits for the first
+    /// (reopened windows connect to the same host at once) instead of
+    /// logging in twice.
+    static OPENING: Mutex<Vec<(String, Arc<Mutex<()>>)>> = Mutex::new(Vec::new());
+
     /// The open connection to `endpoint`, else a new one. Blocks (ssh can
-    /// take seconds): call it off the UI thread.
+    /// take seconds): call it off the UI thread. Concurrent calls for one
+    /// host share one connection attempt.
     pub fn open(endpoint: Endpoint) -> Result<Arc<Connection>> {
         if let Some(conn) = live(&endpoint) {
             return Ok(conn);
         }
-        let conn = Connection::open(endpoint, crate::CLIENT)?;
-        add(&conn);
-        Ok(conn)
+        let Some(k) = key(&endpoint) else { return Connection::open(endpoint, crate::CLIENT) };
+        let gate = {
+            let mut opening = OPENING.lock();
+            match opening.iter().find(|(o, _)| *o == k) {
+                Some((_, g)) => g.clone(),
+                None => {
+                    let g = Arc::new(Mutex::new(()));
+                    opening.push((k.clone(), g.clone()));
+                    g
+                }
+            }
+        };
+        let result = {
+            let _turn = gate.lock();
+            // The one before us may have connected meanwhile.
+            match live(&endpoint) {
+                Some(conn) => Ok(conn),
+                None => Connection::open(endpoint, crate::CLIENT).inspect(add),
+            }
+        };
+        let mut opening = OPENING.lock();
+        if Arc::strong_count(&gate) <= 2 {
+            opening.retain(|(o, g)| *o != k || !Arc::ptr_eq(g, &gate));
+        }
+        result
     }
 
     /// Share `conn` from now on (opened elsewhere, e.g. after installing goattyd).

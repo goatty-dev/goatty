@@ -236,6 +236,25 @@ impl Workspace {
         } else {
             new_tab.h_full().px(px(10.)).child("+")
         };
+        // Where else a new tab can go: the same menu as a right click on +.
+        let more = div()
+            .id("tab-new-more")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(c.hover))
+            .tooltip(tooltip("New tab on another host, detached tabs, new window"))
+            .child(Icon::ChevronDown.svg().size(px(if modern { 12. } else { 11. })).text_color(c.ui.muted))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_new_tab_menu(ev.position, window, cx);
+                }),
+            );
+        let more = if modern { more.w(px(16.)).h(px(28.)).mb(px(2.)).rounded_md() } else { more.h_full().px(px(4.)) };
         let settings = div()
             .id("tab-settings")
             .flex_none()
@@ -282,6 +301,7 @@ impl Workspace {
                     .children(items),
             )
             .child(new_tab)
+            .child(more)
             .child(rest)
             .child(settings)
             .children(right);

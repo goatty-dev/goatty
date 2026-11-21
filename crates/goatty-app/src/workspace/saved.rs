@@ -309,6 +309,46 @@ fn attach_all(conn: &Arc<Connection>, size: TermSize, ids: &[SessionId]) -> Resu
     Ok(sessions)
 }
 
+/// Reattach `tabs` (just detached from this window: "Undo"). A layout
+/// kept for them meanwhile (a detached host's) is forgotten: they're back.
+pub fn reattach(conn: &Arc<Connection>, size: TermSize, tabs: Vec<SavedTab>) -> Result<Option<Restored>> {
+    let ids: Vec<SessionId> = tabs.iter().flat_map(|t| t.tree.leaves()).collect();
+    let sessions = attach_all(conn, size, &ids)?;
+    match conn.list_layouts() {
+        Ok(layouts) => {
+            for l in layouts.iter().filter(|l| !l.sessions.is_empty() && l.sessions.iter().all(|s| sessions.contains_key(s))) {
+                if matches!(conn.claim_layout_id(l.id), Ok(Some(_))) {
+                    conn.save_layout(l.id, Vec::new(), String::new());
+                }
+            }
+        }
+        Err(e) => log::warn!("listing the saved layouts: {e:#}"),
+    }
+    let attached: HashSet<SessionId> = sessions.keys().copied().collect();
+    let saved = SavedWorkspace { version: VERSION, active: tabs.len().saturating_sub(1), tabs, window: None };
+    let Some((tabs, active)) = prune(saved, &attached) else { return Ok(None) };
+    Ok(Some(Restored { id: new_id(), claimed: false, tabs, active, sessions, window: None }))
+}
+
+/// `layouts` with only their sessions still running (`sessions`: the
+/// host's), and without the ones left empty: a layout this connection
+/// detached isn't pruned by the daemon.
+pub fn live_layouts(layouts: Vec<goatty_proto::LayoutInfo>, sessions: &[goatty_proto::SessionInfo]) -> Vec<goatty_proto::LayoutInfo> {
+    let alive: HashSet<SessionId> = sessions.iter().map(|s| s.id).collect();
+    layouts
+        .into_iter()
+        .filter_map(|mut l| {
+            l.sessions.retain(|s| alive.contains(s));
+            (!l.sessions.is_empty()).then_some(l)
+        })
+        .collect()
+}
+
+/// Does saved layout `info` hold a plain SSH tab to `host`?
+pub fn has_plain_tab(info: &goatty_proto::LayoutInfo, host: &str) -> bool {
+    serde_json::from_str::<SavedWorkspace>(&info.json).is_ok_and(|s| s.tabs.iter().any(|t| t.plain.as_deref() == Some(host)))
+}
+
 /// The detached sessions on `conn` that no saved layout shows (those come
 /// back with their layout), oldest first.
 pub fn loose_detached(sessions: &[goatty_proto::SessionInfo], layouts: &[goatty_proto::LayoutInfo]) -> Vec<SessionId> {
@@ -343,7 +383,16 @@ pub fn summary(info: &goatty_proto::LayoutInfo, title: impl Fn(SessionId) -> Opt
     let alive: HashSet<SessionId> = info.sessions.iter().copied().collect();
     let (tabs, _) = prune(saved, &alive)?;
     let panes = tabs.iter().map(|t| t.tree.leaves().len()).sum();
-    let names = tabs.iter().map(|t| t.name.clone().or_else(|| title(t.focused)).unwrap_or_else(|| "shell".into())).collect();
+    let names = tabs
+        .iter()
+        .map(|t| {
+            t.name
+                .clone()
+                .or_else(|| title(t.focused))
+                .or_else(|| t.plain.as_ref().map(|h| format!("ssh {h}")))
+                .unwrap_or_else(|| "shell".into())
+        })
+        .collect();
     Some((tabs.len(), panes, names))
 }
 

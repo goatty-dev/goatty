@@ -202,6 +202,7 @@ impl Workspace {
                 .hover(|s| s.bg(c.hover).text_color(c.ui.text))
                 .child(Icon::Plus.svg().size(px(16.)).text_color(c.ui.muted))
                 .child("New tab")
+                .tooltip(tooltip("New tab (right-click for more)"))
                 .on_click(dispatch(NewTab))
                 .on_mouse_down(gpui::MouseButton::Right, cx.listener(Self::on_new_tab_right_click));
             let footer = div()

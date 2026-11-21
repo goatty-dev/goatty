@@ -404,13 +404,17 @@ impl Workspace {
         );
         entries.push(Entry::Separator);
         // Tabs detached there before (or left by a closed window), all at once.
-        let host = self.tabs.get(g.tabs[0]).and_then(|t| t.host.as_ref()).and_then(super::host_ref_of);
-        let reattach = match host {
+        let spawner = self.tabs.get(g.tabs[0]).and_then(|t| t.host.as_ref());
+        let plain = match spawner {
+            Some(crate::session::Spawner::Plain { host, .. }) => Some(host.clone()),
+            _ => None,
+        };
+        let reattach = match spawner.and_then(super::host_ref_of) {
             Some(host) => Item::new(format!("Reattach detached tabs on {}", g.label), {
                 let me = me.clone();
                 move |window: &mut Window, cx: &mut gpui::App| {
-                    let host = host.clone();
-                    let _ = me.update(cx, |this, cx| this.reattach_detached_on(host, window, cx));
+                    let (host, plain) = (host.clone(), plain.clone());
+                    let _ = me.update(cx, |this, cx| this.reattach_detached_on(host, plain, window, cx));
                 }
             }),
             None => Item::new("Reattach detached tabs", |_: &mut Window, _: &mut gpui::App| {})
@@ -500,8 +504,13 @@ impl Workspace {
         hosts.push(Item::action("Another host…", "connect_to_host", cx).into());
         entries.push(Item::submenu("New tab on…", hosts).icon(Icon::Server).into());
         entries.push(Entry::Separator);
-        let connected = self.active_tab().is_some_and(|t| t.host.as_ref().is_some_and(|h| h.connection().is_some()));
-        let not_here = (!connected).then_some("This tab isn't on a goattyd yet");
+        let not_here = match self.active_tab().map(|t| t.host.as_ref().map(super::host_ref_of)) {
+            Some(Some(Some(_))) => None,
+            Some(None) => Some("This tab is still connecting"),
+            _ => Some("This tab isn't kept by a goattyd"),
+        };
+        // `~/.ssh/config` may have changed since.
+        crate::hosts::refresh(cx);
         entries.push(Item::action("Reattach detached tabs", "reattach_detached", cx).icon(Icon::History).disabled(not_here).into());
         entries.push(Item::action("Sessions on this host…", "list_sessions", cx).icon(Icon::AppWindow).disabled(not_here).into());
         entries.push(Entry::Separator);

@@ -124,6 +124,16 @@ impl Layouts {
         free.into_iter().map(|(_, l)| l).collect()
     }
 
+    /// `conn` lets go of layout `id` (detached tabs): free, and the newest.
+    pub(crate) fn release_one(&mut self, conn: u64, id: LayoutId, now_unix: u64) {
+        let Some(record) = self.map.get_mut(&id).filter(|r| r.owner == Some(conn)) else { return };
+        record.owner = None;
+        self.seq += 1;
+        record.seq = self.seq;
+        record.saved_unix = now_unix;
+        self.trim();
+    }
+
     /// `conn` ended: its layouts are free for the next window.
     pub(crate) fn release(&mut self, conn: u64) {
         for r in self.map.values_mut().filter(|r| r.owner == Some(conn)) {
@@ -204,6 +214,20 @@ mod tests {
         assert!(l.claim_id(8, 20, |s| s != 3).is_none());
         assert!(!l.map.contains_key(&20));
         assert_eq!(l.claim(8, |_| true).unwrap().id, 30);
+    }
+
+    #[test]
+    fn releasing_one_layout_frees_it_as_the_newest() {
+        let mut l = Layouts::default();
+        save(&mut l, 1, 10, &[1]);
+        save(&mut l, 2, 20, &[2]);
+        l.release(2);
+        // Only the owner can let go.
+        l.release_one(2, 10, 5);
+        assert_eq!(l.list_free(|_| true).iter().map(|i| i.id).collect::<Vec<_>>(), [20]);
+        l.release_one(1, 10, 5);
+        let free = l.list_free(|_| true);
+        assert_eq!(free.iter().map(|i| (i.id, i.saved_unix)).collect::<Vec<_>>(), [(10, 5), (20, 0)]);
     }
 
     #[test]

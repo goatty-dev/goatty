@@ -114,11 +114,14 @@ fn main() -> Result<()> {
     let mut reopen = if on_launch == OnLaunch::Reattach && mode == AttachMode::Auto && matches!(endpoint, Some(Endpoint::Local)) {
         workspace::reopen::take_for_launch()
     } else {
+        if on_launch != OnLaunch::Reattach {
+            workspace::reopen::forget_dead();
+        }
         Vec::new()
     };
     if !reopen.is_empty() {
-        let first = Initial::Reopen(reopen.remove(0));
-        app::run(first, reopen.into_iter().map(Initial::Reopen).collect(), open_settings);
+        let first = Initial::Reopen(reopen.remove(0), None);
+        app::run(first, reopen.into_iter().map(|r| Initial::Reopen(r, None)).collect(), open_settings);
         return Ok(());
     }
     let initial = match endpoint {

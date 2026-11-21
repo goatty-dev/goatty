@@ -18,7 +18,8 @@
 //! closed) to restore all at once, one entry per window's worth (#252);
 //! then a new session, "reattach every detached session" (a tab each), and
 //! each session. Enter opens one where `ssh.open_in` says (a new tab or
-//! window), Shift+Enter the other way. Shift+Delete (or the row's
+//! window), Shift+Enter the other way. Shift+Delete on a "Restore N tabs"
+//! entry (twice) ends those tabs' shells. Shift+Delete (or the row's
 //! trash button), pressed twice, ends a session without opening it: the
 //! daemon keeps sessions even across its own restarts, so old ones pile up
 //! otherwise. Escape goes back to the hosts.
@@ -444,7 +445,7 @@ pub struct CommandPalette {
     status: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
     /// The session the next Shift+Delete ends (the first one asks).
-    ending: Option<SessionId>,
+    ending: Option<SharedString>,
     asking: Option<Asking>,
     _subscriptions: Vec<Subscription>,
 }
@@ -643,7 +644,7 @@ impl CommandPalette {
 
     fn select(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
         let ix = ix.min(self.hits.len().saturating_sub(1));
-        if ix != self.selected || self.ending.is_some_and(|id| self.session_at(ix) != Some(id)) {
+        if ix != self.selected || self.ending.as_ref().is_some_and(|id| self.endable_at(ix).map(|(e, _)| e).as_ref() != Some(id)) {
             self.disarm_end();
         }
         self.selected = ix;
@@ -1126,6 +1127,7 @@ impl CommandPalette {
                         log::warn!("listing the saved layouts: {e:#}");
                         Vec::new()
                     });
+                    let layouts = crate::workspace::saved::live_layouts(layouts, &list);
                     anyhow::Ok((conn, list, layouts))
                 })
                 .await;
@@ -1153,13 +1155,17 @@ impl CommandPalette {
         }));
     }
 
-    /// The session listed at hit `ix` ([`Scope::Sessions`]).
-    fn session_at(&self, ix: usize) -> Option<SessionId> {
+    /// What Shift+Delete at hit `ix` ends ([`Scope::Sessions`]): the
+    /// entry's id and its sessions (a session's one, a saved layout's all).
+    fn endable_at(&self, ix: usize) -> Option<(SharedString, Vec<SessionId>)> {
         let hit = self.hits.get(ix)?;
-        match session_choice(&self.commands[hit.index].id)? {
-            AttachMode::Id(id) => Some(id),
-            _ => None,
-        }
+        let id = self.commands[hit.index].id.clone();
+        let sessions = match session_choice(&id)? {
+            AttachMode::Id(s) => vec![s],
+            AttachMode::Layout(l) => self.layouts.iter().find(|x| x.id == l)?.sessions.clone(),
+            _ => return None,
+        };
+        Some((id, sessions))
     }
 
     /// Forget a pending "end this session?".
@@ -1180,31 +1186,40 @@ impl CommandPalette {
         if self.asking.is_some() {
             return;
         }
-        let (Some(id), Some(conn)) = (self.session_at(ix), self.conn.clone()) else { return };
+        let (Some((key, ids)), Some(conn)) = (self.endable_at(ix), self.conn.clone()) else { return };
         let title = self.commands[self.hits[ix].index].title.clone();
+        // A saved layout's entry: "Restore 3 tabs" → "3 tabs".
+        let what = title.strip_prefix("Restore ").map_or_else(|| format!("“{title}”"), |t| format!("those {t}"));
         if self.selected != ix {
             self.select(ix, cx);
         }
-        if self.ending != Some(id) {
-            self.ending = Some(id);
-            let msg = format!("Shift+Delete again ends “{title}”: whatever runs in it stops, and a window showing it closes the pane.");
+        if self.ending.as_ref() != Some(&key) {
+            self.ending = Some(key);
+            let msg = if ids.len() == 1 {
+                format!("Shift+Delete again ends {what}: whatever runs in it stops, and a window showing it closes the pane.")
+            } else {
+                format!("Shift+Delete again ends {what} ({} shells): whatever runs in them stops.", ids.len())
+            };
             self.status = Some((msg.into(), false));
             cx.notify();
             return;
         }
         self.ending = None;
-        self.status = Some((format!("Ending “{title}”…").into(), true));
+        self.status = Some((format!("Ending {what}…").into(), true));
         cx.notify();
+        let ended = ids.clone();
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    conn.kill(id)?;
-                    // It's gone once the shell exited; list what's left then.
+                    for &id in &ids {
+                        conn.kill(id)?;
+                    }
+                    // They're gone once the shells exited; list what's left then.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                     loop {
                         let list = conn.list_sessions()?;
-                        if !list.iter().any(|s| s.id == id) || std::time::Instant::now() > deadline {
+                        if !list.iter().any(|s| ids.contains(&s.id)) || std::time::Instant::now() > deadline {
                             return anyhow::Ok(list);
                         }
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1217,14 +1232,14 @@ impl CommandPalette {
                 }
                 match result {
                     Ok(list) => {
-                        this.status = Some((format!("Ended “{title}”").into(), false));
-                        this.layouts.iter_mut().for_each(|l| l.sessions.retain(|&s| s != id));
+                        this.status = Some((format!("Ended {what}").into(), false));
+                        this.layouts.iter_mut().for_each(|l| l.sessions.retain(|s| !ended.contains(s)));
                         this.layouts.retain(|l| !l.sessions.is_empty());
                         this.sessions = session_commands(list, &this.layouts, &host, unix_now());
                     }
                     Err(e) => {
                         let first = format!("{e:#}").lines().next().unwrap_or_default().to_string();
-                        this.status = Some((format!("Couldn't end “{title}”: {first}").into(), false));
+                        this.status = Some((format!("Couldn't end {what}: {first}").into(), false));
                     }
                 }
                 this.load_commands(cx);
@@ -1314,8 +1329,9 @@ impl CommandPalette {
                 let detail = self.commands[hit.index].detail.clone();
                 let recent = hit.recent && self.query.trim().is_empty();
                 // Sessions can be ended from the list (twice: ask, then end).
-                let endable = self.conn.is_some() && self.session_at(ix).is_some();
-                let armed = endable && self.ending == self.session_at(ix);
+                let endable_at = self.endable_at(ix);
+                let endable = self.conn.is_some() && endable_at.is_some();
+                let armed = endable && self.ending.is_some() && self.ending == endable_at.map(|(e, _)| e);
                 Some(
                     div()
                         .id(ix)

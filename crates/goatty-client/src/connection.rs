@@ -1023,11 +1023,12 @@ impl Connection {
     }
 
     /// Release a saved layout (`id`, `sessions`, `json`) without deleting it
-    /// on `goattyd`, so the next [`Self::claim_layout`] (on this connection if
-    /// it stays pooled, or on a new connection once this one closes) can
-    /// restore it. If the latest layout changes have not been sent to `goattyd`
-    /// yet (for example, while the link is offline), they stay queued for
-    /// reconnect recovery as well as in the local reclaim queue.
+    /// on `goattyd`, so the next claim (by any window: v16 `ReleaseLayout`
+    /// frees it on the daemon; older daemons keep it held by this connection,
+    /// so only this connection reclaims it until it closes) can restore it.
+    /// If the latest layout changes have not been sent to `goattyd` yet (for
+    /// example, while the link is offline), they stay queued for reconnect
+    /// recovery as well as in the local reclaim queue.
     pub fn detach_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
         let mut saved = self.shared.layout.lock();
         if sessions.is_empty() || json.is_empty() {
@@ -1041,6 +1042,15 @@ impl Connection {
         let sent_gen = connected.then_some(cur);
         if connected && !already_queued {
             self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
+        }
+        if connected && self.supports_layout_list() {
+            // Free on the daemon: listed and claimed from there.
+            self.shared.send(&ClientMsg::ReleaseLayout { id });
+            saved.remove(&id);
+            let mut claimed = self.shared.claimed_layouts.lock();
+            claimed.gens.remove(&id);
+            claimed.unclaimed.retain(|(_, info)| info.id != id);
+            return;
         }
         // Keep the detached record replayable across a link drop until a claim
         // (or a newer save) takes ownership of it.
@@ -1288,9 +1298,15 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                     drop(panes);
                     let mut layout = s.layout.lock();
                     let cur = s.link_gen.load(Ordering::Acquire);
+                    let release = s.version.load(Ordering::Relaxed) >= LAYOUT_LIST_SINCE;
                     layout.retain(|_, saved| {
                         s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
                         saved.sent_gen = Some(cur);
+                        if saved.detached && release {
+                            // Detached while offline: free it on the daemon now.
+                            s.send(&ClientMsg::ReleaseLayout { id: saved.id });
+                            return false;
+                        }
                         if saved.detached {
                             let mut claimed = s.claimed_layouts.lock();
                             claimed.gens.remove(&saved.id);
@@ -1756,11 +1772,19 @@ mod tests {
     fn mock_connection(
         server_fn: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>, std::os::unix::net::UnixStream) + Send + 'static,
     ) -> (Connection, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+        mock_connection_v(PROTOCOL_VERSION, server_fn)
+    }
+
+    /// [`mock_connection`] with a daemon that speaks `version`.
+    fn mock_connection_v(
+        version: u32,
+        server_fn: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>, std::os::unix::net::UnixStream) + Send + 'static,
+    ) -> (Connection, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
         let (client_w, server_r) = std::os::unix::net::UnixStream::pair().unwrap();
         let (mut server_w, client_r) = std::os::unix::net::UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
             let hello = ServerMsg::Hello {
-                version: PROTOCOL_VERSION,
+                version,
                 daemon_pid: 1,
                 host: HostInfo { hostname: "h".into(), user: "u".into(), os: "linux".into(), daemon_version: "0".into() },
             };
@@ -1786,7 +1810,7 @@ mod tests {
             next_req: AtomicU32::new(1),
             host: Mutex::new(HostInfo::default()),
             announce: AtomicU32::new(PROTOCOL_VERSION),
-            version: AtomicU32::new(PROTOCOL_VERSION),
+            version: AtomicU32::new(version),
             daemon_pid: AtomicU32::new(1),
             link_gen: AtomicU64::new(1),
             connected: AtomicBool::new(true),
@@ -2095,7 +2119,7 @@ mod tests {
     #[test]
     fn detach_layout_allows_reclaim_on_live_link_and_clears_reconnect_layout() {
         let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection(move |mut r, w| {
+        let (conn, reader_h, server_h) = mock_connection_v(15, move |mut r, w| {
             // Drain the initial SaveLayout frame.
             match read_msg::<_, ClientMsg>(&mut r).unwrap() {
                 ClientMsg::SaveLayout { id: 99, ref sessions, ref json } => {
@@ -2129,28 +2153,7 @@ mod tests {
     #[test]
     fn layouts_of_several_windows_are_kept_apart_and_listed_and_claimed_by_id() {
         let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
-            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
-                let reply = match msg {
-                    ClientMsg::ListLayouts { req } => ServerMsg::Layouts {
-                        req,
-                        layouts: vec![
-                            LayoutInfo { id: 5, json: "detached here".into(), sessions: vec![1], saved_unix: 0 },
-                            LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 },
-                        ],
-                    },
-                    ClientMsg::ClaimLayoutId { req, id } => ServerMsg::Layout {
-                        req,
-                        layout: (id == 6).then(|| LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 }),
-                    },
-                    _ => continue,
-                };
-                w.write_all(&encode(&reply).unwrap()).unwrap();
-                w.flush().unwrap();
-                if matches!(reply, ServerMsg::Layout { layout: None, .. }) {
-                    break;
-                }
-            }
+        let (conn, reader_h, server_h) = mock_connection_v(15, move |_r, w| {
             let _ = rx_drop.recv_timeout(Duration::from_secs(5));
             drop(w);
         });
@@ -2160,13 +2163,12 @@ mod tests {
         assert_eq!(conn.shared.layout.lock().len(), 2);
         // Window b detaches its tabs: listed first, once.
         conn.detach_layout(5, vec![1], "window b".into());
+        // A v15 daemon lists nothing: only what this connection detached.
         let ids: Vec<_> = conn.list_layouts().unwrap().iter().map(|l| (l.id, l.json.clone())).collect();
-        assert_eq!(ids, [(5, "window b".to_string()), (6, "free".to_string())]);
-        // Claiming by id takes the detached one locally, then asks the daemon.
+        assert_eq!(ids, [(5, "window b".to_string())]);
+        // Claiming by id takes the detached one locally.
         assert_eq!(conn.claim_layout_id(5).unwrap().unwrap().json, "window b");
         assert!(!conn.shared.layout.lock().contains_key(&5));
-        assert_eq!(conn.claim_layout_id(6).unwrap().unwrap().sessions, [3]);
-        assert!(conn.claim_layout_id(7).unwrap().is_none());
         // Forgetting window a while connected drops its replay record.
         conn.save_layout(4, Vec::new(), String::new());
         assert!(conn.shared.layout.lock().is_empty());
@@ -2178,9 +2180,63 @@ mod tests {
     }
 
     #[test]
+    fn v16_detach_releases_on_the_daemon_and_lists_and_claims_from_there() {
+        let (seen_tx, seen_rx) = flume::unbounded::<ClientMsg>();
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                let reply = match &msg {
+                    ClientMsg::ListLayouts { req } => Some(ServerMsg::Layouts {
+                        req: *req,
+                        layouts: vec![LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 }],
+                    }),
+                    ClientMsg::ClaimLayoutId { req, id } => Some(ServerMsg::Layout {
+                        req: *req,
+                        layout: (*id == 6).then(|| LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 }),
+                    }),
+                    _ => None,
+                };
+                let done = matches!(&reply, Some(ServerMsg::Layout { layout: None, .. }));
+                let _ = seen_tx.send(msg);
+                if let Some(reply) = reply {
+                    w.write_all(&encode(&reply).unwrap()).unwrap();
+                    w.flush().unwrap();
+                }
+                if done {
+                    break;
+                }
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+        conn.save_layout(4, vec![2], "window a".into());
+        conn.save_layout(5, vec![1], "window b".into());
+        conn.detach_layout(5, vec![1], "window b".into());
+        // Released on the daemon: nothing kept here to replay or reclaim.
+        assert!(!conn.shared.layout.lock().contains_key(&5));
+        assert!(conn.shared.claimed_layouts.lock().unclaimed.is_empty());
+        assert_eq!(conn.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [6]);
+        assert_eq!(conn.claim_layout_id(6).unwrap().unwrap().sessions, [3]);
+        assert!(conn.claim_layout_id(7).unwrap().is_none());
+        let sent: Vec<ClientMsg> = seen_rx.drain().collect();
+        assert!(
+            matches!(
+                sent[..3],
+                [ClientMsg::SaveLayout { id: 4, .. }, ClientMsg::SaveLayout { id: 5, .. }, ClientMsg::ReleaseLayout { id: 5 }]
+            ),
+            "{sent:?}"
+        );
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
     fn detach_layout_while_offline_preserves_unsent_layout_for_recovery() {
         let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection(move |mut r, w| {
+        let (conn, reader_h, server_h) = mock_connection_v(15, move |mut r, w| {
             let _ = read_msg::<_, ClientMsg>(&mut r);
             let _ = rx_drop.recv_timeout(Duration::from_secs(5));
             drop(w);

@@ -70,9 +70,10 @@ pub const SIZE_CONTROL_SINCE: u32 = 14;
 /// `ServerMsg::FlowWindow`, #9).
 pub const FLOW_CONTROL_SINCE: u32 = 15;
 
-/// v16: listing the free window layouts (`ListLayouts` / `ServerMsg::Layouts`)
-/// and claiming one by id (`ClaimLayoutId`), so a client restores the
-/// layout it saved (a window's tabs on that host, #252) rather than the newest.
+/// v16: listing the free window layouts (`ListLayouts` / `ServerMsg::Layouts`),
+/// claiming one by id (`ClaimLayoutId`), so a client restores the layout it
+/// saved (a window's tabs on that host, #252) rather than the newest, and
+/// releasing one without disconnecting (`ReleaseLayout`: detached tabs).
 pub const LAYOUT_LIST_SINCE: u32 = 16;
 
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
@@ -357,6 +358,11 @@ pub enum ClientMsg {
     /// `Layout` (`None` when it's gone or held).
     ClaimLayoutId {
         req: ReqId,
+        id: LayoutId,
+    },
+    /// v16: this connection lets go of layout `id` (detached tabs): it's
+    /// free for any window to claim, the newest one. No reply.
+    ReleaseLayout {
         id: LayoutId,
     },
 }
@@ -725,6 +731,7 @@ mod tests {
         // v16 additions come after v15's.
         assert_eq!(postcard::to_allocvec(&ClientMsg::ListLayouts { req: 1 }).unwrap()[0], 31);
         assert_eq!(postcard::to_allocvec(&ClientMsg::ClaimLayoutId { req: 1, id: 2 }).unwrap()[0], 32);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ReleaseLayout { id: 2 }).unwrap()[0], 33);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Layouts { req: 1, layouts: Vec::new() }).unwrap()[0], 26);
     }
 }

@@ -437,6 +437,10 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientMsg::ClaimLayout { req } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout(conn) }),
                 ClientMsg::ClaimLayoutId { req, id } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout_id(conn, id) }),
                 ClientMsg::ListLayouts { req } => reply(ServerMsg::Layouts { req, layouts: daemon.free_layouts() }),
+                ClientMsg::ReleaseLayout { id } => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    daemon.layouts.lock().release_one(conn, id, now);
+                }
                 ClientMsg::FetchHistory { req, session, before, count } => match daemon.get(session) {
                     Some(s) => {
                         let rows = s.term.history_rows(before, count as usize);

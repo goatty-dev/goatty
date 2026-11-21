@@ -20,7 +20,9 @@ pub enum Initial {
     /// shows the connect screen meanwhile (`crate::connect`, #37).
     Connect(ConnectPlan),
     /// A window from the last run, with its tabs on every host (#252).
-    Reopen(crate::workspace::reopen::WindowRecord),
+    /// The second field: `--settings[=PAGE]`, opened once the active tab's
+    /// host is there.
+    Reopen(crate::workspace::reopen::WindowRecord, Option<String>),
 }
 
 /// `more`: further windows to open (the other windows of the last run).
@@ -28,6 +30,7 @@ pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) 
     gpui_platform::application().with_assets(crate::ui::icons::Assets).run(move |cx: &mut App| {
         AppSettings::init(cx);
         crate::agent::notify::init(cx);
+        crate::workspace::reopen::init(cx);
         cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
         cx.on_action(|_: &ReloadShells, cx| reload_shells(cx));
         command_palette::register_builtins(cx);
@@ -67,12 +70,13 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
             plan.open_settings = plan.open_settings.or(open_settings);
             (Initial::Connect(plan), None)
         }
+        Initial::Reopen(record, settings) => (Initial::Reopen(record, settings.or(open_settings)), None),
         ready => (ready, open_settings),
     };
     // A restored layout resizes the window when it arrives (`Workspace`);
     // a reopened window knows its size right away.
     let (w, h) = match &initial {
-        Initial::Reopen(r) => r.window.map_or(SavedWindow::DEFAULT, |w| w.size()),
+        Initial::Reopen(r, _) => r.window.map_or(SavedWindow::DEFAULT, |w| w.size()),
         _ => SavedWindow::DEFAULT,
     };
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);

@@ -19,7 +19,9 @@
 //!
 //! State, not a setting: `$XDG_STATE_HOME/goatty/windows.json`. Several
 //! goatty processes share the file: each one rewrites only its own records
-//! (by pid), and a record is reopened only once its process is gone.
+//! (by pid, under a lock on `windows.json.lock`), and a record is reopened
+//! only once its process is gone. Writes happen off the UI thread; quitting
+//! waits (briefly) for the last one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,13 +109,31 @@ impl OpenWindows {
         loaded
     }
 
+    /// Written to a temporary file and renamed over it (no backups: it's
+    /// rewritten on every change of a window's hosts).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let mut text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         text.push('\n');
-        goatty_config::store::write_text(path, &text).map(drop)
+        let tmp = path.with_extension("json.tmp");
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Load, change and save the file at `path`, holding the lock that
+    /// keeps other goatty processes from doing the same meanwhile.
+    fn edit<T>(path: &Path, f: impl FnOnce(&mut Self) -> T) -> std::io::Result<T> {
+        let _lock = FileLock::new(path)?;
+        let mut file = Self::load(path);
+        let out = f(&mut file);
+        file.version = VERSION;
+        file.save(path)?;
+        Ok(out)
     }
 
     /// Take out the records of processes `alive` says are gone; the rest
@@ -129,6 +149,32 @@ impl OpenWindows {
         self.version = VERSION;
         self.windows.retain(|w| w.pid != pid);
         self.windows.extend(mine.into_iter().filter(|w| !w.hosts.is_empty()));
+    }
+}
+
+/// An exclusive advisory lock on `<path>.lock`, released when dropped.
+struct FileLock(std::fs::File);
+
+impl FileLock {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("json.lock"))?;
+        // SAFETY: `f` is an open file for the whole call; flock only takes the fd.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(f))
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the file is still open; unlocking an fd we locked.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -150,10 +196,14 @@ fn alive(pid: u32) -> bool {
         return false;
     }
     // A reused pid is some other program.
-    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        Ok(comm) => comm.trim() == "goatty",
-        Err(_) => !Path::new("/proc/self").exists(),
+    if Path::new("/proc/self").exists() {
+        return std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "goatty");
     }
+    // No /proc (macOS): ask ps for the program's name.
+    std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next() == Some("goatty"))
 }
 
 /// The windows to reopen at launch: the records of goatty processes that
@@ -161,53 +211,106 @@ fn alive(pid: u32) -> bool {
 /// them too).
 pub fn take_for_launch() -> Vec<WindowRecord> {
     let Some(path) = state_file() else { return Vec::new() };
-    let mut file = OpenWindows::load(&path);
-    let taken = file.take_dead(alive);
-    if !taken.is_empty() {
-        file.version = VERSION;
-        if let Err(e) = file.save(&path) {
-            log::warn!("saving {}: {e}", path.display());
+    match OpenWindows::edit(&path, |file| file.take_dead(alive)) {
+        Ok(taken) => {
+            if !taken.is_empty() {
+                log::info!("reopening {} window(s) from the last run", taken.len());
+            }
+            taken
         }
-        log::info!("reopening {} window(s) from the last run", taken.len());
+        Err(e) => {
+            log::warn!("reading {}: {e}", path.display());
+            Vec::new()
+        }
     }
-    taken
+}
+
+/// Drop the records of goatty processes that are gone, unread: goatty was
+/// set not to reopen windows (`workspace.on_launch`), so they'd only pile up.
+pub fn forget_dead() {
+    let Some(path) = state_file() else { return };
+    if path.exists()
+        && let Err(e) = OpenWindows::edit(&path, |file| drop(file.take_dead(alive)))
+    {
+        log::warn!("saving {}: {e}", path.display());
+    }
+}
+
+/// What the writer thread is asked to do.
+enum Write {
+    Records(Vec<WindowRecord>),
+    /// Answer once everything before it is written.
+    Flush(flume::Sender<()>),
 }
 
 /// This process's terminal windows and their records.
 #[derive(Default)]
 pub struct Windows {
     records: HashMap<WindowId, WindowRecord>,
-    /// Terminal windows that never had a record yet.
+    /// The terminal windows open now.
     open: Vec<WindowId>,
-    writer: Option<mpsc::Sender<Vec<WindowRecord>>>,
+    /// goatty is quitting: windows closing now stay recorded.
+    quitting: bool,
+    writer: Option<mpsc::Sender<Write>>,
 }
 
 impl Global for Windows {}
 
 impl Windows {
-    /// Write this process's records, off the UI thread, in order.
-    fn write(&mut self) {
-        let mine: Vec<WindowRecord> = self.records.values().cloned().collect();
-        let writer = self.writer.get_or_insert_with(|| {
-            let (tx, rx) = mpsc::channel::<Vec<WindowRecord>>();
+    fn writer(&mut self) -> &mpsc::Sender<Write> {
+        self.writer.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::channel::<Write>();
             let _ = std::thread::Builder::new().name("reopen-writer".into()).spawn(move || {
-                let Some(path) = state_file() else { return };
-                while let Ok(mut mine) = rx.recv() {
-                    // Only the newest matters.
-                    while let Ok(newer) = rx.try_recv() {
-                        mine = newer;
+                let path = state_file();
+                let mut pending: Option<Vec<WindowRecord>> = None;
+                while let Ok(first) = rx.recv() {
+                    // Only the newest records matter; flushes wait for them.
+                    let mut flushes = Vec::new();
+                    for w in std::iter::once(first).chain(rx.try_iter()) {
+                        match w {
+                            Write::Records(r) => pending = Some(r),
+                            Write::Flush(done) => flushes.push(done),
+                        }
                     }
-                    let mut file = OpenWindows::load(&path);
-                    file.replace_own(std::process::id(), mine);
-                    if let Err(e) = file.save(&path) {
+                    if let (Some(mine), Some(path)) = (pending.take(), &path)
+                        && let Err(e) = OpenWindows::edit(path, |file| file.replace_own(std::process::id(), mine))
+                    {
                         log::warn!("saving {}: {e}", path.display());
+                    }
+                    for done in flushes {
+                        let _ = done.send(());
                     }
                 }
             });
             tx
-        });
-        let _ = writer.send(mine);
+        })
     }
+
+    /// Write this process's records, off the UI thread, in order.
+    fn write(&mut self) {
+        let mine: Vec<WindowRecord> = self.records.values().cloned().collect();
+        let _ = self.writer().send(Write::Records(mine));
+    }
+}
+
+/// Before goatty quits (the windows still open stay recorded): wait, at
+/// most until GPUI's quit timeout, for the last write.
+pub fn init(cx: &mut App) {
+    cx.on_app_quit(|cx| {
+        let w = cx.default_global::<Windows>();
+        w.quitting = true;
+        let done = w.writer.as_ref().map(|writer| {
+            let (tx, rx) = flume::bounded(1);
+            let _ = writer.send(Write::Flush(tx));
+            rx
+        });
+        async move {
+            if let Some(rx) = done {
+                let _ = rx.recv_async().await;
+            }
+        }
+    })
+    .detach();
 }
 
 /// A terminal window opened.
@@ -222,6 +325,9 @@ pub fn window_opened(cx: &mut App, id: WindowId) {
 /// Written when it changed.
 pub fn update(cx: &mut App, id: WindowId, record: Option<WindowRecord>) {
     let w = cx.default_global::<Windows>();
+    if w.quitting || !w.open.contains(&id) {
+        return;
+    }
     let changed = match record {
         Some(r) => w.records.insert(id, r.clone()).as_ref() != Some(&r),
         None => w.records.remove(&id).is_some(),
@@ -240,7 +346,7 @@ pub fn window_closed(cx: &mut App, id: WindowId) {
     }
     let w = cx.global_mut::<Windows>();
     w.open.retain(|&o| o != id);
-    if !w.open.is_empty() && w.records.remove(&id).is_some() {
+    if !w.quitting && !w.open.is_empty() && w.records.remove(&id).is_some() {
         w.write();
     }
 }

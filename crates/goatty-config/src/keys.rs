@@ -173,6 +173,7 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     // no such tab or pane, so a single pane loses nothing.
     ("ctrl-shift-t", "new_tab"),
     ("ctrl-shift-n", "new_window"),
+    ("ctrl-shift-r", "reattach_detached"),
     ("ctrl-shift-w", "close_pane"),
     ("ctrl-tab", "next_tab"),
     ("ctrl-shift-tab", "previous_tab"),
