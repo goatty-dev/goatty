@@ -184,9 +184,11 @@ impl Workspace {
             if folded {
                 continue;
             }
+            let last = tabs.last().copied();
             for i in tabs {
                 if let Some(mut v) = views[i].take() {
                     v.group = Some(color);
+                    v.group_end = Some(i) == last;
                     out.push(StripItem::Tab(v));
                 }
             }
