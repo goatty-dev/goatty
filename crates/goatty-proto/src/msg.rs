@@ -360,10 +360,14 @@ pub enum ClientMsg {
         req: ReqId,
         id: LayoutId,
     },
-    /// v16: this connection lets go of layout `id` (detached tabs): it's
-    /// free for any window to claim, the newest one. No reply.
+    /// v16: keep layout `id` with `sessions` and `json` as a free layout
+    /// (detached tabs), the newest one, for any window to claim, unless
+    /// another connection holds it. Safe to send again (a retry after a link
+    /// drop never takes it from a window that claimed it meanwhile). No reply.
     ReleaseLayout {
         id: LayoutId,
+        sessions: Vec<SessionId>,
+        json: String,
     },
 }
 
@@ -731,7 +735,7 @@ mod tests {
         // v16 additions come after v15's.
         assert_eq!(postcard::to_allocvec(&ClientMsg::ListLayouts { req: 1 }).unwrap()[0], 31);
         assert_eq!(postcard::to_allocvec(&ClientMsg::ClaimLayoutId { req: 1, id: 2 }).unwrap()[0], 32);
-        assert_eq!(postcard::to_allocvec(&ClientMsg::ReleaseLayout { id: 2 }).unwrap()[0], 33);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ReleaseLayout { id: 2, sessions: vec![1], json: String::new() }).unwrap()[0], 33);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Layouts { req: 1, layouts: Vec::new() }).unwrap()[0], 26);
     }
 }

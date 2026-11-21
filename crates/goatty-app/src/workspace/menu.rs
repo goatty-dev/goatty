@@ -462,11 +462,19 @@ impl Workspace {
         let groups = if self.groups_shown(cx) { self.groups(cx) } else { Vec::new() };
         let active = groups.iter().find(|g| g.active);
         let mut entries: Vec<Entry> = Vec::new();
+        // Bound to the host it names: the active tab may change while the menu is open.
         let here = match active {
-            Some(g) => format!("New tab on {}", g.label),
-            None => "New tab".to_string(),
+            Some(g) => {
+                let (key, me) = (g.key.clone(), me.clone());
+                let mut item = Item::new(format!("New tab on {}", g.label), move |window: &mut Window, cx: &mut gpui::App| {
+                    let _ = me.update(cx, |this, cx| this.new_tab_in_group(&key, window, cx));
+                });
+                item.shortcut = context_menu::shortcut("new_tab", cx);
+                item
+            }
+            None => Item::action("New tab", "new_tab", cx),
         };
-        entries.push(Item::action(here, "new_tab", cx).icon(Icon::Plus).into());
+        entries.push(here.icon(Icon::Plus).into());
         // The window's other hosts, one click each.
         for g in groups.iter().filter(|g| !g.active) {
             let key = g.key.clone();
@@ -501,7 +509,7 @@ impl Workspace {
             }
         }
         hosts.push(Entry::Separator);
-        hosts.push(Item::action("Another host…", "connect_to_host", cx).into());
+        hosts.push(Item::new("Another host…", |window: &mut Window, cx: &mut gpui::App| crate::hosts::ask_new_tab(window, cx)).into());
         entries.push(Item::submenu("New tab on…", hosts).icon(Icon::Server).into());
         entries.push(Entry::Separator);
         let not_here = match self.active_tab().map(|t| t.host.as_ref().map(super::host_ref_of)) {

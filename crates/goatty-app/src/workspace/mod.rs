@@ -288,6 +288,9 @@ pub struct Workspace {
     /// Hosts (and plain SSH hosts on them) tabs were detached from, newest
     /// last: where Ctrl+Shift+R looks first.
     recently_detached: Vec<(HostRef, Option<String>)>,
+    /// The window took its size from its `reopen` record, which wins over
+    /// the size a host's layout remembers.
+    sized_by_record: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -365,6 +368,7 @@ impl Workspace {
             reopen_key: reopen::new_key(),
             restoring: Vec::new(),
             recently_detached: Vec::new(),
+            sized_by_record: false,
             _subscriptions: vec![appearance, button_layout, settings, activation, bounds],
         };
         reopen::window_opened(cx, this.window_id);
@@ -412,7 +416,9 @@ impl Workspace {
         if let Some(w) = record.window {
             w.apply(window);
             self.window = w;
+            self.sized_by_record = true;
         }
+        self.reopen_key = record.key;
         let mut active = None;
         let active_host = record.active.min(record.hosts.len().saturating_sub(1));
         for (i, h) in record.hosts.into_iter().enumerate() {
@@ -491,7 +497,7 @@ impl Workspace {
             active,
             window: Some(self.window),
         });
-        reopen::update(cx, self.window_id, record);
+        reopen::update(cx, self.window_id, self.reopen_key, record);
     }
 
     /// The window was resized, maximized or went fullscreen: save its size
@@ -646,7 +652,7 @@ impl Workspace {
         }
         // Nothing to reopen either.
         self.restoring.clear();
-        reopen::update(cx, self.window_id, None);
+        reopen::update(cx, self.window_id, self.reopen_key, None);
     }
 
     fn next_id(&mut self) -> u64 {
@@ -850,6 +856,7 @@ impl Workspace {
                 // it takes the restored size (not when restoring into a
                 // window that has other tabs).
                 if self.tabs.len() == 1
+                    && !self.sized_by_record
                     && let Some(w) = r.window
                     && w != self.window
                 {
@@ -1465,6 +1472,17 @@ impl Workspace {
         let undo = self.detached_pane_snapshot(index, id, cx);
         self.note_detached(&undo);
         let only_pane = self.tabs[index].tree == Node::Leaf(id);
+        if !only_pane {
+            // A pane out of a split: kept as a tab of its own, restorable like
+            // detached tabs (the tab it leaves keeps its own layout).
+            for (conn, tabs) in &undo {
+                let sessions: Vec<goatty_proto::SessionId> = tabs.iter().flat_map(|t| t.tree.leaves()).collect();
+                let saved = SavedWorkspace { version: saved::VERSION, tabs: tabs.clone(), active: 0, window: Some(self.window) };
+                if let Ok(json) = serde_json::to_string(&saved) {
+                    conn.detach_layout(saved::new_id(), sessions, json);
+                }
+            }
+        }
         if only_pane {
             self.save_layout(cx);
         }
@@ -1994,14 +2012,29 @@ impl Workspace {
                     }
                     Err(e) => return Err(e),
                 };
-                let sessions = conn.list_sessions()?;
-                let layouts = saved::live_layouts(conn.list_layouts()?, &sessions);
-                let mode = match &wanted {
-                    Some(h) => layouts.iter().find(|l| saved::has_plain_tab(l, h)).map(|l| AttachMode::Layout(l.id)),
-                    None => match layouts.first() {
-                        Some(l) => Some(AttachMode::Layout(l.id)),
-                        None => saved::loose_detached(&sessions, &layouts).last().map(|&id| AttachMode::Id(id)),
-                    },
+                let lookup = || -> anyhow::Result<Option<AttachMode>> {
+                    let sessions = conn.list_sessions()?;
+                    let layouts = saved::live_layouts(conn.list_layouts()?, &sessions);
+                    Ok(match &wanted {
+                        // Only that host's tabs, even out of a layout with others.
+                        Some(h) => match layouts.iter().find(|l| saved::has_plain_tab(l, h)) {
+                            Some(l) => saved::split_plain(&conn, l, h)?.map(AttachMode::Layout),
+                            None => None,
+                        },
+                        None => match layouts.first() {
+                            Some(l) => Some(AttachMode::Layout(l.id)),
+                            None => saved::loose_detached(&sessions, &layouts).last().map(|&id| AttachMode::Id(id)),
+                        },
+                    })
+                };
+                let mode = match lookup() {
+                    Ok(mode) => mode,
+                    // Its link is down: try the next one; the last one says why.
+                    Err(e) if n + 1 < count => {
+                        log::info!("reattach: {}: {e:#}", host.label());
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 };
                 match mode {
                     Some(mode) => return anyhow::Ok((Some((conn, mode)), misses)),

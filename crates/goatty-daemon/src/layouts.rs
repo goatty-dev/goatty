@@ -124,13 +124,18 @@ impl Layouts {
         free.into_iter().map(|(_, l)| l).collect()
     }
 
-    /// `conn` lets go of layout `id` (detached tabs): free, and the newest.
-    pub(crate) fn release_one(&mut self, conn: u64, id: LayoutId, now_unix: u64) {
-        let Some(record) = self.map.get_mut(&id).filter(|r| r.owner == Some(conn)) else { return };
-        record.owner = None;
+    /// `conn` lets go of layout `id` (detached tabs): kept with `sessions`
+    /// and `json`, free, and the newest. Ignored while another connection
+    /// holds it (it claimed the layout since).
+    pub(crate) fn release_one(&mut self, conn: u64, id: LayoutId, sessions: Vec<SessionId>, json: String, now_unix: u64) {
+        if self.map.get(&id).is_some_and(|r| r.owner.is_some_and(|o| o != conn)) {
+            return;
+        }
+        if sessions.is_empty() || json.len() > MAX_JSON {
+            return;
+        }
         self.seq += 1;
-        record.seq = self.seq;
-        record.saved_unix = now_unix;
+        self.map.insert(id, Record { json, sessions, owner: None, saved_unix: now_unix, seq: self.seq });
         self.trim();
     }
 
@@ -222,12 +227,21 @@ mod tests {
         save(&mut l, 1, 10, &[1]);
         save(&mut l, 2, 20, &[2]);
         l.release(2);
-        // Only the owner can let go.
-        l.release_one(2, 10, 5);
+        // Held by another connection: left alone.
+        l.release_one(2, 10, vec![1], "theirs".into(), 5);
         assert_eq!(l.list_free(|_| true).iter().map(|i| i.id).collect::<Vec<_>>(), [20]);
-        l.release_one(1, 10, 5);
+        l.release_one(1, 10, vec![1, 3], "detached".into(), 5);
         let free = l.list_free(|_| true);
         assert_eq!(free.iter().map(|i| (i.id, i.saved_unix)).collect::<Vec<_>>(), [(10, 5), (20, 0)]);
+        assert_eq!((free[0].json.as_str(), free[0].sessions.clone()), ("detached", vec![1, 3]));
+        // Again (a retry after a link drop) is harmless; unknown ids are kept too.
+        l.release_one(1, 10, vec![1, 3], "detached".into(), 6);
+        l.release_one(7, 30, vec![4], "new".into(), 6);
+        assert_eq!(l.list_free(|_| true).iter().map(|i| i.id).collect::<Vec<_>>(), [30, 10, 20]);
+        // Once claimed, a late retry doesn't take it back.
+        l.claim_id(9, 10, |_| true).unwrap();
+        l.release_one(1, 10, vec![1], "stale".into(), 7);
+        assert!(!l.list_free(|_| true).iter().any(|i| i.id == 10));
     }
 
     #[test]

@@ -209,14 +209,21 @@ fn session_command(s: &SessionInfo, now: u64) -> Command {
 
 /// The sessions picker's entries: the saved layouts to restore (newest
 /// first), a new session, every loose detached session at once (when there
-/// are several), then the sessions, newest first.
-fn session_commands(mut list: Vec<SessionInfo>, layouts: &[goatty_proto::LayoutInfo], host: &HostRef, now: u64) -> Vec<Rc<Command>> {
+/// are several), then the sessions, newest first. `layouts`: `None` when
+/// they couldn't be listed (then which sessions are loose is unknown: no
+/// bulk entry).
+fn session_commands(
+    mut list: Vec<SessionInfo>,
+    layouts: Option<&[goatty_proto::LayoutInfo]>,
+    host: &HostRef,
+    now: u64,
+) -> Vec<Rc<Command>> {
     list.sort_by(|a, b| b.created_unix.cmp(&a.created_unix).then(b.id.cmp(&a.id)));
-    let mut out: Vec<Command> = layouts.iter().filter_map(|l| layout_command(l, &list, now)).collect();
+    let mut out: Vec<Command> = layouts.unwrap_or_default().iter().filter_map(|l| layout_command(l, &list, now)).collect();
     let mut new = Command::handler(NEW_SESSION, "Session", &format!("New session on {}", host.label()), |_, _| {});
     new.detail = Some("a fresh shell".into());
     out.push(new);
-    let loose = crate::workspace::saved::loose_detached(&list, layouts).len();
+    let loose = layouts.map_or(0, |l| crate::workspace::saved::loose_detached(&list, l).len());
     if loose > 1 {
         let mut all = Command::handler(ALL_DETACHED, "Session", &format!("Reattach all {loose} detached sessions"), |_, _| {});
         all.detail = Some("a tab each".into());
@@ -224,6 +231,61 @@ fn session_commands(mut list: Vec<SessionInfo>, layouts: &[goatty_proto::LayoutI
     }
     out.extend(list.iter().map(|s| session_command(s, now)));
     out.into_iter().map(Rc::new).collect()
+}
+
+/// What ending sessions from the picker left.
+struct Ended {
+    /// `None`: couldn't be listed.
+    layouts: Option<Vec<goatty_proto::LayoutInfo>>,
+    list: Vec<SessionInfo>,
+    /// How many kill requests failed, and the first error.
+    failed: Option<(usize, String)>,
+    /// Some of them hadn't exited yet when the list was taken.
+    still_running: bool,
+}
+
+/// End `ids` on `conn` (blocks). For saved layout `layout`, the layout is
+/// claimed first, so no window restores it meanwhile; only its sessions
+/// that were confirmed and are still detached end, and whatever else it
+/// holds is released again.
+fn end_sessions(conn: &Connection, layout: Option<goatty_proto::LayoutId>, ids: Vec<SessionId>) -> anyhow::Result<Ended> {
+    let ids = match layout {
+        None => ids,
+        Some(l) => {
+            let Some(info) = conn.claim_layout_id(l)? else {
+                anyhow::bail!("those tabs were restored or changed elsewhere meanwhile; nothing was ended");
+            };
+            let detached: Vec<SessionId> = conn.list_sessions()?.iter().filter(|s| s.attached == 0).map(|s| s.id).collect();
+            let (end, keep): (Vec<SessionId>, Vec<SessionId>) = info.sessions.iter().partition(|s| ids.contains(s) && detached.contains(s));
+            if keep.is_empty() {
+                conn.save_layout(l, Vec::new(), String::new());
+            } else {
+                conn.release_claimed_layout(goatty_proto::LayoutInfo { sessions: keep, ..info });
+            }
+            end
+        }
+    };
+    let mut failed: Vec<String> = Vec::new();
+    for &id in &ids {
+        // One that fails (or exited meanwhile) doesn't stop the others.
+        if let Err(e) = conn.kill(id) {
+            failed.push(format!("{e:#}").lines().next().unwrap_or_default().to_string());
+        }
+    }
+    // They're gone once the shells exited; list what's left then.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let list = loop {
+        let list = conn.list_sessions()?;
+        if !list.iter().any(|s| ids.contains(&s.id)) || std::time::Instant::now() > deadline {
+            break list;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let still_running = list.iter().any(|s| ids.contains(&s.id));
+    // A kill that failed because the session was gone already isn't a failure.
+    let failed = if still_running && !failed.is_empty() { Some((failed.len(), failed[0].clone())) } else { None };
+    let layouts = conn.list_layouts().ok().map(|l| crate::workspace::saved::live_layouts(l, &list));
+    Ok(Ended { layouts, list, failed, still_running })
 }
 
 /// The settings page for hosts, listed last in [`Scope::Hosts`].
@@ -319,6 +381,16 @@ pub struct Entry<'a> {
 
 /// Rank `entries` for `query`. An empty query lists recently used commands
 /// (most recent first), then the rest alphabetically.
+/// [`rank`], except that a host's sessions keep their own order until
+/// something is typed: saved tabs to restore (newest first), then a new
+/// session, then the sessions (newest first).
+pub fn rank_in(scope: &Scope, entries: &[Entry<'_>], query: &str) -> Vec<Hit> {
+    if matches!(scope, Scope::Sessions(_)) && query.trim().is_empty() {
+        return (0..entries.len()).map(|index| Hit { index, positions: Vec::new(), recent: false }).collect();
+    }
+    rank(entries, query)
+}
+
 pub fn rank(entries: &[Entry<'_>], query: &str) -> Vec<Hit> {
     let words: Vec<&str> = query.split_whitespace().collect();
     if words.is_empty() {
@@ -442,6 +514,8 @@ pub struct CommandPalette {
     sessions: Vec<Rc<Command>>,
     /// The host's saved layouts no window holds (restored from the list).
     layouts: Vec<goatty_proto::LayoutInfo>,
+    /// `layouts` could be listed.
+    layouts_known: bool,
     status: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
     /// The session the next Shift+Delete ends (the first one asks).
@@ -495,6 +569,7 @@ impl CommandPalette {
             conn: None,
             sessions: Vec::new(),
             layouts: Vec::new(),
+            layouts_known: false,
             status: None,
             _load: None,
             ending: None,
@@ -619,7 +694,7 @@ impl CommandPalette {
                 only_when_searched: c.only_when_searched && self.scope == Scope::All,
             })
             .collect();
-        self.hits = rank(&entries, query);
+        self.hits = rank_in(&self.scope, &entries, query);
         if self.scope == Scope::Hosts {
             // Adding hosts comes after the hosts.
             if let Some(i) = self.hits.iter().position(|h| self.commands[h.index].id == MANAGE_HOSTS) {
@@ -1108,7 +1183,7 @@ impl CommandPalette {
         let now = unix_now();
         self.show_scope(Scope::Sessions(host.clone()), cx);
         self.layouts.clear();
-        self.sessions = session_commands(Vec::new(), &[], &host, now);
+        self.sessions = session_commands(Vec::new(), Some(&[]), &host, now);
         let endpoint = host.endpoint();
         let label = if hosts::pool::live(&endpoint).is_some() {
             "Loading sessions…".to_string()
@@ -1124,11 +1199,13 @@ impl CommandPalette {
                 .spawn(async move {
                     let conn = hosts::pool::open(endpoint)?;
                     let list = conn.list_sessions()?;
-                    let layouts = conn.list_layouts().unwrap_or_else(|e| {
-                        log::warn!("listing the saved layouts: {e:#}");
-                        Vec::new()
-                    });
-                    let layouts = crate::workspace::saved::live_layouts(layouts, &list);
+                    let layouts = match conn.list_layouts() {
+                        Ok(l) => Some(crate::workspace::saved::live_layouts(l, &list)),
+                        Err(e) => {
+                            log::warn!("listing the saved layouts: {e:#}");
+                            None
+                        }
+                    };
                     anyhow::Ok((conn, list, layouts))
                 })
                 .await;
@@ -1138,9 +1215,14 @@ impl CommandPalette {
                 }
                 match result {
                     Ok((conn, list, layouts)) => {
-                        this.status = list.is_empty().then(|| (format!("No sessions on {} yet", host.label()).into(), false));
-                        this.sessions = session_commands(list, &layouts, &host, unix_now());
-                        this.layouts = layouts;
+                        this.status = if layouts.is_none() {
+                            Some(("Couldn't list the detached tabs; their sessions are listed one by one.".into(), false))
+                        } else {
+                            list.is_empty().then(|| (format!("No sessions on {} yet", host.label()).into(), false))
+                        };
+                        this.sessions = session_commands(list, layouts.as_deref(), &host, unix_now());
+                        this.layouts_known = layouts.is_some();
+                        this.layouts = layouts.unwrap_or_default();
                         this.conn = Some(conn);
                     }
                     Err(e) => {
@@ -1212,40 +1294,28 @@ impl CommandPalette {
         self.ending = None;
         self.status = Some((format!("Ending {what}…").into(), true));
         cx.notify();
-        let ended = ids.clone();
+        let layout = match session_choice(&self.commands[self.hits[ix].index].id) {
+            Some(AttachMode::Layout(l)) => Some(l),
+            _ => None,
+        };
         self._load = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    for &id in &ids {
-                        // One that exited meanwhile doesn't stop the others.
-                        if let Err(e) = conn.kill(id) {
-                            log::info!("ending session {id}: {e:#}");
-                        }
-                    }
-                    // They're gone once the shells exited; list what's left then.
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                    loop {
-                        let list = conn.list_sessions()?;
-                        if !list.iter().any(|s| ids.contains(&s.id)) || std::time::Instant::now() > deadline {
-                            let layouts = conn.list_layouts().unwrap_or_default();
-                            return anyhow::Ok((crate::workspace::saved::live_layouts(layouts, &list), list));
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                })
-                .await;
+            let result = cx.background_executor().spawn(async move { end_sessions(&conn, layout, ids) }).await;
             let _ = this.update(cx, |this, cx| {
                 if this.scope != Scope::Sessions(host.clone()) {
                     return;
                 }
                 match result {
-                    Ok((layouts, list)) => {
-                        let gone = !list.iter().any(|s| ended.contains(&s.id));
-                        let msg = if gone { format!("Ended {what}") } else { format!("Asked {what} to end; some are still exiting") };
+                    Ok(Ended { layouts, list, failed, still_running }) => {
+                        let msg = match (&failed, still_running) {
+                            (Some((n, first)), _) => format!("Couldn't end {n} of {what}: {first}"),
+                            (None, true) => format!("Asked {what} to end; some are still exiting"),
+                            (None, false) => format!("Ended {what}"),
+                        };
                         this.status = Some((msg.into(), false));
-                        this.layouts = layouts;
-                        this.sessions = session_commands(list, &this.layouts, &host, unix_now());
+                        this.layouts_known = layouts.is_some();
+                        this.layouts = layouts.unwrap_or_default();
+                        let known = this.layouts_known.then_some(&this.layouts[..]);
+                        this.sessions = session_commands(list, known, &host, unix_now());
                     }
                     Err(e) => {
                         let first = format!("{e:#}").lines().next().unwrap_or_default().to_string();
@@ -1753,7 +1823,7 @@ mod tests {
         };
         let host = HostRef::Ssh("box".into());
         let list = vec![info(3, "", Some("zsh"), 0, 1_000), info(7, "build", Some("cargo"), 1, 4_000)];
-        let c = session_commands(list.clone(), &[], &host, 4_000 + 7_200);
+        let c = session_commands(list.clone(), Some(&[]), &host, 4_000 + 7_200);
         let ids: Vec<_> = c.iter().map(|c| c.id.to_string()).collect();
         assert_eq!(ids, ["session.new", "session:7", "session:3"], "new first, then newest");
         assert_eq!(c[0].title.as_ref(), "New session on box");
@@ -1776,7 +1846,11 @@ mod tests {
             format!(r#"{{"version":1,"tabs":[{}],"active":0}}"#, tabs.join(","))
         };
         let layouts = [goatty_proto::LayoutInfo { id: 5, json: json(&[3, 11]), sessions: vec![3, 11], saved_unix: 4_000 }];
-        let c = session_commands(list, &layouts, &host, 4_000 + 600);
+        // Unknown layouts: no restore entries, and no bulk reattach (two
+        // loose-looking sessions may be one saved split).
+        let unknown: Vec<_> = session_commands(list.clone(), None, &host, 4_000 + 600).iter().map(|c| c.id.to_string()).collect();
+        assert_eq!(unknown, ["session.new", "session:7", "session:11", "session:9", "session:3"]);
+        let c = session_commands(list, Some(&layouts), &host, 4_000 + 600);
         let ids: Vec<_> = c.iter().map(|c| c.id.to_string()).collect();
         assert_eq!(
             ids,
@@ -1784,6 +1858,21 @@ mod tests {
             "one loose session: no bulk entry"
         );
         assert_eq!((c[0].title.as_ref(), c[0].detail.as_deref()), ("Restore 2 tabs", Some("zsh, logs · detached 10 min")));
+        // Listed in that order (not alphabetically) while nothing is typed.
+        let labels: Vec<SharedString> = c.iter().map(|c| c.label().into()).collect();
+        let entries: Vec<Entry<'_>> = c
+            .iter()
+            .zip(&labels)
+            .map(|(c, label)| Entry {
+                label,
+                title_start: c.title_start(),
+                keywords: &c.keywords,
+                recent_rank: None,
+                only_when_searched: false,
+            })
+            .collect();
+        let order: Vec<usize> = rank_in(&Scope::Sessions(host.clone()), &entries, " ").iter().map(|h| h.index).collect();
+        assert_eq!(order, (0..c.len()).collect::<Vec<_>>());
         assert_eq!(age(100, 130), "just now");
         assert_eq!(age(0, 300), "5 min");
         assert_eq!(age(0, 3 * 86_400), "3 d");

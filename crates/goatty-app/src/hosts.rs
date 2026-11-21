@@ -82,13 +82,18 @@ pub mod pool {
     enum Failed {
         /// What the connect screen offers to fix (install, plain SSH).
         Remote(goatty_client::RemoteProblem),
+        /// The local daemon speaks no protocol of ours (it offers a restart).
+        Local(goatty_client::local::LocalProblem),
         Other(String),
     }
 
     impl Failed {
         fn of(e: &anyhow::Error) -> Self {
-            match e.downcast_ref::<goatty_client::RemoteProblem>() {
-                Some(p) => Failed::Remote(p.clone()),
+            if let Some(p) = e.downcast_ref::<goatty_client::RemoteProblem>() {
+                return Failed::Remote(p.clone());
+            }
+            match e.downcast_ref::<goatty_client::local::LocalProblem>() {
+                Some(p) => Failed::Local(p.clone()),
                 None => Failed::Other(format!("{e:#}")),
             }
         }
@@ -96,6 +101,7 @@ pub mod pool {
         fn error(self) -> anyhow::Error {
             match self {
                 Failed::Remote(p) => p.into(),
+                Failed::Local(p) => p.into(),
                 Failed::Other(msg) => anyhow::anyhow!(msg),
             }
         }
@@ -330,8 +336,11 @@ pub fn connect(cx: &mut App, host: &str) {
 /// same. Deferred, so it can be called while a workspace is being updated
 /// (the palette runs its commands from one).
 pub fn open(cx: &mut App, req: OpenRequest) {
+    // Plain SSH only for a fresh session: restoring or reattaching means the
+    // host's goattyd that listed them (even after the host was set to plain).
+    let fresh = matches!(req.attach, AttachMode::New | AttachMode::Auto);
     let plain = match &req.host {
-        HostRef::Ssh(host) => cx.global::<AppSettings>().client.ssh.plain(host),
+        HostRef::Ssh(host) => fresh && cx.global::<AppSettings>().client.ssh.plain(host),
         HostRef::Local | HostRef::Tailnet { .. } => false,
     };
     log::info!("opening a session on {}{}", req.host.label(), if plain { " (plain SSH)" } else { "" });
@@ -436,6 +445,20 @@ pub fn ask_connect(window: &mut gpui::Window, cx: &mut App) {
         .placeholder("user@example.com, or an alias from ~/.ssh/config")
         .help("Connects once; \"SSH: Add a host to the list…\" keeps it");
     let a = Ask::new("Connect to a host", vec![field], |answers, _, cx| connect(cx, &answers["host"]));
+    crate::command_palette::ask(window, cx, a);
+}
+
+/// Ask for a host (yours suggested) and open a new session there in a tab
+/// of the active window, whatever `ssh.open_in` says (the new-tab menu's
+/// "Another host…").
+pub fn ask_new_tab(window: &mut gpui::Window, cx: &mut App) {
+    let field = Field::host("host", "Host", known_hosts(cx))
+        .placeholder("user@example.com, or an alias from ~/.ssh/config")
+        .help("Opens a new tab there");
+    let a = Ask::new("New tab on a host", vec![field], |answers, _, cx| {
+        let host = HostRef::Ssh(answers["host"].clone());
+        open(cx, OpenRequest { host, attach: AttachMode::New, conn: None, place: OpenIn::Tab });
+    });
     crate::command_palette::ask(window, cx, a);
 }
 

@@ -141,6 +141,10 @@ struct SavedLayoutState {
     /// still sent on reconnect and then moved into `claimed_layouts.unclaimed`
     /// instead of remaining owned by the connection.
     detached: bool,
+    /// v16: the `ReleaseLayout` went out on `sent_gen` before request id
+    /// `.0`: a reply to that request or a later one proves the daemon has it,
+    /// and the record goes. Until then a reconnect sends it again.
+    released_before: Option<ReqId>,
 }
 
 struct Shared {
@@ -455,6 +459,14 @@ impl Connection {
         self.shared.send(&msg(req));
         let reply = rx.recv_timeout(timeout);
         self.shared.pending.lock().remove(&req);
+        if reply.is_ok() {
+            // The daemon handles a connection's messages in order: any
+            // release sent before this request has arrived.
+            self.shared
+                .layout
+                .lock()
+                .retain(|_, s| !(s.sent_gen == Some(link_gen) && s.released_before.is_some_and(|before| before <= req)));
+        }
         match reply {
             Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
             Ok(m) => Ok((link_gen, m)),
@@ -905,7 +917,7 @@ impl Connection {
             // Forgotten on the daemon; nothing to replay.
             layout.remove(&id);
         } else {
-            layout.insert(id, SavedLayoutState { id, sessions, json, sent_gen, detached: false });
+            layout.insert(id, SavedLayoutState { id, sessions, json, sent_gen, detached: false, released_before: None });
         }
     }
 
@@ -964,8 +976,9 @@ impl Connection {
     /// Take over layout `id` (see `ClientMsg::ClaimLayoutId`): one this
     /// connection detached, else the daemon's when it's free. `None` when
     /// it's gone or another window holds it. A daemon older than v16 can't
-    /// claim by id: this falls back to [`Self::claim_layout`] (the newest
-    /// free layout). Blocks: call off the UI thread.
+    /// claim by id: this takes the newest free layout when that's `id` (so
+    /// a single window still comes back), and never another window's.
+    /// Blocks: call off the UI thread.
     pub fn claim_layout_id(&self, id: LayoutId) -> Result<Option<LayoutInfo>> {
         {
             let mut layout = self.shared.layout.lock();
@@ -984,7 +997,14 @@ impl Connection {
             }
         }
         if !self.supports_layout_list() {
-            return self.claim_layout();
+            return Ok(match self.claim_layout()? {
+                Some(info) if info.id == id => Some(info),
+                Some(other) => {
+                    self.release_claimed_layout(other);
+                    None
+                }
+                None => None,
+            });
         }
         let (link_gen, reply) = self.request_with_gen(REQUEST_TIMEOUT, Pending::Reply, |req| ClientMsg::ClaimLayoutId { req, id })?;
         self.claimed_reply(link_gen, reply)
@@ -1026,7 +1046,7 @@ impl Connection {
         if claimed.gens.get(&info.id) == Some(&cur) && self.is_connected() && self.supports_layout_list() {
             // Free on the daemon for any window again.
             claimed.gens.remove(&info.id);
-            self.shared.send(&ClientMsg::ReleaseLayout { id: info.id });
+            self.shared.send(&ClientMsg::ReleaseLayout { id: info.id, sessions: info.sessions, json: info.json });
             return;
         }
         if claimed.gens.remove(&info.id) == Some(cur) && self.is_connected() {
@@ -1049,24 +1069,29 @@ impl Connection {
         }
         let connected = self.is_connected();
         let cur = self.shared.link_gen.load(Ordering::Acquire);
+        if connected && self.supports_layout_list() {
+            // Free on the daemon: listed and claimed from there. Kept here
+            // until a reply shows it arrived (sent again after a link drop).
+            let released_before = Some(self.shared.next_req.load(Ordering::Relaxed));
+            self.shared.send(&ClientMsg::ReleaseLayout { id, sessions: sessions.clone(), json: json.clone() });
+            saved.insert(id, SavedLayoutState { id, sessions, json, sent_gen: Some(cur), detached: true, released_before });
+            let mut claimed = self.shared.claimed_layouts.lock();
+            claimed.gens.remove(&id);
+            claimed.unclaimed.retain(|(_, info)| info.id != id);
+            return;
+        }
         let already_queued =
             saved.get(&id).is_some_and(|s| connected && s.sent_gen == Some(cur) && s.json == json && s.sessions == sessions);
         let sent_gen = connected.then_some(cur);
         if connected && !already_queued {
             self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
         }
-        if connected && self.supports_layout_list() {
-            // Free on the daemon: listed and claimed from there.
-            self.shared.send(&ClientMsg::ReleaseLayout { id });
-            saved.remove(&id);
-            let mut claimed = self.shared.claimed_layouts.lock();
-            claimed.gens.remove(&id);
-            claimed.unclaimed.retain(|(_, info)| info.id != id);
-            return;
-        }
         // Keep the detached record replayable across a link drop until a claim
         // (or a newer save) takes ownership of it.
-        saved.insert(id, SavedLayoutState { id, sessions: sessions.clone(), json: json.clone(), sent_gen, detached: true });
+        saved.insert(
+            id,
+            SavedLayoutState { id, sessions: sessions.clone(), json: json.clone(), sent_gen, detached: true, released_before: None },
+        );
         let mut claimed = self.shared.claimed_layouts.lock();
         claimed.gens.remove(&id);
         claimed.unclaimed.retain(|(_, info)| info.id != id);
@@ -1312,13 +1337,19 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                     let cur = s.link_gen.load(Ordering::Acquire);
                     let release = s.version.load(Ordering::Relaxed) >= LAYOUT_LIST_SINCE;
                     layout.retain(|_, saved| {
-                        s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
                         saved.sent_gen = Some(cur);
                         if saved.detached && release {
-                            // Detached while offline: free it on the daemon now.
-                            s.send(&ClientMsg::ReleaseLayout { id: saved.id });
-                            return false;
+                            // Detached (offline, or its release may not have
+                            // arrived): free it on the daemon now. Never takes it
+                            // from a window that claimed it meanwhile.
+                            saved.released_before = Some(s.next_req.load(Ordering::Relaxed));
+                            s.send(&ClientMsg::ReleaseLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
+                            let mut claimed = s.claimed_layouts.lock();
+                            claimed.gens.remove(&saved.id);
+                            claimed.unclaimed.retain(|(_, info)| info.id != saved.id);
+                            return true;
                         }
+                        s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
                         if saved.detached {
                             let mut claimed = s.claimed_layouts.lock();
                             claimed.gens.remove(&saved.id);
@@ -2224,18 +2255,16 @@ mod tests {
         conn.save_layout(4, vec![2], "window a".into());
         conn.save_layout(5, vec![1], "window b".into());
         conn.detach_layout(5, vec![1], "window b".into());
-        // Released on the daemon: nothing kept here to replay or reclaim.
-        assert!(!conn.shared.layout.lock().contains_key(&5));
+        // Released on the daemon: kept here only until a reply proves it arrived.
+        assert!(conn.shared.layout.lock().get(&5).is_some_and(|s| s.released_before.is_some()));
         assert!(conn.shared.claimed_layouts.lock().unclaimed.is_empty());
         assert_eq!(conn.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [6]);
+        assert!(!conn.shared.layout.lock().contains_key(&5), "the reply proved the release arrived");
         assert_eq!(conn.claim_layout_id(6).unwrap().unwrap().sessions, [3]);
         assert!(conn.claim_layout_id(7).unwrap().is_none());
         let sent: Vec<ClientMsg> = seen_rx.drain().collect();
         assert!(
-            matches!(
-                sent[..3],
-                [ClientMsg::SaveLayout { id: 4, .. }, ClientMsg::SaveLayout { id: 5, .. }, ClientMsg::ReleaseLayout { id: 5 }]
-            ),
+            matches!(&sent[..3], [ClientMsg::SaveLayout { id: 4, .. }, ClientMsg::SaveLayout { id: 5, .. }, ClientMsg::ReleaseLayout { id: 5, sessions, .. }] if sessions == &[1]),
             "{sent:?}"
         );
 

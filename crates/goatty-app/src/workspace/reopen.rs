@@ -100,6 +100,8 @@ impl SavedHost {
 }
 
 impl OpenWindows {
+    /// The file as it is (a newer or damaged one reads as empty).
+    #[cfg(test)]
     pub fn load(path: &Path) -> Self {
         let loaded: Self = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if loaded.version > VERSION {
@@ -122,21 +124,33 @@ impl OpenWindows {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // The new directory entry too, so a power loss keeps the new file.
+        match path.parent() {
+            Some(dir) => std::fs::File::open(dir)?.sync_all(),
+            None => Ok(()),
+        }
     }
 
     /// Load, change and save the file at `path`, holding the lock that
     /// keeps other goatty processes from doing the same meanwhile.
     fn edit<T>(path: &Path, f: impl FnOnce(&mut Self) -> T) -> std::io::Result<T> {
         let _lock = FileLock::new(path)?;
-        if let Some(v) =
-            std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|j| j["version"].as_u64())
-            && v > u64::from(VERSION)
-        {
-            // A newer goatty's file: leave it alone.
-            return Err(std::io::Error::other(format!("{} has format {v}, newer than this goatty's", path.display())));
-        }
-        let mut file = Self::load(path);
+        // Read once, under the lock: a file that can't be read is never
+        // replaced (it'd lose the other processes' windows).
+        let mut file = match std::fs::read(path) {
+            Ok(bytes) => {
+                let version = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|j| j["version"].as_u64());
+                if let Some(v) = version.filter(|&v| v > u64::from(VERSION)) {
+                    // A newer goatty's file: leave it alone.
+                    return Err(std::io::Error::other(format!("{} has format {v}, newer than this goatty's", path.display())));
+                }
+                // Damaged: start over.
+                serde_json::from_slice::<Self>(&bytes).unwrap_or_default()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e),
+        };
         let out = f(&mut file);
         file.version = VERSION;
         file.save(path)?;
@@ -149,6 +163,18 @@ impl OpenWindows {
         let (dead, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.windows).into_iter().partition(|w| !alive(w.pid));
         self.windows = live;
         dead.into_iter().filter(|w| !w.hosts.is_empty()).collect()
+    }
+
+    /// Reserve the records of processes `alive` says are gone for process
+    /// `pid` (they become its records, so no other goatty reopens them, and
+    /// they survive if it exits before reopening them). Returns them.
+    fn reserve_dead(&mut self, pid: u32, alive: impl Fn(u32) -> bool) -> Vec<WindowRecord> {
+        let mut taken = self.take_dead(alive);
+        for w in &mut taken {
+            w.pid = pid;
+        }
+        self.windows.extend(taken.iter().cloned());
+        taken
     }
 
     /// Replace process `pid`'s records with `mine`.
@@ -214,11 +240,11 @@ fn alive(pid: u32) -> bool {
 }
 
 /// The windows to reopen at launch: the records of goatty processes that
-/// are gone, taken out of the file (so a second `goatty` doesn't reopen
-/// them too).
+/// are gone, reserved for this one (so a second `goatty` doesn't reopen
+/// them too; each stays in the file until its window records itself).
 pub fn take_for_launch() -> Vec<WindowRecord> {
     let Some(path) = state_file() else { return Vec::new() };
-    match OpenWindows::edit(&path, |file| file.take_dead(alive)) {
+    match OpenWindows::edit(&path, |file| file.reserve_dead(std::process::id(), alive)) {
         Ok(taken) => {
             if !taken.is_empty() {
                 log::info!("reopening {} window(s) from the last run", taken.len());
@@ -254,6 +280,9 @@ enum Write {
 #[derive(Default)]
 pub struct Windows {
     records: HashMap<WindowId, WindowRecord>,
+    /// Records of the last run's windows being reopened (by key), written
+    /// until their new window records itself.
+    reserved: Vec<WindowRecord>,
     /// The terminal windows open now.
     open: Vec<WindowId>,
     /// goatty is quitting: windows closing now stay recorded.
@@ -295,7 +324,7 @@ impl Windows {
 
     /// Write this process's records, off the UI thread, in order.
     fn write(&mut self) {
-        let mine: Vec<WindowRecord> = self.records.values().cloned().collect();
+        let mine: Vec<WindowRecord> = self.records.values().chain(self.reserved.iter()).cloned().collect();
         let _ = self.writer().send(Write::Records(mine));
     }
 }
@@ -336,17 +365,29 @@ pub fn window_opened(cx: &mut App, id: WindowId) {
     }
 }
 
-/// Window `id` has tabs on these hosts now (`None`: none it could reopen).
-/// Written when it changed.
-pub fn update(cx: &mut App, id: WindowId, record: Option<WindowRecord>) {
+/// Window `record` is being reopened: it stays recorded until that window
+/// records itself (with the same key).
+pub fn reserve(cx: &mut App, record: WindowRecord) {
+    let w = cx.default_global::<Windows>();
+    w.reserved.retain(|r| r.key != record.key);
+    w.reserved.push(record);
+}
+
+/// Window `id` (record key `key`) has tabs on these hosts now (`None`: none
+/// it could reopen). Written when it changed.
+pub fn update(cx: &mut App, id: WindowId, key: u64, record: Option<WindowRecord>) {
     let w = cx.default_global::<Windows>();
     if w.quitting || !w.open.contains(&id) {
         return;
     }
-    let changed = match record {
-        Some(r) => w.records.insert(id, r.clone()).as_ref() != Some(&r),
-        None => w.records.remove(&id).is_some(),
-    };
+    let reserved = w.reserved.len();
+    w.reserved.retain(|r| r.key != key);
+    let changed = w.reserved.len() != reserved;
+    let changed = changed
+        | match record {
+            Some(r) => w.records.insert(id, r.clone()).as_ref() != Some(&r),
+            None => w.records.remove(&id).is_some(),
+        };
     if changed {
         w.write();
     }
@@ -411,11 +452,15 @@ mod tests {
         // Process 1 updates its windows; 2's stay.
         file.replace_own(1, [rec(1, &[(SavedHost::Local, 8)])]);
         assert_eq!(file.windows.iter().map(|w| (w.pid, w.hosts[0].layout)).collect::<Vec<_>>(), [(2, 6), (1, 8)]);
-        // Process 2 is still running: only 1's window is reopened.
-        let taken = file.take_dead(|pid| pid == 2);
-        assert_eq!(taken.iter().map(|w| w.pid).collect::<Vec<_>>(), [1]);
-        assert_eq!(file.windows.iter().map(|w| w.pid).collect::<Vec<_>>(), [2]);
-        assert!(file.take_dead(|pid| pid == 2).is_empty());
+        // Process 2 is still running: only 1's window is reopened, by 3,
+        // which holds it now (so nobody else reopens it, and it's kept if 3
+        // exits before its window records itself).
+        let taken = file.reserve_dead(3, |pid| pid == 2 || pid == 3);
+        assert_eq!(taken.iter().map(|w| (w.pid, w.key)).collect::<Vec<_>>(), [(3, 10)]);
+        assert_eq!(file.windows.iter().map(|w| w.pid).collect::<Vec<_>>(), [2, 3]);
+        assert!(file.reserve_dead(4, |pid| pid == 2 || pid == 3).is_empty());
+        assert_eq!(file.reserve_dead(4, |pid| pid == 2).len(), 1, "3 exited first");
+        assert!(file.take_dead(|_| true).is_empty());
     }
 
     #[test]

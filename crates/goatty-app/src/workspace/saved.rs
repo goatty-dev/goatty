@@ -321,8 +321,14 @@ pub fn reattach(conn: &Arc<Connection>, size: TermSize, tabs: Vec<SavedTab>) -> 
     match conn.list_layouts() {
         Ok(layouts) => {
             for l in layouts.iter().filter(|l| !l.sessions.is_empty() && l.sessions.iter().all(|s| sessions.contains_key(s))) {
-                if matches!(conn.claim_layout_id(l.id), Ok(Some(_))) {
-                    conn.save_layout(l.id, Vec::new(), String::new());
+                // What it holds now, not what was listed: it may have changed.
+                match conn.claim_layout_id(l.id) {
+                    Ok(Some(info)) if info.sessions.iter().all(|s| sessions.contains_key(s)) => {
+                        conn.save_layout(l.id, Vec::new(), String::new());
+                    }
+                    Ok(Some(info)) => conn.release_claimed_layout(info),
+                    Ok(None) => {}
+                    Err(e) => log::warn!("claiming saved layout {:x}: {e:#}", l.id),
                 }
             }
         }
@@ -353,6 +359,40 @@ pub fn has_plain_tab(info: &goatty_proto::LayoutInfo, host: &str) -> bool {
     let Ok(saved) = serde_json::from_str::<SavedWorkspace>(&info.json) else { return false };
     let alive: HashSet<SessionId> = info.sessions.iter().copied().collect();
     prune(saved, &alive).is_some_and(|(tabs, _)| tabs.iter().any(|t| t.plain.as_deref() == Some(host)))
+}
+
+/// Take the tabs of plain SSH host `host` out of free layout `info` into a
+/// free layout of their own, leaving the rest free under `info`'s id: the
+/// id to restore that host's tabs from (`info`'s when it holds nothing
+/// else). `None` when another window took the layout meanwhile. Blocks.
+pub fn split_plain(conn: &Arc<Connection>, info: &goatty_proto::LayoutInfo, host: &str) -> Result<Option<LayoutId>> {
+    let Some(claimed) = conn.claim_layout_id(info.id)? else { return Ok(None) };
+    let Ok(saved) = serde_json::from_str::<SavedWorkspace>(&claimed.json) else {
+        conn.release_claimed_layout(claimed);
+        return Ok(None);
+    };
+    let alive: HashSet<SessionId> = claimed.sessions.iter().copied().collect();
+    let running = |t: &SavedTab| t.tree.leaves().iter().any(|s| alive.contains(s));
+    let (mine, rest): (Vec<SavedTab>, Vec<SavedTab>) = saved.tabs.into_iter().partition(|t| t.plain.as_deref() == Some(host));
+    if !mine.iter().any(running) {
+        conn.release_claimed_layout(claimed);
+        return Ok(None);
+    }
+    if !rest.iter().any(running) {
+        conn.release_claimed_layout(claimed);
+        return Ok(Some(info.id));
+    }
+    let window = saved.window;
+    let part = |tabs: Vec<SavedTab>| {
+        let sessions: Vec<SessionId> = tabs.iter().flat_map(|t| t.tree.leaves()).filter(|s| alive.contains(s)).collect();
+        let json = serde_json::to_string(&SavedWorkspace { version: VERSION, tabs, active: 0, window }).unwrap_or_default();
+        (sessions, json)
+    };
+    let ((ms, mj), (rs, rj)) = (part(mine), part(rest));
+    conn.detach_layout(info.id, rs, rj);
+    let id = new_id();
+    conn.detach_layout(id, ms, mj);
+    Ok(Some(id))
 }
 
 /// The detached sessions on `conn` that no saved layout shows (those come

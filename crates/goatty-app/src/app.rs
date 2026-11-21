@@ -75,6 +75,9 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
     };
     // A restored layout resizes the window when it arrives (`Workspace`);
     // a reopened window knows its size right away.
+    if let Initial::Reopen(record, _) = &initial {
+        crate::workspace::reopen::reserve(cx, record.clone());
+    }
     let (w, h) = match &initial {
         Initial::Reopen(r, _) => r.window.map_or(SavedWindow::DEFAULT, |w| w.size()),
         _ => SavedWindow::DEFAULT,

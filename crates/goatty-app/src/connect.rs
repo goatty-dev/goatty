@@ -321,14 +321,20 @@ fn restart_local(conn: Option<Arc<Connection>>) -> Result<(Arc<Connection>, bool
     Ok((conn, kept))
 }
 
+/// Held while checking or restarting the local daemon: windows reopened
+/// together (each with its own question) restart it once.
+fn one_local_restart() -> std::sync::MutexGuard<'static, ()> {
+    static RESTARTING: Mutex<()> = Mutex::new(());
+    RESTARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Check the local daemon is the installed build: restart it right away
 /// when that keeps its sessions or it holds none, else ask
 /// ([`LocalProblem::Outdated`]). `restarted` says how that went.
 fn check_local(conn: Arc<Connection>, restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
     // One check at a time: windows reopened together mustn't restart the
     // daemon twice. The second one then finds the restarted daemon current.
-    static CHECKING: Mutex<()> = Mutex::new(());
-    let _one = CHECKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _one = one_local_restart();
     let conn = match crate::hosts::pool::live(&Endpoint::Local) {
         // Restarted by the check before this one.
         Some(live) if !Arc::ptr_eq(&live, &conn) => live,
@@ -578,7 +584,14 @@ impl ConnectView {
                 self.outdated = None;
                 let mode = self.plan.mode;
                 self.work("Restarting goattyd…".into(), window, cx, move || {
-                    let (conn, _) = restart_local(None)?;
+                    let _one = one_local_restart();
+                    // Another window's answer may have replaced it meanwhile:
+                    // then this one runs the installed build and speaks our protocol.
+                    let current = pool::open(Endpoint::Local).ok().filter(|c| local::outdated(c.daemon_pid()).is_none());
+                    let conn = match current {
+                        Some(conn) => conn,
+                        None => restart_local(None)?.0,
+                    };
                     let startup = saved::startup(&conn, initial_size(), mode)?;
                     Ok((startup, Spawner::Daemon(conn)))
                 });
