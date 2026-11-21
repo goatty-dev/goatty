@@ -200,8 +200,9 @@ impl Workspace {
         let control = if modern { 24.0 } else { 18.0 };
         let left = chrome::window_buttons(chrome::Side::Left, control, c, window, cx);
         let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
-        // The settings button, and the window buttons when goatty draws them.
-        let chrome_room = 32.0 + chrome::buttons_width(control, window, cx);
+        // The settings button, the new-tab menu's chevron, and the window
+        // buttons when goatty draws them.
+        let chrome_room = 32.0 + 18.0 + chrome::buttons_width(control, window, cx);
         let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels as f32 * GROUP_LABEL_ROOM - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
@@ -222,13 +223,39 @@ impl Workspace {
             .cursor_pointer()
             .text_color(c.ui.muted)
             .hover(|s| s.bg(c.hover).text_color(c.ui.text))
-            .tooltip(tooltip("New tab"))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx));
+            .tooltip(tooltip("New tab (right-click for more)"))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_new_tab_menu(ev.position, window, cx);
+                }),
+            );
         let new_tab = if modern {
             new_tab.size(px(28.)).mb(px(2.)).rounded_md().child(Icon::Plus.svg().size(px(15.)).text_color(c.ui.muted))
         } else {
             new_tab.h_full().px(px(10.)).child("+")
         };
+        // Where else a new tab can go: the same menu as a right click on +.
+        let more = div()
+            .id("tab-new-more")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(c.hover))
+            .tooltip(tooltip("New tab on another host, detached tabs, new window"))
+            .child(Icon::ChevronDown.svg().size(px(if modern { 12. } else { 11. })).text_color(c.ui.muted))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_new_tab_menu(ev.position, window, cx);
+                }),
+            );
+        let more = if modern { more.w(px(16.)).h(px(28.)).mb(px(2.)).rounded_md() } else { more.h_full().px(px(4.)) };
         let settings = div()
             .id("tab-settings")
             .flex_none()
@@ -275,6 +302,7 @@ impl Workspace {
                     .children(items),
             )
             .child(new_tab)
+            .child(more)
             .child(rest)
             .child(settings)
             .children(right);

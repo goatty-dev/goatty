@@ -321,10 +321,25 @@ fn restart_local(conn: Option<Arc<Connection>>) -> Result<(Arc<Connection>, bool
     Ok((conn, kept))
 }
 
+/// Held while checking or restarting the local daemon: windows reopened
+/// together (each with its own question) restart it once.
+fn one_local_restart() -> std::sync::MutexGuard<'static, ()> {
+    static RESTARTING: Mutex<()> = Mutex::new(());
+    RESTARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Check the local daemon is the installed build: restart it right away
 /// when that keeps its sessions or it holds none, else ask
 /// ([`LocalProblem::Outdated`]). `restarted` says how that went.
 fn check_local(conn: Arc<Connection>, restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
+    // One check at a time: windows reopened together mustn't restart the
+    // daemon twice. The second one then finds the restarted daemon current.
+    let _one = one_local_restart();
+    let conn = match crate::hosts::pool::live(&Endpoint::Local) {
+        // Restarted by the check before this one.
+        Some(live) if !Arc::ptr_eq(&live, &conn) => live,
+        _ => conn,
+    };
     let Some(outdated) = local::outdated(conn.daemon_pid()) else { return Ok(conn) };
     // Kept running on purpose, or a restart was refused: until it or the
     // installed build changes.
@@ -527,7 +542,13 @@ impl ConnectView {
             return;
         }
         let (endpoint, mode, conn) = (self.plan.endpoint.clone(), self.plan.mode, self.plan.conn.take());
-        let label = if endpoint.is_local() { "Starting a shell…".to_string() } else { format!("Connecting to {}…", endpoint.label()) };
+        let restoring = matches!(mode, AttachMode::Layout(_) | AttachMode::AllDetached);
+        let label = match (endpoint.is_local(), restoring) {
+            (true, false) => "Starting a shell…".to_string(),
+            (true, true) => "Restoring your tabs…".to_string(),
+            (false, false) => format!("Connecting to {}…", endpoint.label()),
+            (false, true) => format!("Restoring your tabs on {}…", endpoint.label()),
+        };
         let check = endpoint.is_local() && self.check_local;
         let restarted = self.restarted.clone();
         self.work(label, window, cx, move || {
@@ -563,7 +584,14 @@ impl ConnectView {
                 self.outdated = None;
                 let mode = self.plan.mode;
                 self.work("Restarting goattyd…".into(), window, cx, move || {
-                    let (conn, _) = restart_local(None)?;
+                    let _one = one_local_restart();
+                    // Another window's answer may have replaced it meanwhile:
+                    // then this one runs the installed build and speaks our protocol.
+                    let current = pool::open(Endpoint::Local).ok().filter(|c| local::outdated(c.daemon_pid()).is_none());
+                    let conn = match current {
+                        Some(conn) => conn,
+                        None => restart_local(None)?.0,
+                    };
                     let startup = saved::startup(&conn, initial_size(), mode)?;
                     Ok((startup, Spawner::Daemon(conn)))
                 });

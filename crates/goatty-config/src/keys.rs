@@ -81,6 +81,8 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "close_other_tabs", label: "Close the other tabs", group: "Tabs" },
     ActionInfo { name: "detach_other_tabs", label: "Detach the other tabs (keep their shells running)", group: "Tabs" },
     ActionInfo { name: "detach_host", label: "Detach from this host (close its tabs and keep its shells running)", group: "Tabs" },
+    ActionInfo { name: "reattach_detached", label: "Reattach what was detached last on this host (its tabs at once)", group: "Tabs" },
+    ActionInfo { name: "new_window", label: "New window", group: "Tabs" },
     ActionInfo { name: "merge_tab", label: "Bring another tab into this one (side by side)", group: "Tabs" },
     ActionInfo { name: "toggle_tab_sidebar", label: "Fold or unfold the tab sidebar", group: "Tabs" },
     ActionInfo { name: "toggle_vertical_tabs", label: "Switch between vertical and horizontal tabs", group: "Tabs" },
@@ -170,6 +172,8 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     // Tabs. Alt+digit and Alt+arrows fall through to the shell when there's
     // no such tab or pane, so a single pane loses nothing.
     ("ctrl-shift-t", "new_tab"),
+    ("ctrl-shift-n", "new_window"),
+    ("ctrl-shift-r", "reattach_detached"),
     ("ctrl-shift-w", "close_pane"),
     ("ctrl-tab", "next_tab"),
     ("ctrl-shift-tab", "previous_tab"),

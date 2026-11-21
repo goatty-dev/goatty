@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 7;
@@ -69,6 +69,12 @@ pub const SIZE_CONTROL_SINCE: u32 = 14;
 /// v15: adaptive flow-control window on remote links (`ClientMsg::Rtt` /
 /// `ServerMsg::FlowWindow`, #9).
 pub const FLOW_CONTROL_SINCE: u32 = 15;
+
+/// v16: listing the free window layouts (`ListLayouts` / `ServerMsg::Layouts`),
+/// claiming one by id (`ClaimLayoutId`), so a client restores the layout it
+/// saved (a window's tabs on that host, #252) rather than the newest, and
+/// releasing one without disconnecting (`ReleaseLayout`: detached tabs).
+pub const LAYOUT_LIST_SINCE: u32 = 16;
 
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
 /// for postcard headers and path metadata).
@@ -341,6 +347,28 @@ pub enum ClientMsg {
     Rtt {
         rtt_us: u64,
     },
+    /// v16: the layouts no connection holds that still show a running
+    /// session, newest first, with only those sessions listed. Nothing is
+    /// claimed. Reply: `Layouts`.
+    ListLayouts {
+        req: ReqId,
+    },
+    /// v16: take over layout `id` if no connection holds it and it still
+    /// shows a running session (like `ClaimLayout`, for one layout). Reply:
+    /// `Layout` (`None` when it's gone or held).
+    ClaimLayoutId {
+        req: ReqId,
+        id: LayoutId,
+    },
+    /// v16: keep layout `id` with `sessions` and `json` as a free layout
+    /// (detached tabs), the newest one, for any window to claim, unless
+    /// another connection holds it. Safe to send again (a retry after a link
+    /// drop never takes it from a window that claimed it meanwhile). No reply.
+    ReleaseLayout {
+        id: LayoutId,
+        sessions: Vec<SessionId>,
+        json: String,
+    },
 }
 
 /// Why the daemon sent `ServerMsg::TopLine`.
@@ -584,6 +612,11 @@ pub enum ServerMsg {
     FlowWindow {
         window: u32,
     },
+    /// v16: reply to `ListLayouts`.
+    Layouts {
+        req: ReqId,
+        layouts: Vec<LayoutInfo>,
+    },
 }
 
 impl ServerMsg {
@@ -599,6 +632,7 @@ impl ServerMsg {
             | ServerMsg::ShellsReloaded { req, .. }
             | ServerMsg::Plugin { req, .. }
             | ServerMsg::Layout { req, .. }
+            | ServerMsg::Layouts { req, .. }
             | ServerMsg::Shell { req, .. }
             | ServerMsg::Net { req, .. }
             | ServerMsg::History { req, .. }
@@ -698,5 +732,10 @@ mod tests {
         // v15 additions come after v14's.
         assert_eq!(postcard::to_allocvec(&ClientMsg::Rtt { rtt_us: 1000 }).unwrap()[0], 30);
         assert_eq!(postcard::to_allocvec(&ServerMsg::FlowWindow { window: StreamOpts::REMOTE.window }).unwrap()[0], 25);
+        // v16 additions come after v15's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ListLayouts { req: 1 }).unwrap()[0], 31);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ClaimLayoutId { req: 1, id: 2 }).unwrap()[0], 32);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ReleaseLayout { id: 2, sessions: vec![1], json: String::new() }).unwrap()[0], 33);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Layouts { req: 1, layouts: Vec::new() }).unwrap()[0], 26);
     }
 }

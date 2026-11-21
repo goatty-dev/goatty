@@ -68,15 +68,100 @@ pub mod pool {
         live.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade())
     }
 
+    /// One connection attempt in progress, shared by everyone asking for
+    /// that host meanwhile (reopened windows connect to the same host at
+    /// once): one login, one askpass prompt, one timeout.
+    #[derive(Default)]
+    struct Flight {
+        /// Held while connecting; then the outcome for those who waited.
+        outcome: Mutex<Option<std::result::Result<Arc<Connection>, Failed>>>,
+    }
+
+    /// A failed attempt, for each caller that waited for it.
+    #[derive(Clone)]
+    enum Failed {
+        /// What the connect screen offers to fix (install, plain SSH).
+        Remote(goatty_client::RemoteProblem),
+        /// The local daemon speaks no protocol of ours (it offers a restart).
+        Local(goatty_client::local::LocalProblem),
+        Other(String),
+    }
+
+    impl Failed {
+        fn of(e: &anyhow::Error) -> Self {
+            if let Some(p) = e.downcast_ref::<goatty_client::RemoteProblem>() {
+                return Failed::Remote(p.clone());
+            }
+            match e.downcast_ref::<goatty_client::local::LocalProblem>() {
+                Some(p) => Failed::Local(p.clone()),
+                None => Failed::Other(format!("{e:#}")),
+            }
+        }
+
+        fn error(self) -> anyhow::Error {
+            match self {
+                Failed::Remote(p) => p.into(),
+                Failed::Local(p) => p.into(),
+                Failed::Other(msg) => anyhow::anyhow!(msg),
+            }
+        }
+    }
+
+    /// The flights in progress, by key, with how many callers are in each.
+    static OPENING: Mutex<Vec<(String, Arc<Flight>, usize)>> = Mutex::new(Vec::new());
+
     /// The open connection to `endpoint`, else a new one. Blocks (ssh can
-    /// take seconds): call it off the UI thread.
+    /// take seconds): call it off the UI thread. Concurrent calls for one
+    /// host share one attempt, failures included.
     pub fn open(endpoint: Endpoint) -> Result<Arc<Connection>> {
         if let Some(conn) = live(&endpoint) {
             return Ok(conn);
         }
-        let conn = Connection::open(endpoint, crate::CLIENT)?;
-        add(&conn);
-        Ok(conn)
+        let Some(k) = key(&endpoint) else { return Connection::open(endpoint, crate::CLIENT) };
+        let flight = {
+            let mut opening = OPENING.lock();
+            match opening.iter_mut().find(|(o, _, _)| *o == k) {
+                Some((_, f, users)) => {
+                    *users += 1;
+                    f.clone()
+                }
+                None => {
+                    let f = Arc::new(Flight::default());
+                    opening.push((k.clone(), f.clone(), 1));
+                    f
+                }
+            }
+        };
+        // Leaves the flight (the last one out removes it), also on a panic.
+        struct Leave<'a>(&'a str, &'a Arc<Flight>);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                let mut opening = OPENING.lock();
+                if let Some(pos) = opening.iter().position(|(o, f, _)| o == self.0 && Arc::ptr_eq(f, self.1)) {
+                    opening[pos].2 -= 1;
+                    if opening[pos].2 == 0 {
+                        opening.remove(pos);
+                    }
+                }
+            }
+        }
+        let _leave = Leave(&k, &flight);
+        let mut outcome = flight.outcome.lock();
+        match &*outcome {
+            // The attempt we waited for.
+            Some(Ok(conn)) => return Ok(conn.clone()),
+            Some(Err(failed)) => return Err(failed.clone().error()),
+            _ => {}
+        }
+        if let Some(conn) = live(&endpoint) {
+            return Ok(conn);
+        }
+        let result = Connection::open(endpoint, crate::CLIENT).inspect(add);
+        *outcome = Some(match &result {
+            Ok(conn) => Ok(conn.clone()),
+            Err(e) => Err(Failed::of(e)),
+        });
+        result
     }
 
     /// Share `conn` from now on (opened elsewhere, e.g. after installing goattyd).
@@ -251,8 +336,11 @@ pub fn connect(cx: &mut App, host: &str) {
 /// same. Deferred, so it can be called while a workspace is being updated
 /// (the palette runs its commands from one).
 pub fn open(cx: &mut App, req: OpenRequest) {
+    // Plain SSH only for a fresh session: restoring or reattaching means the
+    // host's goattyd that listed them (even after the host was set to plain).
+    let fresh = matches!(req.attach, AttachMode::New | AttachMode::Auto);
     let plain = match &req.host {
-        HostRef::Ssh(host) => cx.global::<AppSettings>().client.ssh.plain(host),
+        HostRef::Ssh(host) => fresh && cx.global::<AppSettings>().client.ssh.plain(host),
         HostRef::Local | HostRef::Tailnet { .. } => false,
     };
     log::info!("opening a session on {}{}", req.host.label(), if plain { " (plain SSH)" } else { "" });
@@ -357,6 +445,20 @@ pub fn ask_connect(window: &mut gpui::Window, cx: &mut App) {
         .placeholder("user@example.com, or an alias from ~/.ssh/config")
         .help("Connects once; \"SSH: Add a host to the list…\" keeps it");
     let a = Ask::new("Connect to a host", vec![field], |answers, _, cx| connect(cx, &answers["host"]));
+    crate::command_palette::ask(window, cx, a);
+}
+
+/// Ask for a host (yours suggested) and open a new session there in a tab
+/// of the active window, whatever `ssh.open_in` says (the new-tab menu's
+/// "Another host…").
+pub fn ask_new_tab(window: &mut gpui::Window, cx: &mut App) {
+    let field = Field::host("host", "Host", known_hosts(cx))
+        .placeholder("user@example.com, or an alias from ~/.ssh/config")
+        .help("Opens a new tab there");
+    let a = Ask::new("New tab on a host", vec![field], |answers, _, cx| {
+        let host = HostRef::Ssh(answers["host"].clone());
+        open(cx, OpenRequest { host, attach: AttachMode::New, conn: None, place: OpenIn::Tab });
+    });
     crate::command_palette::ask(window, cx, a);
 }
 
