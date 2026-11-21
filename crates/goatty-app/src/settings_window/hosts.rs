@@ -51,7 +51,14 @@ impl HostsPage {
         let picker = cx.new(|cx| ColorPicker::new(Color(0), cx));
         subs.push(cx.subscribe(&picker, |view, _, ev: &ColorPickerEvent, cx| match *ev {
             ColorPickerEvent::Changed(c) => view.host_color_changed(c, cx),
-            ColorPickerEvent::Committed(_) => view.flush_host_color(cx),
+            // The user settled on it: it becomes the host's own color, also
+            // when it equals the one shown (an automatic or theme color).
+            ColorPickerEvent::Committed(c) => {
+                if let Some(host) = view.hosts.editing.clone() {
+                    view.hosts.pending = None;
+                    AppSettings::update(cx, |s| s.tabs.set_host_color(&host, Some(HostColor::Custom(c))));
+                }
+            }
         }));
         // Closing the window right after a change must not lose it.
         subs.push(cx.on_release(|view, cx| view.flush_host_color(cx)));
@@ -133,7 +140,11 @@ impl SettingsWindow {
     /// Write a live color change to settings.json.
     fn flush_host_color(&mut self, cx: &mut App) {
         if let Some((host, color)) = self.hosts.pending.take() {
-            AppSettings::update(cx, |s| s.tabs.set_host_color(&host, Some(HostColor::Custom(color))));
+            // Something else (the group's menu) chose a color since: that one stays.
+            let shown = cx.global::<AppSettings>().client.tabs.host_color(&host);
+            if shown == Some(HostColor::Custom(color)) {
+                AppSettings::update(cx, |s| s.tabs.set_host_color(&host, Some(HostColor::Custom(color))));
+            }
         }
     }
 

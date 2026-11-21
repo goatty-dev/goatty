@@ -386,10 +386,11 @@ impl Workspace {
         }
         entries.push(Entry::Separator);
         if !g.local {
-            // The Hosts page lists SSH hosts (plain ones too), not tailnet ones.
+            // The Hosts page lists the hosts of the list (plain ones too), not tailnet ones or typed-in ones.
             let host = self.tabs.get(g.tabs[0]).and_then(|t| t.host.as_ref());
-            let ssh = matches!(host, Some(crate::session::Spawner::Plain { .. }))
-                || matches!(host.and_then(super::host_ref_of), Some(crate::hosts::HostRef::Ssh(_)));
+            let ssh = (matches!(host, Some(crate::session::Spawner::Plain { .. }))
+                || matches!(host.and_then(super::host_ref_of), Some(crate::hosts::HostRef::Ssh(_))))
+                && crate::hosts::current(cx).iter().any(|e| e.host == *g.label);
             entries.push(Self::group_color_menu(&g.label, ssh, cx).into());
         }
         entries.push(
@@ -489,7 +490,7 @@ impl Workspace {
         if matches!(chosen, Some(HostColor::Custom(_))) {
             custom = custom.icon(Icon::Check);
         }
-        custom = custom.disabled((!ssh).then_some("Only for SSH hosts"));
+        custom = custom.disabled((!ssh).then_some("Add this host in Settings → Hosts first"));
         entries.push(custom.into());
         Item::submenu("Color", entries).icon(Icon::Palette)
     }
