@@ -1108,15 +1108,15 @@ fn copy_on_select_became_auto_copy(doc: &mut serde_json::Value) {
     let Some(selection) = doc.as_object_mut().and_then(|m| m.get_mut("selection")).and_then(Value::as_object_mut) else {
         return;
     };
-    match selection.remove("copy_on_select").as_ref().and_then(Value::as_str) {
-        Some("clipboard") => {
-            selection.entry("auto_copy").or_insert(Value::Bool(true));
-        }
-        Some("off") => {
-            selection.entry("primary").or_insert(Value::Bool(false));
-        }
-        _ => {}
-    }
+    // An unknown value stays, so loading reports it.
+    let (key, value) = match selection.get("copy_on_select").and_then(Value::as_str) {
+        Some("clipboard") => ("auto_copy", true),
+        Some("off") => ("primary", false),
+        Some("primary") => ("primary", true),
+        _ => return,
+    };
+    selection.remove("copy_on_select");
+    selection.entry(key).or_insert(Value::Bool(value));
 }
 
 /// Version 1 → 2 (#246): `theme.overrides` became a map keyed by theme id
@@ -1390,6 +1390,10 @@ mod tests {
         assert_eq!(sel(r#"{"version": 2, "selection": {"copy_on_select": "clipboard"}}"#), on);
         assert_eq!(sel(r#"{"version": 2, "selection": {"copy_on_select": "off"}}"#), no_primary);
         assert_eq!(sel(r#"{"version": 2, "selection": {"copy_on_select": "primary"}}"#), SelectionSettings::default());
+        // A value it never had stays, and loading reports it.
+        let typo = store::parse::<ClientSettings>(r#"{"version": 2, "selection": {"copy_on_select": "clipbord"}}"#);
+        assert_eq!(typo.value.selection, SelectionSettings::default());
+        assert!(typo.issues.iter().any(|i| i.path.contains("copy_on_select")), "{:?}", typo.issues);
         // Unversioned files with the old key take the migration too.
         assert_eq!(sel(r#"{"selection": {"copy_on_select": "clipboard"}}"#), on);
         // The new keys load as they are.
