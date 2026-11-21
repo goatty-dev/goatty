@@ -155,6 +155,18 @@ pub fn open_create_custom_theme(cx: &mut App) {
     }
 }
 
+/// Open the Hosts page with the color editor under `host`'s row (the
+/// "Custom color…" of a host group's menu, #257).
+pub fn open_host_color(cx: &mut App, host: &str) {
+    open_at(cx, Some(Page::Hosts));
+    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        let _ = handle.update(cx, |view, _, cx| {
+            view.search.update(cx, |i, cx| i.set_text("", cx));
+            view.edit_host_color(host, cx);
+        });
+    }
+}
+
 /// Open the settings window at `page` (or where it was).
 pub fn open_at(cx: &mut App, page: Option<Page>) {
     if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)

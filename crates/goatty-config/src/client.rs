@@ -459,9 +459,99 @@ pub struct TabSettings {
     pub sidebar_width: f32,
     /// Vertical tabs: the sidebar is folded into a rail of icons.
     pub sidebar_collapsed: bool,
+    /// Colors chosen for a host's tab group (#257), by the host's name as
+    /// the group shows it (the SSH host or tailnet name). A host without
+    /// an entry gets a color from its name ([`HostColor::automatic`]).
+    pub host_colors: BTreeMap<String, HostColor>,
+}
+
+/// The color of a host's tab group, as `settings.json` spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostColor {
+    /// One of the theme's ANSI colors (0–15), so it follows the theme.
+    /// Written as its name in [`HostColor::PALETTE`].
+    Ansi(u8),
+    /// A color of the user's own, written as `#rrggbb`.
+    Custom(crate::Color),
+}
+
+impl HostColor {
+    /// The theme colors a host gets by default and can pick by name:
+    /// blue, magenta, cyan, green, yellow, red.
+    pub const PALETTE: [(&'static str, u8); 6] = [("blue", 4), ("magenta", 5), ("cyan", 6), ("green", 2), ("yellow", 3), ("red", 1)];
+
+    /// The color a host named `name` gets without a choice of its own: from
+    /// its name (FNV-1a), so it's the same everywhere.
+    pub fn automatic(name: &str) -> Self {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in name.bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        // FNV's low bits barely change between similar names: mix them
+        // (MurmurHash3's finalizer).
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x85eb_ca6b);
+        h ^= h >> 13;
+        h = h.wrapping_mul(0xc2b2_ae35);
+        h ^= h >> 16;
+        Self::Ansi(Self::PALETTE[h as usize % Self::PALETTE.len()].1)
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        match Self::PALETTE.iter().find(|(n, _)| n.eq_ignore_ascii_case(s)) {
+            Some(&(_, ansi)) => Some(Self::Ansi(ansi)),
+            None => crate::Color::parse(s).map(Self::Custom),
+        }
+    }
+
+    /// The name of a palette color.
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Ansi(i) => Self::PALETTE.iter().find(|(_, a)| *a == i).map(|(n, _)| *n),
+            Self::Custom(_) => None,
+        }
+    }
+}
+
+impl Serialize for HostColor {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Ansi(_) => s.serialize_str(self.name().unwrap_or("blue")),
+            Self::Custom(c) => c.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HostColor {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).ok_or_else(|| {
+            let names: Vec<&str> = Self::PALETTE.iter().map(|(n, _)| *n).collect();
+            serde::de::Error::custom(format!("{s:?} is not a host color ({} or a color like #rrggbb)", names.join(", ")))
+        })
+    }
 }
 
 impl TabSettings {
+    /// The color chosen for the host named `name`, if any.
+    pub fn host_color(&self, name: &str) -> Option<HostColor> {
+        self.host_colors.get(name).copied()
+    }
+
+    /// Choose the color for the host named `name` (`None`: automatic again).
+    pub fn set_host_color(&mut self, name: &str, color: Option<HostColor>) {
+        match color {
+            Some(c) => {
+                self.host_colors.insert(name.to_string(), c);
+            }
+            None => {
+                self.host_colors.remove(name);
+            }
+        }
+    }
+
     pub const MIN_SIDEBAR_WIDTH: f32 = 140.0;
     pub const MAX_SIDEBAR_WIDTH: f32 = 480.0;
     pub const DEFAULT_SIDEBAR_WIDTH: f32 = 220.0;
@@ -478,6 +568,7 @@ impl Default for TabSettings {
             scroll_to_switch: false,
             sidebar_width: Self::DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
+            host_colors: BTreeMap::new(),
         }
     }
 }
@@ -983,7 +1074,7 @@ pub struct DebugSettings {
 impl Document for ClientSettings {
     const NAME: &'static str = "settings";
     const VERSION: u32 = 3;
-    const OPEN_MAPS: &'static [&'static str] = &["keybindings", "theme.overrides"];
+    const OPEN_MAPS: &'static [&'static str] = &["keybindings", "theme.overrides", "tabs.host_colors"];
 
     fn migrations() -> &'static [Migration] {
         &[(1, global_theme_overrides_became_per_theme), (2, copy_on_select_became_auto_copy)]
@@ -1746,5 +1837,40 @@ mod tests {
         let l = store::parse::<ClientSettings>(r#"{"keyboard":{"ctrl_backspace":"bogus"}}"#);
         assert_eq!(l.value.keyboard.ctrl_backspace, CtrlBackspace::EscBackspace);
         assert!(!l.issues.is_empty());
+    }
+
+    #[test]
+    fn host_colors_are_names_or_custom_colors() {
+        use crate::store;
+        let l = store::parse::<ClientSettings>(r##"{"tabs":{"host_colors":{"prod":"red","user@10.0.0.2":"#336699","bad":"nope"}}}"##);
+        let t = &l.value.tabs;
+        assert_eq!(t.host_color("prod"), Some(HostColor::Ansi(1)));
+        assert_eq!(t.host_color("user@10.0.0.2"), Some(HostColor::Custom(crate::Color(0x336699))));
+        assert_eq!(t.host_color("bad"), None, "a bad entry is dropped");
+        assert_eq!(l.issues.len(), 1, "{:?}", l.issues);
+        assert_eq!(l.issues[0].path, "tabs.host_colors.bad");
+        let json = store::to_json(&l.value, &l.unknown);
+        assert!(json.contains("\"red\"") && json.contains("\"#336699\""), "{json}");
+
+        let mut t = TabSettings::default();
+        t.set_host_color("pi", Some(HostColor::Ansi(6)));
+        assert_eq!(t.host_color("pi"), Some(HostColor::Ansi(6)));
+        t.set_host_color("pi", None);
+        assert!(t.host_colors.is_empty());
+        let l = store::set_key::<ClientSettings>("", "tabs.host_colors.nas", "magenta").unwrap();
+        assert_eq!(l.value.tabs.host_color("nas"), Some(HostColor::Ansi(5)));
+    }
+
+    #[test]
+    fn automatic_host_colors_depend_on_the_name_only() {
+        assert_eq!(HostColor::automatic("prod"), HostColor::automatic("prod"));
+        let colors: std::collections::HashSet<u8> = ["prod", "staging", "pi", "nas", "build", "dev"]
+            .iter()
+            .map(|n| match HostColor::automatic(n) {
+                HostColor::Ansi(i) => i,
+                HostColor::Custom(_) => unreachable!(),
+            })
+            .collect();
+        assert!(colors.len() > 2, "names spread over the colors: {colors:?}");
     }
 }
