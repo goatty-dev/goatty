@@ -39,7 +39,7 @@ tempfile = "3"
 # (goatty-app; tests also read the bundled font). Both are already in the
 # tree through gpui.
 ttf-parser = "0.25"
-fontdb = "0.23"
+fontdb = "0.24"
 # The color picker's OKLCH disc is a generated bitmap: gpui's `RenderImage`
 # takes `image::Frame`s (already in the tree through gpui, same version).
 image = { version = "0.25", default-features = false }
@@ -58,8 +58,8 @@ flate2 = "1"
 tar = "0.4"
 # Plugin packages in other formats (goatty-plugin `archive`): .zip and .tar.xz,
 # both pure Rust (the static goattyd build has no C toolchain to spare).
-zip = { version = "~9.1", default-features = false, features = ["deflate-flate2"] }
-lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "xz"] }
+zip = { version = "~9.7", default-features = false, features = ["deflate-flate2"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 # Plugins (goatty-plugin): TOML manifests, version requirements, signed registry indexes.
 toml = "1.1"
 semver = "1"
