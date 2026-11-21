@@ -3,7 +3,8 @@
 //! size and state (#128). The workspace saves
 //! it on every change (`Connection::save_layout`); starting goatty again
 //! claims the newest layout no window holds and reattaches its sessions
-//! ([`restore`]).
+//! ([`restore`]). A window reopened from `reopen` claims its own layout on
+//! each host by id ([`Claim::Id`], #252).
 //!
 //! The JSON is ours alone; the daemon stores it as is. Bump [`VERSION`]
 //! when the format changes incompatibly (an unreadable layout is ignored,
@@ -124,6 +125,10 @@ pub struct SavedTab {
     pub focused: SessionId,
     #[serde(default)]
     pub zoomed: bool,
+    /// A plain SSH tab (`ssh HOST` in a session of this goattyd): restored
+    /// as one, in that host's group. Missing in layouts saved before #252.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plain: Option<String>,
 }
 
 /// A restored tab: its tree has session ids as leaves, all attached.
@@ -132,11 +137,15 @@ pub struct RestoredTab {
     pub tree: Node,
     pub focused: SessionId,
     pub zoomed: bool,
+    pub plain: Option<String>,
 }
 
 /// A window brought back from a saved layout.
 pub struct Restored {
     pub id: LayoutId,
+    /// `id` is a layout the daemon kept (claimed now), not one made up for
+    /// tabs that weren't in one ([`AttachMode::AllDetached`]).
+    pub claimed: bool,
     pub tabs: Vec<RestoredTab>,
     pub active: usize,
     pub sessions: HashMap<SessionId, Arc<Session>>,
@@ -148,6 +157,18 @@ pub enum Startup {
     /// One tab with this session.
     Session(Arc<Session>),
     Restore(Restored),
+    /// Nothing left to restore ([`AttachMode::Layout`] whose sessions all
+    /// ended, [`AttachMode::AllDetached`] without any).
+    Nothing,
+}
+
+/// Which saved layout to restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// The newest one no window holds.
+    Newest,
+    /// This one (the newest free one from a goattyd older than v16).
+    Id(LayoutId),
 }
 
 /// A fresh layout id: random, so windows on other machines attached to the
@@ -181,7 +202,8 @@ pub fn prune(saved: SavedWorkspace, alive: &HashSet<SessionId>) -> Option<(Vec<R
         let leaves = tree.leaves();
         let focused = if leaves.contains(&tab.focused) { tab.focused } else { leaves[0] };
         let zoomed = tab.zoomed && leaves.len() > 1;
-        tabs.push(RestoredTab { name: tab.name.filter(|n| !n.trim().is_empty()), tree, focused, zoomed });
+        let plain = tab.plain.filter(|h| !h.trim().is_empty());
+        tabs.push(RestoredTab { name: tab.name.filter(|n| !n.trim().is_empty()), tree, focused, zoomed, plain });
     }
     if tabs.is_empty() {
         return None;
@@ -190,31 +212,47 @@ pub fn prune(saved: SavedWorkspace, alive: &HashSet<SessionId>) -> Option<(Vec<R
     Some((tabs, active))
 }
 
-/// Claim the newest saved layout on `conn` and reattach its sessions.
-/// `None` when there is none, or none of its sessions could be attached
-/// (the caller then reattaches a single session as before). Blocks.
-/// What a window attached to `conn` starts with: the last window's saved
-/// layout when attaching automatically, else a single session.
+/// What a window (or tab) attached to `conn` starts with, by `mode`: a
+/// saved layout ([`AttachMode::Auto`]: the newest free one, else a single
+/// session as before; [`AttachMode::Layout`]: that one, else nothing), the
+/// detached sessions ([`AttachMode::AllDetached`]), or a single session.
+/// Blocks.
 pub fn startup(conn: &Arc<Connection>, size: TermSize, mode: AttachMode) -> Result<Startup> {
     let restored = match mode {
-        AttachMode::Auto => match restore(conn, size) {
-            Ok(r) => r,
-            Err(e) if e.downcast_ref::<ReplyLost>().is_some() || !conn.is_connected() => return Err(e),
-            Err(e) => {
-                log::warn!("restoring the last window: {e:#}");
-                None
-            }
-        },
-        _ => None,
+        AttachMode::Auto => link_errors(conn, restore(conn, size, Claim::Newest))?,
+        AttachMode::Layout(id) => link_errors(conn, restore(conn, size, Claim::Id(id)))?,
+        AttachMode::AllDetached => link_errors(conn, detached(conn, size))?,
+        AttachMode::New | AttachMode::Id(_) => None,
     };
-    Ok(match restored {
-        Some(r) => Startup::Restore(r),
-        None => Startup::Session(Session::daemon(conn.clone(), size, mode, None)?),
+    Ok(match (restored, mode) {
+        (Some(r), _) => Startup::Restore(r),
+        (None, AttachMode::Layout(_) | AttachMode::AllDetached) => Startup::Nothing,
+        (None, _) => Startup::Session(Session::daemon(conn.clone(), size, mode, None)?),
     })
 }
 
-pub fn restore(conn: &Arc<Connection>, size: TermSize) -> Result<Option<Restored>> {
-    let Some(info) = conn.claim_layout()? else { return Ok(None) };
+/// A lost link is the caller's problem; anything else means "nothing to
+/// restore" (logged).
+fn link_errors(conn: &Connection, r: Result<Option<Restored>>) -> Result<Option<Restored>> {
+    match r {
+        Ok(r) => Ok(r),
+        Err(e) if e.downcast_ref::<ReplyLost>().is_some() || !conn.is_connected() => Err(e),
+        Err(e) => {
+            log::warn!("restoring tabs: {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// Claim a saved layout on `conn` (`claim`) and reattach its sessions.
+/// `None` when there is none, or none of its sessions could be attached.
+/// Blocks.
+pub fn restore(conn: &Arc<Connection>, size: TermSize, claim: Claim) -> Result<Option<Restored>> {
+    let info = match claim {
+        Claim::Newest => conn.claim_layout()?,
+        Claim::Id(id) => conn.claim_layout_id(id)?,
+    };
+    let Some(info) = info else { return Ok(None) };
     let saved: SavedWorkspace = match serde_json::from_str(&info.json) {
         Ok(s) => s,
         Err(e) => {
@@ -226,9 +264,29 @@ pub fn restore(conn: &Arc<Connection>, size: TermSize) -> Result<Option<Restored
     let alive: HashSet<SessionId> = info.sessions.iter().copied().collect();
     let Some((tabs, _)) = prune(saved.clone(), &alive) else { return Ok(None) };
     let ids: Vec<SessionId> = tabs.iter().flat_map(|t| t.tree.leaves()).collect();
+    let sessions = match attach_all(conn, size, &ids) {
+        Ok(s) => s,
+        Err(e) => {
+            // Return the layout claim so a retry on a live connection can
+            // reclaim it.
+            conn.release_claimed_layout(info);
+            return Err(e);
+        }
+    };
+    let attached: HashSet<SessionId> = sessions.keys().copied().collect();
+    let Some((tabs, active)) = prune(saved, &attached) else { return Ok(None) };
+    log::info!("restored {} tabs with {} sessions", tabs.len(), sessions.len());
+    Ok(Some(Restored { id: info.id, claimed: true, tabs, active, sessions, window }))
+}
+
+/// Attach `ids`, skipping sessions that ended meanwhile. When the link
+/// drops or times out midway, the ones that did attach are detached again
+/// and the error returned: no truncated window that overwrites the saved
+/// layout.
+fn attach_all(conn: &Arc<Connection>, size: TermSize, ids: &[SessionId]) -> Result<HashMap<SessionId, Arc<Session>>> {
     let mut sessions = HashMap::with_capacity(ids.len());
     let mut link_err = None;
-    for (id, res) in Session::daemon_attach_many(conn, size, &ids) {
+    for (id, res) in Session::daemon_attach_many(conn, size, ids) {
         match res {
             Ok(s) => {
                 sessions.insert(id, s);
@@ -243,20 +301,50 @@ pub fn restore(conn: &Arc<Connection>, size: TermSize) -> Result<Option<Restored
         }
     }
     if let Some(err) = link_err {
-        // Don't open a truncated window and overwrite the saved layout when
-        // the link dropped or timed out mid-restore; detach any panes that did
-        // attach and return the layout claim so a retry on a live connection
-        // can reclaim it.
         for &id in sessions.keys() {
             conn.detach(id);
         }
-        conn.release_claimed_layout(info);
         return Err(err);
     }
-    let attached: HashSet<SessionId> = sessions.keys().copied().collect();
-    let Some((tabs, active)) = prune(saved, &attached) else { return Ok(None) };
-    log::info!("restored a window with {} tabs and {} sessions", tabs.len(), sessions.len());
-    Ok(Some(Restored { id: info.id, tabs, active, sessions, window }))
+    Ok(sessions)
+}
+
+/// The detached sessions on `conn` that no saved layout shows (those come
+/// back with their layout), oldest first.
+pub fn loose_detached(sessions: &[goatty_proto::SessionInfo], layouts: &[goatty_proto::LayoutInfo]) -> Vec<SessionId> {
+    let in_layout: HashSet<SessionId> = layouts.iter().flat_map(|l| l.sessions.iter().copied()).collect();
+    let mut ids: Vec<SessionId> = sessions.iter().filter(|s| s.attached == 0 && !in_layout.contains(&s.id)).map(|s| s.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Every loose detached session on `conn` ([`loose_detached`]), a tab each.
+fn detached(conn: &Arc<Connection>, size: TermSize) -> Result<Option<Restored>> {
+    let layouts = conn.list_layouts()?;
+    let ids = loose_detached(&conn.list_sessions()?, &layouts);
+    let sessions = attach_all(conn, size, &ids)?;
+    let tabs: Vec<RestoredTab> = ids
+        .iter()
+        .filter(|id| sessions.contains_key(id))
+        .map(|&id| RestoredTab { name: None, tree: Node::Leaf(id), focused: id, zoomed: false, plain: None })
+        .collect();
+    if tabs.is_empty() {
+        return Ok(None);
+    }
+    let active = tabs.len() - 1;
+    log::info!("reattached {} detached sessions", tabs.len());
+    Ok(Some(Restored { id: new_id(), claimed: false, tabs, active, sessions, window: None }))
+}
+
+/// What a saved layout holds, for a list to pick it from: (tabs, panes,
+/// the tabs' names: their own or their focused session's title).
+pub fn summary(info: &goatty_proto::LayoutInfo, title: impl Fn(SessionId) -> Option<String>) -> Option<(usize, usize, Vec<String>)> {
+    let saved: SavedWorkspace = serde_json::from_str(&info.json).ok()?;
+    let alive: HashSet<SessionId> = info.sessions.iter().copied().collect();
+    let (tabs, _) = prune(saved, &alive)?;
+    let panes = tabs.iter().map(|t| t.tree.leaves().len()).sum();
+    let names = tabs.iter().map(|t| t.name.clone().or_else(|| title(t.focused)).unwrap_or_else(|| "shell".into())).collect();
+    Some((tabs.len(), panes, names))
 }
 
 #[cfg(test)]
@@ -265,7 +353,7 @@ mod tests {
     use super::*;
 
     fn tab(tree: Node, focused: SessionId) -> SavedTab {
-        SavedTab { name: None, tree, focused, zoomed: false }
+        SavedTab { name: None, tree, focused, zoomed: false, plain: None }
     }
 
     fn split(a: SessionId, b: SessionId) -> Node {
@@ -278,12 +366,16 @@ mod tests {
     fn json_format() {
         let saved = SavedWorkspace {
             version: VERSION,
-            tabs: vec![SavedTab { name: Some("build".into()), tree: split(3, 7), focused: 7, zoomed: true }, tab(Node::Leaf(9), 9)],
+            tabs: vec![
+                SavedTab { name: Some("build".into()), tree: split(3, 7), focused: 7, zoomed: true, plain: None },
+                SavedTab { plain: Some("pi".into()), ..tab(Node::Leaf(9), 9) },
+            ],
             active: 1,
             window: Some(SavedWindow { width: 1200.0, height: 800.5, state: WindowState::Maximized }),
         };
         let json = serde_json::to_string(&saved).unwrap();
         assert!(json.contains(r#""window":{"width":1200.0,"height":800.5,"state":"maximized"}"#), "{json}");
+        assert!(json.contains(r#""plain":"pi""#) && json.matches("plain").count() == 1, "{json}");
         assert_eq!(serde_json::from_str::<SavedWorkspace>(&json).unwrap(), saved);
         // Unset fields are optional.
         let short: SavedWorkspace = serde_json::from_str(r#"{"version":1,"tabs":[{"tree":{"leaf":4},"focused":4}],"active":0}"#).unwrap();
@@ -321,7 +413,7 @@ mod tests {
         let saved = SavedWorkspace {
             version: VERSION,
             tabs: vec![
-                SavedTab { name: Some(" ".into()), tree: split(1, 2), focused: 2, zoomed: true },
+                SavedTab { name: Some(" ".into()), tree: split(1, 2), focused: 2, zoomed: true, plain: None },
                 tab(Node::Leaf(3), 3),
                 tab(Node::Leaf(4), 4),
             ],
@@ -337,6 +429,43 @@ mod tests {
         assert_eq!(active, 0);
         assert!(prune(saved.clone(), &HashSet::new()).is_none());
         assert!(prune(SavedWorkspace { version: VERSION + 1, ..saved }, &alive).is_none());
+    }
+
+    #[test]
+    fn plain_tabs_and_summaries() {
+        let saved = SavedWorkspace {
+            version: VERSION,
+            tabs: vec![
+                SavedTab { name: Some("logs".into()), ..tab(split(1, 2), 1) },
+                SavedTab { plain: Some(" ".into()), ..tab(Node::Leaf(3), 3) },
+                SavedTab { plain: Some("pi".into()), ..tab(Node::Leaf(4), 4) },
+            ],
+            active: 0,
+            window: None,
+        };
+        let (tabs, _) = prune(saved.clone(), &[1, 2, 3, 4].into()).unwrap();
+        assert_eq!(tabs.iter().map(|t| t.plain.as_deref()).collect::<Vec<_>>(), [None, None, Some("pi")]);
+        let info = goatty_proto::LayoutInfo { id: 1, json: serde_json::to_string(&saved).unwrap(), sessions: vec![1, 2, 4], saved_unix: 0 };
+        let (tabs, panes, names) = summary(&info, |id| (id == 4).then(|| "htop".to_string())).unwrap();
+        assert_eq!((tabs, panes, names), (2, 3, vec!["logs".to_string(), "htop".to_string()]));
+        assert!(summary(&goatty_proto::LayoutInfo { json: "nope".into(), ..info }, |_| None).is_none());
+    }
+
+    #[test]
+    fn loose_detached_sessions_skip_open_ones_and_saved_layouts() {
+        let s = |id, attached| goatty_proto::SessionInfo {
+            id,
+            pid: None,
+            title: String::new(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            attached,
+            created_unix: 0,
+            process: None,
+        };
+        let layouts = [goatty_proto::LayoutInfo { id: 1, json: String::new(), sessions: vec![2], saved_unix: 0 }];
+        assert_eq!(loose_detached(&[s(5, 0), s(2, 0), s(3, 1), s(1, 0)], &layouts), [1, 5]);
     }
 
     #[test]

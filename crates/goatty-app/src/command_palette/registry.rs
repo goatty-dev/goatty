@@ -440,6 +440,15 @@ pub fn builtins() -> Vec<Command> {
             "close",
             "leave",
         ]),
+        Command::action("tab.reattach_detached", "Tabs", "Reattach the detached tabs on this host", "reattach_detached").keywords(&[
+            "restore",
+            "reopen",
+            "undo detach",
+            "bring back",
+            "sessions",
+            "background",
+        ]),
+        Command::action("window.new", "Window", "New window", "new_window").keywords(&["open", "another window"]),
         Command::handler("tab.detach_host_pick", "Tabs", "Detach from a host…", |window, cx| {
             window.defer(cx, |window, cx| {
                 if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {

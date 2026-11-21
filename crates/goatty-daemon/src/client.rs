@@ -435,6 +435,8 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     daemon.layouts.lock().save(conn, id, sessions, json, now);
                 }
                 ClientMsg::ClaimLayout { req } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout(conn) }),
+                ClientMsg::ClaimLayoutId { req, id } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout_id(conn, id) }),
+                ClientMsg::ListLayouts { req } => reply(ServerMsg::Layouts { req, layouts: daemon.free_layouts() }),
                 ClientMsg::FetchHistory { req, session, before, count } => match daemon.get(session) {
                     Some(s) => {
                         let rows = s.term.history_rows(before, count as usize);

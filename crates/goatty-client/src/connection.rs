@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
-    ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LayoutId, LayoutInfo, NET_SINCE,
-    PROTOCOL_VERSION, REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId,
-    SessionInfo, StreamOpts, WinSize, encode, read_msg,
+    ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LAYOUT_LIST_SINCE, LayoutId, LayoutInfo,
+    NET_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg,
+    SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -156,9 +156,11 @@ struct Shared {
     /// Number of in-flight `ClientMsg::Attach` requests per `(link_gen, session)`,
     /// used to serialize `detach_sink` against replacement attaches on a pooled link.
     attaching: Mutex<HashMap<(u64, SessionId), usize>>,
-    /// The window's last saved layout, saved again after a reconnect (the
-    /// daemon frees a layout when its connection drops).
-    layout: Mutex<Option<SavedLayoutState>>,
+    /// Each window's last saved layout on this (pooled) connection, saved
+    /// again after a reconnect (the daemon frees a layout when its
+    /// connection drops). A forget (no sessions) made offline stays until
+    /// it was sent.
+    layout: Mutex<HashMap<LayoutId, SavedLayoutState>>,
     claimed_layouts: Mutex<ClaimedLayouts>,
     pending: Mutex<HashMap<ReqId, Pending>>,
     /// `SizeControl` that came before the `Attached` of a session we don't
@@ -312,7 +314,7 @@ impl Connection {
             out,
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
-            layout: Mutex::new(None),
+            layout: Mutex::new(HashMap::new()),
             claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
@@ -899,7 +901,12 @@ impl Connection {
         if connected {
             self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
         }
-        *layout = Some(SavedLayoutState { id, sessions, json, sent_gen, detached: false });
+        if sessions.is_empty() && connected {
+            // Forgotten on the daemon; nothing to replay.
+            layout.remove(&id);
+        } else {
+            layout.insert(id, SavedLayoutState { id, sessions, json, sent_gen, detached: false });
+        }
     }
 
     /// Take over the newest layout no window holds (see
@@ -912,14 +919,19 @@ impl Connection {
             while let Some((g, info)) = claimed.unclaimed.pop_front() {
                 if g == cur && self.is_connected() {
                     claimed.gens.insert(info.id, cur);
-                    if layout.as_ref().is_some_and(|s| s.id == info.id && s.detached) {
-                        *layout = None;
+                    if layout.get(&info.id).is_some_and(|s| s.detached) {
+                        layout.remove(&info.id);
                     }
                     return Ok(Some(info));
                 }
             }
         }
         let (link_gen, reply) = self.request_with_gen(REQUEST_TIMEOUT, Pending::Reply, |req| ClientMsg::ClaimLayout { req })?;
+        self.claimed_reply(link_gen, reply)
+    }
+
+    /// Note a `Layout` reply's claim on link `link_gen`.
+    fn claimed_reply(&self, link_gen: u64, reply: ServerMsg) -> Result<Option<LayoutInfo>> {
         match reply {
             ServerMsg::Layout { layout, .. } => {
                 if let Some(info) = &layout {
@@ -927,8 +939,8 @@ impl Connection {
                     let mut claimed = self.shared.claimed_layouts.lock();
                     if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
                         claimed.gens.insert(info.id, link_gen);
-                        if saved.as_ref().is_some_and(|s| s.id == info.id && s.detached) {
-                            *saved = None;
+                        if saved.get(&info.id).is_some_and(|s| s.detached) {
+                            saved.remove(&info.id);
                         }
                     }
                 }
@@ -936,6 +948,65 @@ impl Connection {
             }
             other => bail!("unexpected reply {other:?}"),
         }
+    }
+
+    /// Whether the daemon lists free layouts and claims them by id (v16).
+    pub fn supports_layout_list(&self) -> bool {
+        self.protocol_version() >= LAYOUT_LIST_SINCE
+    }
+
+    /// Take over layout `id` (see `ClientMsg::ClaimLayoutId`): one this
+    /// connection detached, else the daemon's when it's free. `None` when
+    /// it's gone or another window holds it. A daemon older than v16 can't
+    /// claim by id: this falls back to [`Self::claim_layout`] (the newest
+    /// free layout). Blocks: call off the UI thread.
+    pub fn claim_layout_id(&self, id: LayoutId) -> Result<Option<LayoutInfo>> {
+        {
+            let mut layout = self.shared.layout.lock();
+            let mut claimed = self.shared.claimed_layouts.lock();
+            let cur = self.shared.link_gen.load(Ordering::Acquire);
+            claimed.unclaimed.retain(|(g, _)| *g == cur);
+            if self.is_connected()
+                && let Some(pos) = claimed.unclaimed.iter().position(|(_, info)| info.id == id)
+                && let Some((_, info)) = claimed.unclaimed.remove(pos)
+            {
+                claimed.gens.insert(info.id, cur);
+                if layout.get(&info.id).is_some_and(|s| s.detached) {
+                    layout.remove(&info.id);
+                }
+                return Ok(Some(info));
+            }
+        }
+        if !self.supports_layout_list() {
+            return self.claim_layout();
+        }
+        let (link_gen, reply) = self.request_with_gen(REQUEST_TIMEOUT, Pending::Reply, |req| ClientMsg::ClaimLayoutId { req, id })?;
+        self.claimed_reply(link_gen, reply)
+    }
+
+    /// The layouts a window could restore here, newest first: the ones this
+    /// connection detached (`detach_layout`), then the daemon's free ones
+    /// (v16; older daemons list none). Claims nothing. Blocks: call off the
+    /// UI thread.
+    pub fn list_layouts(&self) -> Result<Vec<LayoutInfo>> {
+        let mut list: Vec<LayoutInfo> = {
+            let claimed = self.shared.claimed_layouts.lock();
+            let cur = self.shared.link_gen.load(Ordering::Acquire);
+            claimed.unclaimed.iter().filter(|(g, _)| *g == cur).map(|(_, info)| info.clone()).collect()
+        };
+        if self.supports_layout_list() {
+            match self.request(Pending::Reply, |req| ClientMsg::ListLayouts { req })? {
+                ServerMsg::Layouts { layouts, .. } => {
+                    for l in layouts {
+                        if !list.iter().any(|x| x.id == l.id) {
+                            list.push(l);
+                        }
+                    }
+                }
+                other => bail!("unexpected reply {other:?}"),
+            }
+        }
+        Ok(list)
     }
 
     /// Return a layout previously obtained from [`Self::claim_layout`] when
@@ -960,22 +1031,20 @@ impl Connection {
     pub fn detach_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
         let mut saved = self.shared.layout.lock();
         if sessions.is_empty() || json.is_empty() {
-            if saved.as_ref().is_some_and(|s| s.id == id) {
-                *saved = None;
-            }
+            saved.remove(&id);
             return;
         }
         let connected = self.is_connected();
         let cur = self.shared.link_gen.load(Ordering::Acquire);
         let already_queued =
-            saved.as_ref().is_some_and(|s| s.id == id && connected && s.sent_gen == Some(cur) && s.json == json && s.sessions == sessions);
+            saved.get(&id).is_some_and(|s| connected && s.sent_gen == Some(cur) && s.json == json && s.sessions == sessions);
         let sent_gen = connected.then_some(cur);
         if connected && !already_queued {
             self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
         }
         // Keep the detached record replayable across a link drop until a claim
         // (or a newer save) takes ownership of it.
-        *saved = Some(SavedLayoutState { id, sessions: sessions.clone(), json: json.clone(), sent_gen, detached: true });
+        saved.insert(id, SavedLayoutState { id, sessions: sessions.clone(), json: json.clone(), sent_gen, detached: true });
         let mut claimed = self.shared.claimed_layouts.lock();
         claimed.gens.remove(&id);
         claimed.unclaimed.retain(|(_, info)| info.id != id);
@@ -1218,8 +1287,8 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                     }
                     drop(panes);
                     let mut layout = s.layout.lock();
-                    if let Some(mut saved) = layout.take() {
-                        let cur = s.link_gen.load(Ordering::Acquire);
+                    let cur = s.link_gen.load(Ordering::Acquire);
+                    layout.retain(|_, saved| {
                         s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
                         saved.sent_gen = Some(cur);
                         if saved.detached {
@@ -1231,8 +1300,9 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                                 LayoutInfo { id: saved.id, json: saved.json.clone(), sessions: saved.sessions.clone(), saved_unix: 0 },
                             ));
                         }
-                        *layout = Some(saved);
-                    }
+                        // A forget made offline is done once sent.
+                        !saved.sessions.is_empty()
+                    });
                     drop(layout);
                     break;
                 }
@@ -1457,6 +1527,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::ShellsReloaded { req, .. }
         | ServerMsg::Plugin { req, .. }
         | ServerMsg::Layout { req, .. }
+        | ServerMsg::Layouts { req, .. }
         | ServerMsg::Shell { req, .. }
         | ServerMsg::Net { req, .. }
         | ServerMsg::PathStat { req, .. }
@@ -1619,7 +1690,7 @@ mod tests {
             out,
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
-            layout: Mutex::new(None),
+            layout: Mutex::new(HashMap::new()),
             claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
@@ -1708,7 +1779,7 @@ mod tests {
             out,
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
-            layout: Mutex::new(None),
+            layout: Mutex::new(HashMap::new()),
             claimed_layouts: Mutex::new(ClaimedLayouts::default()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
@@ -2038,16 +2109,67 @@ mod tests {
         });
 
         conn.save_layout(99, vec![10, 20], "{\"version\":1}".into());
-        assert!(conn.shared.layout.lock().is_some());
+        assert!(conn.shared.layout.lock().contains_key(&99));
 
         conn.detach_layout(99, vec![10, 20], "{\"version\":1}".into());
-        assert!(conn.shared.layout.lock().as_ref().is_some_and(|s| s.detached), "detached layout stays replayable until claimed");
+        assert!(conn.shared.layout.lock().get(&99).is_some_and(|s| s.detached), "detached layout stays replayable until claimed");
 
         let reclaimed = conn.claim_layout().unwrap().expect("detached layout should be claimable on live link");
-        assert!(conn.shared.layout.lock().is_none(), "claiming the detached layout clears the replay record");
+        assert!(conn.shared.layout.lock().is_empty(), "claiming the detached layout clears the replay record");
         assert_eq!(reclaimed.id, 99);
         assert_eq!(reclaimed.sessions, vec![10, 20]);
         assert_eq!(reclaimed.json, "{\"version\":1}");
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn layouts_of_several_windows_are_kept_apart_and_listed_and_claimed_by_id() {
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                let reply = match msg {
+                    ClientMsg::ListLayouts { req } => ServerMsg::Layouts {
+                        req,
+                        layouts: vec![
+                            LayoutInfo { id: 5, json: "detached here".into(), sessions: vec![1], saved_unix: 0 },
+                            LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 },
+                        ],
+                    },
+                    ClientMsg::ClaimLayoutId { req, id } => ServerMsg::Layout {
+                        req,
+                        layout: (id == 6).then(|| LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 }),
+                    },
+                    _ => continue,
+                };
+                w.write_all(&encode(&reply).unwrap()).unwrap();
+                w.flush().unwrap();
+                if matches!(reply, ServerMsg::Layout { layout: None, .. }) {
+                    break;
+                }
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+        // Two windows on one pooled connection: both are replayed after a reconnect.
+        conn.save_layout(4, vec![2], "window a".into());
+        conn.save_layout(5, vec![1], "window b".into());
+        assert_eq!(conn.shared.layout.lock().len(), 2);
+        // Window b detaches its tabs: listed first, once.
+        conn.detach_layout(5, vec![1], "window b".into());
+        let ids: Vec<_> = conn.list_layouts().unwrap().iter().map(|l| (l.id, l.json.clone())).collect();
+        assert_eq!(ids, [(5, "window b".to_string()), (6, "free".to_string())]);
+        // Claiming by id takes the detached one locally, then asks the daemon.
+        assert_eq!(conn.claim_layout_id(5).unwrap().unwrap().json, "window b");
+        assert!(!conn.shared.layout.lock().contains_key(&5));
+        assert_eq!(conn.claim_layout_id(6).unwrap().unwrap().sessions, [3]);
+        assert!(conn.claim_layout_id(7).unwrap().is_none());
+        // Forgetting window a while connected drops its replay record.
+        conn.save_layout(4, Vec::new(), String::new());
+        assert!(conn.shared.layout.lock().is_empty());
 
         let _ = tx_drop.send(());
         reader_h.join().unwrap();
@@ -2075,7 +2197,7 @@ mod tests {
         conn.detach_layout(77, vec![1, 2], "{\"version\":1,\"renamed\":true}".into());
 
         let pending = conn.shared.layout.lock();
-        let saved = pending.as_ref().expect("offline unsent layout must be preserved for reconnect");
+        let saved = pending.get(&77).expect("offline unsent layout must be preserved for reconnect");
         assert_eq!(saved.id, 77);
         assert_eq!(saved.json, "{\"version\":1,\"renamed\":true}");
         assert!(saved.detached);

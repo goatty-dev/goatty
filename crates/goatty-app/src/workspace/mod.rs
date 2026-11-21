@@ -24,6 +24,8 @@
 //!   program's notification) as toasts and desktop notifications (#205).
 //! - `saved`: the layout goattyd keeps for the window, so the next
 //!   `goatty` restores every tab and split (#118).
+//! - `reopen`: which hosts each window has tabs on, so the next `goatty`
+//!   reopens every window with its tabs on every host (#252).
 //!
 //! Each tab is on one host, and a window can hold tabs on several (a local
 //! shell next to a few servers). A tab remembers its [`Spawner`]: new
@@ -37,8 +39,10 @@
 //! (`crate::connect`, #37): the window opens at once, and the tab gets its
 //! panes when the connection is made (`open_connect_tab`).
 //!
-//! Each goattyd the window has tabs on keeps the layout of those tabs, so
-//! `goatty` (or `goatty --ssh host`) brings them back. While a window is
+//! Each goattyd the window has tabs on keeps the layout of those tabs, and
+//! `reopen` remembers which goattyds those are, so `goatty` brings back
+//! every window with its tabs on every host (`goatty --ssh host`: that
+//! host's). While a window is
 //! active, the settings window and "reload shells" act on its active tab's
 //! host (`settings_window::set_host_link`).
 
@@ -50,6 +54,7 @@ pub(crate) mod icons;
 mod layout;
 mod menu;
 mod notices;
+pub mod reopen;
 pub mod saved;
 pub use chrome::requested as requested_decorations;
 mod sidebar;
@@ -269,6 +274,13 @@ pub struct Workspace {
     host_epochs: Vec<(groups::HostKey, u64)>,
     /// What panes told (toasts, desktop notifications; `notices`).
     notices: notices::Notices,
+    /// This window, for its `reopen` record.
+    window_id: gpui::WindowId,
+    reopen_key: u64,
+    /// Tabs still connecting to restore a host's tabs (reopened windows,
+    /// "Restore tabs" in the sessions picker): their host stays in the
+    /// `reopen` record meanwhile, so quitting before they connect loses nothing.
+    restoring: Vec<(u64, reopen::HostRecord)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -342,8 +354,12 @@ impl Workspace {
             group_focus: Vec::new(),
             host_epochs: Vec::new(),
             notices: Default::default(),
+            window_id: window.window_handle().window_id(),
+            reopen_key: reopen::new_key(),
+            restoring: Vec::new(),
             _subscriptions: vec![appearance, button_layout, settings, activation, bounds],
         };
+        reopen::window_opened(cx, this.window_id);
         match initial {
             Initial::Ready { startup, spawner } => {
                 this.home = Some(spawner.clone());
@@ -358,11 +374,99 @@ impl Workspace {
                         let active = this.insert_restored(r, &spawner, 0, window, cx);
                         this.activate(active, window, cx);
                     }
+                    Startup::Nothing => this.spawn_into_empty(spawner, window, cx),
                 }
             }
             Initial::Connect(plan) => this.open_connect_tab(plan, window, cx),
+            Initial::Reopen(record) => this.reopen(record, window, cx),
         }
         this
+    }
+
+    /// Open a window from the last run (#252): a connecting tab per host
+    /// that claims this window's layout there, in the order of their tabs.
+    fn reopen(&mut self, record: reopen::WindowRecord, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(w) = record.window {
+            w.apply(window);
+            self.window = w;
+        }
+        let mut active = None;
+        for (i, h) in record.hosts.into_iter().enumerate() {
+            let plan = ConnectPlan {
+                endpoint: h.host.host_ref().endpoint(),
+                mode: AttachMode::Layout(h.layout),
+                open_settings: None,
+                plain: false,
+                conn: None,
+            };
+            self.open_connect_tab(plan, window, cx);
+            let tab = self.tabs[self.active].id;
+            self.restoring.push((tab, h));
+            if i == record.active {
+                active = Some(tab);
+            }
+        }
+        if let Some(i) = active.and_then(|id| self.tab_index(id)) {
+            self.activate(i, window, cx);
+        }
+        self.record_window(cx);
+    }
+
+    /// The window has no tab yet and nothing to restore: a new shell on
+    /// `spawner`'s host.
+    fn spawn_into_empty(&mut self, spawner: Spawner, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let task = {
+            let spawner = spawner.clone();
+            cx.background_executor().spawn(async move { spawner.spawn(TermSize::new(100, 30), None) })
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(session) => this.insert_pane(session, Placement::NewTab, spawner, None, window, cx),
+                Err(e) => {
+                    let toast = Toast::error("Couldn't start a shell").body(format!("{e:#}")).key("workspace.spawn");
+                    toast::show_in(window, cx, toast);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Tell `reopen` which hosts this window has tabs on now.
+    fn record_window(&self, cx: &mut Context<'_, Self>) {
+        let mut hosts: Vec<reopen::HostRecord> = Vec::new();
+        let mut active = 0;
+        for (i, t) in self.tabs.iter().enumerate() {
+            let record = match t.host.as_ref().and_then(Spawner::connection) {
+                Some(conn) => {
+                    let Some(layout) = self.layouts.iter().find(|l| Arc::ptr_eq(&l.conn, conn)) else { continue };
+                    let Some(host) = reopen::SavedHost::of(conn.endpoint()) else { continue };
+                    reopen::HostRecord { host, layout: layout.id }
+                }
+                None => match self.restoring.iter().find(|(id, _)| *id == t.id) {
+                    Some((_, r)) => r.clone(),
+                    None => continue,
+                },
+            };
+            let at = match hosts.iter().position(|h| h.host == record.host) {
+                Some(at) => at,
+                None => {
+                    hosts.push(record);
+                    hosts.len() - 1
+                }
+            };
+            if i == self.active {
+                active = at;
+            }
+        }
+        let record = (!hosts.is_empty()).then(|| reopen::WindowRecord {
+            pid: std::process::id(),
+            key: self.reopen_key,
+            hosts,
+            active,
+            window: Some(self.window),
+        });
+        reopen::update(cx, self.window_id, record);
     }
 
     /// The window was resized, maximized or went fullscreen: save its size
@@ -414,7 +518,16 @@ impl Workspace {
         cx: &mut Context<'_, Self>,
     ) -> usize {
         if let Some(conn) = spawner.connection() {
-            self.layout_for(conn).id = r.id;
+            let has_tabs = self.tabs.iter().any(|t| t.host.as_ref().and_then(Spawner::connection).is_some_and(|c| Arc::ptr_eq(c, conn)));
+            if has_tabs {
+                // The window keeps its own layout there, which takes these
+                // tabs in from the next save on; the claimed one is done.
+                if r.claimed {
+                    conn.save_layout(r.id, Vec::new(), String::new());
+                }
+            } else {
+                self.layout_for(conn).id = r.id;
+            }
         }
         let mut at = at.min(self.tabs.len());
         let first = at;
@@ -433,17 +546,11 @@ impl Workspace {
             let Some(tree) = tree else { continue };
             let focused = pane_of.get(&t.focused).copied().unwrap_or(panes[0].id);
             let id = self.next_id();
-            let tab = Tab {
-                id,
-                tree,
-                panes,
-                focused,
-                zoomed: t.zoomed,
-                name: t.name,
-                host: Some(spawner.clone()),
-                connecting: None,
-                activity: None,
+            let host = match t.plain {
+                Some(host) => Spawner::Plain { host, base: Box::new(spawner.clone()) },
+                None => spawner.clone(),
             };
+            let tab = Tab { id, tree, panes, focused, zoomed: t.zoomed, name: t.name, host: Some(host), connecting: None, activity: None };
             self.tabs.insert(at, tab);
             at += 1;
         }
@@ -457,8 +564,7 @@ impl Workspace {
         let mut groups: Vec<LayoutGroup> = Vec::new();
         for (i, t) in self.tabs.iter().enumerate() {
             let Some(conn) = t.host.as_ref().and_then(Spawner::connection) else { continue };
-            let session_of = |id: PaneId| t.pane(id).and_then(|p| p.view.read(cx).session().daemon_id());
-            let Some(tree) = t.tree.map_leaves(&mut |id| session_of(id)) else { continue };
+            let Some(tab) = saved_tab(t, cx) else { continue };
             let g = match groups.iter().position(|g| Arc::ptr_eq(&g.conn, conn)) {
                 Some(g) => g,
                 None => {
@@ -467,9 +573,8 @@ impl Workspace {
                 }
             };
             let g = &mut groups[g];
-            g.sessions.extend(tree.leaves());
-            let focused = session_of(t.focused).unwrap_or_else(|| tree.leaves()[0]);
-            g.tabs.push(SavedTab { name: t.name.clone(), tree, focused, zoomed: t.zoomed });
+            g.sessions.extend(tab.tree.leaves());
+            g.tabs.push(tab);
             if i < self.active {
                 g.before_active += 1;
             }
@@ -500,14 +605,18 @@ impl Workspace {
             // Done with a host once it heard the layout is gone.
             !json.is_empty()
         });
+        self.record_window(cx);
     }
 
     /// The window is going away with its last tab: every goattyd forgets
     /// its layout (sent before the kills, whose replies prove both arrived).
-    fn forget_layouts(&mut self) {
+    fn forget_layouts(&mut self, cx: &mut Context<'_, Self>) {
         for layout in self.layouts.drain(..) {
             layout.conn.save_layout(layout.id, Vec::new(), String::new());
         }
+        // Nothing to reopen either.
+        self.restoring.clear();
+        reopen::update(cx, self.window_id, None);
     }
 
     fn next_id(&mut self) -> u64 {
@@ -694,7 +803,13 @@ impl Workspace {
         // made here); this computer: offer missing tools (once per run).
         crate::shell_sync::on_connect(spawner.host_link(), installed, cx);
         let was_active = index == self.active;
+        let tab_id = self.tabs[index].id;
+        self.restoring.retain(|(id, _)| *id != tab_id);
         let show = match startup {
+            Startup::Nothing => {
+                self.nothing_to_restore(index, spawner, window, cx);
+                return;
+            }
             Startup::Session(session) => {
                 let pane = self.make_pane(session, window, cx);
                 let tab = &mut self.tabs[index];
@@ -730,6 +845,55 @@ impl Workspace {
             self.save_layout(cx);
             cx.notify();
         }
+    }
+
+    /// The connecting tab at `index` found nothing left to restore on its
+    /// host: it goes away with a note (the window's last tab gets a new
+    /// shell there instead, so the window doesn't vanish).
+    fn nothing_to_restore(&mut self, index: usize, spawner: Spawner, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let host = groups::host_label(&spawner);
+        if self.tabs.len() == 1 {
+            // The connect screen stays until the shell is there.
+            let tab = &mut self.tabs[index];
+            tab.host = Some(spawner.clone());
+            let toast = Toast::info(format!("Nothing left to restore on {host}"))
+                .body("Those tabs' shells ended meanwhile; here's a new one.")
+                .key("workspace.restore");
+            toast::show_in(window, cx, toast);
+            // Fill the placeholder tab: replaced once the shell is there.
+            let placeholder = tab.id;
+            let task = cx.background_executor().spawn({
+                let spawner = spawner.clone();
+                async move { spawner.spawn(TermSize::new(100, 30), None) }
+            });
+            cx.spawn_in(window, async move |this, cx| {
+                let result = task.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let Some(index) = this.tab_index(placeholder) else {
+                        if let Ok(session) = result {
+                            this.discard_spawned_session(session, cx);
+                        }
+                        return;
+                    };
+                    match result {
+                        Ok(session) => this.connected(index, Startup::Session(session), spawner, false, window, cx),
+                        Err(e) => {
+                            let toast = Toast::error("Couldn't start a shell").body(format!("{e:#}")).key("workspace.spawn");
+                            toast::show_in(window, cx, toast);
+                            this.remove_tab(index, window, cx);
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
+        let toast = Toast::info(format!("Nothing left to restore on {host}"))
+            .body("Those tabs' shells ended meanwhile.")
+            .key(format!("workspace.restore:{host}"));
+        toast::show_in(window, cx, toast);
+        self.remove_tab(index, window, cx);
     }
 
     // ---- creating and closing panes -----------------------------------------
@@ -925,6 +1089,7 @@ impl Workspace {
             self.close_menu_of_tab(id, window, cx);
         }
         let tab = self.tabs.remove(index);
+        self.restoring.retain(|(id, _)| *id != tab.id);
         let key = self.host_key(&tab);
         if !self.tabs.iter().any(|t| self.host_key(t) == key) {
             self.bump_host_epoch(&key);
@@ -957,7 +1122,7 @@ impl Workspace {
         }
         if self.tabs.is_empty() {
             log::info!("last session ended");
-            self.forget_layouts();
+            self.forget_layouts(cx);
             if cx.try_global::<crate::hosts::LastWorkspace>().is_some_and(|w| w.0 == window.window_handle()) {
                 crate::settings_window::set_host_link(cx, None);
             }
@@ -1073,7 +1238,7 @@ impl Workspace {
         }
         // Closing the window quits the app: let goattyd hear about it first
         // (the layout goes before the kills, whose replies prove both arrived).
-        self.forget_layouts();
+        self.forget_layouts(cx);
         cx.spawn_in(window, async move |this, cx| {
             kill.await;
             let _ = this.update_in(cx, |this, window, cx| this.remove_target(target, window, cx));
@@ -1146,11 +1311,9 @@ impl Workspace {
             if !include(t) {
                 continue;
             }
-            let session_of = |id: PaneId| t.pane(id).and_then(|p| p.view.read(cx).session().daemon_id());
-            let Some(tree) = t.tree.map_leaves(&mut |id| session_of(id)) else { continue };
-            sessions.extend(tree.leaves());
-            let focused = session_of(t.focused).unwrap_or_else(|| tree.leaves()[0]);
-            tabs.push(SavedTab { name: t.name.clone(), tree, focused, zoomed: t.zoomed });
+            let Some(tab) = saved_tab(t, cx) else { continue };
+            sessions.extend(tab.tree.leaves());
+            tabs.push(tab);
             if i < self.active {
                 before_active += 1;
             }
@@ -1645,6 +1808,114 @@ impl Workspace {
         self.detach_group(&key, window, cx);
     }
 
+    fn reattach_detached(&mut self, _: &ReattachDetached, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let host = match self.active_tab().map(|t| t.host.as_ref().map(host_ref_of)) {
+            Some(Some(Some(host))) => host,
+            Some(None) => {
+                toast::show_in(window, cx, Toast::info("Still connecting").body("Try again once this tab is connected.").key("reattach"));
+                return;
+            }
+            _ => {
+                let toast = Toast::info("Nothing to reattach here").body("This tab's shell isn't kept by a goattyd.").key("reattach");
+                toast::show_in(window, cx, toast);
+                return;
+            }
+        };
+        self.reattach_detached_on(host, window, cx);
+    }
+
+    /// Bring back what was detached last on `host` (#252): the newest saved
+    /// layout no window holds (a detached host, tabs or a closed window), all
+    /// its tabs at once; else the newest detached session. Looked up off the
+    /// UI thread; a note when there's nothing.
+    pub(super) fn reattach_detached_on(&mut self, host: HostRef, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let endpoint = host.endpoint();
+        let task = cx.background_executor().spawn(async move {
+            let conn = crate::hosts::pool::open(endpoint)?;
+            let layouts = conn.list_layouts()?;
+            let mode = match layouts.first() {
+                Some(l) => Some(AttachMode::Layout(l.id)),
+                None => saved::loose_detached(&conn.list_sessions()?, &layouts).last().map(|&id| AttachMode::Id(id)),
+            };
+            anyhow::Ok((conn, mode))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok((conn, Some(mode))) => {
+                    let plan = ConnectPlan { endpoint: conn.endpoint().clone(), mode, open_settings: None, plain: false, conn: Some(conn) };
+                    this.open_connect_tab(plan, window, cx);
+                }
+                Ok((_, None)) => {
+                    let label = host.label().to_string();
+                    let toast = Toast::info(format!("Nothing detached on {label}"))
+                        .body("Every shell there is open in a window.")
+                        .action("Sessions…", move |window, cx| {
+                            let host = host.clone();
+                            if let Some(Some(ws)) = window.root::<Workspace>() {
+                                ws.update(cx, |ws, cx| ws.open_palette(Scope::Sessions(host), window, cx));
+                            }
+                        })
+                        .key("reattach");
+                    toast::show_in(window, cx, toast);
+                }
+                Err(e) => {
+                    let toast = Toast::error("Couldn't reattach").body(format!("{e:#}")).key("reattach");
+                    toast::show_in(window, cx, toast);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A new window with a new shell on the active tab's host (this
+    /// computer while it connects).
+    fn new_window(&mut self, _: &NewWindow, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        let host = self.active_tab().and_then(|t| t.host.clone()).or_else(|| self.home.clone());
+        let initial = match host {
+            Some(spawner @ Spawner::Local(_)) => Initial::Ready { startup: Startup::Nothing, spawner },
+            Some(Spawner::Plain { host, .. }) => Initial::Connect(ConnectPlan {
+                endpoint: HostRef::Ssh(host).endpoint(),
+                mode: AttachMode::New,
+                open_settings: None,
+                plain: true,
+                conn: None,
+            }),
+            Some(Spawner::Daemon(conn)) => Initial::Connect(ConnectPlan {
+                endpoint: conn.endpoint().clone(),
+                mode: AttachMode::New,
+                open_settings: None,
+                plain: false,
+                conn: Some(conn),
+            }),
+            None => Initial::Connect(ConnectPlan {
+                endpoint: goatty_client::Endpoint::Local,
+                mode: AttachMode::New,
+                open_settings: None,
+                plain: false,
+                conn: None,
+            }),
+        };
+        cx.defer(move |cx| crate::app::open_terminal_window(cx, initial, None));
+    }
+
+    /// A new tab on `host` in this window: in its group when the window has
+    /// one (`plain`: its plain SSH group), else connecting there.
+    pub(super) fn new_tab_on_host(&mut self, host: HostRef, plain: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let existing = self.tabs.iter().find(|t| match (&t.host, &host) {
+            (Some(Spawner::Plain { host: h, .. }), HostRef::Ssh(want)) => plain && h == want,
+            (Some(s @ Spawner::Daemon(_)), _) => !plain && host_ref_of(s).as_ref() == Some(&host),
+            _ => false,
+        });
+        if let Some(t) = existing {
+            let key = self.host_key(t);
+            self.new_tab_in_group(&key, window, cx);
+            return;
+        }
+        let plan = ConnectPlan { endpoint: host.endpoint(), mode: AttachMode::New, open_settings: None, plain, conn: None };
+        self.open_connect_tab(plan, window, cx);
+    }
+
     /// Ctrl+Shift+B: fold or unfold the vertical sidebar. With horizontal
     /// tabs the key goes on to the shell.
     fn toggle_tab_sidebar(&mut self, _: &ToggleTabSidebar, _window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -1841,20 +2112,8 @@ impl Workspace {
     /// computer's goattyd; a tab whose sessions no goattyd keeps (a local
     /// PTY), or that reaches its daemon another way, says so instead.
     fn list_sessions(&mut self, _: &ListSessions, window: &mut Window, cx: &mut Context<'_, Self>) {
-        fn host_of(spawner: &Spawner) -> Option<HostRef> {
-            match spawner {
-                Spawner::Daemon(conn) => match conn.endpoint() {
-                    goatty_client::Endpoint::Local => Some(HostRef::Local),
-                    goatty_client::Endpoint::Ssh(t) => Some(HostRef::Ssh(t.host.clone())),
-                    goatty_client::Endpoint::Tailnet(t) => Some(HostRef::Tailnet { dns: t.dns.clone(), name: t.name.clone() }),
-                    goatty_client::Endpoint::Command { .. } => None,
-                },
-                Spawner::Plain { base, .. } => host_of(base),
-                Spawner::Local(_) => None,
-            }
-        }
         let Some(tab) = self.active_tab() else { return };
-        let body = match tab.host.as_ref().map(host_of) {
+        let body = match tab.host.as_ref().map(host_ref_of) {
             Some(Some(host)) => return self.open_palette(Scope::Sessions(host), window, cx),
             Some(None) => "This tab's shell isn't kept by a goattyd goatty can list sessions of.",
             None => "This tab is still connecting.",
@@ -2092,6 +2351,33 @@ impl Workspace {
 
 /// A ring around a split pane whose agent waits for the user, and a pill
 /// in its corner saying what for.
+/// The goattyd host behind `spawner` (plain SSH: the goattyd it runs on).
+fn host_ref_of(spawner: &Spawner) -> Option<HostRef> {
+    match spawner {
+        Spawner::Daemon(conn) => match conn.endpoint() {
+            goatty_client::Endpoint::Local => Some(HostRef::Local),
+            goatty_client::Endpoint::Ssh(t) => Some(HostRef::Ssh(t.host.clone())),
+            goatty_client::Endpoint::Tailnet(t) => Some(HostRef::Tailnet { dns: t.dns.clone(), name: t.name.clone() }),
+            goatty_client::Endpoint::Command { .. } => None,
+        },
+        Spawner::Plain { base, .. } => host_ref_of(base),
+        Spawner::Local(_) => None,
+    }
+}
+
+/// Tab `t` as goattyd keeps it: session ids for leaves (`None` while it
+/// has no daemon session).
+fn saved_tab(t: &Tab, cx: &gpui::App) -> Option<SavedTab> {
+    let session_of = |id: PaneId| t.pane(id).and_then(|p| p.view.read(cx).session().daemon_id());
+    let tree = t.tree.map_leaves(&mut |id| session_of(id))?;
+    let focused = session_of(t.focused).unwrap_or_else(|| tree.leaves()[0]);
+    let plain = match &t.host {
+        Some(Spawner::Plain { host, .. }) => Some(host.clone()),
+        _ => None,
+    };
+    Some(SavedTab { name: t.name.clone(), tree, focused, zoomed: t.zoomed, plain })
+}
+
 fn waiting_badge(status: &crate::agent::AgentStatus, ui: Ui, font: gpui::SharedString) -> impl IntoElement {
     let icon = status.icon().unwrap_or(crate::ui::icons::Icon::Hand);
     let pill = div()
@@ -2256,6 +2542,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_other_tabs))
             .on_action(cx.listener(Self::detach_other_tabs))
             .on_action(cx.listener(Self::detach_host))
+            .on_action(cx.listener(Self::reattach_detached))
+            .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::toggle_tab_sidebar))
             .on_action(cx.listener(Self::toggle_vertical_tabs))
             .on_action(cx.listener(|this, _: &SplitRight, w, cx| this.split(Direction::Right, w, cx)))

@@ -527,7 +527,13 @@ impl ConnectView {
             return;
         }
         let (endpoint, mode, conn) = (self.plan.endpoint.clone(), self.plan.mode, self.plan.conn.take());
-        let label = if endpoint.is_local() { "Starting a shell…".to_string() } else { format!("Connecting to {}…", endpoint.label()) };
+        let restoring = matches!(mode, AttachMode::Layout(_) | AttachMode::AllDetached);
+        let label = match (endpoint.is_local(), restoring) {
+            (true, false) => "Starting a shell…".to_string(),
+            (true, true) => "Restoring your tabs…".to_string(),
+            (false, false) => format!("Connecting to {}…", endpoint.label()),
+            (false, true) => format!("Restoring your tabs on {}…", endpoint.label()),
+        };
         let check = endpoint.is_local() && self.check_local;
         let restarted = self.restarted.clone();
         self.work(label, window, cx, move || {

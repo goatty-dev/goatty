@@ -53,6 +53,16 @@ impl HostKey {
     }
 }
 
+/// A host's name for messages: "this computer", the SSH host, the tailnet name.
+pub(super) fn host_label(spawner: &Spawner) -> String {
+    match spawner {
+        Spawner::Local(_) => "this computer".into(),
+        Spawner::Daemon(conn) if conn.endpoint().is_local() => "this computer".into(),
+        Spawner::Daemon(conn) => conn.endpoint().label().to_string(),
+        Spawner::Plain { host, .. } => host.clone(),
+    }
+}
+
 /// One host's tabs, as drawn.
 pub(super) struct Group {
     pub key: HostKey,

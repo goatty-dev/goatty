@@ -586,6 +586,36 @@ fn window_layouts_go_to_one_later_window() {
     assert_eq!(c.claim_layout().unwrap(), None);
 }
 
+/// #252: a window with tabs on several hosts saves one layout per host;
+/// the next goatty lists the free ones and takes back exactly its own.
+#[test]
+fn free_layouts_are_listed_and_claimed_by_id() {
+    let d = start_daemon();
+    let a = Connection::open(proxy_endpoint(&d), "window a").unwrap();
+    let b = Connection::open(proxy_endpoint(&d), "window b").unwrap();
+    let s1 = a.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    let s2 = b.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    a.save_layout(1, vec![s1], "a".into());
+    // Requests are handled in order: once this is answered, a's save was too.
+    a.list_layouts().unwrap();
+    b.save_layout(2, vec![s2], "b".into());
+    b.list_layouts().unwrap();
+    let c = Connection::open(proxy_endpoint(&d), "next goatty").unwrap();
+    assert!(c.supports_layout_list());
+    assert_eq!(c.list_layouts().unwrap(), [], "both are held");
+    drop(a);
+    drop(b);
+    eventually("both layouts are free", || c.list_layouts().unwrap().len() == 2);
+    // Newest first; listing claims nothing.
+    assert_eq!(c.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [2, 1]);
+    let got = c.claim_layout_id(1).unwrap().unwrap();
+    assert_eq!((got.id, got.json.as_str(), got.sessions), (1, "a", vec![s1]));
+    assert_eq!(c.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [2]);
+    assert_eq!(c.claim_layout_id(1).unwrap(), None, "held now");
+    assert_eq!(c.claim_layout_id(99).unwrap(), None);
+    assert_eq!(c.claim_layout().unwrap().map(|l| l.id), Some(2));
+}
+
 #[test]
 fn unhandled_osc_is_silenced_by_default() {
     let dir = tempfile::Builder::new().prefix("goatty-osc-test-").tempdir().unwrap();

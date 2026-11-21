@@ -14,8 +14,11 @@
 //! round-trip time for the ones goatty is connected to, and a typed
 //! `user@host` that isn't one of them. Picking a host lists its sessions
 //! ([`Scope::Sessions`], fetched off the UI thread, connecting first when
-//! needed): Enter opens one, or a new one, where `ssh.open_in` says (a new
-//! tab or window), Shift+Enter the other way. Shift+Delete (or the row's
+//! needed): first the tabs detached there (or left by a window that
+//! closed) to restore all at once, one entry per window's worth (#252);
+//! then a new session, "reattach every detached session" (a tab each), and
+//! each session. Enter opens one where `ssh.open_in` says (a new tab or
+//! window), Shift+Enter the other way. Shift+Delete (or the row's
 //! trash button), pressed twice, ends a session without opening it: the
 //! daemon keeps sessions even across its own restarts, so old ones pile up
 //! otherwise. Escape goes back to the hosts.
@@ -120,12 +123,56 @@ pub enum Scope {
 /// The "new session" entry of [`Scope::Sessions`].
 const NEW_SESSION: &str = "session.new";
 
+/// The "every detached session" entry of [`Scope::Sessions`].
+const ALL_DETACHED: &str = "session.detached";
+
 /// What a session entry's id says to open.
 fn session_choice(id: &str) -> Option<AttachMode> {
     if id == NEW_SESSION {
         return Some(AttachMode::New);
     }
+    if id == ALL_DETACHED {
+        return Some(AttachMode::AllDetached);
+    }
+    if let Some(layout) = id.strip_prefix("layout:") {
+        return layout.parse().ok().map(AttachMode::Layout);
+    }
     id.strip_prefix("session:")?.parse().ok().map(AttachMode::Id)
+}
+
+/// A session's name in lists: its title, else its program.
+fn session_title(s: &SessionInfo) -> String {
+    let process = s.process.as_deref().filter(|p| !p.is_empty());
+    if !s.title.trim().is_empty() { s.title.trim().to_string() } else { process.unwrap_or("shell").to_string() }
+}
+
+/// `1 tab`, `3 tabs`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
+}
+
+/// The entry that restores saved layout `info`: its tabs with their names.
+fn layout_command(info: &goatty_proto::LayoutInfo, list: &[SessionInfo], now: u64) -> Option<Command> {
+    let title_of = |id: SessionId| list.iter().find(|s| s.id == id).map(session_title);
+    let (tabs, panes, names) = crate::workspace::saved::summary(info, title_of)?;
+    let mut title = format!("Restore {}", count(tabs, "tab", "tabs"));
+    if panes > tabs {
+        title.push_str(&format!(" ({} in all)", count(panes, "pane", "panes")));
+    }
+    let mut c = Command::handler(&format!("layout:{}", info.id), "Restore", &title, |_, _| {});
+    let words: Vec<&str> = names.iter().map(String::as_str).chain(["restore", "detached", "tabs", "window"]).collect();
+    c = c.keywords(&words);
+    const SHOWN: usize = 4;
+    let mut detail = names.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        detail.push_str(&format!(" +{}", names.len() - SHOWN));
+    }
+    detail.push_str(if info.saved_unix == 0 { " · just detached" } else { " · detached" });
+    if info.saved_unix != 0 {
+        detail.push_str(&format!(" {}", age(info.saved_unix, now)));
+    }
+    c.detail = Some(detail.into());
+    Some(c)
 }
 
 /// `5 min`, `3 h`, `2 d` since `created` (unix seconds).
@@ -143,7 +190,7 @@ fn age(created: u64, now: u64) -> String {
 /// the program, directory, whether a window shows it and its age.
 fn session_command(s: &SessionInfo, now: u64) -> Command {
     let process = s.process.as_deref().filter(|p| !p.is_empty());
-    let title = if !s.title.trim().is_empty() { s.title.trim().to_string() } else { process.unwrap_or("shell").to_string() };
+    let title = session_title(s);
     let mut c = Command::handler(&format!("session:{}", s.id), "Session", &title, |_, _| {});
     let mut words: Vec<&str> = Vec::new();
     words.extend(process);
@@ -159,12 +206,23 @@ fn session_command(s: &SessionInfo, now: u64) -> Command {
     c
 }
 
-/// The sessions picker's entries: a new session, then the sessions, newest first.
-fn session_commands(mut list: Vec<SessionInfo>, host: &HostRef, now: u64) -> Vec<Rc<Command>> {
+/// The sessions picker's entries: the saved layouts to restore (newest
+/// first), a new session, every loose detached session at once (when there
+/// are several), then the sessions, newest first.
+fn session_commands(mut list: Vec<SessionInfo>, layouts: &[goatty_proto::LayoutInfo], host: &HostRef, now: u64) -> Vec<Rc<Command>> {
     list.sort_by(|a, b| b.created_unix.cmp(&a.created_unix).then(b.id.cmp(&a.id)));
+    let mut out: Vec<Command> = layouts.iter().filter_map(|l| layout_command(l, &list, now)).collect();
     let mut new = Command::handler(NEW_SESSION, "Session", &format!("New session on {}", host.label()), |_, _| {});
     new.detail = Some("a fresh shell".into());
-    std::iter::once(new).chain(list.iter().map(|s| session_command(s, now))).map(Rc::new).collect()
+    out.push(new);
+    let loose = crate::workspace::saved::loose_detached(&list, layouts).len();
+    if loose > 1 {
+        let mut all = Command::handler(ALL_DETACHED, "Session", &format!("Reattach all {loose} detached sessions"), |_, _| {});
+        all.detail = Some("a tab each".into());
+        out.push(all.keywords(&["restore", "every", "detached"]));
+    }
+    out.extend(list.iter().map(|s| session_command(s, now)));
+    out.into_iter().map(Rc::new).collect()
 }
 
 /// The settings page for hosts, listed last in [`Scope::Hosts`].
@@ -381,6 +439,8 @@ pub struct CommandPalette {
     /// what's going on (`loading`: with a spinner), the fetch.
     conn: Option<Arc<Connection>>,
     sessions: Vec<Rc<Command>>,
+    /// The host's saved layouts no window holds (restored from the list).
+    layouts: Vec<goatty_proto::LayoutInfo>,
     status: Option<(SharedString, bool)>,
     _load: Option<Task<()>>,
     /// The session the next Shift+Delete ends (the first one asks).
@@ -433,6 +493,7 @@ impl CommandPalette {
             history_path,
             conn: None,
             sessions: Vec::new(),
+            layouts: Vec::new(),
             status: None,
             _load: None,
             ending: None,
@@ -1045,7 +1106,7 @@ impl CommandPalette {
     fn show_sessions(&mut self, host: HostRef, cx: &mut Context<'_, Self>) {
         let now = unix_now();
         self.show_scope(Scope::Sessions(host.clone()), cx);
-        self.sessions = session_commands(Vec::new(), &host, now);
+        self.sessions = session_commands(Vec::new(), &[], &host, now);
         let endpoint = host.endpoint();
         let label = if hosts::pool::live(&endpoint).is_some() {
             "Loading sessions…".to_string()
@@ -1061,7 +1122,11 @@ impl CommandPalette {
                 .spawn(async move {
                     let conn = hosts::pool::open(endpoint)?;
                     let list = conn.list_sessions()?;
-                    anyhow::Ok((conn, list))
+                    let layouts = conn.list_layouts().unwrap_or_else(|e| {
+                        log::warn!("listing the saved layouts: {e:#}");
+                        Vec::new()
+                    });
+                    anyhow::Ok((conn, list, layouts))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1069,9 +1134,10 @@ impl CommandPalette {
                     return;
                 }
                 match result {
-                    Ok((conn, list)) => {
+                    Ok((conn, list, layouts)) => {
                         this.status = list.is_empty().then(|| (format!("No sessions on {} yet", host.label()).into(), false));
-                        this.sessions = session_commands(list, &host, unix_now());
+                        this.sessions = session_commands(list, &layouts, &host, unix_now());
+                        this.layouts = layouts;
                         this.conn = Some(conn);
                     }
                     Err(e) => {
@@ -1152,7 +1218,9 @@ impl CommandPalette {
                 match result {
                     Ok(list) => {
                         this.status = Some((format!("Ended “{title}”").into(), false));
-                        this.sessions = session_commands(list, &host, unix_now());
+                        this.layouts.iter_mut().for_each(|l| l.sessions.retain(|&s| s != id));
+                        this.layouts.retain(|l| !l.sessions.is_empty());
+                        this.sessions = session_commands(list, &this.layouts, &host, unix_now());
                     }
                     Err(e) => {
                         let first = format!("{e:#}").lines().next().unwrap_or_default().to_string();
@@ -1659,7 +1727,7 @@ mod tests {
         };
         let host = HostRef::Ssh("box".into());
         let list = vec![info(3, "", Some("zsh"), 0, 1_000), info(7, "build", Some("cargo"), 1, 4_000)];
-        let c = session_commands(list, &host, 4_000 + 7_200);
+        let c = session_commands(list.clone(), &[], &host, 4_000 + 7_200);
         let ids: Vec<_> = c.iter().map(|c| c.id.to_string()).collect();
         assert_eq!(ids, ["session.new", "session:7", "session:3"], "new first, then newest");
         assert_eq!(c[0].title.as_ref(), "New session on box");
@@ -1668,6 +1736,28 @@ mod tests {
         assert!(matches!(session_choice("session.new"), Some(AttachMode::New)));
         assert!(matches!(session_choice("session:7"), Some(AttachMode::Id(7))));
         assert!(session_choice("ssh.host:box").is_none());
+        assert!(matches!(session_choice("layout:12"), Some(AttachMode::Layout(12))));
+        assert!(matches!(session_choice("session.detached"), Some(AttachMode::AllDetached)));
+        assert!(session_choice("layout:x").is_none());
+
+        // Saved layouts come first, then the new session, every loose
+        // detached session (when there are two), then each session.
+        let mut list = list;
+        list.push(info(9, "", Some("htop"), 0, 2_000));
+        list.push(info(11, "logs", Some("tail"), 0, 3_000));
+        let json = |ids: &[u64]| {
+            let tabs: Vec<String> = ids.iter().map(|id| format!(r#"{{"tree":{{"leaf":{id}}},"focused":{id}}}"#)).collect();
+            format!(r#"{{"version":1,"tabs":[{}],"active":0}}"#, tabs.join(","))
+        };
+        let layouts = [goatty_proto::LayoutInfo { id: 5, json: json(&[3, 11]), sessions: vec![3, 11], saved_unix: 4_000 }];
+        let c = session_commands(list, &layouts, &host, 4_000 + 600);
+        let ids: Vec<_> = c.iter().map(|c| c.id.to_string()).collect();
+        assert_eq!(
+            ids,
+            ["layout:5", "session.new", "session:7", "session:11", "session:9", "session:3"],
+            "one loose session: no bulk entry"
+        );
+        assert_eq!((c[0].title.as_ref(), c[0].detail.as_deref()), ("Restore 2 tabs", Some("zsh, logs · detached 10 min")));
         assert_eq!(age(100, 130), "just now");
         assert_eq!(age(0, 300), "5 min");
         assert_eq!(age(0, 3 * 86_400), "3 d");

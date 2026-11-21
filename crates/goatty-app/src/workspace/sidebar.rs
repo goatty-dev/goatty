@@ -66,6 +66,11 @@ const SAVE_AFTER: Duration = Duration::from_millis(400);
 pub(super) struct SidebarDrag;
 
 impl Workspace {
+    fn on_new_tab_right_click(&mut self, ev: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        cx.stop_propagation();
+        self.open_new_tab_menu(ev.position, window, cx);
+    }
+
     /// The sidebar's size: while its edge is dragged, the dragged one.
     fn sidebar(&self, cx: &gpui::App) -> Sidebar {
         self.sidebar_drag.map_or_else(|| saved_sidebar(cx), |(_, now)| now)
@@ -143,7 +148,10 @@ impl Workspace {
                     StripItem::Tab(t) => self.rail_tile(t, c, cx),
                 })
                 .collect();
-            let new_tab = sidebar_button("tab-rail-new", Icon::Plus, "New tab", c).size(px(TILE)).on_click(dispatch(NewTab));
+            let new_tab = sidebar_button("tab-rail-new", Icon::Plus, "New tab (right-click for more)", c)
+                .size(px(TILE))
+                .on_click(dispatch(NewTab))
+                .on_mouse_down(gpui::MouseButton::Right, cx.listener(Self::on_new_tab_right_click));
             frame
                 .px(px((RAIL_WIDTH - TILE) / 2.))
                 .py(px(PAD))
@@ -194,7 +202,8 @@ impl Workspace {
                 .hover(|s| s.bg(c.hover).text_color(c.ui.text))
                 .child(Icon::Plus.svg().size(px(16.)).text_color(c.ui.muted))
                 .child("New tab")
-                .on_click(dispatch(NewTab));
+                .on_click(dispatch(NewTab))
+                .on_mouse_down(gpui::MouseButton::Right, cx.listener(Self::on_new_tab_right_click));
             let footer = div()
                 .flex_none()
                 .flex()

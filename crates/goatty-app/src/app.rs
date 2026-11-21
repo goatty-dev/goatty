@@ -19,9 +19,12 @@ pub enum Initial {
     /// A goattyd to connect to first: the window opens at once, its tab
     /// shows the connect screen meanwhile (`crate::connect`, #37).
     Connect(ConnectPlan),
+    /// A window from the last run, with its tabs on every host (#252).
+    Reopen(crate::workspace::reopen::WindowRecord),
 }
 
-pub fn run(initial: Initial, open_settings: Option<String>) {
+/// `more`: further windows to open (the other windows of the last run).
+pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) {
     gpui_platform::application().with_assets(crate::ui::icons::Assets).run(move |cx: &mut App| {
         AppSettings::init(cx);
         crate::agent::notify::init(cx);
@@ -37,10 +40,14 @@ pub fn run(initial: Initial, open_settings: Option<String>) {
         crate::welcome::check_first_run(cx);
         cx.background_executor().spawn(async { crate::terminal::cleanup_stale_remote_cache() }).detach();
         open_terminal_window(cx, initial, open_settings);
+        for initial in more {
+            open_terminal_window(cx, initial, None);
+        }
         crate::welcome::open_if_first_run(cx);
         // Quit with the last window (the settings window may outlive the
         // terminal window briefly, or close first).
-        cx.on_window_closed(|cx, _| {
+        cx.on_window_closed(|cx, id| {
+            crate::workspace::reopen::window_closed(cx, id);
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -62,8 +69,12 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
         }
         ready => (ready, open_settings),
     };
-    // A restored layout resizes the window when it arrives (`Workspace`).
-    let (w, h) = SavedWindow::DEFAULT;
+    // A restored layout resizes the window when it arrives (`Workspace`);
+    // a reopened window knows its size right away.
+    let (w, h) = match &initial {
+        Initial::Reopen(r) => r.window.map_or(SavedWindow::DEFAULT, |w| w.size()),
+        _ => SavedWindow::DEFAULT,
+    };
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
     let opened = cx.open_window(
         WindowOptions {

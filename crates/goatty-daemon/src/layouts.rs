@@ -95,6 +95,35 @@ impl Layouts {
         Some(LayoutInfo { id, json: record.json.clone(), sessions: record.sessions.clone(), saved_unix: record.saved_unix })
     }
 
+    /// Give `conn` layout `id` when it's free and still shows a running
+    /// session (with only those sessions listed).
+    pub(crate) fn claim_id(&mut self, conn: u64, id: LayoutId, alive: impl Fn(SessionId) -> bool) -> Option<LayoutInfo> {
+        let record = self.map.get_mut(&id).filter(|r| r.owner.is_none())?;
+        record.sessions.retain(|&s| alive(s));
+        if record.sessions.is_empty() {
+            self.map.remove(&id);
+            return None;
+        }
+        record.owner = Some(conn);
+        Some(LayoutInfo { id, json: record.json.clone(), sessions: record.sessions.clone(), saved_unix: record.saved_unix })
+    }
+
+    /// The free layouts that still show a running session, newest first,
+    /// with only those sessions listed. Claims nothing.
+    pub(crate) fn list_free(&self, alive: impl Fn(SessionId) -> bool) -> Vec<LayoutInfo> {
+        let mut free: Vec<(u64, LayoutInfo)> = self
+            .map
+            .iter()
+            .filter(|(_, r)| r.owner.is_none())
+            .filter_map(|(&id, r)| {
+                let sessions: Vec<SessionId> = r.sessions.iter().copied().filter(|&s| alive(s)).collect();
+                (!sessions.is_empty()).then(|| (r.seq, LayoutInfo { id, json: r.json.clone(), sessions, saved_unix: r.saved_unix }))
+            })
+            .collect();
+        free.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        free.into_iter().map(|(_, l)| l).collect()
+    }
+
     /// `conn` ended: its layouts are free for the next window.
     pub(crate) fn release(&mut self, conn: u64) {
         for r in self.map.values_mut().filter(|r| r.owner == Some(conn)) {
@@ -150,6 +179,31 @@ mod tests {
         assert_eq!((got.id, got.sessions), (20, vec![2]));
         assert_eq!(l.claim(9, |s| s != 4).unwrap().id, 10);
         assert!(l.claim(9, |_| true).is_none());
+    }
+
+    #[test]
+    fn listing_shows_free_layouts_and_claiming_by_id_takes_that_one() {
+        let mut l = Layouts::default();
+        save(&mut l, 1, 10, &[1, 2]);
+        save(&mut l, 2, 20, &[3]);
+        save(&mut l, 3, 30, &[4]);
+        l.release(1);
+        l.release(2);
+        // 30 is still held; 20's session ended.
+        let list = l.list_free(|s| s != 3);
+        assert_eq!(list.iter().map(|i| i.id).collect::<Vec<_>>(), [10]);
+        l.release(3);
+        let list = l.list_free(|s| s != 2);
+        assert_eq!(list.iter().map(|i| (i.id, i.sessions.clone())).collect::<Vec<_>>(), [(30, vec![4]), (20, vec![3]), (10, vec![1])]);
+        // Listing claims nothing; claiming by id skips the newer ones.
+        let got = l.claim_id(9, 10, |s| s != 2).unwrap();
+        assert_eq!((got.id, got.sessions), (10, vec![1]));
+        assert!(l.claim_id(8, 10, |_| true).is_none(), "held by 9 now");
+        assert!(l.claim_id(8, 77, |_| true).is_none(), "unknown");
+        // A layout whose sessions all ended is dropped.
+        assert!(l.claim_id(8, 20, |s| s != 3).is_none());
+        assert!(!l.map.contains_key(&20));
+        assert_eq!(l.claim(8, |_| true).unwrap().id, 30);
     }
 
     #[test]

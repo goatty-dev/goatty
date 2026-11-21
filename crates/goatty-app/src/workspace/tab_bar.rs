@@ -222,8 +222,15 @@ impl Workspace {
             .cursor_pointer()
             .text_color(c.ui.muted)
             .hover(|s| s.bg(c.hover).text_color(c.ui.text))
-            .tooltip(tooltip("New tab"))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx));
+            .tooltip(tooltip("New tab (right-click for more)"))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_new_tab_menu(ev.position, window, cx);
+                }),
+            );
         let new_tab = if modern {
             new_tab.size(px(28.)).mb(px(2.)).rounded_md().child(Icon::Plus.svg().size(px(15.)).text_color(c.ui.muted))
         } else {
