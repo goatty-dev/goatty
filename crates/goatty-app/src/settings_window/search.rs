@@ -75,7 +75,13 @@ pub const INDEX: &[Entry] = &[
     e(Page::Terminal, "Links", "Open remote files with", "ssh remote editor opener vscode zed neovim").keys(&["links.remote_file_opener"]),
     e(Page::Terminal, "Links", "Max remote file download", "remote file size limit megabytes mib fetch")
         .keys(&["links.remote_max_size_mb"]),
-    e(Page::Terminal, "Selection", "Copy selected text", "copy on select primary clipboard").keys(&["selection.copy_on_select"]),
+    e(Page::Terminal, "Selection", "Copy when you select", "auto copy on select clipboard toast").keys(&["selection.auto_copy"]),
+    e(Page::Terminal, "Selection", "Unselect after copying", "auto copy clear deselect highlight keep selection")
+        .keys(&["selection.clear_after_copy"]),
+    // The row exists only where there's a primary selection.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    e(Page::Terminal, "Selection", "Middle click pastes what you select", "primary selection middle click paste")
+        .keys(&["selection.primary"]),
     e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),
     e(Page::Terminal, "Pasting", "Ask before pasting", "paste confirm protection bracketed multiline").keys(&["paste.confirm"]),

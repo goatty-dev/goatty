@@ -718,24 +718,24 @@ pub struct PasteSettings {
     pub middle_click: MiddleClick,
 }
 
-/// Where text selected with the mouse goes by itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CopyOnSelect {
-    /// The primary selection (Linux), for middle-click pasting anywhere.
-    /// Elsewhere nothing.
-    #[default]
-    Primary,
-    /// The clipboard too (and the primary selection on Linux).
-    Clipboard,
-    /// Nowhere; copy explicitly.
-    Off,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// What happens to text you select with the mouse (#266).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SelectionSettings {
-    pub copy_on_select: CopyOnSelect,
+    /// Copy to the clipboard as soon as a mouse selection ends, and say so.
+    pub auto_copy: bool,
+    /// After an auto-copy, unselect the text, as Ctrl+C does. Off keeps it
+    /// highlighted.
+    pub clear_after_copy: bool,
+    /// Also put selected text in the primary selection, which middle click
+    /// pastes in any app (Linux, FreeBSD; ignored elsewhere).
+    pub primary: bool,
+}
+
+impl Default for SelectionSettings {
+    fn default() -> Self {
+        Self { auto_copy: false, clear_after_copy: true, primary: true }
+    }
 }
 
 /// What a right click on the terminal does (#186). Programs that use the
@@ -982,16 +982,22 @@ pub struct DebugSettings {
 
 impl Document for ClientSettings {
     const NAME: &'static str = "settings";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
     const OPEN_MAPS: &'static [&'static str] = &["keybindings", "theme.overrides"];
 
     fn migrations() -> &'static [Migration] {
-        &[(1, global_theme_overrides_became_per_theme)]
+        &[(1, global_theme_overrides_became_per_theme), (2, copy_on_select_became_auto_copy)]
     }
 
     fn default_version(user: &serde_json::Value) -> u32 {
         let has_v1_overrides = user.pointer("/theme/overrides").and_then(serde_json::Value::as_object).is_some_and(looks_like_v1_overrides);
-        if has_v1_overrides { 1 } else { Self::VERSION }
+        if has_v1_overrides {
+            1
+        } else if user.pointer("/selection/copy_on_select").is_some() {
+            2
+        } else {
+            Self::VERSION
+        }
     }
 
     fn validate(&mut self) -> Vec<Issue> {
@@ -1093,6 +1099,24 @@ const V1_OVERRIDE_SLOTS: &[&str] =
 
 fn looks_like_v1_overrides(overrides: &serde_json::Map<String, serde_json::Value>) -> bool {
     !overrides.is_empty() && overrides.iter().any(|(k, v)| V1_OVERRIDE_SLOTS.contains(&k.as_str()) || !v.is_object())
+}
+
+/// Version 2 → 3 (#266): `selection.copy_on_select` (`primary`,
+/// `clipboard` or `off`) became the `auto_copy` and `primary` switches.
+fn copy_on_select_became_auto_copy(doc: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(selection) = doc.as_object_mut().and_then(|m| m.get_mut("selection")).and_then(Value::as_object_mut) else {
+        return;
+    };
+    match selection.remove("copy_on_select").as_ref().and_then(Value::as_str) {
+        Some("clipboard") => {
+            selection.entry("auto_copy").or_insert(Value::Bool(true));
+        }
+        Some("off") => {
+            selection.entry("primary").or_insert(Value::Bool(false));
+        }
+        _ => {}
+    }
 }
 
 /// Version 1 → 2 (#246): `theme.overrides` became a map keyed by theme id
@@ -1351,6 +1375,33 @@ mod tests {
         assert!(unset.issues.is_empty(), "{:?}", unset.issues);
         assert_eq!(unset.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Background)), None);
         assert_eq!(unset.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Ansi(1))), Some(Color(0x445566)));
+    }
+
+    #[test]
+    fn version_2_copy_on_select_migrates_to_auto_copy() {
+        use crate::store;
+        let sel = |text: &str| {
+            let loaded = store::parse::<ClientSettings>(text);
+            assert!(loaded.issues.is_empty(), "{text}: {:?}", loaded.issues);
+            loaded.value.selection
+        };
+        let on = SelectionSettings { auto_copy: true, ..SelectionSettings::default() };
+        let no_primary = SelectionSettings { primary: false, ..SelectionSettings::default() };
+        assert_eq!(sel(r#"{"version": 2, "selection": {"copy_on_select": "clipboard"}}"#), on);
+        assert_eq!(sel(r#"{"version": 2, "selection": {"copy_on_select": "off"}}"#), no_primary);
+        assert_eq!(sel(r#"{"version": 2, "selection": {"copy_on_select": "primary"}}"#), SelectionSettings::default());
+        // Unversioned files with the old key take the migration too.
+        assert_eq!(sel(r#"{"selection": {"copy_on_select": "clipboard"}}"#), on);
+        // The new keys load as they are.
+        let keep = r#"{"selection": {"auto_copy": true, "clear_after_copy": false}}"#;
+        assert_eq!(sel(keep), SelectionSettings { auto_copy: true, clear_after_copy: false, primary: true });
+
+        // set_key migrates the old key before applying the edit.
+        let edited =
+            store::set_key::<ClientSettings>(r#"{"version": 2, "selection": {"copy_on_select": "off"}}"#, "selection.auto_copy", "true")
+                .unwrap();
+        assert!(edited.issues.is_empty(), "{:?}", edited.issues);
+        assert_eq!(edited.value.selection, SelectionSettings { auto_copy: true, clear_after_copy: true, primary: false });
     }
 
     fn with(vars: &[(&str, &str)]) -> ClientSettings {
