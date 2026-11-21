@@ -716,6 +716,7 @@ mod tests {
             warnings: vec![],
             dependencies: vec![],
             digest: String::new(),
+            previous: None,
         };
         assert!(check_plan(&step, &p).is_ok());
         p.version = "1.1.0".into();

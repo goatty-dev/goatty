@@ -15,7 +15,8 @@
 //! * [`index`] + [`sign`]: registries, their signed index, verification,
 //! * [`fetch`]: HTTPS downloads through curl/wget,
 //! * [`archive`]: unpacking package downloads (tar.gz/xz/zst, zip),
-//! * [`api`]: plugin operations as JSON (protocol, GUI).
+//! * [`api`]: plugin operations as JSON (protocol, GUI),
+//! * [`changes`]: what an update changes, for a review that shows only that.
 //!
 //! The `goatty-plugin` binary wraps these for plugin authors (`new`,
 //! `validate`, `render`, `hash`) and registry maintainers (`index build`,
@@ -25,6 +26,7 @@ pub mod alias;
 pub mod api;
 pub mod archive;
 pub mod bundle;
+pub mod changes;
 pub mod commands;
 pub mod fetch;
 pub mod index;

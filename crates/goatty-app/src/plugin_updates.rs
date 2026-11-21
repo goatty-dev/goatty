@@ -4,10 +4,11 @@
 //! goattyd fetches its registries in the background (once they're a day
 //! old); the app asks the active tab's host (`Request::Updates`) when the
 //! active host changes and every few hours, at most every [`CHECK_EVERY`]
-//! per host. Each update is told once per run of the app. "Review" opens
-//! the Plugins page, where every update still goes through the plan and
-//! its approval: nothing is installed from here, least of all a version
-//! that asks for new permissions. `plugins.notify_updates` turns it off.
+//! per host. Each update is told once per run of the app. "Show" opens
+//! the Plugins page's Updates list (one click per update, or Update all;
+//! one that asks for new permissions or changes shell code opens its
+//! review first). Nothing is installed from the toast itself.
+//! `plugins.notify_updates` turns it off.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -106,13 +107,13 @@ fn updates_toast(updates: &[Update], link: &HostLink) -> Toast {
     }
     let mut lines: Vec<String> = updates.iter().map(|u| format!("{}: {} → {}", u.name, u.installed, u.version)).collect();
     if updates.iter().any(|u| !u.new_permissions.is_empty()) {
-        lines.push("Some ask for new permissions: review them before updating.".into());
+        lines.push("Some ask for new permissions: you'll review those before they install.".into());
     }
     Toast::info(title)
         .body(lines.join("\n"))
         .key("plugins.updates")
         .duration(Duration::from_secs(20))
-        .action("Review", move |_, cx| settings_window::open_plugin_updates(cx, link.clone()))
+        .action("Show", move |_, cx| settings_window::open_plugin_updates(cx, link.clone()))
 }
 
 #[cfg(test)]

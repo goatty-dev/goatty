@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use goatty_config::HostSettings;
-use goatty_plugin::api::{Available, Catalog, Download, Installed, PackageState, PackageStatus, Plan, RegistryStatus, Step, Update};
+use goatty_plugin::api::{
+    Available, Catalog, Download, Installed, PackageState, PackageStatus, Plan, Previous, PreviousPackage, RegistryStatus, Step, Update,
+};
 use goatty_plugin::fetch::Fetch;
 use goatty_plugin::manifest::{self, Load, Manifest};
 use goatty_plugin::schema::{self, Values};
@@ -376,34 +378,7 @@ impl Plugins<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let stored = settings.plugins.get(&m.id).map(|c| c.settings.clone()).unwrap_or_default();
-        let (values, _) = schema::resolve(m, &stored);
-        let aliases = m
-            .aliases
-            .iter()
-            .map(|a| {
-                let mut s = format!("{} → {}", a.name, goatty_plugin::alias::expansion(m, a, &values));
-                if let Some(w) = &a.when {
-                    let on = manifest::applies(&a.when, &values);
-                    let when = goatty_plugin::alias::describe(m, w);
-                    s.push_str(&format!("  (while {when}: {})", if on { "on now" } else { "off now" }));
-                }
-                s
-            })
-            .collect();
-        let env = m
-            .env
-            .iter()
-            .map(|e| {
-                let value = template::expand_inline(&e.value, m, &values, None);
-                let mut s = if value.is_empty() { format!("{} (not set while empty)", e.name) } else { format!("{}={value}", e.name) };
-                if let Some(w) = &e.when {
-                    s.push_str(&format!("  (when {w}: {})", if manifest::applies(&e.when, &values) { "on now" } else { "off now" }));
-                }
-                s
-            })
-            .chain(m.files.iter().filter_map(|f| f.env.as_ref().map(|v| format!("{v}=<goatty's generated {} file>", f.name))))
-            .collect();
+        let (aliases, env) = shell_additions(m, settings);
         let files = m.files.iter().map(|f| f.name.clone()).collect();
         let shell_code = match &m.zsh.init {
             Some(init) => {
@@ -415,15 +390,7 @@ impl Plugins<'_> {
             }
             None => None,
         };
-        let requires = m
-            .requires
-            .commands
-            .iter()
-            .map(|cmd| match on_path(cmd) {
-                Some(p) => format!("{cmd}: found at {}", p.display()),
-                None => format!("{cmd}: not installed here (goatty doesn't install it); the integration stays off until it is"),
-            })
-            .collect();
+        let requires = required_commands(m, &on_path);
 
         let mut warnings = Vec::new();
         // (One installed along with it gets turned on.)
@@ -484,9 +451,54 @@ impl Plugins<'_> {
             warnings,
             dependencies: Vec::new(),
             digest: String::new(),
+            previous: None,
         };
         plan.digest = plan.compute_digest(&c.files);
+        // Not in the digest: what the update replaces, to show only what changes.
+        if plan.replaces.is_some() {
+            plan.previous = self.previous(&m.id, lock, settings, &on_path).map(Box::new);
+        }
         Ok(plan)
+    }
+
+    /// The installed version of `id`, as [`Plan`] items, for an update's
+    /// review. `None` when it can't be read (the review then shows
+    /// everything).
+    fn previous(&self, id: &str, lock: &Lock, settings: &HostSettings, on_path: &dyn Fn(&str) -> Option<PathBuf>) -> Option<Previous> {
+        let e = lock.plugins.get(id)?;
+        let m = lock::manifest_of(self.dirs, id, e).map_err(|err| log::info!("plan: can't read installed {id}: {err:#}")).ok()?;
+        let shell_code = match &m.zsh.init {
+            Some(init) => {
+                let bytes = lock::read_checked(self.dirs, id, e, init).ok()?;
+                Some((init.clone(), String::from_utf8_lossy(&bytes).into_owned()))
+            }
+            None => None,
+        };
+        let (aliases, env) = shell_additions(&m, settings);
+        Some(Previous {
+            version: e.version.clone(),
+            source: e.source.clone(),
+            verified: e.verified,
+            packages: e
+                .packages
+                .iter()
+                .map(|p| {
+                    let asset = m.packages.iter().find(|mp| mp.id == p.id).and_then(|mp| mp.asset_for(&current_target()));
+                    PreviousPackage {
+                        id: p.id.clone(),
+                        version: p.version.clone(),
+                        url: asset.map(|a| a.url.clone()).unwrap_or_default(),
+                        sha256: asset.map(|a| a.sha256.clone()).unwrap_or_default(),
+                    }
+                })
+                .collect(),
+            permissions: permissions::describe(&m),
+            aliases,
+            env,
+            files: m.files.iter().map(|f| f.name.clone()).collect(),
+            shell_code,
+            requires: required_commands(&m, on_path),
+        })
     }
 
     /// Install `c` if its plan still has the digest the user approved.
@@ -935,6 +947,53 @@ impl Plugins<'_> {
         }
         installed
     }
+}
+
+/// A plugin's aliases and variables as the plan shows them, with the
+/// current settings.
+fn shell_additions(m: &Manifest, settings: &HostSettings) -> (Vec<String>, Vec<String>) {
+    let stored = settings.plugins.get(&m.id).map(|c| c.settings.clone()).unwrap_or_default();
+    let (values, _) = schema::resolve(m, &stored);
+    let aliases = m
+        .aliases
+        .iter()
+        .map(|a| {
+            let mut s = format!("{} → {}", a.name, goatty_plugin::alias::expansion(m, a, &values));
+            if let Some(w) = &a.when {
+                let on = manifest::applies(&a.when, &values);
+                let when = goatty_plugin::alias::describe(m, w);
+                s.push_str(&format!("  (while {when}: {})", if on { "on now" } else { "off now" }));
+            }
+            s
+        })
+        .collect();
+    let env = m
+        .env
+        .iter()
+        .map(|e| {
+            let value = template::expand_inline(&e.value, m, &values, None);
+            let mut s = if value.is_empty() { format!("{} (not set while empty)", e.name) } else { format!("{}={value}", e.name) };
+            if let Some(w) = &e.when {
+                s.push_str(&format!("  (when {w}: {})", if manifest::applies(&e.when, &values) { "on now" } else { "off now" }));
+            }
+            s
+        })
+        .chain(m.files.iter().filter_map(|f| f.env.as_ref().map(|v| format!("{v}=<goatty's generated {} file>", f.name))))
+        .collect();
+    (aliases, env)
+}
+
+/// The commands a plugin needs that goatty won't install, and whether
+/// they're here.
+fn required_commands(m: &Manifest, on_path: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<String> {
+    m.requires
+        .commands
+        .iter()
+        .map(|cmd| match on_path(cmd) {
+            Some(p) => format!("{cmd}: found at {}", p.display()),
+            None => format!("{cmd}: not installed here (goatty doesn't install it); the integration stays off until it is"),
+        })
+        .collect()
 }
 
 impl Plugins<'_> {

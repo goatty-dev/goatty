@@ -364,6 +364,39 @@ pub struct Plan {
     pub dependencies: Vec<Plan>,
     /// Over everything security-relevant; [`Request::Install`] sends it back.
     pub digest: String,
+    /// For an update: what the installed version has, so a review can show
+    /// only what changes ([`Plan::changes`]). Not part of the digest.
+    /// `None` for an install, or from a goattyd that doesn't send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<Box<Previous>>,
+}
+
+/// The installed version of a plugin, as an update's plan sees it: the
+/// same items as [`Plan`], to compare against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Previous {
+    pub version: String,
+    pub source: String,
+    pub verified: bool,
+    pub packages: Vec<PreviousPackage>,
+    pub permissions: Vec<Granted>,
+    pub aliases: Vec<String>,
+    pub env: Vec<String>,
+    pub files: Vec<String>,
+    pub shell_code: Option<(String, String)>,
+    pub requires: Vec<String>,
+}
+
+/// A program of the installed version, for [`Previous`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousPackage {
+    pub id: String,
+    pub version: String,
+    /// This host's download (empty: none, a system copy).
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
