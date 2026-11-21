@@ -2,11 +2,15 @@
 //! the horizontal strip in two styles (`tabs.style`) and holds what every
 //! style shares; the vertical style is in `sidebar`.
 //!
-//! - **modern**: browser-like tabs with rounded tops; the active one has the
-//!   terminal's background and merges into it. Icon, title, close button
-//!   (always on the active tab, on hover for the others), a + button.
+//! - **modern**: browser-like. Background tabs are quiet text that floats
+//!   above the bar's bottom edge, a rounded pill on hover, with faint
+//!   dividers between them. The active tab has the terminal's background,
+//!   rounded top corners and flared bottom ones, so it merges into the
+//!   panes. Icon, title, close button (always on the active tab, on hover
+//!   for the others), a + button.
 //! - **compact**: one line of small monospace text, kitty-style: number,
-//!   icon and title; the active tab in the accent color.
+//!   icon and title. The active tab has the terminal's background (it
+//!   merges into the panes) and an accent-colored number.
 //!
 //! Every style: click to switch, middle-click to close, double-click to
 //! rename, right-click for the tab's menu (`menu`), double-click the
@@ -28,9 +32,12 @@
 //! in the background), a check or a cross when done or failed, until the
 //! tab is looked at. Hovering the mark tells what the agent said.
 //!
-//! With tabs on several hosts (`groups`), each host's tabs follow a label
-//! in the host's color (click: fold, right-click: the host's menu), and
-//! each tab carries a line in that color.
+//! With tabs on several hosts (`groups`), each host's tabs follow a chip
+//! with the host's name, like a browser's tab groups (#253): solid in the
+//! host's color while the group is open, with a line in that color along
+//! the bar's bottom edge joining the chip to the group's background tabs;
+//! folded, a tinted chip with the number of tabs and their activity.
+//! Click the chip to fold, right-click for the host's menu.
 
 use std::time::{Duration, Instant};
 
@@ -56,16 +63,21 @@ use crate::ui::controls::tooltip;
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
 
-const MODERN_HEIGHT: f32 = 38.0;
-const MODERN_TAB_HEIGHT: f32 = 32.0;
-const COMPACT_HEIGHT: f32 = 24.0;
+const MODERN_HEIGHT: f32 = 40.0;
+/// The active modern tab, which reaches down into the panes.
+const MODERN_TAB_HEIGHT: f32 = 34.0;
+/// Background modern tabs, which float above the bar's bottom edge.
+const MODERN_BACK_HEIGHT: f32 = 28.0;
+/// How far the active modern tab's bottom corners curve out.
+const FLARE: f32 = 8.0;
+/// How far background modern tabs float above the bar's bottom edge.
+const MODERN_LIFT: f32 = MODERN_TAB_HEIGHT - MODERN_BACK_HEIGHT - 2.0;
+const COMPACT_HEIGHT: f32 = 26.0;
 /// Modern tabs share the strip down to this width; then it scrolls.
 const MIN_TAB: f32 = 96.0;
 const MAX_TAB: f32 = 220.0;
 /// Narrower modern tabs only show a close button when active.
 const NARROW_TAB: f32 = 120.0;
-/// About how wide a host group's label is, kept free when sizing tabs.
-const GROUP_LABEL_ROOM: f32 = 110.0;
 
 /// Colors of the tabs, from the theme.
 #[derive(Clone, Copy)]
@@ -86,10 +98,16 @@ impl Colors {
         let ui = Ui::get(cx);
         let colors = &cx.global::<AppSettings>().colors;
         let terminal: Hsla = rgb(colors.background.0).into();
-        // A bit darker than the terminal in dark themes, a bit greyer in light ones.
-        let bar =
-            if colors.is_dark() { Hsla { l: terminal.l * 0.7, ..terminal } } else { Hsla { l: (terminal.l - 0.06).max(0.0), ..terminal } };
-        let hover = if colors.is_dark() { Hsla { l: (bar.l + 0.06).min(1.0), ..bar } } else { Hsla { l: (bar.l - 0.05).max(0.0), ..bar } };
+        // Darker than the terminal in dark themes (lighter when the terminal
+        // is near black and can't get darker), a bit greyer in light ones.
+        let bar = if colors.is_dark() {
+            let l = if terminal.l < 0.06 { terminal.l + 0.045 } else { terminal.l * 0.6 };
+            Hsla { l, ..terminal }
+        } else {
+            Hsla { l: (terminal.l - 0.06).max(0.0), ..terminal }
+        };
+        // Between the bar and the terminal: a hovered tab never outshines the active one.
+        let hover = if colors.is_dark() { Hsla { l: (bar.l + 0.03).min(1.0), ..bar } } else { Hsla { l: (bar.l - 0.05).max(0.0), ..bar } };
         let edge = ui.text.opacity(if colors.is_dark() { 0.07 } else { 0.1 });
         Self { ui, bar, terminal, hover, edge }
     }
@@ -162,6 +180,14 @@ pub(super) struct TabView {
     pub dragged: bool,
     /// Its host group's color, when tabs are grouped by host.
     pub group: Option<Hsla>,
+    /// The last tab of its host group (the group's line ends here).
+    pub group_end: bool,
+    /// Drawn after another background tab: a faint divider between them.
+    pub divider: bool,
+    /// Right after / right before the active tab in the strip (a group's
+    /// line makes room for its flared corners).
+    pub prev_active: bool,
+    pub next_active: bool,
 }
 
 /// A progress line: how full, or moving when it can't tell.
@@ -192,26 +218,42 @@ impl Workspace {
         let c = Colors::get(cx);
         let style = cx.global::<AppSettings>().client.tabs.style;
         let modern = style != TabStyle::Compact;
-        let (labels, tabs) = strip.iter().fold((0, 0), |(l, t), i| match i {
-            StripItem::Group(_) => (l + 1, t),
+        let (labels, tabs) = strip.iter().fold((0.0, 0), |(l, t), i| match i {
+            StripItem::Group(g) => (l + group_label_width(g), t),
             StripItem::Tab(_) => (l, t + 1),
         });
+        let active_at = strip.iter().position(|i| matches!(i, StripItem::Tab(t) if t.active));
         let csd = chrome::csd(window).is_some();
         let control = if modern { 24.0 } else { 18.0 };
         let left = chrome::window_buttons(chrome::Side::Left, control, c, window, cx);
         let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
         // The settings button, the new-tab menu's chevron, and the window
         // buttons when goatty draws them.
-        let chrome_room = 32.0 + 18.0 + chrome::buttons_width(control, window, cx);
-        let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels as f32 * GROUP_LABEL_ROOM - chrome_room;
+        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx);
+        let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
+        // A divider goes between two background tabs, never next to the
+        // active one or a group's label.
+        let mut after_tab = false;
         let items: Vec<AnyElement> = strip
             .into_iter()
-            .map(|item| match item {
-                StripItem::Group(g) => self.group_label(g, modern, c, cx),
-                StripItem::Tab(t) if modern => self.modern_tab(t, width, c, cx),
-                StripItem::Tab(t) => self.compact_tab(t, c, cx),
+            .enumerate()
+            .map(|(at, item)| {
+                let next_active = active_at == Some(at + 1);
+                match item {
+                    StripItem::Group(g) => {
+                        after_tab = false;
+                        self.group_label(g, modern, at == 0, next_active, c, cx)
+                    }
+                    StripItem::Tab(mut t) => {
+                        t.divider = after_tab && !t.active;
+                        t.prev_active = at > 0 && active_at == Some(at - 1);
+                        t.next_active = next_active;
+                        after_tab = !t.active;
+                        if modern { self.modern_tab(t, width, c, cx) } else { self.compact_tab(t, c, cx) }
+                    }
+                }
             })
             .collect();
         let new_tab = div()
@@ -233,9 +275,9 @@ impl Workspace {
                 }),
             );
         let new_tab = if modern {
-            new_tab.size(px(28.)).mb(px(2.)).rounded_md().child(Icon::Plus.svg().size(px(15.)).text_color(c.ui.muted))
+            new_tab.w(px(26.)).h(px(28.)).rounded_l_md().child(Icon::Plus.svg().size(px(15.)).text_color(c.ui.muted))
         } else {
-            new_tab.h_full().px(px(10.)).child("+")
+            new_tab.h_full().pl(px(10.)).pr(px(6.)).child("+")
         };
         // Where else a new tab can go: the same menu as a right click on +.
         let more = div()
@@ -255,7 +297,15 @@ impl Workspace {
                     this.open_new_tab_menu(ev.position, window, cx);
                 }),
             );
-        let more = if modern { more.w(px(16.)).h(px(28.)).mb(px(2.)).rounded_md() } else { more.h_full().px(px(4.)) };
+        let more = if modern { more.w(px(16.)).h(px(28.)).rounded_r_md() } else { more.h_full().pl(px(2.)).pr(px(6.)) };
+        // + and its menu's chevron as one split button.
+        let new_tab = div()
+            .flex_none()
+            .flex()
+            .when(modern, |d| d.items_center().mb(px(MODERN_LIFT)))
+            .when(!modern, |d| d.h_full())
+            .child(new_tab)
+            .child(more);
         let settings = div()
             .id("tab-settings")
             .flex_none()
@@ -268,7 +318,7 @@ impl Workspace {
             .tooltip(tooltip("Settings"))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx));
         let settings = if modern {
-            settings.size(px(28.)).mb(px(2.)).rounded_md().child(Icon::Sliders.svg().size(px(15.)).text_color(c.ui.muted))
+            settings.size(px(28.)).mb(px(MODERN_LIFT)).rounded_md().child(Icon::Sliders.svg().size(px(15.)).text_color(c.ui.muted))
         } else {
             settings.h_full().px(px(8.)).child(Icon::Sliders.svg().size(px(13.)).text_color(c.ui.muted))
         };
@@ -281,12 +331,15 @@ impl Workspace {
             .flex_none()
             .h(px(height))
             .w_full()
+            .relative()
             .flex()
             .bg(c.bar)
             .font_family(cx.global::<AppSettings>().ui_font.clone())
             .on_scroll(cx.listener(Self::on_tabs_scroll))
             .when(modern, |d| d.items_end().px(px(6.)).gap(px(2.)))
             .when(!modern, |d| d.items_stretch().text_size(px(12.)))
+            // The seam to the panes, which the active tab opens.
+            .child(div().absolute().bottom_0().left_0().right_0().h(px(1.)).bg(seam(c)))
             .children(left)
             .child(
                 // The tabs scroll sideways when they don't fit.
@@ -298,11 +351,11 @@ impl Workspace {
                     .h_full()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll)
-                    .when(modern, |d| d.items_end().gap(px(2.)))
+                    // Room for the active tab's flared corners.
+                    .when(modern, |d| d.items_end().gap(px(2.)).px(px(FLARE)))
                     .children(items),
             )
             .child(new_tab)
-            .child(more)
             .child(rest)
             .child(settings)
             .children(right);
@@ -391,6 +444,10 @@ impl Workspace {
             connecting,
             dragged: self.dragging == Some(tab.id),
             group: None,
+            group_end: false,
+            divider: false,
+            prev_active: false,
+            next_active: false,
         }
     }
 
@@ -610,46 +667,85 @@ impl Workspace {
     }
 
     fn modern_tab(&self, t: TabView, width: f32, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+        let hover_group = SharedString::from(format!("tab-{}", t.id));
         let icon = self.tab_icon(&t, 14.0, c, cx, || Icon::Terminal.svg().size(px(14.)).text_color(c.ui.muted).into_any_element());
+        let icon = quiet_icon(icon, t.active, hover_group.clone());
         // Narrow background tabs leave the room to the title (middle-click
         // or the menu still close them).
         let close = (t.active || width >= NARROW_TAB).then(|| self.close_button(&t, 18.0, c, cx));
         let title = self.tab_title(&t, cx);
         let marker = self.tab_marker(&t, 13.0, c);
         let waiting = !t.active && is_waiting(&t);
-        self.tab_shell(&t, Axis::Row, cx)
+        let panes = (t.panes > 1).then(|| pane_count(t.panes, c));
+        let shell = self
+            .tab_shell(&t, Axis::Row, cx)
             .flex_none()
             .w(px(width))
-            .h(px(MODERN_TAB_HEIGHT))
             .pl(px(10.))
             .pr(px(6.))
             .gap(px(if width < NARROW_TAB { 6. } else { 8. }))
-            .rounded_t(px(8.))
-            .text_sm()
-            .when(t.active, |d| d.bg(c.terminal).text_color(c.ui.text))
-            .when(!t.active, |d| d.text_color(c.ui.muted).hover(|s| s.bg(c.hover).text_color(c.ui.text)))
-            .when(waiting, |d| d.bg(c.ui.warning.opacity(0.12)).text_color(c.ui.text))
+            .text_size(px(text::LABEL))
             .child(icon)
             .child(title)
             .children(marker)
-            .when(t.panes > 1, |d| {
-                d.child(div().flex_none().text_xs().text_color(c.ui.muted).child(SharedString::from(format!("{}", t.panes))))
-            })
-            .children(close)
-            .when_some(t.group, |d, color| d.child(group_line(color, t.active, true)))
-            .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 8.0, c)))
-            .into_any_element()
+            .children(panes)
+            .children(close);
+        let shell = if t.active {
+            // Outlined in its group's color (continuing the group's line up
+            // its flared corners and around it), else by the bar's seam; it
+            // reaches down and merges into the panes.
+            let (w, line) = outline(&t, c);
+            shell
+                .h(px(MODERN_TAB_HEIGHT))
+                .pb(px(2.))
+                .rounded_t(px(10.))
+                .bg(c.terminal)
+                .border_t(px(w))
+                .border_l(px(w))
+                .border_r(px(w))
+                .border_color(line)
+                .text_color(c.ui.text)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(flare(true, w, line, c))
+                .child(flare(false, w, line, c))
+        } else {
+            // Background tabs float above the bar's bottom edge, where their
+            // group's line runs; the line makes room for the active tab's
+            // flared corners next to it.
+            let room = FLARE - 2.0 - ACTIVE_GROUP_LINE;
+            let left = if t.prev_active { room } else { 0. };
+            let right = if t.group_end {
+                2.
+            } else if t.next_active {
+                room
+            } else {
+                -2.
+            };
+            shell
+                .h(px(MODERN_BACK_HEIGHT))
+                .mb(px(MODERN_LIFT))
+                .rounded(px(radius::CONTROL - 2.))
+                .text_color(c.ui.muted)
+                .hover(|s| s.bg(c.hover).text_color(c.ui.text))
+                .when(waiting, |d| d.bg(c.ui.warning.opacity(0.14)).text_color(c.ui.text))
+                .when(t.divider, |d| d.child(divider(hover_group, -1.5, c)))
+                .when_some(t.group, |d, color| d.child(group_line(color, -MODERN_LIFT, left, right, false, t.group_end)))
+        };
+        shell.children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 10.0, c))).into_any_element()
     }
 
     fn compact_tab(&self, t: TabView, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
         let mono = cx.global::<AppSettings>().client.font.family.clone().unwrap_or_else(|| "monospace".into());
-        let fg = if t.active { c.ui.on_accent } else { c.ui.muted };
-        let icon =
-            self.agent_logo(&t, 12.0, fg, cx).or_else(|| self.process_icon(t.process.as_deref(), 12.0, t.active.then_some(fg), c, cx));
+        let hover_group = SharedString::from(format!("tab-{}", t.id));
+        let fg = if t.active { c.ui.text } else { c.ui.muted };
+        let icon = self.agent_logo(&t, 12.0, fg, cx).or_else(|| self.process_icon(t.process.as_deref(), 12.0, None, c, cx));
+        let icon = icon.map(|i| quiet_icon(i, t.active, hover_group.clone()));
         let title = self.tab_title(&t, cx);
         let marker = self.tab_marker(&t, 11.0, c);
         let waiting = !t.active && is_waiting(&t);
         let number = SharedString::from(format!("{}", t.index + 1));
+        let number_color = if t.active { t.group.unwrap_or(c.ui.accent_text) } else { c.ui.muted.opacity(0.75) };
+        let (w, line) = outline(&t, c);
         self.tab_shell(&t, Axis::Row, cx)
             .flex_none()
             .max_w(px(220.))
@@ -657,55 +753,102 @@ impl Workspace {
             .gap(px(6.))
             .font_family(mono)
             .text_color(fg)
-            .when(t.active, |d| d.bg(c.ui.accent))
+            .when(t.active, |d| {
+                // Like the modern tab: outlined in its group's color (or by the
+                // seam) and merging into the panes.
+                // Inset from the window's top edge, so the outline's top shows.
+                d.bg(c.terminal)
+                    .mt(px(2.))
+                    .rounded_t(px(4.))
+                    .border_t(px(w))
+                    .border_l(px(w))
+                    .border_r(px(w))
+                    .border_color(line)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+            })
             .when(!t.active, |d| d.hover(|s| s.bg(c.hover).text_color(c.ui.text)))
             .when(waiting, |d| d.bg(c.ui.warning.opacity(0.16)).text_color(c.ui.text))
-            .child(div().flex_none().opacity(0.7).child(number))
+            .when(t.divider, |d| d.child(divider(hover_group, -0.5, c)))
+            .child(div().flex_none().text_color(number_color).child(number))
             .children(icon)
             .child(title)
             .children(marker)
             .when(t.panes > 1, |d| d.child(div().flex_none().opacity(0.7).child(SharedString::from(format!("[{}]", t.panes)))))
-            .when_some(t.group, |d, color| d.child(group_line(color, t.active, false)))
+            .when_some(t.group.filter(|_| !t.active), |d, color| {
+                d.child(group_line(color, 0.0, 0.0, if t.group_end { 2. } else { 0. }, false, t.group_end))
+            })
             .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 4.0, c)))
             .into_any_element()
     }
 
-    /// A host group's label in the strip: the host's icon and name in its
-    /// color; folded, also how many tabs it holds and their activity.
-    /// Click: fold or unfold; right-click: the group's menu.
-    fn group_label(&self, g: Group, modern: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+    /// A host group's chip, as the strip and the sidebar show it: the
+    /// host's name, solid in its color while the group is open (this
+    /// computer's chip is a quiet neutral one); folded, a tinted chip with
+    /// a chevron, how many tabs it holds and their activity. `small` for
+    /// the compact strip. Click: fold or unfold (Shift: detach);
+    /// right-click: the group's menu.
+    pub(super) fn group_chip(&self, g: &Group, small: bool, c: Colors, cx: &mut Context<'_, Self>) -> gpui::Stateful<gpui::Div> {
         let key = g.key.clone();
         let menu_key = g.key.clone();
         let folded = g.folded;
-        let tip = group_tooltip(&g);
-        let icon = if g.local { Icon::Monitor } else { Icon::Server };
+        let tip = group_tooltip(g);
+        let mark = group_mark(g, c).filter(|_| folded).map(|color| div().flex_none().size(px(6.)).rounded_full().bg(color));
+        let has_mark = mark.is_some();
         let count = folded.then(|| {
+            let size = if small { 13. } else { 16. };
             div()
                 .flex_none()
-                .px(px(5.))
+                .min_w(px(size))
+                .h(px(size))
+                .px(px(4.))
+                .flex()
+                .items_center()
+                .justify_center()
                 .rounded_full()
-                .bg(g.color.opacity(0.25))
-                .text_size(px(11.))
+                .bg(g.color.opacity(0.24))
+                .text_size(px(if small { 9.5 } else { 10.5 }))
                 .child(SharedString::from(g.tabs.len().to_string()))
         });
-        let mark = group_mark(&g, c).filter(|_| folded).map(|color| div().flex_none().size(px(7.)).rounded_full().bg(color));
-        let label = div()
+        let (fg, glyph) = if folded {
+            (c.ui.text.opacity(0.9), Some((Icon::ChevronRight, g.color)))
+        } else if g.local {
+            (c.ui.text.opacity(0.85), Some((Icon::Monitor, c.ui.muted)))
+        } else {
+            (on_color(g.color), None)
+        };
+        let pl = if glyph.is_some() { 7. } else { 9. };
+        let pr = match (folded, has_mark) {
+            (false, _) => 9.,
+            (true, true) => 7.,
+            (true, false) => 4.,
+        };
+        let color = g.color;
+        let chip = div()
             .id(gpui::ElementId::NamedInteger("tab-group".into(), g.ids[0]))
             .flex_none()
             .flex()
             .items_center()
-            .gap(px(6.))
-            .max_w(px(180.))
+            .gap(px(5.))
+            .max_w(px(160.))
+            .rounded_full()
             .cursor_pointer()
-            .text_color(c.ui.text)
-            .bg(g.color.opacity(if g.active { 0.24 } else { 0.14 }))
-            .hover(|s| s.bg(g.color.opacity(0.32)))
+            .font_family(cx.global::<AppSettings>().ui_font.clone())
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(fg)
+            .map(|d| match (folded, g.local) {
+                (true, _) => d.bg(color.opacity(0.14)).border_1().border_color(color.opacity(0.45)).hover(|s| s.bg(color.opacity(0.22))),
+                (false, true) => {
+                    d.bg(c.ui.text.opacity(0.08)).border_1().border_color(c.ui.text.opacity(0.14)).hover(|s| s.bg(c.ui.text.opacity(0.14)))
+                }
+                (false, false) => d.bg(color).hover(|s| s.opacity(0.85)),
+            })
             .tooltip(tooltip(tip))
-            .child(icon.svg().size(px(13.)).text_color(g.color))
+            .children(glyph.map(|(icon, color)| icon.svg().flex_none().size(px(if small { 10. } else { 11. })).text_color(color)))
             .child(div().min_w_0().truncate().child(g.label.clone()))
             .children(count)
             .children(mark)
             .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
                 if ev.modifiers().shift {
                     this.detach_group(&key, window, cx);
                 } else {
@@ -719,11 +862,36 @@ impl Workspace {
                     cx.stop_propagation();
                 }),
             );
-        if modern {
-            label.h(px(24.)).mb(px(4.)).mx(px(2.)).px(px(8.)).rounded(px(radius::CONTROL)).text_size(px(12.)).into_any_element()
+        if small {
+            chip.h(px(19.)).pl(px(pl - 2.)).pr(px(pr - 1.)).text_size(px(10.5))
         } else {
-            label.h_full().px(px(8.)).into_any_element()
+            chip.h(px(22.)).pl(px(pl)).pr(px(pr)).text_size(px(text::CAPTION))
         }
+    }
+
+    /// A host group's label in the strip: its chip (`group_chip`), with the
+    /// group's line along the bar's bottom edge starting under it.
+    fn group_label(&self, g: Group, modern: bool, first: bool, next_active: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+        let folded = g.folded;
+        let chip = self.group_chip(&g, !modern, c, cx);
+        // The chip sits in a slot as tall as a background tab, so the
+        // group's line starts under it.
+        let (slot_h, lift, gap) = if modern { (MODERN_BACK_HEIGHT, MODERN_LIFT, 2.) } else { (COMPACT_HEIGHT, 0., 0.) };
+        let right = if next_active && modern { FLARE - 2. - ACTIVE_GROUP_LINE } else { -gap };
+        div()
+            .flex_none()
+            .relative()
+            .flex()
+            .items_center()
+            .h(px(slot_h))
+            .mb(px(lift))
+            // Groups keep a little apart from each other.
+            .when(!first, |d| d.ml(px(if modern { 8. } else { 6. })))
+            .pl(px(6.))
+            .pr(px(4.))
+            .child(chip)
+            .when(!folded, |d| d.child(group_line(g.color, -lift, 6., right, true, false)))
+            .into_any_element()
     }
 }
 
@@ -739,11 +907,117 @@ pub(super) fn group_tooltip(g: &Group) -> String {
     format!("{tip}\n{tabs} · {click} · Shift+click to detach · right-click for more")
 }
 
-/// The line in a host group's color on a tab: across the top of the active
-/// modern tab (it merges into the panes below), else along the bottom.
-fn group_line(color: Hsla, active: bool, modern: bool) -> impl IntoElement {
-    let line = div().absolute().h(px(2.)).rounded_full().bg(color);
-    if modern && active { line.top_0().left(px(8.)).right(px(8.)) } else { line.bottom_0().left(px(4.)).right(px(4.)).opacity(0.85) }
+/// How wide the active tab's outline is when it's in a host group (as
+/// wide as the group's line, which it continues).
+const ACTIVE_GROUP_LINE: f32 = 2.0;
+
+/// A stretch of a host group's line along the bottom of the bar, under
+/// its label and background tabs. `bottom` places it at the bar's edge
+/// from an item lifted above it; `left`/`right` are insets (negative
+/// bridges the gap to the next item); it rounds off where the group
+/// starts and ends.
+fn group_line(color: Hsla, bottom: f32, left: f32, right: f32, start: bool, end: bool) -> impl IntoElement {
+    div()
+        .absolute()
+        .bottom(px(bottom))
+        .h(px(2.))
+        .left(px(left))
+        .right(px(right))
+        .bg(color)
+        .when(start, |d| d.rounded_l(px(1.)))
+        .when(end, |d| d.rounded_r(px(1.)))
+}
+
+/// The active tab's outline: its host group's color, as wide as the
+/// group's line, else the bar's seam.
+pub(super) fn outline(t: &TabView, c: Colors) -> (f32, Hsla) {
+    match t.group {
+        Some(color) => (ACTIVE_GROUP_LINE, color),
+        None => (1.0, seam(c)),
+    }
+}
+
+/// The line between the bar and the panes, which the active tab opens.
+pub(super) fn seam(c: Colors) -> Hsla {
+    c.ui.text.opacity(if c.ui.dark { 0.1 } else { 0.12 })
+}
+
+/// The faint line between two background tabs, `left` px off the tab's
+/// left edge; it hides while the tab is hovered.
+fn divider(hover_group: SharedString, left: f32, c: Colors) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(gpui::relative(0.5))
+        .mt(px(-7.))
+        .h(px(14.))
+        .w(px(1.))
+        .bg(c.ui.text.opacity(0.12))
+        .group_hover(hover_group, |s| s.invisible())
+}
+
+/// A background tab's icon recedes a little, until the tab is hovered.
+pub(super) fn quiet_icon(icon: AnyElement, active: bool, hover_group: SharedString) -> AnyElement {
+    if active {
+        return icon;
+    }
+    div().flex_none().flex().opacity(0.65).group_hover(hover_group, |s| s.opacity(1.)).child(icon).into_any_element()
+}
+
+/// One of the active modern tab's flared bottom corners, curving its
+/// sides out into the bar like a browser tab. Its edge, `w` px of `line`,
+/// carries the tab's outline on into the bar's seam or group line.
+fn flare(left: bool, w: f32, line: Hsla, c: Colors) -> impl IntoElement {
+    let cut = div().size_full().bg(c.bar).border_b(px(w)).border_color(line);
+    let cut = if left { cut.border_r(px(w)).rounded_br(px(FLARE)) } else { cut.border_l(px(w)).rounded_bl(px(FLARE)) };
+    let corner = div().absolute().bottom_0().size(px(FLARE)).bg(c.terminal).child(cut);
+    if left { corner.left(px(-FLARE)) } else { corner.right(px(-FLARE)) }
+}
+
+/// How many panes a tab holds, as a small badge.
+pub(super) fn pane_count(n: usize, c: Colors) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .h(px(16.))
+        .px(px(5.))
+        .rounded(px(5.))
+        .bg(c.ui.text.opacity(0.07))
+        .text_size(px(10.5))
+        .text_color(c.ui.muted)
+        .child(Icon::Columns2.svg().size(px(10.)).text_color(c.ui.muted))
+        .child(SharedString::from(n.to_string()))
+}
+
+/// Text that reads on `bg`: near-black on light colors, else near-white.
+/// The cut is above WCAG's even-contrast point (about 0.18): its luminance
+/// weighs green so heavily that mid-tone greens would get muddy dark text.
+fn on_color(bg: Hsla) -> Hsla {
+    if luminance(bg) > 0.3 { gpui::hsla(bg.h, 0.25, 0.1, 1.0) } else { gpui::hsla(bg.h, 0.2, 0.98, 1.0) }
+}
+
+/// WCAG relative luminance.
+fn luminance(c: Hsla) -> f32 {
+    let rgb = c.to_rgb();
+    let lin = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+}
+
+/// About how wide a host group's chip is in the modern strip (kept free
+/// when sizing the tabs).
+fn group_label_width(g: &Group) -> f32 {
+    let text = g.label.chars().count() as f32 * 6.0;
+    let extras = if g.folded {
+        44.0
+    } else if g.local {
+        14.0
+    } else {
+        0.0
+    };
+    // The chip's padding, its slot's, the room between groups.
+    (text + extras + 18.0 + 10.0 + 8.0).min(180.0)
 }
 
 /// The dot a folded host group shows: its tabs' waiting agents first,
@@ -848,7 +1122,7 @@ pub(super) fn activity_look(activity: Activity, c: Colors) -> (&'static str, Hsl
 /// double-click), between [`MIN_TAB`] and [`MAX_TAB`]; past that the strip
 /// scrolls.
 fn modern_tab_width(window: f32, tabs: usize) -> f32 {
-    const RESERVED: f32 = 12.0 + 30.0 + 48.0;
+    const RESERVED: f32 = 12.0 + 2.0 * FLARE + 30.0 + 48.0;
     let gaps = 2.0 * tabs.saturating_sub(1) as f32;
     ((window - RESERVED - gaps) / tabs.max(1) as f32).clamp(MIN_TAB, MAX_TAB)
 }
@@ -860,8 +1134,19 @@ mod tests {
         use super::modern_tab_width as w;
         assert_eq!(w(1200.0, 1), 220.0);
         assert_eq!(w(1200.0, 0), 220.0);
-        // 1200 - 90 reserved - 18 gaps = 1092 for 10 tabs.
-        assert!((w(1200.0, 10) - 109.2).abs() < 0.01);
+        // 1200 - 106 reserved - 18 gaps = 1076 for 10 tabs.
+        assert!((w(1200.0, 10) - 107.6).abs() < 0.01);
         assert_eq!(w(1200.0, 40), super::MIN_TAB, "then the strip scrolls");
+    }
+
+    #[test]
+    fn chip_text_reads_on_its_color() {
+        use super::{luminance, on_color};
+        let yellow: gpui::Hsla = gpui::rgb(0xe5c07b).into();
+        let navy: gpui::Hsla = gpui::rgb(0x1e3a8a).into();
+        assert!(luminance(on_color(yellow)) < 0.1, "dark text on a light chip");
+        assert!(luminance(on_color(navy)) > 0.8, "light text on a dark chip");
+        let green: gpui::Hsla = gpui::rgb(0x40a02b).into();
+        assert!(luminance(on_color(green)) > 0.8, "light text on a mid-tone green");
     }
 }

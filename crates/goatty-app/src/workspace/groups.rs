@@ -158,7 +158,8 @@ impl Workspace {
             }
             let (label, detail, local) = Self::host_names(tab, cx);
             let color = if local {
-                crate::ui::style::Ui::get(cx).muted
+                // Quiet, like its chip.
+                crate::ui::style::Ui::get(cx).muted.opacity(0.5)
             } else {
                 let ansi = GROUP_COLORS[color_slot(&label)];
                 gpui::rgb(settings.colors.ansi[ansi].0).into()
@@ -194,9 +195,11 @@ impl Workspace {
             if folded {
                 continue;
             }
+            let last = tabs.last().copied();
             for i in tabs {
                 if let Some(mut v) = views[i].take() {
                     v.group = Some(color);
+                    v.group_end = Some(i) == last;
                     out.push(StripItem::Tab(v));
                 }
             }
