@@ -232,6 +232,18 @@ impl Daemon {
         self.layouts.lock().claim(conn, |s| live.contains(&s))
     }
 
+    /// Give connection `conn` free layout `id` (see `Layouts::claim_id`).
+    pub(crate) fn claim_layout_id(&self, conn: u64, id: goatty_proto::LayoutId) -> Option<goatty_proto::LayoutInfo> {
+        let live: std::collections::HashSet<SessionId> = self.sessions.lock().keys().copied().collect();
+        self.layouts.lock().claim_id(conn, id, |s| live.contains(&s))
+    }
+
+    /// The free layouts (see `Layouts::list_free`).
+    pub(crate) fn free_layouts(&self) -> Vec<goatty_proto::LayoutInfo> {
+        let live: std::collections::HashSet<SessionId> = self.sessions.lock().keys().copied().collect();
+        self.layouts.lock().list_free(|s| live.contains(&s))
+    }
+
     pub(crate) fn list(&self) -> Vec<SessionInfo> {
         let mut list: Vec<_> = self.sessions.lock().values().map(|s| s.info()).collect();
         list.sort_by_key(|s| s.id);

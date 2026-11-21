@@ -11,6 +11,9 @@
 //!   and settings. In a program that uses the mouse, a note says how the
 //!   click reaches it,
 //! * a divider's: even out that split, or every split,
+//! * the new-tab button's (#252): a new tab here or on another host of the
+//!   window, a new tab on any known host (submenu), reattaching what was
+//!   detached, the sessions picker, a new window,
 //! * a host group's label (`groups`): a new tab on that host, fold or
 //!   unfold, show only this host, every host, the host's settings, close
 //!   its tabs.
@@ -34,6 +37,8 @@ use crate::ui::icons::Icon;
 pub(super) enum MenuOwner {
     Tab(u64),
     Pane(PaneId),
+    /// The new-tab button (the strip's, the sidebar's).
+    NewTabButton,
 }
 
 /// The open menu.
@@ -98,6 +103,7 @@ impl Workspace {
         let mine = match owner {
             MenuOwner::Tab(t) => t == tab,
             MenuOwner::Pane(p) => self.tab_index(tab).is_some_and(|i| self.tabs[i].pane(p).is_some()),
+            MenuOwner::NewTabButton => false,
         };
         if mine {
             self.close_menu(window, cx);
@@ -397,6 +403,24 @@ impl Workspace {
             .into(),
         );
         entries.push(Entry::Separator);
+        // Tabs detached there before (or left by a closed window), all at once.
+        let spawner = self.tabs.get(g.tabs[0]).and_then(|t| t.host.as_ref());
+        let plain = match spawner {
+            Some(crate::session::Spawner::Plain { host, .. }) => Some(host.clone()),
+            _ => None,
+        };
+        let reattach = match spawner.and_then(super::host_ref_of) {
+            Some(host) => Item::new(format!("Reattach detached tabs on {}", g.label), {
+                let me = me.clone();
+                move |window: &mut Window, cx: &mut gpui::App| {
+                    let (host, plain) = (host.clone(), plain.clone());
+                    let _ = me.update(cx, |this, cx| this.reattach_detached_on(host, plain, window, cx));
+                }
+            }),
+            None => Item::new("Reattach detached tabs", |_: &mut Window, _: &mut gpui::App| {})
+                .disabled(Some(if matches!(key, super::groups::HostKey::Connecting(_)) { "Still connecting" } else { "Not on a goattyd" })),
+        };
+        entries.push(reattach.icon(Icon::History).into());
         let mut detach = Item::new(format!("Detach from {}", g.label), on(Box::new(|this, k, w, cx| this.detach_group(k, w, cx))))
             .icon(Icon::Unlink)
             .disabled(self.cannot_detach_tabs(&g.ids, cx));
@@ -420,6 +444,88 @@ impl Workspace {
         );
         let owner = MenuOwner::Tab(g.ids[0]);
         self.open_menu(owner, entries, at, false, window, cx);
+    }
+
+    // ---- the new-tab button's menu -------------------------------------------------
+
+    /// What a right click on the new-tab button offers: where a new tab
+    /// can go, and getting detached tabs back.
+    pub(super) fn open_new_tab_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<'_, Self>) {
+        use crate::hosts::HostRef;
+        let me = cx.entity().downgrade();
+        let on_host = |host: HostRef, plain: bool| {
+            let me = me.clone();
+            move |window: &mut Window, cx: &mut gpui::App| {
+                let _ = me.update(cx, |this, cx| this.new_tab_on_host(host.clone(), plain, window, cx));
+            }
+        };
+        let groups = if self.groups_shown(cx) { self.groups(cx) } else { Vec::new() };
+        let active = groups.iter().find(|g| g.active);
+        let mut entries: Vec<Entry> = Vec::new();
+        // Bound to the host it names: the active tab may change while the menu is open.
+        let here = match active {
+            Some(g) => {
+                let (key, me) = (g.key.clone(), me.clone());
+                let mut item = Item::new(format!("New tab on {}", g.label), move |window: &mut Window, cx: &mut gpui::App| {
+                    let _ = me.update(cx, |this, cx| this.new_tab_in_group(&key, window, cx));
+                });
+                item.shortcut = context_menu::shortcut("new_tab", cx);
+                item
+            }
+            None => Item::action("New tab", "new_tab", cx),
+        };
+        entries.push(here.icon(Icon::Plus).into());
+        // The window's other hosts, one click each.
+        for g in groups.iter().filter(|g| !g.active) {
+            let key = g.key.clone();
+            let me = me.clone();
+            entries.push(
+                Item::new(format!("New tab on {}", g.label), move |window: &mut Window, cx: &mut gpui::App| {
+                    let _ = me.update(cx, |this, cx| this.new_tab_in_group(&key, window, cx));
+                })
+                .icon(if g.local { Icon::Monitor } else { Icon::Server })
+                .disabled(matches!(g.key, super::groups::HostKey::Connecting(_)).then_some("Still connecting"))
+                .into(),
+            );
+        }
+        // Every host goatty knows: this computer, your SSH hosts, paired
+        // tailnet computers.
+        let mut hosts: Vec<Entry> = vec![Item::new("This computer", on_host(HostRef::Local, false)).icon(Icon::Monitor).into()];
+        let ssh = crate::hosts::current(cx);
+        if !ssh.is_empty() {
+            hosts.push(Entry::Header("SSH".into()));
+            for e in ssh {
+                let mut item = Item::new(e.label.clone(), on_host(HostRef::Ssh(e.host.clone()), e.plain)).icon(Icon::Server);
+                item.shortcut = e.plain.then(|| "plain SSH".into());
+                hosts.push(item.into());
+            }
+        }
+        let tailnet: Vec<_> = crate::tailnet::current(cx).into_iter().filter(|e| e.paired).collect();
+        if !tailnet.is_empty() {
+            hosts.push(Entry::Header("Tailnet".into()));
+            for e in tailnet {
+                let host = HostRef::Tailnet { dns: e.dns.clone(), name: e.name.clone() };
+                hosts.push(Item::new(e.name.clone(), on_host(host, false)).icon(Icon::Globe).into());
+            }
+        }
+        hosts.push(Entry::Separator);
+        hosts.push(Item::new("Another host…", |window: &mut Window, cx: &mut gpui::App| crate::hosts::ask_new_tab(window, cx)).into());
+        entries.push(Item::submenu("New tab on…", hosts).icon(Icon::Server).into());
+        entries.push(Entry::Separator);
+        let not_here = match self.active_tab().map(|t| t.host.as_ref().map(super::host_ref_of)) {
+            Some(Some(Some(_))) => None,
+            Some(None) => Some("This tab is still connecting"),
+            _ => Some("This tab isn't kept by a goattyd"),
+        };
+        // `~/.ssh/config` may have changed since.
+        crate::hosts::refresh(cx);
+        entries.push(Item::action("Reattach detached tabs", "reattach_detached", cx).icon(Icon::History).disabled(not_here).into());
+        entries.push(Item::action("Sessions on this host…", "list_sessions", cx).icon(Icon::AppWindow).disabled(not_here).into());
+        entries.push(Entry::Separator);
+        let connecting = self.active_tab().is_none_or(|t| t.host.is_none()).then_some("This tab is still connecting");
+        entries.push(Item::action("Duplicate this tab", "duplicate_tab", cx).icon(Icon::Copy).disabled(connecting).into());
+        entries.push(Item::action("New window", "new_window", cx).into());
+        self.open_menu(MenuOwner::NewTabButton, entries, at, false, window, cx);
     }
 
     // ---- a divider's menu -------------------------------------------------------

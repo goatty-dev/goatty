@@ -297,14 +297,15 @@ impl SettingsWindow {
                 "on-launch",
                 "When goatty starts",
                 opts(&[
-                    (OnLaunch::Reattach, "Restore the last window", "Its tabs and splits, with their sessions"),
+                    (OnLaunch::Reattach, "Restore every window", "Their tabs and splits on every host, with their sessions"),
+                    (OnLaunch::ReattachLocal, "Restore this computer's tabs", "Other hosts' tabs stay detached until you connect"),
                     (OnLaunch::New, "Start a new session", "An empty window with a fresh shell"),
                 ]),
                 &s.workspace.on_launch,
                 cx,
                 |v, _, cx| AppSettings::update(cx, |s| s.workspace.on_launch = v),
             )))
-            .footer("The --new and --attach command-line flags still win.");
+            .footer("Reconnecting to other hosts may ask for SSH passwords. The --new, --attach and --ssh command-line flags still win.");
         let tabs = section(ui, "Tabs")
             .child(row(ui, "Style").below(self.tab_style_cards(ui, cx)))
             .child(row(ui, "Show the tab bar").control(segmented(

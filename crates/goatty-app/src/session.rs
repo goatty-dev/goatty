@@ -41,12 +41,19 @@ impl Waker {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachMode {
-    /// Reattach to the newest detached session, else create one.
+    /// The newest saved layout no window holds, else the newest detached
+    /// session, else a new one.
     Auto,
     New,
     Id(u64),
+    /// Saved layout `id` (a window's tabs on that host, #252), else nothing
+    /// (`saved::Startup::Nothing`).
+    Layout(goatty_proto::LayoutId),
+    /// Every detached session that isn't in a saved layout, a tab each,
+    /// else nothing.
+    AllDetached,
 }
 
 /// Link status shown in the title bar.
@@ -420,10 +427,15 @@ impl Session {
     /// one, a local daemon uses this process's directory.
     pub fn daemon(conn: Arc<Connection>, size: TermSize, mode: AttachMode, cwd: Option<String>) -> Result<Arc<Self>> {
         let target = match mode {
-            AttachMode::New => None,
+            AttachMode::New | AttachMode::Layout(_) | AttachMode::AllDetached => None,
             AttachMode::Id(id) => Some(id),
             AttachMode::Auto => conn.list_sessions()?.iter().filter(|s| s.attached == 0).map(|s| s.id).max(),
         };
+        if let Some(id) = target.filter(|&id| conn.shows(id)) {
+            // One pane per session on a connection: another one would take
+            // the open pane's output.
+            anyhow::bail!("session {id} is open in a goatty window already");
+        }
         let (host_label, ssh_host) = Self::daemon_host_meta(&conn);
         let (s, sink) = Self::new_daemon(&conn, size, target.unwrap_or(0), host_label, ssh_host);
         let id = match target {
