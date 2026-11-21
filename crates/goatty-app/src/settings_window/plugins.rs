@@ -3,12 +3,18 @@
 //! the manifest groups them; its tools, permissions and aliases), what the
 //! registries offer, and the install review.
 //!
+//! Updates (#244) take one click: the page asks the host for the update's
+//! plan and installs it right away when it does nothing the installed
+//! version couldn't ([`goatty_plugin::changes`]); otherwise the review
+//! opens, showing only what changes. "Update all" queues every update
+//! ([`Batch`]) and collects the ones that need a look for the end.
+//!
 //! Installing and removing are host operations (`goatty_plugin::api`
 //! through the daemon, or in-process with `--local`). A plugin's settings
 //! are host settings (`plugins.<id>` in `host.json`): they're edited in the
 //! same draft as the Shell page and applied with Preview/Apply.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use goatty_config::{HostSettings, PluginConfig};
 use goatty_plugin::api::{self, Catalog, Installed, PackageState, Plan};
@@ -56,6 +62,18 @@ pub struct PluginsPage {
     pub follow: Option<Follow>,
     /// The loop asking the host for install progress runs.
     polling: bool,
+    /// Updates and approved installs waiting their turn (#244).
+    pub batch: Option<Batch>,
+    /// Update reviews waiting (updates that need a look). Survives
+    /// leaving the review: the Updates list offers them.
+    pub review_queue: VecDeque<Box<Plan>>,
+    /// The review shown came from the queue (not a Browse install).
+    pub from_queue: bool,
+    /// Queued reviews done (approved or skipped) in this pass, for "2 of 3".
+    review_done: usize,
+    /// An update's review shows everything the new version does, not
+    /// only what changes.
+    pub show_full_plan: bool,
     /// Text fields for string/path/list settings: `"<plugin>.<setting>"`.
     inputs: HashMap<String, Entity<TextInput>>,
     filter: Option<Entity<TextInput>>,
@@ -75,6 +93,7 @@ impl PluginsPage {
         self.plan_review = None;
         self.plan_return = from.map(|page| (id, page));
         self.show_code = false;
+        self.show_full_plan = false;
         id
     }
 
@@ -101,11 +120,79 @@ impl PluginsPage {
         if self.plan_return.as_ref().is_some_and(|(rid, _)| *rid == id) { self.plan_return.take().map(|(_, page)| page) } else { None }
     }
 
+    /// Close the review for good (Cancel, or Skip on a queued one): the
+    /// next queued one shows, if any.
     pub(super) fn dismiss_plan(&mut self) -> Option<Option<Page>> {
         self.plan.take()?;
         let back = self.plan_review.take().and_then(|rid| self.take_plan_return(rid));
         self.plan_return = None;
+        if std::mem::take(&mut self.from_queue) {
+            self.review_done += 1;
+            if self.show_next_review() {
+                return Some(None);
+            }
+        }
         Some(back)
+    }
+
+    /// Show the next queued review. Returns whether there was one.
+    pub(super) fn show_next_review(&mut self) -> bool {
+        let Some(next) = self.review_queue.pop_front() else {
+            self.review_done = 0;
+            return false;
+        };
+        let id = self.begin_review(None);
+        self.accept_review_plan(id, next);
+        self.from_queue = true;
+        true
+    }
+
+    /// The queued review shown is number `.0` of `.1` (`None`: a single
+    /// review).
+    pub fn review_position(&self) -> Option<(usize, usize)> {
+        let total = self.review_done + 1 + self.review_queue.len();
+        (self.from_queue && total > 1).then_some((self.review_done + 1, total))
+    }
+
+    /// Queue update reviews (each plugin once, the newest plan winning).
+    #[allow(clippy::vec_box)] // Plans move between `plan` and the queue as they are.
+    fn queue_reviews(&mut self, plans: Vec<Box<Plan>>) {
+        for p in plans {
+            if self.from_queue && self.plan.as_ref().is_some_and(|q| q.id == p.id) {
+                continue;
+            }
+            match self.review_queue.iter_mut().find(|q| q.id == p.id) {
+                Some(q) => *q = p,
+                None => self.review_queue.push_back(p),
+            }
+        }
+    }
+
+    /// Drop waiting reviews that no longer apply: the plugin is gone, or
+    /// the update on offer is another version now.
+    fn prune_reviews(&mut self) {
+        let Some(cat) = &self.catalog else { return };
+        let current = |p: &Plan| cat.installed.iter().any(|i| i.id == p.id && i.update.as_deref() == Some(p.version.as_str()));
+        self.review_queue.retain(|p| current(p));
+    }
+
+    /// What's happening with `id`'s update, if anything.
+    pub fn update_state(&self, id: &str) -> Option<UpdateState> {
+        if self.follow.as_ref().is_some_and(|f| f.id == id) {
+            return Some(UpdateState::Installing);
+        }
+        if let Some(b) = &self.batch {
+            if b.current.as_deref() == Some(id) {
+                return Some(UpdateState::Checking);
+            }
+            if b.queue.iter().any(|j| j.id() == id) {
+                return Some(UpdateState::Queued);
+            }
+        }
+        if self.review_queue.iter().any(|p| p.id == id) || self.plan.as_ref().is_some_and(|p| p.id == id) {
+            return Some(UpdateState::NeedsReview);
+        }
+        None
     }
 
     /// Empty the search field (so the whole list shows).
@@ -115,11 +202,110 @@ impl PluginsPage {
         }
     }
 
+    /// Close the review and forget where it came from. A queued review
+    /// goes back to waiting (Back, Esc, another page): the list offers it.
     pub(super) fn clear_review(&mut self) {
-        self.plan = None;
+        if let Some(p) = self.plan.take()
+            && std::mem::take(&mut self.from_queue)
+        {
+            self.review_queue.push_front(p);
+        }
+        self.review_done = 0;
         self.plan_return = None;
         self.plan_review = None;
         self.active_review = None;
+    }
+}
+
+/// Where an update stands (the Updates list shows it instead of its button).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateState {
+    /// Waiting its turn.
+    Queued,
+    /// Asking the host what it changes.
+    Checking,
+    Installing,
+    /// It changes something to look at first.
+    NeedsReview,
+}
+
+/// One thing a [`Batch`] does.
+#[derive(Debug)]
+pub enum Job {
+    /// Ask for the update's plan; install it if it needs no review.
+    Check { id: String, version: String },
+    /// A plan the user approved.
+    Install(Box<Plan>),
+}
+
+impl Job {
+    fn id(&self) -> &str {
+        match self {
+            Job::Check { id, .. } => id,
+            Job::Install(p) => &p.id,
+        }
+    }
+}
+
+/// Updates (and approved installs) done one after the other, reported
+/// together at the end (#244).
+#[derive(Debug, Default)]
+pub struct Batch {
+    queue: VecDeque<Job>,
+    /// The plugin whose plan is being asked for, or that's installing.
+    current: Option<String>,
+    /// "eza 1.1.0", by whether it was an update.
+    done: Vec<(bool, String)>,
+    failed: Vec<String>,
+    /// Updates it found that need a look (queued for review).
+    reviews: usize,
+    reload: bool,
+    /// The host's report, for a batch of one.
+    lines: Vec<String>,
+    /// Stopped by a cancel: the rest isn't done.
+    stopped: bool,
+}
+
+impl Batch {
+    /// Updates still to do after the current one.
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// The summary for the result bar: (ok, lines; the first is its title).
+    fn summary(&self) -> Option<(bool, Vec<String>)> {
+        if self.done.is_empty() && self.failed.is_empty() && !self.stopped {
+            return None;
+        }
+        let mut lines = Vec::new();
+        let list = |update: bool| self.done.iter().filter(|(u, _)| *u == update).map(|(_, n)| n.clone()).collect::<Vec<_>>();
+        let (updated, installed) = (list(true), list(false));
+        let plugins = |n: usize| if n == 1 { "1 plugin".to_string() } else { format!("{n} plugins") };
+        if self.stopped {
+            lines.push(if self.done.is_empty() {
+                "Stopped: nothing was updated".into()
+            } else {
+                format!("Stopped after {}", plugins(self.done.len()))
+            });
+        } else if !self.failed.is_empty() {
+            lines.push(if self.done.is_empty() {
+                format!("{} failed", plugins(self.failed.len()))
+            } else {
+                format!("Updated {}; {} failed", plugins(self.done.len()), self.failed.len())
+            });
+        }
+        if self.done.len() == 1 && self.failed.is_empty() && !self.stopped && !self.lines.is_empty() {
+            lines.extend(self.lines.iter().cloned());
+        } else {
+            if !updated.is_empty() {
+                lines.push(format!("Updated {}", updated.join(", ")));
+            }
+            if !installed.is_empty() {
+                lines.push(format!("Installed {}", installed.join(", ")));
+            }
+        }
+        lines.extend(self.failed.iter().map(|f| format!("Failed: {f}")));
+        Some((self.failed.is_empty() && !self.stopped, lines))
     }
 }
 
@@ -144,6 +330,8 @@ pub struct Follow {
     last_heard: std::time::Instant,
     /// The host can't report progress or cancel (a goattyd from before #102).
     pub no_progress: bool,
+    /// Part of a [`Batch`]: its outcome goes into the batch's summary.
+    pub batch: bool,
 }
 
 impl Follow {
@@ -157,6 +345,7 @@ impl Follow {
             return_id,
             last_heard: std::time::Instant::now(),
             no_progress: false,
+            batch: false,
         }
     }
 
@@ -231,7 +420,7 @@ pub enum Tab {
 /// A host request's result, back on the UI thread.
 type Done<T> = Box<dyn FnOnce(&mut SettingsWindow, anyhow::Result<T>, &mut Context<'_, SettingsWindow>)>;
 
-fn size(bytes: u64) -> String {
+pub(super) fn size(bytes: u64) -> String {
     if bytes < 1_000_000 { format!("{} kB", bytes.div_ceil(1000)) } else { format!("{:.1} MB", bytes as f64 / 1e6) }
 }
 
@@ -280,6 +469,7 @@ impl SettingsWindow {
             Box::new(|view, result, cx| match result {
                 Ok(c) => {
                     view.plugins.catalog = Some(c);
+                    view.plugins.prune_reviews();
                     view.plugins.error = None;
                     view.sync_plugin_inputs(cx);
                 }
@@ -353,6 +543,7 @@ impl SettingsWindow {
                 }
                 let name = f.name();
                 self.plugins.follow = None;
+                self.plugins.batch = None;
                 toast::show(cx, Toast::warning(format!("Lost track of {name}")).body("The host didn't come back; see the Plugins page."));
                 return false;
             }
@@ -365,6 +556,7 @@ impl SettingsWindow {
                     self.plugins.follow = None;
                     self.load_host(cx);
                     self.load_plugins(false, cx);
+                    self.batch_lost_track(cx);
                 }
                 return false;
             }
@@ -383,6 +575,7 @@ impl SettingsWindow {
             self.plugins.follow = None;
             self.load_host(cx);
             self.load_plugins(false, cx);
+            self.batch_lost_track(cx);
             return false;
         };
         if !p.step.finished() {
@@ -395,8 +588,9 @@ impl SettingsWindow {
             api::Step::Failed { error } => Err(anyhow::anyhow!(error)),
             _ => Err(fetch::Cancelled.into()),
         };
+        let name = f.name();
         let ids = [f.id].into_iter().chain(f.deps).collect();
-        self.after_change(result, ids, true, f.return_id, cx);
+        self.install_finished(result, ids, name, f.verb == "Updating", f.return_id, f.batch, cx);
         false
     }
 
@@ -467,20 +661,44 @@ impl SettingsWindow {
 
     /// Install the reviewed plan (the host refuses if it changed since).
     /// Its progress shows on the page, with a Cancel button until it's
-    /// activated.
+    /// activated. While other updates run (or more reviews wait), it's
+    /// queued behind them and the next review shows.
     pub fn install_reviewed(&mut self, cx: &mut Context<'_, Self>) {
-        if self.plugins.follow.is_some() {
-            toast::show(cx, Toast::info("Another plugin is being installed").body("Wait for it to finish first.").key("plugins.busy"));
-            return;
-        }
         let Some(plan) = self.plugins.plan.take() else { return };
         let return_id = self.plugins.plan_review.take();
+        let from_queue = std::mem::take(&mut self.plugins.from_queue);
+        if from_queue || self.plugins.batch.is_some() || self.plugins.follow.is_some() {
+            self.plugins.batch.get_or_insert_default().queue.push_back(Job::Install(plan));
+            if from_queue {
+                self.plugins.review_done += 1;
+            }
+            if !(from_queue && self.plugins.show_next_review()) {
+                if let Some(rid) = return_id
+                    && let Some(back) = self.plugins.take_plan_return(rid)
+                {
+                    self.go(back, cx);
+                }
+            } else {
+                self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+            }
+            self.next_in_batch(cx);
+            cx.notify();
+            return;
+        }
+        self.install_plan(plan, return_id, false, cx);
+    }
+
+    /// Start installing `plan` and follow it.
+    fn install_plan(&mut self, plan: Box<Plan>, return_id: Option<u64>, batch: bool, cx: &mut Context<'_, Self>) {
         let id = plan.id.clone();
-        let verb = if plan.replaces.is_some() { "Updating" } else { "Installing" };
+        let update = plan.replaces.is_some();
+        let verb = if update { "Updating" } else { "Installing" };
         let mut follow = Follow::new(id.clone(), verb, true, return_id);
+        follow.batch = batch;
         let deps: Vec<String> = plan.dependencies.iter().map(|d| d.id.clone()).collect();
         follow.deps = deps.clone();
         let ids: Vec<String> = [id.clone()].into_iter().chain(deps).collect();
+        let name = format!("{} {}", plan.name, plan.version);
         follow.progress = Some(api::InstallProgress {
             id: id.clone(),
             name: plan.name.clone(),
@@ -497,7 +715,7 @@ impl SettingsWindow {
             Box::new(move |view, result, cx| {
                 let Some(f) = view.plugins.follow.as_mut().filter(|f| f.id == id) else {
                     // Not followed any more (another host): just report it.
-                    view.after_change(result, ids, true, return_id, cx);
+                    view.after_change(result, ids, true, return_id, true, cx);
                     return;
                 };
                 if let (Err(e), Some(link)) = (&result, &link)
@@ -515,11 +733,193 @@ impl SettingsWindow {
                     Err(_) if cancelled => Err(fetch::Cancelled.into()),
                     r => r,
                 };
-                view.after_change(result, ids, true, return_id, cx);
+                view.install_finished(result, ids, name, update, return_id, batch, cx);
             }),
             cx,
         );
         self.poll_installs(cx);
+    }
+
+    /// An install ended: into the batch's summary (and on with the batch),
+    /// or reported on its own.
+    #[allow(clippy::too_many_arguments)]
+    fn install_finished(
+        &mut self,
+        result: anyhow::Result<api::Changed>,
+        ids: Vec<String>,
+        name: String,
+        update: bool,
+        return_id: Option<u64>,
+        batch: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let in_batch = batch && self.plugins.batch.is_some();
+        if let Some(b) = self.plugins.batch.as_mut().filter(|_| in_batch) {
+            b.current = None;
+            match &result {
+                Ok(c) => {
+                    b.done.push((update, name));
+                    b.reload |= c.reload;
+                    b.lines.extend(c.lines.iter().cloned());
+                }
+                Err(e) if fetch::Cancelled::is(e) => {
+                    // A cancel stops the whole run.
+                    b.queue.clear();
+                    b.stopped = true;
+                }
+                Err(e) => b.failed.push(format!("{name}: {e:#}")),
+            }
+        }
+        self.after_change(result, ids, true, return_id, !in_batch, cx);
+        self.next_in_batch(cx);
+    }
+
+    /// The followed install's outcome is unknown (the host forgot it):
+    /// go on with the batch.
+    fn batch_lost_track(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(b) = self.plugins.batch.as_mut() {
+            b.current = None;
+        }
+        self.next_in_batch(cx);
+    }
+
+    /// Update each of `items` (id, version), one after the other: an
+    /// update that does nothing the installed version couldn't installs
+    /// right away; the others wait for the user's review, which opens when
+    /// the rest is done. Already queued or running ones are skipped.
+    pub fn update_plugins(&mut self, items: Vec<(String, String)>, cx: &mut Context<'_, Self>) {
+        let mut added = false;
+        for (id, version) in items {
+            if self.plugins.update_state(&id).is_some() {
+                continue;
+            }
+            self.plugins.batch.get_or_insert_default().queue.push_back(Job::Check { id, version });
+            added = true;
+        }
+        if added {
+            self.next_in_batch(cx);
+        }
+        cx.notify();
+    }
+
+    /// Do the batch's next job, once nothing else is installing.
+    fn next_in_batch(&mut self, cx: &mut Context<'_, Self>) {
+        if self.plugins.follow.is_some() {
+            return; // Resumes when that install ends.
+        }
+        let Some(b) = self.plugins.batch.as_mut() else { return };
+        if b.current.is_some() {
+            return;
+        }
+        let Some(job) = b.queue.pop_front() else {
+            self.finish_batch(cx);
+            return;
+        };
+        b.current = Some(job.id().to_owned());
+        match job {
+            Job::Install(plan) => self.install_plan(plan, None, true, cx),
+            Job::Check { id, version } => {
+                let asked = id.clone();
+                self.plugin_call(
+                    api::Request::Plan { id, version: Some(version) },
+                    |r| match r {
+                        api::Reply::Plan(p) => Some(p),
+                        _ => None,
+                    },
+                    Box::new(move |view, result: anyhow::Result<Box<Plan>>, cx| {
+                        // Gone with the host, or stopped meanwhile.
+                        let Some(b) = view.plugins.batch.as_mut().filter(|b| b.current.as_deref() == Some(asked.as_str())) else {
+                            return;
+                        };
+                        b.current = None;
+                        match result {
+                            // A goattyd that doesn't send the installed
+                            // version: no way to tell, so review it.
+                            Ok(plan) if plan.changes().is_none_or(|c| c.needs_review()) => {
+                                b.reviews += 1;
+                                view.plugins.queue_reviews(vec![plan]);
+                            }
+                            Ok(plan) => b.queue.push_front(Job::Install(plan)),
+                            Err(e) => b.failed.push(format!("{asked}: {e:#}")),
+                        }
+                        view.next_in_batch(cx);
+                    }),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// The batch is done: report it, and offer the updates that need a look.
+    fn finish_batch(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(b) = self.plugins.batch.take() else { return };
+        if let Some((ok, lines)) = b.summary() {
+            self.outcome = Some(Outcome { ok, lines, diff: Vec::new(), reload: b.reload });
+        }
+        if b.reviews == 0 || b.stopped || self.plugins.review_queue.is_empty() {
+            return;
+        }
+        // Open the first review only where the user is looking at the list.
+        let on_list = self.page == Page::Plugins
+            && self.plugins.tab == Tab::Installed
+            && self.plugins.detail.is_none()
+            && self.plugins.plan.is_none()
+            && self.plugins.active_review.is_none();
+        if on_list {
+            self.plugins.show_next_review();
+            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+            return;
+        }
+        if self.plugins.plan.is_some() && self.plugins.from_queue {
+            return; // Already reviewing: the rest follow.
+        }
+        let n = self.plugins.review_queue.len();
+        let this = cx.entity().downgrade();
+        let t = Toast::info(if n == 1 { "An update needs your review".to_string() } else { format!("{n} updates need your review") })
+            .body("Check what changes before they install.")
+            .key("plugins.review")
+            .action("Review", move |_, cx| {
+                let _ = this.update(cx, |v, cx| v.open_queued_review(cx));
+            });
+        toast::show(cx, t);
+    }
+
+    /// Stop the batch: nothing more starts; a running download is cancelled.
+    pub fn stop_updates(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(b) = self.plugins.batch.as_mut() else { return };
+        b.queue.clear();
+        b.stopped = true;
+        if self.plugins.follow.as_ref().is_some_and(|f| f.batch) {
+            self.cancel_install(cx);
+        } else if b.current.is_none() {
+            self.finish_batch(cx);
+        }
+        cx.notify();
+    }
+
+    /// Skip the queued review shown (it stays not updated): the next one shows.
+    pub fn skip_review(&mut self, cx: &mut Context<'_, Self>) {
+        if self.plugins.dismiss_plan().is_some() {
+            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        }
+        cx.notify();
+    }
+
+    /// Show the first waiting review (the list's "Review" on waiting updates).
+    pub fn open_queued_review(&mut self, cx: &mut Context<'_, Self>) {
+        if self.page != Page::Plugins {
+            self.go(Page::Plugins, cx);
+        }
+        if self.plugins.plan.is_none() && self.plugins.show_next_review() {
+            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        }
+        cx.notify();
+    }
+
+    /// Drop the waiting reviews (and close the one shown).
+    pub fn skip_all_reviews(&mut self, cx: &mut Context<'_, Self>) {
+        self.plugins.review_queue.clear();
+        self.skip_review(cx);
     }
 
     pub fn uninstall_plugin(&mut self, id: String, cx: &mut Context<'_, Self>) {
@@ -555,7 +955,7 @@ impl SettingsWindow {
                     _ => None,
                 };
                 let unneeded = result.as_ref().map(|c| c.unneeded.clone()).unwrap_or_default();
-                view.after_change(result, vec![id.clone()], false, None, cx);
+                view.after_change(result, vec![id.clone()], false, None, true, cx);
                 if let Some(rest) = next {
                     view.uninstall_plugins(rest, host, cx);
                 } else if !unneeded.is_empty() {
@@ -598,6 +998,7 @@ impl SettingsWindow {
         ids: Vec<String>,
         installed: bool,
         return_id: Option<u64>,
+        report: bool,
         cx: &mut Context<'_, Self>,
     ) {
         let first = ids.first().cloned();
@@ -617,13 +1018,20 @@ impl SettingsWindow {
                         draft.plugins.remove(&id);
                     }
                 }
-                self.outcome = Some(Outcome { ok: true, lines: c.lines, diff: Vec::new(), reload: c.reload });
+                if report {
+                    self.outcome = Some(Outcome { ok: true, lines: c.lines, diff: Vec::new(), reload: c.reload });
+                }
             }
             Err(e) if fetch::Cancelled::is(&e) => {
-                let what = first.as_deref().unwrap_or("the plugin");
-                toast::show(cx, Toast::info(format!("Cancelled installing {what}")).body("Nothing on the host changed."));
+                if report {
+                    let what = first.as_deref().unwrap_or("the plugin");
+                    toast::show(cx, Toast::info(format!("Cancelled {what}")).body("Nothing on the host changed."));
+                }
             }
-            Err(e) => self.outcome = Some(Outcome { ok: false, lines: vec![format!("{e:#}")], diff: Vec::new(), reload: false }),
+            Err(e) if report => {
+                self.outcome = Some(Outcome { ok: false, lines: vec![format!("{e:#}")], diff: Vec::new(), reload: false });
+            }
+            Err(_) => {}
         }
         self.load_host(cx);
         self.load_plugins(false, cx);
@@ -721,10 +1129,14 @@ impl SettingsWindow {
             self.plugins.detail.as_ref().and_then(|id| self.plugins.catalog.as_ref()?.installed.iter().find(|i| &i.id == id))
         {
             let detail = self.plugin_detail(ui, inst, cx);
-            return match &self.plugins.follow {
-                Some(f) => div().flex().flex_col().gap(px(20.)).child(self.install_progress(ui, f, cx)).child(detail).into_any_element(),
-                None => detail,
-            };
+            return div()
+                .flex()
+                .flex_col()
+                .gap(px(20.))
+                .children(self.plugins.follow.as_ref().map(|f| self.install_progress(ui, f, cx)))
+                .children(self.batch_progress(ui, cx))
+                .child(detail)
+                .into_any_element();
         }
         let mut page = div().flex().flex_col().gap(px(20.));
         if let Some(e) = &self.plugins.error {
@@ -733,6 +1145,7 @@ impl SettingsWindow {
         if let Some(f) = &self.plugins.follow {
             page = page.child(self.install_progress(ui, f, cx));
         }
+        page = page.children(self.batch_progress(ui, cx));
         let Some(cat) = &self.plugins.catalog else {
             return page
                 .child(card(ui).child(kit::empty(
@@ -803,6 +1216,10 @@ impl SettingsWindow {
         match tab {
             Tab::Installed => {
                 let shown = |i: &&Installed| matches(&i.id, &i.manifest.name, &i.manifest.summary, &i.manifest.keywords);
+                let updates: Vec<&Installed> = cat.installed.iter().filter(|i| i.update.is_some() && !i.builtin).filter(shown).collect();
+                if !updates.is_empty() {
+                    page = page.child(self.updates_section(ui, cat, &updates, cx));
+                }
                 let builtin: Vec<&Installed> = cat.installed.iter().filter(|i| i.builtin).filter(shown).collect();
                 let installed: Vec<&Installed> = cat.installed.iter().filter(|i| !i.builtin).filter(shown).collect();
                 if !installed.is_empty() || query.is_empty() {
@@ -833,9 +1250,9 @@ impl SettingsWindow {
                 if query.is_empty() {
                     let on = cx.global::<AppSettings>().file.value.plugins.notify_updates;
                     page = page.child(
-                        section(ui, "Updates").child(
+                        section(ui, "Notifications").child(
                             row(ui, "Tell me about plugin updates")
-                                .desc("Checks the active tab's host every few hours; you still review each update")
+                                .desc("Checks the active tab's host every few hours; nothing installs without a click")
                                 .control(toggle("plugins-notify-updates", on, ui, |_, cx| {
                                     AppSettings::update(cx, |s| s.plugins.notify_updates = !s.plugins.notify_updates);
                                 })),
@@ -872,15 +1289,168 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// The followed install: what it's doing, how far, and Cancel.
-    fn install_progress(&self, ui: Ui, f: &Follow, cx: &Context<'_, Self>) -> AnyElement {
+    /// The installed plugins with a newer version: each with its own
+    /// Update (one click), and Update all. Updates that change permissions
+    /// or shell code open their review instead of installing.
+    fn updates_section(&self, ui: Ui, cat: &Catalog, updates: &[&Installed], cx: &Context<'_, Self>) -> AnyElement {
+        let idle: Vec<(String, String)> = updates
+            .iter()
+            .filter(|i| self.plugins.update_state(&i.id).is_none())
+            .filter_map(|i| Some((i.id.clone(), i.update.clone()?)))
+            .collect();
+        let waiting = updates.iter().filter(|i| self.plugins.update_state(&i.id) == Some(UpdateState::NeedsReview)).count();
+        let running = self.plugins.batch.is_some();
+        let desc = match (running, waiting) {
+            (true, _) => "Updating one after the other…".to_string(),
+            (false, 0) => format!("{} available", updates.len()),
+            (false, 1) => "One waits for your review".to_string(),
+            (false, n) => format!("{n} wait for your review"),
+        };
+        let mut s = section(ui, "Updates").desc(desc);
+        // One action, by what makes sense now.
+        if running {
+            s = s.action(button_with(
+                "plugins-update-all",
+                Some(Icon::Close),
+                "Stop updates",
+                ButtonKind::Normal,
+                ui,
+                self.act_and_focus(cx, None, |v, cx| v.stop_updates(cx)),
+            ));
+        } else if idle.len() > 1 {
+            let n = idle.len();
+            s = s.action(button_with(
+                "plugins-update-all",
+                Some(Icon::Download),
+                format!("Update all {n}"),
+                ButtonKind::Primary,
+                ui,
+                self.act_and_focus(cx, None, move |v, cx| v.update_plugins(idle.clone(), cx)),
+            ));
+        } else if waiting > 0 && idle.is_empty() {
+            s = s.action(button_with(
+                "plugins-update-all",
+                Some(Icon::Shield),
+                if waiting == 1 { "Review".to_string() } else { format!("Review {waiting}") },
+                ButtonKind::Primary,
+                ui,
+                self.act_and_focus(cx, None, |v, cx| v.open_queued_review(cx)),
+            ));
+        }
+        // After a row's button turns into a state badge, focus moves to the
+        // next row's button (or the page's first control).
+        let next_idle = |id: &str| -> Option<SharedString> {
+            let ids: Vec<&String> = updates.iter().filter(|i| self.plugins.update_state(&i.id).is_none()).map(|i| &i.id).collect();
+            let at = ids.iter().position(|i| *i == id)?;
+            ids.get(at + 1).map(|i| SharedString::from(format!("update-{i}")))
+        };
+        s.children(updates.iter().map(|inst| self.update_row(ui, cat, inst, next_idle(&inst.id), cx)))
+            .footer("New permissions, programs or shell code wait for your review; other updates install with one click.")
+            .into_any_element()
+    }
+
+    /// Like [`act`](Self::act), then moves keyboard focus to the control
+    /// `to` (or the page's first one): the clicked button goes away.
+    fn act_and_focus(
+        &self,
+        cx: &Context<'_, Self>,
+        to: Option<SharedString>,
+        f: impl Fn(&mut Self, &mut Context<'_, Self>) + 'static,
+    ) -> impl Fn(&mut Window, &mut gpui::App) + 'static {
+        let this = cx.entity().downgrade();
+        move |window, cx| {
+            let _ = this.update(cx, |v, cx| {
+                f(v, cx);
+                let target = to.clone().map_or(focus::Handover::FirstOnPage, |id| focus::Handover::Control(id.into()));
+                focus::hand_over(&v.focus, target, window, cx);
+            });
+        }
+    }
+
+    /// One update: old → new, what to expect, and its button or state.
+    fn update_row(&self, ui: Ui, cat: &Catalog, inst: &Installed, next: Option<SharedString>, cx: &Context<'_, Self>) -> AnyElement {
+        let newer = inst.update.clone().unwrap_or_default();
+        let new_perms = new_permissions(cat, inst);
+        let name = inst.manifest.name.clone();
+        let mut desc = format!("{} → {newer}", inst.version);
+        if !new_perms.is_empty() {
+            let short: Vec<&str> = new_perms.iter().map(|p| short_permission(*p)).collect();
+            desc.push_str(&format!(" · new: {}", short.join(", ")));
+        }
+        let id = inst.id.clone();
+        let control = match self.plugins.update_state(&id) {
+            Some(UpdateState::Queued) => badge("Queued", Tone::Neutral, ui).into_any_element(),
+            Some(UpdateState::Checking) => badge("Checking…", Tone::Neutral, ui).into_any_element(),
+            Some(UpdateState::Installing) => badge("Updating…", Tone::Accent, ui).into_any_element(),
+            Some(UpdateState::NeedsReview) => button_with(
+                SharedString::from(format!("update-review-{id}")),
+                Some(Icon::Shield),
+                "Review",
+                ButtonKind::Primary,
+                ui,
+                self.act_and_focus(cx, None, move |v, cx| v.open_review_for(&id, cx)),
+            )
+            .aria_label(SharedString::from(format!("Review the {name} update")))
+            .into_any_element(),
+            None => {
+                let item = vec![(id.clone(), newer.clone())];
+                let review = !new_perms.is_empty();
+                button_with(
+                    SharedString::from(format!("update-{id}")),
+                    Some(if review { Icon::Shield } else { Icon::Download }),
+                    if review { "Review" } else { "Update" },
+                    ButtonKind::Normal,
+                    ui,
+                    self.act_and_focus(cx, next, move |v, cx| v.update_plugins(item.clone(), cx)),
+                )
+                .aria_label(SharedString::from(if review {
+                    format!("Review the {name} update")
+                } else {
+                    format!("Update {name} to {newer}")
+                }))
+                .into_any_element()
+            }
+        };
+        row(ui, name.clone())
+            .icon(if new_perms.is_empty() { Icon::Package } else { Icon::Shield })
+            .desc(desc)
+            .control(control)
+            .into_any_element()
+    }
+
+    /// Show the waiting review of `id`'s update (from the list, or the
+    /// plugin's page, which it returns to).
+    pub fn open_review_for(&mut self, id: &str, cx: &mut Context<'_, Self>) {
+        if self.plugins.plan.as_ref().is_some_and(|p| p.id == id) {
+            return;
+        }
+        if let Some(i) = self.plugins.review_queue.iter().position(|p| p.id == id)
+            && let Some(p) = self.plugins.review_queue.remove(i)
+        {
+            self.plugins.clear_review();
+            self.plugins.review_queue.push_front(p);
+        }
+        self.open_queued_review(cx);
+    }
+
+    /// The followed install: what it's doing, how far, and Cancel (Stop
+    /// all, in a batch: a cancel stops the rest too).
+    pub(super) fn install_progress(&self, ui: Ui, f: &Follow, cx: &Context<'_, Self>) -> AnyElement {
         let connected = self.link.as_ref().is_some_and(HostLink::is_connected);
         let cancellable = connected && !f.no_progress && !f.cancelling() && f.progress.as_ref().is_none_or(|p| p.step.cancellable());
         let title = format!("{} {}", f.verb, f.name());
+        let queued = self.plugins.batch.as_ref().map_or(0, Batch::queued);
+        let label = if f.batch && queued > 0 { "Stop all" } else { "Cancel" };
         // Unavailable, not hidden (and focus stays on it): the
         // description (step_text) and the tooltip say why it's off.
         let cancel = if cancellable {
-            button("plugin-install-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.cancel_install(cx)))
+            button(
+                "plugin-install-cancel",
+                label,
+                ButtonKind::Ghost,
+                ui,
+                self.act(cx, |v, cx| if v.plugins.batch.is_some() { v.stop_updates(cx) } else { v.cancel_install(cx) }),
+            )
         } else {
             let why = if !connected {
                 "Not connected to the host"
@@ -891,18 +1461,49 @@ impl SettingsWindow {
             } else {
                 "It's being set up: too late to cancel"
             };
-            button("plugin-install-cancel", "Cancel", ButtonKind::Ghost, ui, |_, _| {}).opacity(0.45).cursor_default().tooltip(tooltip(why))
+            button("plugin-install-cancel", label, ButtonKind::Ghost, ui, |_, _| {}).opacity(0.45).cursor_default().tooltip(tooltip(why))
         };
+        let mut desc = step_text(f, connected);
+        if queued > 0 {
+            desc.push_str(&format!(" · {queued} more after this"));
+        }
         let r = row(ui, title.clone())
             .icon(Icon::Download)
-            .desc(step_text(f, connected))
+            .desc(desc)
             .below(progress_bar("plugin-install-progress", step_fraction(f), title, ui).mt(px(4.)))
             .control(cancel);
         kit::group(ui).child(r).into_any_element()
     }
 
+    /// The batch's state while no install runs (asking the host what an
+    /// update changes): the same card, so the page doesn't jump.
+    pub(super) fn batch_progress(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<AnyElement> {
+        if self.plugins.follow.is_some() {
+            return None;
+        }
+        let b = self.plugins.batch.as_ref()?;
+        let id = b.current.as_ref()?;
+        let name = self
+            .plugins
+            .catalog
+            .as_ref()
+            .and_then(|c| c.installed.iter().find(|i| &i.id == id))
+            .map_or_else(|| id.clone(), |i| i.manifest.name.clone());
+        let mut desc = "Asking the host what the update changes".to_string();
+        if b.queued() > 0 {
+            desc.push_str(&format!(" · {} more after this", b.queued()));
+        }
+        let title = format!("Checking {name}");
+        let r = row(ui, title.clone())
+            .icon(Icon::Download)
+            .desc(desc)
+            .below(progress_bar("plugin-install-progress", None, title, ui).mt(px(4.)))
+            .control(button("plugin-install-cancel", "Stop all", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.stop_updates(cx))));
+        Some(kit::group(ui).child(r).into_any_element())
+    }
+
     /// The round icon standing for a plugin.
-    fn plugin_avatar(ui: Ui, category: Category, builtin: bool, size: f32) -> impl IntoElement {
+    pub(super) fn plugin_avatar(ui: Ui, category: Category, builtin: bool, size: f32) -> impl IntoElement {
         let icon = match category {
             Category::Application => Icon::AppWindow,
             Category::Environment if builtin => Icon::Zap,
@@ -964,7 +1565,14 @@ impl SettingsWindow {
                                     .text_color(if enabled { ui.text } else { ui.muted })
                                     .child(SharedString::from(inst.manifest.name.clone())),
                             )
-                            .when_some(inst.update.clone(), |d, v| d.child(badge(format!("Update {v}"), Tone::Accent, ui)))
+                            .when_some(inst.update.clone(), |d, v| {
+                                d.child(match self.plugins.update_state(&inst.id) {
+                                    Some(UpdateState::Installing) => badge("Updating…", Tone::Accent, ui),
+                                    Some(UpdateState::NeedsReview) => badge("Update needs review", Tone::Warning, ui),
+                                    Some(UpdateState::Queued | UpdateState::Checking) => badge("Update queued", Tone::Neutral, ui),
+                                    None => badge(format!("Update {v}"), Tone::Accent, ui),
+                                })
+                            })
                             .when(fetch && enabled, |d| d.child(badge(if missing { "Needs install" } else { "Update" }, Tone::Warning, ui)))
                             .when(inst.incompatible.is_some(), |d| d.child(badge("Not for this host", Tone::Danger, ui)))
                             .when(!inst.verified && !inst.builtin, |d| d.child(badge("Unverified", Tone::Warning, ui))),
@@ -1097,14 +1705,39 @@ impl SettingsWindow {
         let mut actions = div().flex().flex_wrap().items_center().gap(px(8.));
         if let Some(newer) = inst.update.clone() {
             let (id, v) = (id.clone(), newer.clone());
-            actions = actions.child(button_with(
-                SharedString::from(format!("update-{id}")),
-                Some(Icon::Download),
-                format!("Update to {newer}"),
-                ButtonKind::Primary,
-                ui,
-                self.act(cx, move |view, cx| view.review_plugin(id.clone(), Some(v.clone()), cx)),
-            ));
+            actions = actions.child(match self.plugins.update_state(&id) {
+                Some(UpdateState::NeedsReview) => button_with(
+                    SharedString::from(format!("update-{id}")),
+                    Some(Icon::Shield),
+                    format!("Review the update to {newer}"),
+                    ButtonKind::Primary,
+                    ui,
+                    self.act_and_focus(cx, None, move |view, cx| view.open_review_for(&id, cx)),
+                )
+                .into_any_element(),
+                Some(state) => badge(
+                    match state {
+                        UpdateState::Installing => format!("Updating to {newer}…"),
+                        UpdateState::Checking => "Checking the update…".into(),
+                        _ => "Update queued".into(),
+                    },
+                    Tone::Accent,
+                    ui,
+                )
+                .into_any_element(),
+                None => {
+                    let review = self.plugins.catalog.as_ref().is_some_and(|c| !new_permissions(c, inst).is_empty());
+                    button_with(
+                        SharedString::from(format!("update-{id}")),
+                        Some(if review { Icon::Shield } else { Icon::Download }),
+                        if review { format!("Review the update to {newer}") } else { format!("Update to {newer}") },
+                        ButtonKind::Primary,
+                        ui,
+                        self.act_and_focus(cx, None, move |view, cx| view.update_plugins(vec![(id.clone(), v.clone())], cx)),
+                    )
+                    .into_any_element()
+                }
+            });
         }
         if fetch {
             let id = id.clone();
@@ -1372,210 +2005,32 @@ impl SettingsWindow {
         };
         r.into_any_element()
     }
+}
 
-    // ---- The install review -------------------------------------------------
+/// Permissions `inst`'s update asks for that the installed version
+/// doesn't have, from the registry's listing (before any plan is asked for).
+fn new_permissions(cat: &Catalog, inst: &Installed) -> Vec<Permission> {
+    let Some(a) = cat.available.iter().find(|a| a.id == inst.id && inst.update.as_ref() == Some(&a.version)) else { return Vec::new() };
+    let old = permissions::all(&inst.manifest);
+    a.permissions.iter().filter(|p| !old.contains(p)).copied().collect()
+}
 
-    /// Everything the plugin (and each plugin it needs that comes along)
-    /// will do, before it does it.
-    fn plan_view(&self, ui: Ui, plan: &Plan, cx: &Context<'_, Self>) -> AnyElement {
-        let mut page = div().flex().flex_col().gap(px(28.)).child(Self::plan_hero(ui, plan));
-        if !plan.dependencies.is_empty() {
-            let names: Vec<String> = plan.dependencies.iter().map(|d| d.name.clone()).collect();
-            page = page.child(banner(
-                ui,
-                Tone::Accent,
-                format!("Also installs {}", names.join(", ")),
-                vec![format!("{} needs {}: installed first, with one approval. What each does is below.", plan.name, names.join(", "))],
-            ));
-        }
-        page = page.children(self.plan_sections(ui, plan, cx));
-        for d in &plan.dependencies {
-            page = page.child(Self::plan_hero(ui, d)).children(self.plan_sections(ui, d, cx));
-        }
-        let verb = if plan.replaces.is_some() { "Update" } else { "Install" };
-        page.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap(px(8.))
-                .when(self.plugins.follow.is_some(), |d| d.child(kit::hint(ui, "Another plugin is being installed")))
-                .child(button("plan-cancel", "Cancel", ButtonKind::Ghost, ui, self.act(cx, |v, cx| v.back(cx))))
-                .child(button_with(
-                    "plan-install",
-                    Some(Icon::Download),
-                    verb,
-                    ButtonKind::Primary,
-                    ui,
-                    self.act(cx, |v, cx| v.install_reviewed(cx)),
-                )),
-        )
-        .into_any_element()
-    }
-
-    /// A planned plugin's name, version, origin and description.
-    fn plan_hero(ui: Ui, plan: &Plan) -> AnyElement {
-        let source = if plan.builtin {
-            "Comes with goatty: this installs the tool it needs into goatty's own directory".to_string()
-        } else if plan.verified {
-            format!("By {} · from the {} registry, signature checked", plan.publisher, plan.source)
-        } else {
-            format!("By {} · from {}, not from a registry", plan.publisher, plan.source)
-        };
-        let version = match &plan.replaces {
-            Some(old) if *old != plan.version => format!("{old} → {}", plan.version),
-            _ => plan.version.clone(),
-        };
-        let hero = card(ui)
-            .p(px(20.))
-            .gap(px(14.))
-            .child(
-                div().flex().items_center().gap(px(16.)).child(Self::plugin_avatar(ui, Category::Environment, plan.builtin, 52.)).child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(
-                                    div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(SharedString::from(plan.name.clone())),
-                                )
-                                .child(badge(version, Tone::Neutral, ui))
-                                .when(plan.verified, |d| d.child(Icon::ShieldCheck.svg().size(px(16.)).text_color(ui.success))),
-                        )
-                        .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(source))),
-                ),
-            )
-            .child(div().text_size(px(text::BODY)).child(SharedString::from(plan.summary.clone())))
-            .when(!plan.description.trim().is_empty(), |d| {
-                d.child(
-                    div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(plan.description.trim().to_string())),
-                )
-            });
-        hero.into_any_element()
-    }
-
-    /// A planned plugin's warnings, permissions, downloads, shell additions and code.
-    fn plan_sections(&self, ui: Ui, plan: &Plan, cx: &Context<'_, Self>) -> Vec<AnyElement> {
-        let mono = kit::mono(cx);
-        let mut page: Vec<AnyElement> = Vec::new();
-        if !plan.warnings.is_empty() {
-            page.push(banner(ui, Tone::Warning, "Read this first", plan.warnings.clone()).into_any_element());
-        }
-        page.push(
-            section(ui, "What it may do")
-                .children(plan.permissions.iter().map(|g| {
-                    let mut desc = String::new();
-                    if !g.details.is_empty() {
-                        desc.push_str(&g.details.join(", "));
-                        desc.push_str(". ");
-                    }
-                    if !g.reason.is_empty() {
-                        desc.push_str(&g.reason);
-                        desc.push(' ');
-                    }
-                    desc.push_str(&g.meaning);
-                    row(ui, g.title.clone()).icon(perm_icon(g.permission)).desc(desc)
-                }))
-                .into_any_element(),
-        );
-        if !plan.downloads.is_empty() {
-            page.push(
-                section(ui, "Downloads")
-                    .children(plan.downloads.iter().map(|d| {
-                        let (desc, control) = match &d.system {
-                            Some(p) => (format!("Already installed at {p}: goatty uses that copy"), badge("Skipped", Tone::Success, ui)),
-                            None if d.current => ("goatty's copy is already installed".to_string(), badge("Skipped", Tone::Success, ui)),
-                            None => (url_host(&d.url), badge(size(d.size), Tone::Neutral, ui)),
-                        };
-                        row(ui, format!("{} {}", d.package, d.version)).icon(Icon::Download).desc(desc).control(control)
-                    }))
-                    .footer("Into goatty's own directory, no sudo. Each download is checked against the checksum in the signed manifest before it's unpacked.")
-                    .into_any_element(),
-            );
-        }
-        // Short items as chips; long ones (alias definitions) as wrapped lines.
-        let chips = |items: &[String]| {
-            if items.iter().any(|i| i.len() > 32) {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .p(px(10.))
-                    .rounded(px(radius::CONTROL))
-                    .bg(ui.bg)
-                    .border_1()
-                    .border_color(ui.divider)
-                    .font_family(mono.clone())
-                    .text_size(px(text::CAPTION))
-                    .children(items.iter().map(|i| div().child(SharedString::from(i.clone()))))
-            } else {
-                div().flex().flex_wrap().gap(px(6.)).children(items.iter().map(|i| {
-                    div()
-                        .px(px(8.))
-                        .py(px(3.))
-                        .rounded(px(6.))
-                        .bg(ui.field)
-                        .font_family(mono.clone())
-                        .text_size(px(text::CAPTION))
-                        .child(SharedString::from(i.clone()))
-                }))
-            }
-        };
-        let adds: Vec<(&str, &Vec<String>)> = [("Aliases", &plan.aliases), ("Environment variables", &plan.env), ("Needs", &plan.requires)]
-            .into_iter()
-            .filter(|(_, v)| !v.is_empty())
-            .collect();
-        if !adds.is_empty() {
-            page.push(
-                section(ui, "Adds to your shell").children(adds.into_iter().map(|(t, v)| row(ui, t).below(chips(v)))).into_any_element(),
-            );
-        }
-        if let Some((file, code)) = &plan.shell_code {
-            let open = self.plugins.show_code;
-            let mut s = section(ui, "Shell code").child(
-                row(ui, if open { "Hide the code" } else { "Read the code" })
-                    .icon(Icon::Code)
-                    .desc(format!("{file} runs when every goatty shell starts · {} lines", code.lines().count()))
-                    .on_click(
-                        SharedString::from(format!("plan-code-{}", plan.id)),
-                        cx.listener(|v, _, _, cx| {
-                            v.plugins.show_code = !v.plugins.show_code;
-                            cx.notify();
-                        }),
-                    ),
-            );
-            if open {
-                s = s.child(
-                    div()
-                        .id(SharedString::from(format!("plan-code-text-{}", plan.id)))
-                        .max_h(px(320.))
-                        .overflow_y_scroll()
-                        .mx(px(16.))
-                        .mb(px(16.))
-                        .p(px(12.))
-                        .rounded(px(radius::CONTROL))
-                        .bg(ui.bg)
-                        .border_1()
-                        .border_color(ui.divider)
-                        .font_family(mono.clone())
-                        .text_size(px(text::CAPTION))
-                        .children(code.lines().map(|l| {
-                            div().whitespace_nowrap().child(SharedString::from(if l.is_empty() { " ".to_string() } else { l.to_string() }))
-                        })),
-                );
-            }
-            page.push(s.into_any_element());
-        }
-        page
+/// A permission in a word or two, for the Updates list.
+fn short_permission(p: Permission) -> &'static str {
+    match p {
+        Permission::Binaries => "programs",
+        Permission::ShellCode => "shell code",
+        Permission::Network => "network",
+        Permission::Aliases => "aliases",
+        Permission::Env => "variables",
+        Permission::ConfigFiles => "config files",
+        Permission::Commands => "commands",
+        Permission::Snippets => "snippets",
+        Permission::SnippetSources => "snippet sources",
     }
 }
 
-fn perm_icon(p: Permission) -> Icon {
+pub(super) fn perm_icon(p: Permission) -> Icon {
     match p {
         Permission::Binaries => Icon::Package,
         Permission::ShellCode => Icon::Code,
@@ -1587,12 +2042,6 @@ fn perm_icon(p: Permission) -> Icon {
         Permission::Snippets => Icon::TextCursorInput,
         Permission::SnippetSources => Icon::Zap,
     }
-}
-
-/// `https://github.com/x/y/releases/…` → `github.com`.
-fn url_host(url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    format!("From {}", rest.split('/').next().unwrap_or(rest))
 }
 
 fn changed(r: api::Reply) -> Option<api::Changed> {
@@ -1630,6 +2079,7 @@ mod tests {
             warnings: Vec::new(),
             dependencies: Vec::new(),
             digest: "sha256:test".into(),
+            previous: None,
         })
     }
 
@@ -1660,5 +2110,71 @@ mod tests {
         assert_eq!(page.dismiss_plan(), Some(Some(Page::Profile)));
         assert!(page.plan.is_none());
         assert_eq!(page.take_plan_return(req), None);
+    }
+
+    #[test]
+    fn queued_reviews_count_and_back_keeps_them_waiting() {
+        let mut page = PluginsPage::default();
+        page.queue_reviews(vec![test_plan("a"), test_plan("b"), test_plan("a")]);
+        assert_eq!(page.review_queue.len(), 2, "one review per plugin");
+        assert!(page.show_next_review());
+        assert_eq!(page.review_position(), Some((1, 2)));
+        assert_eq!(page.update_state("b"), Some(UpdateState::NeedsReview));
+
+        // Back (or another page) keeps the shown review waiting, in front.
+        page.clear_review();
+        assert!(page.plan.is_none());
+        assert_eq!(page.review_queue.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+
+        // Skip drops it and goes on to the next, then back to the list.
+        assert!(page.show_next_review());
+        assert_eq!(page.dismiss_plan(), Some(None));
+        assert_eq!(page.plan.as_ref().map(|p| p.id.as_str()), Some("b"));
+        assert_eq!(page.review_position(), Some((2, 2)));
+        assert_eq!(page.dismiss_plan(), Some(None));
+        assert!(page.plan.is_none() && page.review_queue.is_empty());
+        assert_eq!(page.review_position(), None);
+    }
+
+    #[test]
+    fn a_browse_install_review_leaves_the_update_queue_alone() {
+        let mut page = PluginsPage::default();
+        page.queue_reviews(vec![test_plan("upd")]);
+        let req = page.begin_review(Some(Page::Profile));
+        assert!(page.accept_review_plan(req, test_plan("new")));
+        assert_eq!(page.review_position(), None);
+        // Cancel goes back where it came from, not into the queued update.
+        assert_eq!(page.dismiss_plan(), Some(Some(Page::Profile)));
+        assert!(page.plan.is_none());
+        assert_eq!(page.review_queue.len(), 1);
+        // Leaving a Browse review doesn't queue it either.
+        let req = page.begin_review(None);
+        assert!(page.accept_review_plan(req, test_plan("new")));
+        page.clear_review();
+        assert_eq!(page.review_queue.len(), 1);
+    }
+
+    #[test]
+    fn a_batch_reports_once() {
+        let mut b = Batch::default();
+        assert_eq!(b.summary(), None, "nothing done: nothing to report");
+        b.done.push((true, "eza 1.1.0".into()));
+        b.lines.push("Updated eza to 1.1.0; reload running shells to use it".into());
+        assert_eq!(b.summary(), Some((true, b.lines.clone())), "one update keeps the host's own report");
+        b.done.push((true, "zoxide 0.9.8".into()));
+        b.failed.push("bat 0.25: no network".into());
+        let (ok, lines) = b.summary().unwrap();
+        assert!(!ok);
+        assert_eq!(lines, ["Updated 2 plugins; 1 failed", "Updated eza 1.1.0, zoxide 0.9.8", "Failed: bat 0.25: no network"]);
+
+        let stopped = Batch { stopped: true, ..Default::default() };
+        assert_eq!(stopped.summary(), Some((false, vec!["Stopped: nothing was updated".to_string()])));
+
+        let page = PluginsPage {
+            batch: Some(Batch { queue: [Job::Check { id: "eza".into(), version: "1.1.0".into() }].into(), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(page.update_state("eza"), Some(UpdateState::Queued));
+        assert_eq!(page.update_state("bat"), None);
     }
 }

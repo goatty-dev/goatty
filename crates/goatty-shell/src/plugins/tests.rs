@@ -252,6 +252,14 @@ fn update_replaces_version_and_packages() {
     let c2 = p.find("demo", None).unwrap();
     let plan2 = p.plan(&c2, &settings).unwrap();
     assert_eq!(plan2.replaces.as_deref(), Some("1.0.0"));
+    // The plan carries the installed version: the review shows only what changes.
+    assert!(plan.previous.is_none(), "an install has nothing to compare with");
+    let changes = plan2.changes().expect("an update knows the installed version");
+    assert_eq!((changes.from.as_str(), changes.to.as_str()), ("1.0.0", "1.1.0"));
+    assert_eq!(changes.packages.len(), 1, "{changes:?}");
+    assert_eq!((changes.packages[0].from.as_deref(), changes.packages[0].to.as_deref()), (Some("2.0"), Some("2.1")));
+    assert!(changes.shell_code.is_none() && changes.aliases.is_empty(), "{changes:?}");
+    assert!(!changes.needs_review(), "a new build of the same program: {:?}", changes.review_reasons());
 
     // Cancelled while downloading: the host stays at 1.0.0.
     let jobs = jobs::Jobs::default();

@@ -23,6 +23,7 @@ mod hosts;
 pub(crate) mod kit;
 mod network;
 mod path;
+mod plugin_review;
 mod plugins;
 mod problems;
 mod profile;
@@ -685,7 +686,7 @@ impl SettingsWindow {
             (a, b) => a.is_none() && b.is_none(),
         };
         // An install in progress keeps its host until it's over.
-        if same || self.draft.is_some() || self.busy || self.plugins.follow.is_some() {
+        if same || self.draft.is_some() || self.busy || self.plugins.follow.is_some() || self.plugins.batch.is_some() {
             return;
         }
         self.link = link;

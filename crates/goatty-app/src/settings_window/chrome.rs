@@ -392,7 +392,15 @@ impl SettingsWindow {
                 Some(_) => "Reinstall",
                 None => "Install",
             };
-            return Some((format!("{verb} {}", plan.name).into(), "Review what it does before anything changes".into()));
+            let mut sub = match plan.changes() {
+                Some(c) if c.from != c.to => format!("What changes from {} to {}", c.from, c.to),
+                Some(_) => "Same version: reinstall it as it is".to_string(),
+                None => "Review what it does before anything changes".to_string(),
+            };
+            if let Some((n, of)) = self.plugins.review_position() {
+                sub.push_str(&format!(" · {n} of {of}"));
+            }
+            return Some((format!("{verb} {}", plan.name).into(), sub.into()));
         }
         let id = self.plugins.detail.as_ref()?;
         let inst = self.plugins.catalog.as_ref()?.installed.iter().find(|i| &i.id == id)?;
@@ -402,11 +410,16 @@ impl SettingsWindow {
     pub(super) fn back(&mut self, cx: &mut Context<'_, Self>) {
         if self.page == Page::Prompt {
             self.close_prompt_modules(cx);
+        } else if self.plugins.plan.is_some() && self.plugins.from_queue {
+            // Back to the list: the review keeps waiting there.
+            self.plugins.clear_review();
         } else if let Some(back) = self.plugins.dismiss_plan() {
             if let Some(page) = back {
                 self.go(page, cx);
                 return;
             }
+            // The next queued review shows from its top.
+            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
         } else {
             self.plugins.detail = None;
         }

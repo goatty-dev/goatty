@@ -22,6 +22,7 @@ lzma-rust2.workspace = true
 zstd.workspace = true
 clap.workspace = true
 regex.workspace = true
+similar.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
