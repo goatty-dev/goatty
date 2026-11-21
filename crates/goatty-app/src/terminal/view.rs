@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use goatty_client::RemotePathInfo;
 use goatty_config::{
-    ClientSettings, CopyOnSelect, CtrlBackspace, CtrlDelete, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm,
-    RemoteFileOpen, Renderer, RightClick,
+    ClientSettings, CtrlBackspace, CtrlDelete, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, RemoteFileOpen, Renderer,
+    RightClick,
 };
 use goatty_term::input::{
     Key, KeyKind, KeyOptions, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event_with, encode_mouse, encode_paste,
@@ -730,19 +730,28 @@ impl TerminalView {
         }
     }
 
-    /// A finished mouse selection goes to the primary selection and/or the
-    /// clipboard (`selection.copy_on_select`).
+    /// A finished mouse selection goes to the primary selection
+    /// (`selection.primary`) and, with `selection.auto_copy`, to the
+    /// clipboard: a toast says so, and with `selection.clear_after_copy` the
+    /// text is unselected, as after Ctrl+C.
     fn copy_on_select(&mut self, cx: &mut Context<'_, Self>) {
-        let mode = cx.global::<AppSettings>().client.selection.copy_on_select;
-        if mode == CopyOnSelect::Off {
+        let sel = cx.global::<AppSettings>().client.selection;
+        if !sel.auto_copy && !sel.primary {
             return;
         }
         let Some(text) = self.session.terminal.selection_text().filter(|t| !t.is_empty()) else { return };
+        let chars = text.chars().count();
         let item = ClipboardItem::new_string(text);
-        if mode == CopyOnSelect::Clipboard {
-            cx.write_to_clipboard(item.clone());
+        if sel.primary {
+            write_primary(cx, item.clone());
         }
-        write_primary(cx, item);
+        if sel.auto_copy {
+            cx.write_to_clipboard(item);
+            toast::show(cx, copied_toast(chars).key("terminal.copy"));
+            if sel.clear_after_copy {
+                self.session.terminal.selection_clear();
+            }
+        }
     }
 
     /// The explicit copy action (menu, palette, Ctrl+Shift+C) says what it
@@ -752,7 +761,7 @@ impl TerminalView {
             Some(text) => {
                 let chars = text.chars().count();
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
-                Toast::success("Copied to clipboard").body(if chars == 1 { "1 character".into() } else { format!("{chars} characters") })
+                copied_toast(chars)
             }
             None => Toast::info("Nothing to copy").body("Select text with the mouse first."),
         };
@@ -2149,12 +2158,14 @@ impl TerminalView {
         if ev.button == GMouseButton::Middle {
             return; // selections and links are the left button's
         }
-        self.end_selection(cx);
+        let selected = self.end_selection(cx);
         let pressed_link = self.pressed_link.take();
         let pressed_pending = self.pressed_pending_link.take();
         // A release over the letterbox opens nothing (its cell is clamped).
         let on_grid = self.geom.get().in_grid(ev.position);
-        if ev.button == GMouseButton::Left && on_grid && !self.session.terminal.has_selection() {
+        // A drag that selected text opens nothing, even if auto-copy has
+        // already unselected it.
+        if ev.button == GMouseButton::Left && on_grid && !selected && !self.session.terminal.has_selection() {
             if let Some(target) = pressed_link {
                 self.mouse_cell = Some((col, row));
                 self.refresh_hover(cx);
@@ -2254,19 +2265,23 @@ impl TerminalView {
     }
 
     /// The selecting drag ended: copy what it selected, if anything.
-    fn end_selection(&mut self, cx: &mut Context<'_, Self>) {
+    /// Returns whether it selected something (auto-copy may already have
+    /// unselected it again).
+    fn end_selection(&mut self, cx: &mut Context<'_, Self>) -> bool {
         if !self.selecting {
-            return;
+            return false;
         }
         self.selecting = false;
         self.drag_pos = None;
         self.autoscroll = None;
-        if self.session.terminal.has_selection() {
+        let selected = self.session.terminal.has_selection();
+        if selected {
             self.copy_on_select(cx);
         } else {
             self.session.terminal.selection_clear();
         }
         cx.notify();
+        selected
     }
 
     fn on_scroll(&mut self, ev: &ScrollEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -2321,6 +2336,11 @@ fn read_primary(cx: &App) -> Option<ClipboardItem> {
     return cx.read_from_primary();
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     return cx.read_from_clipboard();
+}
+
+/// "Copied to clipboard", with how much.
+fn copied_toast(chars: usize) -> Toast {
+    Toast::success("Copied to clipboard").body(if chars == 1 { "1 character".into() } else { format!("{chars} characters") })
 }
 
 /// Set the primary selection where there is one.
@@ -2621,7 +2641,7 @@ impl Render for TerminalView {
                                     }
                                 } else {
                                     // Released where we didn't see it (outside the window).
-                                    view.end_selection(cx);
+                                    let _ = view.end_selection(cx);
                                 }
                             });
                         });

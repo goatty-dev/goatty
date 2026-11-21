@@ -2,8 +2,8 @@
 //! (startup, tabs, panes, notifications).
 
 use goatty_config::{
-    CopyOnSelect, CtrlBackspace, CtrlDelete, LinkClick, LinkSettings, MiddleClick, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm,
-    RemoteFileOpen, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
+    CtrlBackspace, CtrlDelete, LinkClick, LinkSettings, MiddleClick, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm, RemoteFileOpen,
+    RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -96,21 +96,31 @@ impl SettingsWindow {
             )
             .footer("Paths count when the file or folder exists on that host. Right-click a link for all options.");
 
-        let copy_opts = if PRIMARY_SELECTION {
-            opts(&[
-                (CopyOnSelect::Primary, "Primary selection", "Middle click pastes it, in any app"),
-                (CopyOnSelect::Clipboard, "Primary and clipboard", "Ctrl+V pastes it too"),
-                (CopyOnSelect::Off, "Off", "Copy with Ctrl+Shift+C"),
-            ])
-        } else {
-            // Without a primary selection, `primary` copies nowhere.
-            opts(&[(CopyOnSelect::Clipboard, "Clipboard", ""), (CopyOnSelect::Primary, "Off", "")])
-        };
-        let selection = section(ui, "Selection").child(row(ui, "Copy selected text").desc("When you select with the mouse").control(
-            self.select("copy-on-select", "Copy selected text", copy_opts, &s.selection.copy_on_select, cx, |v, _, cx| {
-                AppSettings::update(cx, |s| s.selection.copy_on_select = v)
-            }),
-        ));
+        let sel = s.selection;
+        let selection = section(ui, "Selection")
+            .child(row(ui, "Copy when you select").desc("Text you select with the mouse goes to the clipboard at once").control(toggle(
+                "selection-auto-copy",
+                sel.auto_copy,
+                ui,
+                client(|s| s.selection.auto_copy = !s.selection.auto_copy),
+            )))
+            .child(
+                row(ui, "Unselect after copying")
+                    .desc(if sel.auto_copy { "Off keeps the text highlighted" } else { "Only with copy when you select" })
+                    .disabled(!sel.auto_copy)
+                    .control(toggle(
+                        "selection-clear-after-copy",
+                        sel.clear_after_copy,
+                        ui,
+                        client(|s| s.selection.clear_after_copy = !s.selection.clear_after_copy),
+                    )),
+            )
+            .when_some_child(PRIMARY_SELECTION.then_some(()), |()| {
+                row(ui, "Middle click pastes what you select")
+                    .desc("The primary selection, shared by all apps")
+                    .control(toggle("selection-primary", sel.primary, ui, client(|s| s.selection.primary = !s.selection.primary)))
+                    .into_any_element()
+            });
 
         let mouse = section(ui, "Mouse").child(row(ui, "Right click").desc("Shift+right-click does the other thing").control(self.select(
             "right-click",
