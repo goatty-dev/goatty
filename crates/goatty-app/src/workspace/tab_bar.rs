@@ -106,7 +106,8 @@ impl Colors {
         } else {
             Hsla { l: (terminal.l - 0.06).max(0.0), ..terminal }
         };
-        let hover = if colors.is_dark() { Hsla { l: (bar.l + 0.06).min(1.0), ..bar } } else { Hsla { l: (bar.l - 0.05).max(0.0), ..bar } };
+        // Between the bar and the terminal: a hovered tab never outshines the active one.
+        let hover = if colors.is_dark() { Hsla { l: (bar.l + 0.03).min(1.0), ..bar } } else { Hsla { l: (bar.l - 0.05).max(0.0), ..bar } };
         let edge = ui.text.opacity(if colors.is_dark() { 0.07 } else { 0.1 });
         Self { ui, bar, terminal, hover, edge }
     }
@@ -228,7 +229,7 @@ impl Workspace {
         let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
         // The settings button, the new-tab menu's chevron, and the window
         // buttons when goatty draws them.
-        let chrome_room = 32.0 + 18.0 + chrome::buttons_width(control, window, cx);
+        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx);
         let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
@@ -274,9 +275,9 @@ impl Workspace {
                 }),
             );
         let new_tab = if modern {
-            new_tab.size(px(28.)).mb(px(MODERN_LIFT)).rounded_md().child(Icon::Plus.svg().size(px(15.)).text_color(c.ui.muted))
+            new_tab.w(px(26.)).h(px(28.)).rounded_l_md().child(Icon::Plus.svg().size(px(15.)).text_color(c.ui.muted))
         } else {
-            new_tab.h_full().px(px(10.)).child("+")
+            new_tab.h_full().pl(px(10.)).pr(px(6.)).child("+")
         };
         // Where else a new tab can go: the same menu as a right click on +.
         let more = div()
@@ -296,7 +297,15 @@ impl Workspace {
                     this.open_new_tab_menu(ev.position, window, cx);
                 }),
             );
-        let more = if modern { more.w(px(16.)).h(px(28.)).mb(px(MODERN_LIFT)).rounded_md() } else { more.h_full().px(px(4.)) };
+        let more = if modern { more.w(px(16.)).h(px(28.)).rounded_r_md() } else { more.h_full().pl(px(2.)).pr(px(6.)) };
+        // + and its menu's chevron as one split button.
+        let new_tab = div()
+            .flex_none()
+            .flex()
+            .when(modern, |d| d.items_center().mb(px(MODERN_LIFT)))
+            .when(!modern, |d| d.h_full())
+            .child(new_tab)
+            .child(more);
         let settings = div()
             .id("tab-settings")
             .flex_none()
@@ -347,7 +356,6 @@ impl Workspace {
                     .children(items),
             )
             .child(new_tab)
-            .child(more)
             .child(rest)
             .child(settings)
             .children(right);
@@ -748,7 +756,15 @@ impl Workspace {
             .when(t.active, |d| {
                 // Like the modern tab: outlined in its group's color (or by the
                 // seam) and merging into the panes.
-                d.bg(c.terminal).border_t(px(w)).border_l(px(w)).border_r(px(w)).border_color(line).font_weight(gpui::FontWeight::MEDIUM)
+                // Inset from the window's top edge, so the outline's top shows.
+                d.bg(c.terminal)
+                    .mt(px(2.))
+                    .rounded_t(px(4.))
+                    .border_t(px(w))
+                    .border_l(px(w))
+                    .border_r(px(w))
+                    .border_color(line)
+                    .font_weight(gpui::FontWeight::MEDIUM)
             })
             .when(!t.active, |d| d.hover(|s| s.bg(c.hover).text_color(c.ui.text)))
             .when(waiting, |d| d.bg(c.ui.warning.opacity(0.16)).text_color(c.ui.text))
@@ -765,21 +781,21 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// A host group's label in the strip: a chip with the host's name,
-    /// solid in its color while the group is open (its tabs follow, joined
-    /// by a line in that color along the bar's bottom edge; this computer's
-    /// chip is a quiet neutral one); folded, a tinted chip with a chevron,
-    /// how many tabs it holds and their activity. Click: fold or unfold;
+    /// A host group's chip, as the strip and the sidebar show it: the
+    /// host's name, solid in its color while the group is open (this
+    /// computer's chip is a quiet neutral one); folded, a tinted chip with
+    /// a chevron, how many tabs it holds and their activity. `small` for
+    /// the compact strip. Click: fold or unfold (Shift: detach);
     /// right-click: the group's menu.
-    fn group_label(&self, g: Group, modern: bool, first: bool, next_active: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+    pub(super) fn group_chip(&self, g: &Group, small: bool, c: Colors, cx: &mut Context<'_, Self>) -> gpui::Stateful<gpui::Div> {
         let key = g.key.clone();
         let menu_key = g.key.clone();
         let folded = g.folded;
-        let tip = group_tooltip(&g);
-        let mark = group_mark(&g, c).filter(|_| folded).map(|color| div().flex_none().size(px(6.)).rounded_full().bg(color));
+        let tip = group_tooltip(g);
+        let mark = group_mark(g, c).filter(|_| folded).map(|color| div().flex_none().size(px(6.)).rounded_full().bg(color));
         let has_mark = mark.is_some();
         let count = folded.then(|| {
-            let size = if modern { 16. } else { 13. };
+            let size = if small { 13. } else { 16. };
             div()
                 .flex_none()
                 .min_w(px(size))
@@ -790,7 +806,7 @@ impl Workspace {
                 .justify_center()
                 .rounded_full()
                 .bg(g.color.opacity(0.24))
-                .text_size(px(if modern { 10.5 } else { 9.5 }))
+                .text_size(px(if small { 9.5 } else { 10.5 }))
                 .child(SharedString::from(g.tabs.len().to_string()))
         });
         let (fg, glyph) = if folded {
@@ -800,6 +816,13 @@ impl Workspace {
         } else {
             (on_color(g.color), None)
         };
+        let pl = if glyph.is_some() { 7. } else { 9. };
+        let pr = match (folded, has_mark) {
+            (false, _) => 9.,
+            (true, true) => 7.,
+            (true, false) => 4.,
+        };
+        let color = g.color;
         let chip = div()
             .id(gpui::ElementId::NamedInteger("tab-group".into(), g.ids[0]))
             .flex_none()
@@ -813,20 +836,19 @@ impl Workspace {
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(fg)
             .map(|d| match (folded, g.local) {
-                (true, _) => {
-                    d.bg(g.color.opacity(0.14)).border_1().border_color(g.color.opacity(0.45)).hover(|s| s.bg(g.color.opacity(0.22)))
-                }
+                (true, _) => d.bg(color.opacity(0.14)).border_1().border_color(color.opacity(0.45)).hover(|s| s.bg(color.opacity(0.22))),
                 (false, true) => {
                     d.bg(c.ui.text.opacity(0.08)).border_1().border_color(c.ui.text.opacity(0.14)).hover(|s| s.bg(c.ui.text.opacity(0.14)))
                 }
-                (false, false) => d.bg(g.color).hover(|s| s.opacity(0.85)),
+                (false, false) => d.bg(color).hover(|s| s.opacity(0.85)),
             })
             .tooltip(tooltip(tip))
-            .children(glyph.map(|(icon, color)| icon.svg().flex_none().size(px(if modern { 11. } else { 10. })).text_color(color)))
+            .children(glyph.map(|(icon, color)| icon.svg().flex_none().size(px(if small { 10. } else { 11. })).text_color(color)))
             .child(div().min_w_0().truncate().child(g.label.clone()))
             .children(count)
             .children(mark)
             .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                cx.stop_propagation();
                 if ev.modifiers().shift {
                     this.detach_group(&key, window, cx);
                 } else {
@@ -840,19 +862,21 @@ impl Workspace {
                     cx.stop_propagation();
                 }),
             );
-        let pl = if glyph.is_some() { 7. } else { 9. };
-        let pr = match (folded, has_mark) {
-            (false, _) => 9.,
-            (true, true) => 7.,
-            (true, false) => 4.,
-        };
+        if small {
+            chip.h(px(19.)).pl(px(pl - 2.)).pr(px(pr - 1.)).text_size(px(10.5))
+        } else {
+            chip.h(px(22.)).pl(px(pl)).pr(px(pr)).text_size(px(text::CAPTION))
+        }
+    }
+
+    /// A host group's label in the strip: its chip (`group_chip`), with the
+    /// group's line along the bar's bottom edge starting under it.
+    fn group_label(&self, g: Group, modern: bool, first: bool, next_active: bool, c: Colors, cx: &mut Context<'_, Self>) -> AnyElement {
+        let folded = g.folded;
+        let chip = self.group_chip(&g, !modern, c, cx);
         // The chip sits in a slot as tall as a background tab, so the
         // group's line starts under it.
-        let (chip, slot_h, lift, gap) = if modern {
-            (chip.h(px(22.)).pl(px(pl)).pr(px(pr)).text_size(px(text::CAPTION)), MODERN_BACK_HEIGHT, MODERN_LIFT, 2.)
-        } else {
-            (chip.h(px(19.)).pl(px(pl - 2.)).pr(px(pr - 1.)).text_size(px(10.5)), COMPACT_HEIGHT, 0., 0.)
-        };
+        let (slot_h, lift, gap) = if modern { (MODERN_BACK_HEIGHT, MODERN_LIFT, 2.) } else { (COMPACT_HEIGHT, 0., 0.) };
         let right = if next_active && modern { FLARE - 2. - ACTIVE_GROUP_LINE } else { -gap };
         div()
             .flex_none()
@@ -906,7 +930,7 @@ fn group_line(color: Hsla, bottom: f32, left: f32, right: f32, start: bool, end:
 
 /// The active tab's outline: its host group's color, as wide as the
 /// group's line, else the bar's seam.
-fn outline(t: &TabView, c: Colors) -> (f32, Hsla) {
+pub(super) fn outline(t: &TabView, c: Colors) -> (f32, Hsla) {
     match t.group {
         Some(color) => (ACTIVE_GROUP_LINE, color),
         None => (1.0, seam(c)),
@@ -914,7 +938,7 @@ fn outline(t: &TabView, c: Colors) -> (f32, Hsla) {
 }
 
 /// The line between the bar and the panes, which the active tab opens.
-fn seam(c: Colors) -> Hsla {
+pub(super) fn seam(c: Colors) -> Hsla {
     c.ui.text.opacity(if c.ui.dark { 0.1 } else { 0.12 })
 }
 
@@ -933,7 +957,7 @@ fn divider(hover_group: SharedString, left: f32, c: Colors) -> impl IntoElement 
 }
 
 /// A background tab's icon recedes a little, until the tab is hovered.
-fn quiet_icon(icon: AnyElement, active: bool, hover_group: SharedString) -> AnyElement {
+pub(super) fn quiet_icon(icon: AnyElement, active: bool, hover_group: SharedString) -> AnyElement {
     if active {
         return icon;
     }
@@ -951,7 +975,7 @@ fn flare(left: bool, w: f32, line: Hsla, c: Colors) -> impl IntoElement {
 }
 
 /// How many panes a tab holds, as a small badge.
-fn pane_count(n: usize, c: Colors) -> impl IntoElement {
+pub(super) fn pane_count(n: usize, c: Colors) -> impl IntoElement {
     div()
         .flex_none()
         .flex()
@@ -967,16 +991,11 @@ fn pane_count(n: usize, c: Colors) -> impl IntoElement {
         .child(SharedString::from(n.to_string()))
 }
 
-/// Text that reads on `bg`: near-black or near-white, whichever has the
-/// higher WCAG contrast.
+/// Text that reads on `bg`: near-black on light colors, else near-white.
+/// The cut is above WCAG's even-contrast point (about 0.18): its luminance
+/// weighs green so heavily that mid-tone greens would get muddy dark text.
 fn on_color(bg: Hsla) -> Hsla {
-    let dark = gpui::hsla(bg.h, 0.25, 0.1, 1.0);
-    let light = gpui::hsla(bg.h, 0.2, 0.98, 1.0);
-    let ratio = |a: Hsla, b: Hsla| {
-        let (la, lb) = (luminance(a), luminance(b));
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    };
-    if ratio(dark, bg) >= ratio(light, bg) { dark } else { light }
+    if luminance(bg) > 0.3 { gpui::hsla(bg.h, 0.25, 0.1, 1.0) } else { gpui::hsla(bg.h, 0.2, 0.98, 1.0) }
 }
 
 /// WCAG relative luminance.
@@ -1127,5 +1146,7 @@ mod tests {
         let navy: gpui::Hsla = gpui::rgb(0x1e3a8a).into();
         assert!(luminance(on_color(yellow)) < 0.1, "dark text on a light chip");
         assert!(luminance(on_color(navy)) > 0.8, "light text on a dark chip");
+        let green: gpui::Hsla = gpui::rgb(0x40a02b).into();
+        assert!(luminance(on_color(green)) > 0.8, "light text on a mid-tone green");
     }
 }

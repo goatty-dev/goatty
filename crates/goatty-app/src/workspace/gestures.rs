@@ -70,7 +70,7 @@ impl WheelSwitch {
 }
 
 /// Width of the folded sidebar: a rail of icons.
-pub const RAIL_WIDTH: f32 = 52.0;
+pub const RAIL_WIDTH: f32 = 56.0;
 /// Dragging the edge further left than this folds the sidebar.
 const FOLD_BELOW: f32 = 96.0;
 /// Dragging a folded sidebar's edge past this unfolds it (the gap to
