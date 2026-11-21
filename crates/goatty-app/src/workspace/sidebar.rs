@@ -6,7 +6,7 @@
 //!   (plus the host when remote) or, while a coding agent works or waits,
 //!   what it's doing (#205); activity or agent markers, the pane count, a
 //!   close button on hover. The active row is raised in the terminal's
-//!   color and outlined (in its host group's color when grouped); a
+//!   color; a
 //!   background row whose agent waits for the user is tinted; background
 //!   rows' icons recede until hovered.
 //!   "New tab" ends the list; the list scrolls and keeps the active tab in
@@ -45,9 +45,7 @@ use gpui::{
 use super::Workspace;
 use super::gestures::{RAIL_WIDTH, Sidebar};
 use super::groups::{Group, StripItem};
-use super::tab_bar::{
-    Axis, Colors, TabView, activity_look, group_mark, is_waiting, outline, pane_count, progress_line, quiet_icon, status_color,
-};
+use super::tab_bar::{Axis, Colors, TabView, activity_look, group_mark, is_waiting, pane_count, progress_line, quiet_icon, status_color};
 use crate::actions::{NewTab, OpenSettings, ToggleTabSidebar};
 use crate::settings::AppSettings;
 use crate::ui::controls::tooltip;
@@ -289,7 +287,6 @@ impl Workspace {
         let waiting = !t.active && is_waiting(&t);
         let close = self.close_button(&t, 22.0, c, cx);
         let panes = (t.panes > 1).then(|| pane_count(t.panes, c));
-        let (_, line) = outline(&t, c);
         let text = div()
             .flex_1()
             .min_w_0()
@@ -310,21 +307,16 @@ impl Workspace {
             .pr(px(6.))
             .gap(px(10.))
             .rounded(px(radius::CONTROL))
-            .border_1()
-            // Raised in the terminal's color, outlined in its group's color.
-            .when(t.active, |d| d.bg(c.terminal).border_color(line).shadow_sm().text_color(c.ui.text).font_weight(gpui::FontWeight::MEDIUM))
-            .when(!t.active, |d| {
-                d.border_color(gpui::transparent_black()).text_color(c.ui.muted).hover(|s| s.bg(c.hover).text_color(c.ui.text))
-            })
-            .when(waiting, |d| d.bg(c.ui.warning.opacity(0.12)).border_color(c.ui.warning.opacity(0.35)).text_color(c.ui.text))
+            // Raised in the terminal's color.
+            .when(t.active, |d| d.bg(c.terminal).shadow_sm().text_color(c.ui.text).font_weight(gpui::FontWeight::MEDIUM))
+            .when(!t.active, |d| d.text_color(c.ui.muted).hover(|s| s.bg(c.hover).text_color(c.ui.text)))
+            .when(waiting, |d| d.bg(c.ui.warning.opacity(0.12)).text_color(c.ui.text))
             .child(icon)
             .child(text)
             .children(marker)
             .children(panes)
             .child(close)
-            .when_some(t.group, |d, color| {
-                d.ml(px(GROUP_INDENT)).child(group_line(color, GROUP_INDENT - GROUP_LINE_X, 1., t.group_end, 2.))
-            })
+            .when_some(t.group, |d, color| d.ml(px(GROUP_INDENT)).child(group_line(color, GROUP_INDENT - GROUP_LINE_X, t.group_end, 2.)))
             .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 10.0, c)))
             .into_any_element()
     }
@@ -495,7 +487,6 @@ impl Workspace {
                 .child(SharedString::from(letter))
                 .into_any_element()
         });
-        let icon = quiet_icon(icon, t.active, SharedString::from(format!("tab-{}", t.id)));
         let tip = match (&t.detail, t.panes) {
             (Some(d), 1) => format!("{}\n{d}", t.label),
             (Some(d), n) => format!("{}\n{d} · {n} panes", t.label),
@@ -516,15 +507,14 @@ impl Workspace {
             .size(px(TILE))
             .justify_center()
             .rounded(px(radius::CONTROL))
-            .border_1()
-            .when(t.active, |d| d.bg(c.terminal).border_color(outline(&t, c).1).shadow_sm())
-            .when(!t.active, |d| d.border_color(gpui::transparent_black()).hover(|s| s.bg(c.hover)))
+            .when(t.active, |d| d.bg(c.terminal).shadow_sm())
+            .when(!t.active, |d| d.hover(|s| s.bg(c.hover)))
             .tooltip(tooltip(tip))
             .when(!t.active && is_waiting(&t), |d| d.bg(c.ui.warning.opacity(0.14)))
             .child(icon)
             .children(dot)
             .children(badge)
-            .when_some(t.group, |d, color| d.child(group_line(color, (RAIL_WIDTH - TILE - MARGIN) / 2., 1., t.group_end, 4.)))
+            .when_some(t.group, |d, color| d.child(group_line(color, (RAIL_WIDTH - TILE - MARGIN) / 2., t.group_end, 4.)))
             .children(t.progress.map(|bar| progress_line(bar, ("tab-progress", t.id), 7.0, c)))
             .into_any_element()
     }
@@ -602,18 +592,17 @@ impl Workspace {
 }
 
 /// A stretch of a host group's line beside one of its tabs, `offset` px
-/// left of the tab (`border` is the tab's border width, which absolute
-/// positions start inside of). It bridges the `gap` to the next row, and
-/// ends with the group.
-fn group_line(color: gpui::Hsla, offset: f32, border: f32, end: bool, gap: f32) -> impl IntoElement {
+/// left of the tab. It bridges the `gap` to the next row, and ends with
+/// the group.
+fn group_line(color: gpui::Hsla, offset: f32, end: bool, gap: f32) -> impl IntoElement {
     div()
         .absolute()
-        .left(px(-offset - border - 1.))
-        .top(px(-border))
+        .left(px(-offset - 1.))
+        .top_0()
         .w(px(2.))
         .bg(color)
         .when(end, |d| d.bottom(px(10.)).rounded_b(px(1.)))
-        .when(!end, |d| d.bottom(px(-gap - border)))
+        .when(!end, |d| d.bottom(px(-gap)))
 }
 
 /// An agent's state on a rail tile's corner: its icon on a disc in the
