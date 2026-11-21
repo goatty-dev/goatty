@@ -47,7 +47,7 @@ use goatty_term::TermSize;
 use crate::app::Initial;
 use crate::cli::Cli;
 use crate::connect::ConnectPlan;
-use crate::session::{Session, Spawner};
+use crate::session::{AttachMode, Session, Spawner};
 use crate::workspace::saved::Startup;
 
 pub const CLIENT: &str = concat!("goatty ", env!("CARGO_PKG_VERSION"));
@@ -108,7 +108,23 @@ fn main() -> Result<()> {
 
     let mode = cli.attach_mode(on_launch == OnLaunch::New);
     let open_settings = cli.settings.clone();
-    let initial = match cli.endpoint()? {
+    let endpoint = cli.endpoint()?;
+    // Plain `goatty`: every window of the last run, with its tabs on every
+    // host (#252). `--ssh`, `--new` and `--attach` ask for something else.
+    let mut reopen = if on_launch == OnLaunch::Reattach && mode == AttachMode::Auto && matches!(endpoint, Some(Endpoint::Local)) {
+        workspace::reopen::take_for_launch()
+    } else {
+        if on_launch != OnLaunch::Reattach {
+            workspace::reopen::forget_dead();
+        }
+        Vec::new()
+    };
+    if !reopen.is_empty() {
+        let first = Initial::Reopen(reopen.remove(0), None);
+        app::run(first, reopen.into_iter().map(|r| Initial::Reopen(r, None)).collect(), open_settings);
+        return Ok(());
+    }
+    let initial = match endpoint {
         None => {
             // No daemon: this process owns the shell and the host settings.
             // Initial size is a guess; the terminal resizes on first layout.
@@ -134,6 +150,6 @@ fn main() -> Result<()> {
             Initial::Connect(ConnectPlan { endpoint, mode, open_settings: None, plain, conn: None })
         }
     };
-    app::run(initial, open_settings);
+    app::run(initial, Vec::new(), open_settings);
     Ok(())
 }

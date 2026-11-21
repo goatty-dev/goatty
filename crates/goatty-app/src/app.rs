@@ -19,12 +19,18 @@ pub enum Initial {
     /// A goattyd to connect to first: the window opens at once, its tab
     /// shows the connect screen meanwhile (`crate::connect`, #37).
     Connect(ConnectPlan),
+    /// A window from the last run, with its tabs on every host (#252).
+    /// The second field: `--settings[=PAGE]`, opened once the active tab's
+    /// host is there.
+    Reopen(crate::workspace::reopen::WindowRecord, Option<String>),
 }
 
-pub fn run(initial: Initial, open_settings: Option<String>) {
+/// `more`: further windows to open (the other windows of the last run).
+pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) {
     gpui_platform::application().with_assets(crate::ui::icons::Assets).run(move |cx: &mut App| {
         AppSettings::init(cx);
         crate::agent::notify::init(cx);
+        crate::workspace::reopen::init(cx);
         cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
         cx.on_action(|_: &ReloadShells, cx| reload_shells(cx));
         command_palette::register_builtins(cx);
@@ -37,10 +43,14 @@ pub fn run(initial: Initial, open_settings: Option<String>) {
         crate::welcome::check_first_run(cx);
         cx.background_executor().spawn(async { crate::terminal::cleanup_stale_remote_cache() }).detach();
         open_terminal_window(cx, initial, open_settings);
+        for initial in more {
+            open_terminal_window(cx, initial, None);
+        }
         crate::welcome::open_if_first_run(cx);
         // Quit with the last window (the settings window may outlive the
         // terminal window briefly, or close first).
-        cx.on_window_closed(|cx, _| {
+        cx.on_window_closed(|cx, id| {
+            crate::workspace::reopen::window_closed(cx, id);
             if cx.windows().is_empty() {
                 cx.quit();
             }
@@ -60,10 +70,18 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
             plan.open_settings = plan.open_settings.or(open_settings);
             (Initial::Connect(plan), None)
         }
+        Initial::Reopen(record, settings) => (Initial::Reopen(record, settings.or(open_settings)), None),
         ready => (ready, open_settings),
     };
-    // A restored layout resizes the window when it arrives (`Workspace`).
-    let (w, h) = SavedWindow::DEFAULT;
+    // A restored layout resizes the window when it arrives (`Workspace`);
+    // a reopened window knows its size right away.
+    if let Initial::Reopen(record, _) = &initial {
+        crate::workspace::reopen::reserve(cx, record.clone());
+    }
+    let (w, h) = match &initial {
+        Initial::Reopen(r, _) => r.window.map_or(SavedWindow::DEFAULT, |w| w.size()),
+        _ => SavedWindow::DEFAULT,
+    };
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
     let opened = cx.open_window(
         WindowOptions {

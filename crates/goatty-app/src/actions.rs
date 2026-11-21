@@ -116,6 +116,11 @@ actions!(
         DetachOtherTabs,
         /// Detach every tab on the active tab's host without ending their shells.
         DetachHost,
+        /// Bring back what was detached last on the active tab's host: its
+        /// tabs (a detached host or window), else the newest detached session.
+        ReattachDetached,
+        /// A new window with a new shell on the active tab's host.
+        NewWindow,
         /// Fold the vertical tab sidebar into a rail of icons, or unfold it.
         ToggleTabSidebar,
         /// Switch `tabs.style` between vertical and horizontal.
@@ -221,6 +226,8 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "close_other_tabs" => Box::new(CloseOtherTabs),
         "detach_other_tabs" => Box::new(DetachOtherTabs),
         "detach_host" => Box::new(DetachHost),
+        "reattach_detached" => Box::new(ReattachDetached),
+        "new_window" => Box::new(NewWindow),
         "toggle_tab_sidebar" => Box::new(ToggleTabSidebar),
         "toggle_vertical_tabs" => Box::new(ToggleVerticalTabs),
         "next_host" => Box::new(NextHost),
