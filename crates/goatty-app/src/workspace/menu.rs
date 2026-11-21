@@ -385,6 +385,13 @@ impl Workspace {
             entries.push(Item::action("Show every host", "show_all_hosts", cx).into());
         }
         entries.push(Entry::Separator);
+        if !g.local {
+            // The Hosts page lists SSH hosts (plain ones too), not tailnet ones.
+            let host = self.tabs.get(g.tabs[0]).and_then(|t| t.host.as_ref());
+            let ssh = matches!(host, Some(crate::session::Spawner::Plain { .. }))
+                || matches!(host.and_then(super::host_ref_of), Some(crate::hosts::HostRef::Ssh(_)));
+            entries.push(Self::group_color_menu(&g.label, ssh, cx).into());
+        }
         entries.push(
             Item::new(
                 "Settings for this host",
@@ -444,6 +451,47 @@ impl Workspace {
         );
         let owner = MenuOwner::Tab(g.ids[0]);
         self.open_menu(owner, entries, at, false, window, cx);
+    }
+
+    /// "Color" in a host group's menu (#257): the theme's colors by name,
+    /// back to automatic, and the Hosts page for any other color.
+    fn group_color_menu(host: &str, ssh: bool, cx: &gpui::App) -> Item {
+        use goatty_config::HostColor;
+        let chosen = cx.global::<AppSettings>().client.tabs.host_color(host);
+        let set = |color: Option<HostColor>| {
+            let host = host.to_string();
+            move |_: &mut Window, cx: &mut gpui::App| {
+                AppSettings::update(cx, |s| s.tabs.set_host_color(&host, color));
+            }
+        };
+        let mut entries: Vec<Entry> = HostColor::PALETTE
+            .iter()
+            .map(|&(name, ansi)| {
+                let mut label = name.to_string();
+                label[..1].make_ascii_uppercase();
+                let mut item = Item::new(label, set(Some(HostColor::Ansi(ansi))));
+                if chosen == Some(HostColor::Ansi(ansi)) {
+                    item = item.icon(Icon::Check);
+                }
+                item.into()
+            })
+            .collect();
+        entries.push(Entry::Separator);
+        let mut automatic = Item::new("Automatic", set(None));
+        if chosen.is_none() {
+            automatic = automatic.icon(Icon::Check);
+        }
+        entries.push(automatic.into());
+        let mut custom = Item::new("Custom color…", {
+            let host = host.to_string();
+            move |_: &mut Window, cx: &mut gpui::App| crate::settings_window::open_host_color(cx, &host)
+        });
+        if matches!(chosen, Some(HostColor::Custom(_))) {
+            custom = custom.icon(Icon::Check);
+        }
+        custom = custom.disabled((!ssh).then_some("Only for SSH hosts"));
+        entries.push(custom.into());
+        Item::submenu("Color", entries).icon(Icon::Palette)
     }
 
     // ---- the new-tab button's menu -------------------------------------------------

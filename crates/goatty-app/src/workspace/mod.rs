@@ -49,7 +49,7 @@
 mod arrange;
 mod chrome;
 mod gestures;
-mod groups;
+pub(crate) mod groups;
 pub(crate) mod icons;
 mod layout;
 mod menu;

@@ -16,11 +16,14 @@
 //!   going to a tab in a folded group (a click, Alt+number, the palette)
 //!   unfolds it. The next/previous tab keys and the mouse wheel skip
 //!   folded tabs. "Show only this host" folds every other group.
-//! - **Colors**: a host's color comes from its name ([`color_slot`]), so it's
-//!   the same in every window and every run. This computer has no color.
+//! - **Colors**: a host's color is the one chosen for it (`tabs.host_colors`,
+//!   from the Hosts page or the label's menu, #257), else one of the theme's
+//!   colors picked from its name, so it's the same in every window and every
+//!   run ([`host_color`]). This computer has no color.
 //! - **Switching hosts**: the next/previous host actions go to the tab
 //!   that was last active in that host's group.
 
+use goatty_config::HostColor;
 use gpui::{Context, Hsla, SharedString, Window};
 
 use super::tab_bar::TabView;
@@ -91,9 +94,19 @@ pub(super) enum StripItem {
     Tab(TabView),
 }
 
-/// The theme's ANSI colors groups take, by [`color_slot`]: blue, magenta,
-/// cyan, green, yellow, red.
-const GROUP_COLORS: [usize; 6] = [4, 5, 6, 2, 3, 1];
+/// The color of the tab group of the host named `name`: its chosen color,
+/// else the automatic one.
+pub(crate) fn host_rgb(name: &str, settings: &AppSettings) -> goatty_config::Color {
+    match settings.client.tabs.host_color(name).unwrap_or_else(|| HostColor::automatic(name)) {
+        HostColor::Ansi(i) => settings.colors.ansi[usize::from(i) % 16],
+        HostColor::Custom(c) => c,
+    }
+}
+
+/// [`host_rgb`] as the tab strip draws it.
+pub(crate) fn host_color(name: &str, settings: &AppSettings) -> Hsla {
+    gpui::rgb(host_rgb(name, settings).0).into()
+}
 
 impl Workspace {
     pub(super) fn host_key(&self, tab: &Tab) -> HostKey {
@@ -161,8 +174,7 @@ impl Workspace {
                 // Quiet, like its chip.
                 crate::ui::style::Ui::get(cx).muted.opacity(0.5)
             } else {
-                let ansi = GROUP_COLORS[color_slot(&label)];
-                gpui::rgb(settings.colors.ansi[ansi].0).into()
+                host_color(&label, settings)
             };
             out.push(Group {
                 folded: self.folded.contains(&key),
@@ -359,24 +371,6 @@ pub(super) fn group_order<K: PartialEq>(keys: &[K]) -> Vec<usize> {
     order
 }
 
-/// Which of the group colors a host gets: from its name (FNV-1a), so it's
-/// the same everywhere.
-pub(super) fn color_slot(name: &str) -> usize {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in name.bytes() {
-        h ^= u32::from(b);
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    // FNV's low bits barely change between similar names: mix them
-    // (MurmurHash3's finalizer).
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x85eb_ca6b);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xc2b2_ae35);
-    h ^= h >> 16;
-    h as usize % GROUP_COLORS.len()
-}
-
 /// The next (`forward`) or previous tab after `from` that isn't `hidden`,
 /// coming round at the ends; `None` when there is no other one.
 pub(super) fn cycle_visible(from: usize, forward: bool, hidden: &[bool]) -> Option<usize> {
@@ -413,15 +407,6 @@ mod tests {
         assert_eq!(group_order::<&str>(&[]), Vec::<usize>::new());
         // A tab of b dragged in front of a's first tab: b's group goes first.
         assert_eq!(group_order(&["b", "a", "a", "b"]), [0, 3, 1, 2]);
-    }
-
-    #[test]
-    fn colors_depend_on_the_name_only() {
-        assert_eq!(color_slot("prod"), color_slot("prod"));
-        assert!(color_slot("prod") < GROUP_COLORS.len());
-        let slots: std::collections::HashSet<usize> =
-            ["prod", "staging", "pi", "nas", "build", "dev"].iter().map(|n| color_slot(n)).collect();
-        assert!(slots.len() > 2, "names spread over the colors: {slots:?}");
     }
 
     #[test]

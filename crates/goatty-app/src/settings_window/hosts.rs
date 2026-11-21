@@ -3,7 +3,7 @@
 //! `~/.ssh/config` are client settings (`ssh` in `settings.json`), saved
 //! right away.
 
-use goatty_config::{Issue, LocalEcho, OpenIn, SshHost, SyncMode, ssh_host_problem};
+use goatty_config::{Color, HostColor, Issue, LocalEcho, OpenIn, SshHost, SyncMode, ssh_host_problem};
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, div, prelude::*, px,
 };
@@ -12,8 +12,9 @@ use super::SettingsWindow;
 use super::kit::{self, card, divider, field, opt, row, section};
 use crate::hosts::{self, HostEntry, HostList};
 use crate::settings::AppSettings;
+use crate::ui::color_picker::{ColorPicker, ColorPickerEvent};
 use crate::ui::controls::{ButtonKind, Tone, banner, button_with, icon_button, segmented, toggle, tooltip};
-use crate::ui::focus;
+use crate::ui::focus::{self, Ring, Scroller};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
 use crate::ui::text_input::{TextInput, TextInputEvent};
@@ -23,6 +24,12 @@ pub struct HostsPage {
     name: Entity<TextInput>,
     /// Why the last Add didn't go through.
     error: Option<String>,
+    /// Picks a custom color for the host in `editing` (#257).
+    picker: Entity<ColorPicker>,
+    /// The host whose color is being edited, under its row.
+    editing: Option<String>,
+    /// A custom color shown but not saved yet (the picker is being dragged).
+    pending: Option<(String, Color)>,
     _subs: Vec<Subscription>,
 }
 
@@ -41,7 +48,14 @@ impl HostsPage {
                 TextInputEvent::Submitted(_) => view.add_host(cx),
             }));
         }
-        Self { host, name, error: None, _subs: subs }
+        let picker = cx.new(|cx| ColorPicker::new(Color(0), cx));
+        subs.push(cx.subscribe(&picker, |view, _, ev: &ColorPickerEvent, cx| match *ev {
+            ColorPickerEvent::Changed(c) => view.host_color_changed(c, cx),
+            ColorPickerEvent::Committed(_) => view.flush_host_color(cx),
+        }));
+        // Closing the window right after a change must not lose it.
+        subs.push(cx.on_release(|view, cx| view.flush_host_color(cx)));
+        Self { host, name, error: None, picker, editing: None, pending: None, _subs: subs }
     }
 }
 
@@ -72,6 +86,130 @@ impl SettingsWindow {
         }
         self.hosts.error = None;
         cx.notify();
+    }
+
+    /// The color the tab group of `host` has now.
+    fn host_rgb(host: &str, cx: &App) -> Color {
+        crate::workspace::groups::host_rgb(host, cx.global::<AppSettings>())
+    }
+
+    /// Show or hide the color editor under `host`'s row.
+    fn toggle_host_color(&mut self, host: &str, cx: &mut Context<'_, Self>) {
+        self.flush_host_color(cx);
+        if self.hosts.editing.as_deref() == Some(host) {
+            self.hosts.editing = None;
+        } else {
+            self.edit_host_color(host, cx);
+        }
+        cx.notify();
+    }
+
+    /// Open the color editor under `host`'s row, at its current color.
+    pub(super) fn edit_host_color(&mut self, host: &str, cx: &mut Context<'_, Self>) {
+        self.flush_host_color(cx);
+        let color = Self::host_rgb(host, cx);
+        self.hosts.editing = Some(host.to_string());
+        self.hosts.picker.update(cx, |p, cx| p.open(color, cx));
+        cx.notify();
+    }
+
+    /// A palette color for `host`, or `None`: automatic again.
+    fn set_host_color(&mut self, host: &str, color: Option<HostColor>, cx: &mut Context<'_, Self>) {
+        self.hosts.pending = None;
+        AppSettings::update(cx, |s| s.tabs.set_host_color(host, color));
+        let shown = Self::host_rgb(host, cx);
+        self.hosts.picker.update(cx, |p, cx| p.open(shown, cx));
+        cx.notify();
+    }
+
+    /// The picker moved to `color`: show it live, and save it once it settles.
+    fn host_color_changed(&mut self, color: Color, cx: &mut Context<'_, Self>) {
+        let Some(host) = self.hosts.editing.clone() else { return };
+        AppSettings::preview(cx, |s| s.tabs.set_host_color(&host, Some(HostColor::Custom(color))));
+        self.hosts.pending = Some((host, color));
+        cx.notify();
+    }
+
+    /// Write a live color change to settings.json.
+    fn flush_host_color(&mut self, cx: &mut App) {
+        if let Some((host, color)) = self.hosts.pending.take() {
+            AppSettings::update(cx, |s| s.tabs.set_host_color(&host, Some(HostColor::Custom(color))));
+        }
+    }
+
+    /// The round button that shows a host's color and opens its editor.
+    fn host_color_button(&self, ui: Ui, e: &HostEntry, cx: &Context<'_, Self>) -> AnyElement {
+        let host = e.host.clone();
+        let open = self.hosts.editing.as_deref() == Some(e.host.as_str());
+        let color = crate::workspace::groups::host_color(&e.host, cx.global::<AppSettings>());
+        let id: gpui::ElementId = SharedString::from(format!("host-color-{}", hash(&e.host))).into();
+        let el = div()
+            .id(id.clone())
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!("Color of {}'s tabs", e.label)))
+            .flex_shrink_0()
+            .size(px(22.))
+            .rounded_full()
+            .border_2()
+            .border_color(if open { ui.accent } else { ui.divider })
+            .bg(color)
+            .cursor_pointer()
+            .tooltip(tooltip(format!("Color of {}'s tabs", e.label)))
+            .on_click(cx.listener(move |v, _, _, cx| v.toggle_host_color(&host, cx)));
+        focus::tab(el, &id, ui, Ring::Outer, Scroller::Page).into_any_element()
+    }
+
+    /// Under a host's row while its color is edited: the theme's colors, back
+    /// to automatic, and the picker for any other color.
+    fn host_color_editor(&self, ui: Ui, host: &str, cx: &Context<'_, Self>) -> AnyElement {
+        let app = cx.global::<AppSettings>();
+        let chosen = app.client.tabs.host_color(host);
+        let key = hash(host);
+        let swatch = |i: usize, name: &'static str, ansi: u8| {
+            let (h, on) = (host.to_string(), chosen == Some(HostColor::Ansi(ansi)));
+            let id: gpui::ElementId = SharedString::from(format!("host-swatch-{key}-{i}")).into();
+            let el = div()
+                .id(id.clone())
+                .role(gpui::Role::Button)
+                .aria_label(SharedString::from(format!("Use {name}")))
+                .size(px(26.))
+                .rounded_full()
+                .border_2()
+                .border_color(if on { ui.accent } else { ui.divider })
+                .bg(gpui::rgb(app.colors.ansi[usize::from(ansi) % 16].0))
+                .cursor_pointer()
+                .tooltip(tooltip(name))
+                .on_click(cx.listener(move |v, _, _, cx| v.set_host_color(&h, Some(HostColor::Ansi(ansi)), cx)));
+            focus::tab(el, &id, ui, Ring::Outer, Scroller::Page)
+        };
+        let automatic = {
+            let h = host.to_string();
+            button_with(
+                ("host-color-auto", key),
+                None,
+                "Automatic",
+                if chosen.is_none() { ButtonKind::Primary } else { ButtonKind::Normal },
+                ui,
+                self.act(cx, move |v, cx| v.set_host_color(&h, None, cx)),
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .px(px(16.))
+            .pb(px(14.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .flex_wrap()
+                    .children(HostColor::PALETTE.iter().enumerate().map(|(i, &(name, ansi))| swatch(i, name, ansi)))
+                    .child(automatic),
+            )
+            .child(self.hosts.picker.clone())
+            .into_any_element()
     }
 
     /// The choices for bringing the shell setup to hosts; `default` adds
@@ -138,7 +276,8 @@ impl SettingsWindow {
                 hosts::connect(cx, &host)
             })
         };
-        div()
+        let color_button = self.host_color_button(ui, e, cx);
+        let row = div()
             .id(gid.clone())
             .group(gid.clone())
             .flex()
@@ -178,15 +317,30 @@ impl SettingsWindow {
                         )
                     }),
             )
+            .child(color_button)
             .children(sync_select)
             .child(plain_toggle)
             .child(connect)
             .when(!discovered, |d| {
-                d.child(icon_button(("host-remove", hash(&e.host)), Icon::Trash, "Remove from the list", ui, move |_, cx: &mut App| {
-                    AppSettings::update(cx, |s| s.ssh.hosts.retain(|h| h.host != host));
-                }))
-            })
-            .into_any_element()
+                d.child(icon_button(
+                    ("host-remove", hash(&e.host)),
+                    Icon::Trash,
+                    "Remove from the list",
+                    ui,
+                    self.act(cx, move |v, cx| {
+                        if v.hosts.editing.as_deref() == Some(host.as_str()) {
+                            v.hosts.editing = None;
+                        }
+                        v.hosts.pending = v.hosts.pending.take().filter(|(h, _)| *h != host);
+                        AppSettings::update(cx, |s| {
+                            s.ssh.hosts.retain(|h| h.host != host);
+                            s.tabs.set_host_color(&host, None);
+                        });
+                    }),
+                ))
+            });
+        let editor = (self.hosts.editing.as_deref() == Some(e.host.as_str())).then(|| self.host_color_editor(ui, &e.host, cx));
+        div().flex().flex_col().child(row).children(editor).into_any_element()
     }
 
     fn host_list(&self, ui: Ui, entries: &[&HostEntry], cx: &Context<'_, Self>) -> gpui::Div {

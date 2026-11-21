@@ -112,7 +112,7 @@ pub const INDEX: &[Entry] = &[
     e(Page::Workspace, "Notifications", "A program asks to notify you", "osc 9 osc 777 notify-send program notification")
         .keys(&["notifications.programs"]),
     // Entries goatty dropped from `ssh.hosts` show in a banner over the list.
-    e(Page::Hosts, "Your hosts", "Your hosts", "ssh add host list user server").keys(&["ssh.hosts"]),
+    e(Page::Hosts, "Your hosts", "Your hosts", "ssh add host list user server color tab group").keys(&["ssh.hosts", "tabs.host_colors"]),
     e(Page::Hosts, "Connecting", "Open hosts in", "ssh window tab remote").keys(&["ssh.open_in"]),
     e(Page::Hosts, "Connecting", "Show typing before the host echoes it", "local echo prediction latency lag slow mosh remote")
         .keys(&["ssh.local_echo"]),
