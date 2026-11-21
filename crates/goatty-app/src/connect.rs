@@ -325,6 +325,15 @@ fn restart_local(conn: Option<Arc<Connection>>) -> Result<(Arc<Connection>, bool
 /// when that keeps its sessions or it holds none, else ask
 /// ([`LocalProblem::Outdated`]). `restarted` says how that went.
 fn check_local(conn: Arc<Connection>, restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
+    // One check at a time: windows reopened together mustn't restart the
+    // daemon twice. The second one then finds the restarted daemon current.
+    static CHECKING: Mutex<()> = Mutex::new(());
+    let _one = CHECKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let conn = match crate::hosts::pool::live(&Endpoint::Local) {
+        // Restarted by the check before this one.
+        Some(live) if !Arc::ptr_eq(&live, &conn) => live,
+        _ => conn,
+    };
     let Some(outdated) = local::outdated(conn.daemon_pid()) else { return Ok(conn) };
     // Kept running on purpose, or a restart was refused: until it or the
     // installed build changes.

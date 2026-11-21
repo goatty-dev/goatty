@@ -950,6 +950,12 @@ impl Connection {
         }
     }
 
+    /// Whether a pane on this connection shows `session` (attaching it
+    /// again would take that pane's place).
+    pub fn shows(&self, session: SessionId) -> bool {
+        self.shared.panes.lock().contains_key(&session)
+    }
+
     /// Whether the daemon lists free layouts and claims them by id (v16).
     pub fn supports_layout_list(&self) -> bool {
         self.protocol_version() >= LAYOUT_LIST_SINCE
@@ -1017,6 +1023,12 @@ impl Connection {
     pub fn release_claimed_layout(&self, info: LayoutInfo) {
         let mut claimed = self.shared.claimed_layouts.lock();
         let cur = self.shared.link_gen.load(Ordering::Acquire);
+        if claimed.gens.get(&info.id) == Some(&cur) && self.is_connected() && self.supports_layout_list() {
+            // Free on the daemon for any window again.
+            claimed.gens.remove(&info.id);
+            self.shared.send(&ClientMsg::ReleaseLayout { id: info.id });
+            return;
+        }
         if claimed.gens.remove(&info.id) == Some(cur) && self.is_connected() {
             claimed.unclaimed.push_back((cur, info));
         }
@@ -2026,7 +2038,7 @@ mod tests {
         let layout = LayoutInfo { id: 0x42, sessions: vec![1, 2], json: r#"{"version":1}"#.into(), saved_unix: 10 };
         let server_layout = layout.clone();
         let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+        let (conn, reader_h, server_h) = mock_connection_v(15, move |mut r, mut w| {
             // Answer only ONE ClaimLayout from the wire: the retry must come
             // from the stashed layout on the live connection.
             match read_msg::<_, ClientMsg>(&mut r).unwrap() {

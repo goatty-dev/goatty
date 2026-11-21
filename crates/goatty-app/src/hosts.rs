@@ -68,42 +68,93 @@ pub mod pool {
         live.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade())
     }
 
-    /// Opens in progress, per key: a second caller waits for the first
-    /// (reopened windows connect to the same host at once) instead of
-    /// logging in twice.
-    static OPENING: Mutex<Vec<(String, Arc<Mutex<()>>)>> = Mutex::new(Vec::new());
+    /// One connection attempt in progress, shared by everyone asking for
+    /// that host meanwhile (reopened windows connect to the same host at
+    /// once): one login, one askpass prompt, one timeout.
+    #[derive(Default)]
+    struct Flight {
+        /// Held while connecting; then the outcome for those who waited.
+        outcome: Mutex<Option<std::result::Result<Arc<Connection>, Failed>>>,
+    }
+
+    /// A failed attempt, for each caller that waited for it.
+    #[derive(Clone)]
+    enum Failed {
+        /// What the connect screen offers to fix (install, plain SSH).
+        Remote(goatty_client::RemoteProblem),
+        Other(String),
+    }
+
+    impl Failed {
+        fn of(e: &anyhow::Error) -> Self {
+            match e.downcast_ref::<goatty_client::RemoteProblem>() {
+                Some(p) => Failed::Remote(p.clone()),
+                None => Failed::Other(format!("{e:#}")),
+            }
+        }
+
+        fn error(self) -> anyhow::Error {
+            match self {
+                Failed::Remote(p) => p.into(),
+                Failed::Other(msg) => anyhow::anyhow!(msg),
+            }
+        }
+    }
+
+    /// The flights in progress, by key, with how many callers are in each.
+    static OPENING: Mutex<Vec<(String, Arc<Flight>, usize)>> = Mutex::new(Vec::new());
 
     /// The open connection to `endpoint`, else a new one. Blocks (ssh can
     /// take seconds): call it off the UI thread. Concurrent calls for one
-    /// host share one connection attempt.
+    /// host share one attempt, failures included.
     pub fn open(endpoint: Endpoint) -> Result<Arc<Connection>> {
         if let Some(conn) = live(&endpoint) {
             return Ok(conn);
         }
         let Some(k) = key(&endpoint) else { return Connection::open(endpoint, crate::CLIENT) };
-        let gate = {
+        let flight = {
             let mut opening = OPENING.lock();
-            match opening.iter().find(|(o, _)| *o == k) {
-                Some((_, g)) => g.clone(),
+            match opening.iter_mut().find(|(o, _, _)| *o == k) {
+                Some((_, f, users)) => {
+                    *users += 1;
+                    f.clone()
+                }
                 None => {
-                    let g = Arc::new(Mutex::new(()));
-                    opening.push((k.clone(), g.clone()));
-                    g
+                    let f = Arc::new(Flight::default());
+                    opening.push((k.clone(), f.clone(), 1));
+                    f
                 }
             }
         };
-        let result = {
-            let _turn = gate.lock();
-            // The one before us may have connected meanwhile.
-            match live(&endpoint) {
-                Some(conn) => Ok(conn),
-                None => Connection::open(endpoint, crate::CLIENT).inspect(add),
+        // Leaves the flight (the last one out removes it), also on a panic.
+        struct Leave<'a>(&'a str, &'a Arc<Flight>);
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                let mut opening = OPENING.lock();
+                if let Some(pos) = opening.iter().position(|(o, f, _)| o == self.0 && Arc::ptr_eq(f, self.1)) {
+                    opening[pos].2 -= 1;
+                    if opening[pos].2 == 0 {
+                        opening.remove(pos);
+                    }
+                }
             }
-        };
-        let mut opening = OPENING.lock();
-        if Arc::strong_count(&gate) <= 2 {
-            opening.retain(|(o, g)| *o != k || !Arc::ptr_eq(g, &gate));
         }
+        let _leave = Leave(&k, &flight);
+        let mut outcome = flight.outcome.lock();
+        match &*outcome {
+            // The attempt we waited for.
+            Some(Ok(conn)) => return Ok(conn.clone()),
+            Some(Err(failed)) => return Err(failed.clone().error()),
+            _ => {}
+        }
+        if let Some(conn) = live(&endpoint) {
+            return Ok(conn);
+        }
+        let result = Connection::open(endpoint, crate::CLIENT).inspect(add);
+        *outcome = Some(match &result {
+            Ok(conn) => Ok(conn.clone()),
+            Err(e) => Err(Failed::of(e)),
+        });
         result
     }
 

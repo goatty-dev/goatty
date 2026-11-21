@@ -129,6 +129,13 @@ impl OpenWindows {
     /// keeps other goatty processes from doing the same meanwhile.
     fn edit<T>(path: &Path, f: impl FnOnce(&mut Self) -> T) -> std::io::Result<T> {
         let _lock = FileLock::new(path)?;
+        if let Some(v) =
+            std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|j| j["version"].as_u64())
+            && v > u64::from(VERSION)
+        {
+            // A newer goatty's file: leave it alone.
+            return Err(std::io::Error::other(format!("{} has format {v}, newer than this goatty's", path.display())));
+        }
         let mut file = Self::load(path);
         let out = f(&mut file);
         file.version = VERSION;
@@ -319,6 +326,14 @@ pub fn window_opened(cx: &mut App, id: WindowId) {
     if !w.open.contains(&id) {
         w.open.push(id);
     }
+    // A window that closed as the last one (the settings window kept goatty
+    // running) isn't the last one any more.
+    let before = w.records.len();
+    let open = w.open.clone();
+    w.records.retain(|id, _| open.contains(id));
+    if w.records.len() != before {
+        w.write();
+    }
 }
 
 /// Window `id` has tabs on these hosts now (`None`: none it could reopen).
@@ -411,6 +426,9 @@ mod tests {
         assert_eq!(OpenWindows::load(&path), OpenWindows::default());
         std::fs::write(&path, r#"{"version":99,"windows":[{"pid":1,"key":1,"hosts":[{"host":{"kind":"local"},"layout":1}]}]}"#).unwrap();
         assert_eq!(OpenWindows::load(&path), OpenWindows::default());
+        // ... and not overwritten.
+        assert!(OpenWindows::edit(&path, |f| f.replace_own(1, [])).is_err());
+        assert!(std::fs::read_to_string(&path).unwrap().contains(r#""version":99"#));
     }
 
     #[test]

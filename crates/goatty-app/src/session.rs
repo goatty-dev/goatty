@@ -431,6 +431,11 @@ impl Session {
             AttachMode::Id(id) => Some(id),
             AttachMode::Auto => conn.list_sessions()?.iter().filter(|s| s.attached == 0).map(|s| s.id).max(),
         };
+        if let Some(id) = target.filter(|&id| conn.shows(id)) {
+            // One pane per session on a connection: another one would take
+            // the open pane's output.
+            anyhow::bail!("session {id} is open in a goatty window already");
+        }
         let (host_label, ssh_host) = Self::daemon_host_meta(&conn);
         let (s, sink) = Self::new_daemon(&conn, size, target.unwrap_or(0), host_label, ssh_host);
         let id = match target {

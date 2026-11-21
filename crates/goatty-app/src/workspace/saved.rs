@@ -279,11 +279,15 @@ pub fn restore(conn: &Arc<Connection>, size: TermSize, claim: Claim) -> Result<O
     Ok(Some(Restored { id: info.id, claimed: true, tabs, active, sessions, window }))
 }
 
-/// Attach `ids`, skipping sessions that ended meanwhile. When the link
-/// drops or times out midway, the ones that did attach are detached again
-/// and the error returned: no truncated window that overwrites the saved
-/// layout.
+/// Attach `ids`, skipping sessions that ended meanwhile and ones a pane of
+/// this goatty shows already on `conn` (one connection has one pane per
+/// session: attaching again would leave that pane without output). When
+/// the link drops or times out midway, the ones that did attach are
+/// detached again and the error returned: no truncated window that
+/// overwrites the saved layout.
 fn attach_all(conn: &Arc<Connection>, size: TermSize, ids: &[SessionId]) -> Result<HashMap<SessionId, Arc<Session>>> {
+    let ids: Vec<SessionId> = ids.iter().copied().filter(|&id| !conn.shows(id)).collect();
+    let ids = &ids[..];
     let mut sessions = HashMap::with_capacity(ids.len());
     let mut link_err = None;
     for (id, res) in Session::daemon_attach_many(conn, size, ids) {
@@ -344,9 +348,11 @@ pub fn live_layouts(layouts: Vec<goatty_proto::LayoutInfo>, sessions: &[goatty_p
         .collect()
 }
 
-/// Does saved layout `info` hold a plain SSH tab to `host`?
+/// Does saved layout `info` hold a plain SSH tab to `host` that still runs?
 pub fn has_plain_tab(info: &goatty_proto::LayoutInfo, host: &str) -> bool {
-    serde_json::from_str::<SavedWorkspace>(&info.json).is_ok_and(|s| s.tabs.iter().any(|t| t.plain.as_deref() == Some(host)))
+    let Ok(saved) = serde_json::from_str::<SavedWorkspace>(&info.json) else { return false };
+    let alive: HashSet<SessionId> = info.sessions.iter().copied().collect();
+    prune(saved, &alive).is_some_and(|(tabs, _)| tabs.iter().any(|t| t.plain.as_deref() == Some(host)))
 }
 
 /// The detached sessions on `conn` that no saved layout shows (those come

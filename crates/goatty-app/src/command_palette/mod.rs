@@ -1107,6 +1107,7 @@ impl CommandPalette {
     fn show_sessions(&mut self, host: HostRef, cx: &mut Context<'_, Self>) {
         let now = unix_now();
         self.show_scope(Scope::Sessions(host.clone()), cx);
+        self.layouts.clear();
         self.sessions = session_commands(Vec::new(), &[], &host, now);
         let endpoint = host.endpoint();
         let label = if hosts::pool::live(&endpoint).is_some() {
@@ -1189,7 +1190,11 @@ impl CommandPalette {
         let (Some((key, ids)), Some(conn)) = (self.endable_at(ix), self.conn.clone()) else { return };
         let title = self.commands[self.hits[ix].index].title.clone();
         // A saved layout's entry: "Restore 3 tabs" → "3 tabs".
-        let what = title.strip_prefix("Restore ").map_or_else(|| format!("“{title}”"), |t| format!("those {t}"));
+        let what = match title.strip_prefix("Restore ") {
+            None => format!("“{title}”"),
+            Some(t) if t.starts_with("1 tab") => "that tab".to_string(),
+            Some(t) => format!("those {}", t.split(" (").next().unwrap_or(t)),
+        };
         if self.selected != ix {
             self.select(ix, cx);
         }
@@ -1213,14 +1218,18 @@ impl CommandPalette {
                 .background_executor()
                 .spawn(async move {
                     for &id in &ids {
-                        conn.kill(id)?;
+                        // One that exited meanwhile doesn't stop the others.
+                        if let Err(e) = conn.kill(id) {
+                            log::info!("ending session {id}: {e:#}");
+                        }
                     }
                     // They're gone once the shells exited; list what's left then.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                     loop {
                         let list = conn.list_sessions()?;
                         if !list.iter().any(|s| ids.contains(&s.id)) || std::time::Instant::now() > deadline {
-                            return anyhow::Ok(list);
+                            let layouts = conn.list_layouts().unwrap_or_default();
+                            return anyhow::Ok((crate::workspace::saved::live_layouts(layouts, &list), list));
                         }
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
@@ -1231,10 +1240,11 @@ impl CommandPalette {
                     return;
                 }
                 match result {
-                    Ok(list) => {
-                        this.status = Some((format!("Ended {what}").into(), false));
-                        this.layouts.iter_mut().for_each(|l| l.sessions.retain(|s| !ended.contains(s)));
-                        this.layouts.retain(|l| !l.sessions.is_empty());
+                    Ok((layouts, list)) => {
+                        let gone = !list.iter().any(|s| ended.contains(&s.id));
+                        let msg = if gone { format!("Ended {what}") } else { format!("Asked {what} to end; some are still exiting") };
+                        this.status = Some((msg.into(), false));
+                        this.layouts = layouts;
                         this.sessions = session_commands(list, &this.layouts, &host, unix_now());
                     }
                     Err(e) => {
