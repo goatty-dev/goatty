@@ -146,6 +146,68 @@ impl Launcher {
         launch.managed = true;
         launch
     }
+
+    /// Launch a direct program (`argv`, no shell) using this host's managed
+    /// `PATH` (imported folders, daemon `PATH`, `shell.path`, and goatty
+    /// plugin binaries in `bin/`), imported shell variables, and active
+    /// plugins' environment/config variables (#241).
+    pub fn launch_command(&self, host: &Effective<HostSettings>, mut argv: Vec<String>, cwd: Option<&str>) -> Result<Launch> {
+        anyhow::ensure!(!argv.is_empty(), "nothing to run");
+        let raw_program = argv.remove(0);
+        let mut env_map = std::collections::BTreeMap::<String, String>::new();
+        let (path, has_dirs) = match &self.dirs {
+            Some(dirs) => {
+                let settings = &host.value;
+                if settings.shell.import.enabled {
+                    let record = crate::import::Record::load(dirs);
+                    if let Some(h) = &record.harvest {
+                        for var in &h.vars {
+                            if var.name == "PATH"
+                                || var.name == "ZDOTDIR"
+                                || var.name.starts_with("GOATTY_")
+                                || settings.shell.import.skip_vars.iter().any(|s| s == &var.name)
+                            {
+                                continue;
+                            }
+                            env_map.insert(var.name.clone(), var.value.clone());
+                        }
+                    }
+                }
+                let (plugins, _) = crate::plugins::active(dirs, settings);
+                let needs_gen = plugins.iter().any(|a| a.manifest.files.iter().any(|f| f.env.is_some()));
+                if needs_gen && !dirs.zsh_dir().join(".zshrc").is_file() {
+                    let _ = self.apply(host);
+                }
+                let home = std::env::var("HOME").ok();
+                for a in &plugins {
+                    let mut values = a.values.clone();
+                    goatty_plugin::zsh::expand_home(&a.manifest, &mut values, home.as_deref());
+                    for e in a.manifest.env.iter().filter(|e| goatty_plugin::manifest::applies(&e.when, &values)) {
+                        let v = goatty_plugin::template::expand_inline(&e.value, &a.manifest, &values, None);
+                        if !v.is_empty() {
+                            env_map.insert(e.name.clone(), v);
+                        }
+                    }
+                    for f in a.manifest.files.iter().filter(|f| goatty_plugin::manifest::applies(&f.when, &values)) {
+                        if let Some(var) = &f.env {
+                            let file_path = dirs.zsh_dir().join("plugins").join(&a.manifest.id).join(&f.name);
+                            if file_path.is_file() {
+                                env_map.insert(var.clone(), file_path.to_string_lossy().into_owned());
+                            }
+                        }
+                    }
+                }
+                let managed = crate::snippets::managed_path(dirs, settings);
+                env_map.insert("PATH".into(), managed.clone());
+                (managed, true)
+            }
+            None => (std::env::var("PATH").unwrap_or_default(), false),
+        };
+        let resolved = crate::snippets::find_in_with_cwd(&path, &raw_program, cwd)
+            .with_context(|| format!("{raw_program:?} isn't installed on this host (not found on PATH)"))?;
+        let env = if has_dirs { env_map.into_iter().collect() } else { Vec::new() };
+        Ok(Launch { program: resolved.to_string_lossy().into_owned(), args: argv, env, managed: false })
+    }
 }
 
 /// `program` if given, else zsh if installed, else `$SHELL`, else /bin/sh.
@@ -241,5 +303,47 @@ mod tests {
         off.value.shell.managed = false;
         assert!(!l.launch(&off).managed);
         assert!(!Launcher::new(None, None).launch(&h).managed, "no HOME: plain zsh");
+    }
+
+    #[test]
+    fn launch_command_finds_managed_bin_and_shell_path_and_sets_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        std::fs::create_dir_all(dirs.bin_dir()).unwrap();
+        let plugin_tool = dirs.bin_dir().join("goatty-test-tool");
+        std::fs::write(&plugin_tool, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&plugin_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let extra_dir = tmp.path().join("extra-bin");
+        std::fs::create_dir_all(&extra_dir).unwrap();
+        let extra_tool = extra_dir.join("goatty-extra-tool");
+        std::fs::write(&extra_tool, "#!/bin/sh\necho extra\n").unwrap();
+        std::fs::set_permissions(&extra_tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut h = HostSettings::default();
+        h.shell.path.push(extra_dir.to_string_lossy().into_owned());
+        let eff = Effective::plain(h);
+        let l = Launcher::new(Some(dirs.clone()), None);
+
+        let launch = l.launch_command(&eff, vec!["goatty-test-tool".into(), "--flag".into()], None).unwrap();
+        assert_eq!(launch.program, plugin_tool.to_string_lossy());
+        assert_eq!(launch.args, ["--flag"]);
+        assert!(!launch.managed);
+        let path_val = launch.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_str()).unwrap();
+        assert!(path_val.contains(dirs.bin_dir().to_str().unwrap()), "{path_val}");
+        assert!(path_val.contains(extra_dir.to_str().unwrap()), "{path_val}");
+
+        let launch2 = l.launch_command(&eff, vec!["goatty-extra-tool".into()], None).unwrap();
+        assert_eq!(launch2.program, extra_tool.to_string_lossy());
+
+        // Relative path resolves against cwd.
+        let launch3 = l.launch_command(&eff, vec!["./goatty-extra-tool".into()], Some(extra_dir.to_str().unwrap())).unwrap();
+        assert_eq!(std::fs::canonicalize(&launch3.program).unwrap(), std::fs::canonicalize(&extra_tool).unwrap());
+
+        // Missing tool reports a clear error.
+        let err = l.launch_command(&eff, vec!["goatty-no-such-program-xyz".into()], None).unwrap_err();
+        assert!(err.to_string().contains("not found on PATH"), "{err}");
     }
 }

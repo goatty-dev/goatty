@@ -148,9 +148,21 @@ fn is_executable(p: &Path) -> bool {
 
 /// `program` in `path` (or itself when it's a path), requiring execute permission.
 pub(crate) fn find_in(path: &str, program: &str) -> Option<PathBuf> {
+    find_in_with_cwd(path, program, None)
+}
+
+/// Like [`find_in`], resolving relative paths containing `/` against `cwd`.
+pub(crate) fn find_in_with_cwd(path: &str, program: &str, cwd: Option<&str>) -> Option<PathBuf> {
     if program.contains('/') {
-        let p = PathBuf::from(program);
-        return is_executable(&p).then_some(p);
+        let p = Path::new(program);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
+            Path::new(dir).join(p)
+        } else {
+            p.to_path_buf()
+        };
+        return is_executable(&resolved).then_some(resolved);
     }
     path.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join(program)).find(|p| is_executable(p))
 }

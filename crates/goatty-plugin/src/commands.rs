@@ -120,9 +120,71 @@ pub struct PaletteCommand {
     /// when false, the command isn't offered in the palette or menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    /// Where this command opens: typed into the current pane's prompt
+    /// (default), or launched directly in a new split or tab (#241).
+    /// Skipped on serialization so `Installed.manifest` never emits `open_in`
+    /// to older clients whose `PaletteCommand` denies unknown fields; wire
+    /// replies carry non-default placements on `Installed::command_open_in`.
+    #[serde(default, skip_serializing)]
+    pub open_in: OpenIn,
     /// Also in the terminal's right-click menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<CommandMenu>,
+}
+
+/// Where a palette command opens when run (#241).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenIn {
+    /// Type the command line into the focused pane's idle shell prompt.
+    #[default]
+    Current,
+    /// Launch the program directly in a new split pane to the right.
+    SplitRight,
+    /// Launch the program directly in a new split pane below.
+    SplitDown,
+    /// Launch the program directly in a new split pane to the left.
+    SplitLeft,
+    /// Launch the program directly in a new split pane above.
+    SplitUp,
+    /// Launch the program directly in a new tab on the same host.
+    Tab,
+}
+
+impl OpenIn {
+    pub const ALL: [Self; 6] = [Self::Current, Self::SplitRight, Self::SplitDown, Self::SplitLeft, Self::SplitUp, Self::Tab];
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::Current
+    }
+
+    /// Whether this placement spawns the program directly in a new pane or tab
+    /// instead of typing into the active pane's shell prompt.
+    pub fn launches_direct(self) -> bool {
+        self != Self::Current
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current pane",
+            Self::SplitRight => "Split right",
+            Self::SplitDown => "Split down",
+            Self::SplitLeft => "Split left",
+            Self::SplitUp => "Split up",
+            Self::Tab => "New tab",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Current => "current pane",
+            Self::SplitRight => "split right",
+            Self::SplitDown => "split down",
+            Self::SplitLeft => "split left",
+            Self::SplitUp => "split up",
+            Self::Tab => "new tab",
+        }
+    }
 }
 
 /// Where in a pane a command applies, from what the focused pane runs.
@@ -619,6 +681,69 @@ pub fn command_line(c: &PaletteCommand, values: &BTreeMap<String, String>) -> St
     words.join(" ")
 }
 
+/// The direct `argv` `c` spawns (without a shell) for `values` (by input id)
+/// when opening in a split or new tab (#241). Whole-word `{input}` with an
+/// empty optional value is omitted. Leading `~` / `~/` in `path` and `folder`
+/// inputs is expanded against `home` when known.
+pub fn command_argv(c: &PaletteCommand, values: &BTreeMap<String, String>, home: Option<&str>) -> Vec<String> {
+    let mut argv = Vec::new();
+    for (i, t) in c.run.iter().enumerate() {
+        if i == 0 {
+            argv.push(t.clone());
+            continue;
+        }
+        let Ok(ps) = parts(t) else { continue };
+        if let [Part::Var(v)] = ps.as_slice() {
+            let value = values.get(*v).map(String::as_str).unwrap_or_default();
+            if value.is_empty() {
+                continue;
+            }
+            let is_path = c.inputs.iter().any(|i| i.id == *v && matches!(i.kind, InputKind::Path | InputKind::Folder));
+            argv.push(if is_path { expand_tilde(value, home) } else { value.to_string() });
+            continue;
+        }
+        let mut word = String::new();
+        for p in &ps {
+            match p {
+                Part::Text(s) => word.push_str(s),
+                Part::Var(v) => {
+                    let value = values.get(*v).map(String::as_str).unwrap_or_default();
+                    let is_path = c.inputs.iter().any(|i| i.id == *v && matches!(i.kind, InputKind::Path | InputKind::Folder));
+                    if is_path {
+                        word.push_str(&expand_tilde(value, home));
+                    } else {
+                        word.push_str(value);
+                    }
+                }
+            }
+        }
+        argv.push(word);
+    }
+    argv
+}
+
+/// Whether any `path` or `folder` input value in `values` starts with `~` or
+/// `~/` (so direct launch benefits from resolving the host's `$HOME`).
+pub fn needs_home_expansion(c: &PaletteCommand, values: &BTreeMap<String, String>) -> bool {
+    c.inputs
+        .iter()
+        .filter(|i| matches!(i.kind, InputKind::Path | InputKind::Folder))
+        .any(|i| values.get(&i.id).is_some_and(|v| v == "~" || v.starts_with("~/")))
+}
+
+fn expand_tilde(value: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return value.to_string();
+    };
+    if value == "~" {
+        home.to_string()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        format!("{}/{rest}", home.trim_end_matches('/'))
+    } else {
+        value.to_string()
+    }
+}
+
 /// What `input`'s source runs for the earlier `values` (argv, never a
 /// shell); `Err` says what to fill in first.
 pub fn source_argv(c: &PaletteCommand, input: &CommandInput, values: &BTreeMap<String, String>) -> Result<Vec<String>, String> {
@@ -701,7 +826,7 @@ fn check_pane(c: &PaletteCommand, at: &str) -> Vec<Problem> {
     if let Some(p) = pane.programs.iter().find(|p| !is_program_name(p)) {
         err(&format!("{p:?}: a program's name (letters, digits, . _ + -), not a path"));
     }
-    if c.keys.is_empty() && (!pane.programs.is_empty() || pane.at == Some(PaneAt::Program)) {
+    if c.keys.is_empty() && !c.open_in.launches_direct() && (!pane.programs.is_empty() || pane.at == Some(PaneAt::Program)) {
         err("a run line is typed at a shell prompt; inside a program, send keys instead");
     }
     out
@@ -827,6 +952,9 @@ pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
         }
         for p in check_pane(c, &at).into_iter().chain(check_keys(c, &inputs, &at)) {
             err(p.path, p.message);
+        }
+        if !c.keys.is_empty() && c.open_in.launches_direct() {
+            err(format!("{at}.open_in"), "keys are sent to the current pane; remove open_in".into());
         }
         match c.run.first() {
             None if !c.keys.is_empty() => {}
@@ -1179,6 +1307,12 @@ choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
         assert!(has(&p, "not a path") && has(&p, "not at a prompt"), "{p:?}");
         assert!(has(&bad("keys = [\"q\"]\n[command.pane]"), "say which programs"));
         assert!(has(&bad("keys = [\"\"]"), "keys[0]: empty"));
+        assert!(has(&bad("keys = [\"q\"]\nopen_in = \"split-right\""), "open_in: keys are sent to the current pane"));
+        // A run command in a new split/tab may still target a foreground program.
+        with_commands(
+            "[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\nopen_in = \"split-right\"\n[command.pane]\nprograms = [\"vim\"]\n",
+        )
+        .unwrap();
         // A run command may be for prompts only; keys need no program on the host.
         with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\n[command.pane]\nat = \"prompt\"\n").unwrap();
         with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nkeys = [\"q\"]\n").unwrap();
@@ -1220,6 +1354,7 @@ choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
             pane: None,
             inputs: Vec::new(),
             when: None,
+            open_in: OpenIn::Current,
             menu: None,
         };
         let nasty = ["it's \"$HOME\" `id` $(echo hi); ls *", "\\ ' \" ! ~ # &"];
@@ -1229,5 +1364,66 @@ choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
         let line = command_line(&c, &v);
         let out = std::process::Command::new("sh").arg("-c").arg(&line).output().unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("{}\npre-{}\n", nasty[0], nasty[1]));
+    }
+
+    #[test]
+    fn open_in_and_direct_argv() {
+        let toml = r#"
+[[command]]
+id = "lazygit"
+title = "Open Lazygit"
+run = ["eza", "--level={depth}", "{dir}", "{filter}"]
+open_in = "split-right"
+
+[[command.input]]
+id = "dir"
+label = "Folder"
+type = "folder"
+default = "."
+
+[[command.input]]
+id = "depth"
+label = "Depth"
+type = "integer"
+default = "2"
+
+[[command.input]]
+id = "filter"
+label = "Filter"
+optional = true
+"#;
+        let m = with_commands(toml).unwrap();
+        let c = &m.commands[0];
+        assert_eq!(c.open_in, OpenIn::SplitRight);
+        assert!(c.open_in.launches_direct());
+        // `open_in` is never serialized inside `PaletteCommand` (wire replies
+        // carry it on `Installed::command_open_in`) so older clients whose
+        // `PaletteCommand` denies unknown fields still decode the catalog.
+        assert!(!serde_json::to_string(c).unwrap().contains("open_in"));
+
+        let plain = with_commands(COMMANDS).unwrap();
+        assert_eq!(plain.commands[0].open_in, OpenIn::Current);
+        assert!(!serde_json::to_string(&plain.commands[0]).unwrap().contains("open_in"));
+
+        // Permissions description notes the split/tab placement.
+        let perms = crate::permissions::describe(&m);
+        let g = perms.into_iter().find(|g| g.permission == crate::permissions::Permission::Commands).unwrap();
+        assert_eq!(g.details, ["Open Lazygit: eza --level={depth} {dir} {filter} (in split right)"]);
+
+        // Direct argv: no shell quoting, optional empty omitted, path ~ expanded.
+        let mut v = BTreeMap::new();
+        v.insert("dir".into(), "~/my repo".into());
+        v.insert("depth".into(), "3".into());
+        v.insert("filter".into(), String::new());
+        assert!(needs_home_expansion(c, &v));
+        assert_eq!(command_argv(c, &v, Some("/home/u")), ["eza", "--level=3", "/home/u/my repo"]);
+        // Non-path input keeps literal ~ and shell metacharacters intact.
+        v.insert("dir".into(), "~".into());
+        v.insert("filter".into(), "~/$(id)".into());
+        assert_eq!(command_argv(c, &v, Some("/home/u")), ["eza", "--level=3", "/home/u", "~/$(id)"]);
+
+        // Invalid open_in value is rejected.
+        let bad = with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\nopen_in = \"floating\"\n");
+        assert!(bad.is_err());
     }
 }

@@ -26,6 +26,8 @@ use crate::toast::{self, Toast};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
     Builtin,
+    /// A user-defined custom command from `settings.json` (#242).
+    Custom,
     /// A plugin, by its manifest id (its `[[command]]`s, see `crate::plugin_commands`).
     Plugin(SharedString),
 }
@@ -57,6 +59,9 @@ pub struct Command {
     /// Listed only once something is typed (or after it was used): the
     /// hosts, which would otherwise crowd the full list.
     pub only_when_searched: bool,
+    /// Optional foreground program names when this command applies. Empty
+    /// means always shown.
+    pub when_program: Vec<SharedString>,
     pub source: Source,
     /// Where in a pane it applies (a plugin command's `[command.pane]`,
     /// #240): the palette leaves it out elsewhere.
@@ -87,6 +92,7 @@ impl Command {
             keywords: Vec::new(),
             detail: None,
             only_when_searched: false,
+            when_program: Vec::new(),
             source: Source::Builtin,
             pane: None,
             key_action: None,
@@ -118,6 +124,18 @@ impl Command {
     /// The `goatty_config::keys` action whose shortcuts this command shows.
     pub fn key_action(&self) -> Option<&str> {
         self.key_action.as_deref()
+    }
+
+    /// Whether this command applies while `program` is running in the focused pane.
+    pub fn matches_program(&self, program: Option<&str>) -> bool {
+        if self.when_program.is_empty() {
+            return true;
+        }
+        let Some(prog) = program.map(str::trim).filter(|p| !p.is_empty()) else {
+            return false;
+        };
+        let base = prog.rsplit('/').next().unwrap_or(prog);
+        self.when_program.iter().any(|w| w.eq_ignore_ascii_case(prog) || w.eq_ignore_ascii_case(base))
     }
 
     /// Run the command. The caller has closed the palette and focused the
@@ -165,7 +183,12 @@ impl CommandRegistry {
 
     /// Remove every plugin's commands (the active host changed).
     pub fn unregister_plugins(&mut self) {
-        self.commands.retain(|c| c.source == Source::Builtin);
+        self.commands.retain(|c| !matches!(c.source, Source::Plugin(_)));
+    }
+
+    /// Remove every user-defined custom command (re-synced from `settings.json`).
+    pub fn unregister_custom(&mut self) {
+        self.commands.retain(|c| c.source != Source::Custom);
     }
 
     /// Remove every command from `source` (a plugin was unloaded).

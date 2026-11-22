@@ -78,6 +78,7 @@ pub struct Session {
     backend: Backend,
     pub ui_events: flume::Receiver<UiEvent>,
     pub exited: AtomicBool,
+    exit_code: Mutex<Option<u32>>,
     pub bytes_in: AtomicU64,
     pub status: Mutex<LinkStatus>,
     /// `user@host` for remote daemons, `None` locally.
@@ -161,10 +162,40 @@ impl Spawner {
             Spawner::Plain { host, base } => {
                 let argv = plain_ssh_argv(host);
                 match &**base {
-                    Spawner::Daemon(conn) => Session::daemon_run(conn.clone(), size, argv),
-                    _ => Session::local_command(size, argv),
+                    Spawner::Daemon(conn) => Session::daemon_run(conn.clone(), size, argv, None),
+                    _ => Session::local_command(size, None, argv, None),
                 }
             }
+        }
+    }
+
+    /// Launch `argv` directly (no shell) on this host in `cwd` (#241).
+    /// Blocks on the daemon's reply: call it off the UI thread.
+    pub fn spawn_command(&self, size: TermSize, argv: Vec<String>, cwd: Option<String>) -> Result<Arc<Session>> {
+        match self {
+            Spawner::Local(host) => Session::local_command(size, Some(host), argv, cwd),
+            Spawner::Daemon(conn) => Session::daemon_run(conn.clone(), size, argv, cwd),
+            Spawner::Plain { host, .. } => {
+                anyhow::bail!("Can't launch programs directly on plain SSH ({host}); connect with goattyd instead.")
+            }
+        }
+    }
+
+    /// This host's home directory, for expanding `~` in direct-launch arguments
+    /// off the UI thread.
+    pub fn resolve_home(&self) -> Option<String> {
+        match self {
+            Spawner::Local(_) => std::env::var("HOME").ok().filter(|h| !h.is_empty()),
+            Spawner::Daemon(conn) => {
+                if conn.endpoint().is_local() {
+                    std::env::var("HOME").ok().filter(|h| !h.is_empty())
+                } else if conn.supports_remote_files() {
+                    conn.stat_path(None, None, vec!["~".into()]).ok().flatten().map(|info| info.path)
+                } else {
+                    None
+                }
+            }
+            Spawner::Plain { .. } => None,
         }
     }
 }
@@ -247,7 +278,10 @@ impl PaneSink for Sink {
                 s.terminal.feed(format!("\r\n\x1b[0;31m[goatty: session lost: {why}]\x1b[0m\r\n").as_bytes());
                 *s.status.lock() = LinkStatus::Lost(why);
             }
-            PaneEvent::Exited(_) => s.exited.store(true, Ordering::Release),
+            PaneEvent::Exited(code) => {
+                *s.exit_code.lock() = code;
+                s.exited.store(true, Ordering::Release);
+            }
             PaneEvent::Process(name) => *s.process.lock() = name,
             PaneEvent::Cwd(cwd) => {
                 *s.remote_cwd.lock() = cwd;
@@ -300,6 +334,7 @@ impl Session {
             backend,
             ui_events: ui,
             exited: AtomicBool::new(false),
+            exit_code: Mutex::new(None),
             bytes_in: AtomicU64::new(0),
             status: Mutex::new(LinkStatus::Connected),
             host_label,
@@ -328,11 +363,25 @@ impl Session {
         Self::local_pty(size, cmd, launch.managed.then_some(host))
     }
 
-    /// `argv` in a PTY owned by this process (when no daemon can run it).
-    pub fn local_command(size: TermSize, mut argv: Vec<String>) -> Result<Arc<Self>> {
-        anyhow::ensure!(!argv.is_empty(), "nothing to run");
-        let program = argv.remove(0);
-        Self::local_pty(size, ShellCommand::new(program, argv, Vec::new()), None)
+    /// `argv` in a PTY owned by this process (when no daemon can run it, or
+    /// `--local`). When `host` is given, resolves the executable and sets the
+    /// host's managed `PATH` and plugin/imported environment (#241).
+    pub fn local_command(size: TermSize, host: Option<&HostService>, mut argv: Vec<String>, cwd: Option<String>) -> Result<Arc<Self>> {
+        let mut cmd = match host {
+            Some(host) => {
+                let launch = host.launcher.launch_command(&host.settings(), argv, cwd.as_deref())?;
+                ShellCommand::new(launch.program, launch.args, launch.env)
+            }
+            None => {
+                anyhow::ensure!(!argv.is_empty(), "nothing to run");
+                let program = argv.remove(0);
+                ShellCommand::new(program, argv, Vec::new())
+            }
+        };
+        if let Some(cwd) = cwd.filter(|c| std::path::Path::new(c).is_dir()) {
+            cmd.cwd = Some(cwd.into());
+        }
+        Self::local_pty(size, cmd, None)
     }
 
     /// `managed`: goatty's zsh, tracked by `host` for reloads.
@@ -386,6 +435,22 @@ impl Session {
             }
             if let (Some(pid), Some(host)) = (managed_pid, &host) {
                 host.untrack_shell(pid);
+            }
+            if let Backend::Local(pty) = &s2.backend {
+                // On Unix, PTY EOF can arrive slightly before the child is
+                // reapable; poll briefly so immediate non-zero exits still
+                // report their status before `exited` is published.
+                let mut code = None;
+                for i in 0..40 {
+                    if let Some(c) = pty.lock().try_wait() {
+                        code = Some(c);
+                        break;
+                    }
+                    if i + 1 < 40 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                *s2.exit_code.lock() = code;
             }
             s2.exited.store(true, Ordering::Release);
             s2.waker.wake();
@@ -488,17 +553,25 @@ impl Session {
             .collect()
     }
 
-    /// Run `argv` in a new session on the daemon behind `conn` (plain SSH:
-    /// `ssh host` in a session of the local daemon).
-    pub fn daemon_run(conn: Arc<Connection>, size: TermSize, argv: Vec<String>) -> Result<Arc<Self>> {
-        let (s, sink) = Self::new_daemon(&conn, size, 0, None, None);
-        let cwd = conn.endpoint().is_local().then(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())).flatten();
+    /// Run `argv` in a new session on the daemon behind `conn` (in `cwd` when
+    /// given, else this process's directory when `conn` is local).
+    pub fn daemon_run(conn: Arc<Connection>, size: TermSize, argv: Vec<String>, cwd: Option<String>) -> Result<Arc<Self>> {
+        let (host_label, ssh_host) = Self::daemon_host_meta(&conn);
+        let (s, sink) = Self::new_daemon(&conn, size, 0, host_label, ssh_host);
+        let cwd = cwd.or_else(|| {
+            conn.endpoint().is_local().then(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())).flatten()
+        });
         let id = conn.run(win(size), cwd, argv, sink)?;
         log::info!("running in session {id}");
         if let Backend::Daemon { id: slot, .. } = &s.backend {
             slot.store(id, Ordering::Relaxed);
         }
         Ok(s)
+    }
+
+    /// Exit code of the session's process once it has exited, if known.
+    pub fn exit_code(&self) -> Option<u32> {
+        *self.exit_code.lock()
     }
 
     /// Re-arm the wake-up. Call when handling a wake, before reading state.
@@ -748,9 +821,13 @@ impl Session {
     }
 
     /// The shell's working directory on the session's host: daemon-tracked
-    /// CWD (OSC 7 with `/proc` fallback) when available, else client OSC 7.
+    /// CWD (OSC 7 with `/proc` fallback) when available, else client OSC 7,
+    /// else local PTY's `/proc` cwd.
     pub fn cwd(&self) -> Option<PathBuf> {
-        self.remote_cwd.lock().as_deref().map(PathBuf::from).or_else(|| self.terminal.current_directory())
+        self.remote_cwd.lock().as_deref().map(PathBuf::from).or_else(|| self.terminal.current_directory()).or_else(|| match &self.backend {
+            Backend::Local(pty) => pty.lock().cwd(),
+            Backend::Daemon { .. } => None,
+        })
     }
 
     /// String form of [`Self::cwd`], used to key cached remote path lookups.

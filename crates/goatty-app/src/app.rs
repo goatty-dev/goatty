@@ -34,6 +34,7 @@ pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) 
         cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
         cx.on_action(|_: &ReloadShells, cx| reload_shells(cx));
         command_palette::register_builtins(cx);
+        crate::custom_commands::init(cx);
         crate::plugin_commands::init(cx);
         crate::plugin_updates::init(cx);
         crate::snippets::init(cx);

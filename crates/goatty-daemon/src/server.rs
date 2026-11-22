@@ -116,13 +116,13 @@ impl Daemon {
         self.spawn(conn, ShellCommand::new(launch.program, launch.args, launch.env), managed, ws, cwd)
     }
 
-    /// A session running `argv` instead of a shell.
-    pub(crate) fn run(self: &Arc<Self>, conn: u64, ws: WinSize, cwd: Option<String>, mut argv: Vec<String>) -> Result<Arc<Session>> {
-        if argv.is_empty() {
-            bail!("nothing to run");
-        }
-        let program = argv.remove(0);
-        self.spawn(conn, ShellCommand::new(program, argv, Vec::new()), false, ws, cwd)
+    /// A session running `argv` instead of a shell, using the host's managed
+    /// `PATH` and environment so tools installed by goatty plugins or listed in
+    /// `shell.path` are found (#241).
+    pub(crate) fn run(self: &Arc<Self>, conn: u64, ws: WinSize, cwd: Option<String>, argv: Vec<String>) -> Result<Arc<Session>> {
+        let host = self.host.settings();
+        let launch = self.host.launcher.launch_command(&host, argv, cwd.as_deref())?;
+        self.spawn(conn, ShellCommand::new(launch.program, launch.args, launch.env), false, ws, cwd)
     }
 
     fn spawn(self: &Arc<Self>, conn: u64, mut cmd: ShellCommand, managed: bool, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
@@ -210,7 +210,19 @@ impl Daemon {
             let daemon = self.clone();
             std::thread::Builder::new().name(format!("s{id}-reader")).spawn(move || {
                 pump_output(&s, reader);
-                let code = s.pty.lock().try_wait();
+                // The PTY master can hit EOF/EIO slightly before the child is
+                // reapable via WNOHANG; retry briefly so short-lived `Run`
+                // sessions report their exit code reliably.
+                let mut code = None;
+                for attempt in 0..40 {
+                    if let Some(status) = s.pty.lock().try_wait() {
+                        code = Some(status);
+                        break;
+                    }
+                    if attempt + 1 < 40 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
                 log::info!("session {}: exited ({code:?})", s.id);
                 daemon.sessions.lock().remove(&s.id);
                 if crate::systemd::has_fd_store() {

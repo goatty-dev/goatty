@@ -13,6 +13,7 @@ mod close_confirm;
 mod command_palette;
 mod commands;
 mod connect;
+mod custom_commands;
 mod fonts;
 mod hosts;
 mod output_view;

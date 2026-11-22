@@ -382,6 +382,10 @@ pub struct Entry<'a> {
 /// Whether `c` applies to the focused pane (`pane`: its program and
 /// whether it's at a prompt; `None`: no pane, so only commands for any).
 fn fits_pane(c: &Command, pane: Option<&(Option<String>, bool)>) -> bool {
+    let process = pane.and_then(|(p, _)| p.as_deref());
+    if !c.matches_program(process) {
+        return false;
+    }
     match (&c.pane, pane) {
         (None, _) => true,
         (Some(_), None) => false,

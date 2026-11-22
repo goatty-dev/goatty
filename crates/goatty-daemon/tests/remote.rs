@@ -325,3 +325,77 @@ fn daemon_takes_its_socket_from_systemd() {
 fn which(name: &str) -> Result<PathBuf, ()> {
     std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(name)).find(|p| p.is_file())).ok_or(())
 }
+
+/// `ClientMsg::Run` resolves programs installed in the host's managed `bin/`
+/// directory (where goatty plugins link binaries), runs in `cwd`, and exits
+/// cleanly (#241).
+#[test]
+fn run_finds_managed_bin_tool_and_uses_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("d.sock");
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let bin_dir = home.join(".local/share/goatty/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let tool = bin_dir.join("goatty-run-probe");
+    std::fs::write(&tool, "#!/bin/sh\nprintf 'ran-in:%s\\n' \"$PWD\"\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_goattyd"))
+        .arg("serve")
+        .env("GOATTY_SOCKET", &sock)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(Instant::now() < deadline, "daemon did not listen");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let (mut s, reply) = hello(&sock, PROTOCOL_VERSION);
+    assert!(matches!(reply, ServerMsg::Hello { .. }));
+    let work_str = work.to_string_lossy().into_owned();
+    s.write_all(
+        &encode(&ClientMsg::Run {
+            req: 1,
+            size: SIZE,
+            cwd: Some(work_str.clone()),
+            argv: vec!["goatty-run-probe".into()],
+            opts: StreamOpts::LOCAL,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let mut exit_code = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match read_msg::<_, ServerMsg>(&mut s).unwrap() {
+            ServerMsg::Attached { snapshot, .. } => out.extend(snapshot),
+            ServerMsg::Output { data, .. } => out.extend(data),
+            ServerMsg::Exited { code, .. } => {
+                exit_code = Some(code);
+                break;
+            }
+            ServerMsg::Error { message, .. } => panic!("daemon returned error: {message}"),
+            _ => {}
+        }
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let text = String::from_utf8_lossy(&out);
+    let expected_work = work.canonicalize().unwrap_or_else(|_| work.clone());
+    let expected_str = expected_work.to_string_lossy();
+    assert!(text.contains(&format!("ran-in:{expected_str}")) || text.contains(&format!("ran-in:{work_str}")), "{text:?}");
+    assert_eq!(exit_code, Some(Some(0)));
+}

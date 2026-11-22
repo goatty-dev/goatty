@@ -9,6 +9,8 @@
 //! plan and refuses when anything security-relevant changed in between, so
 //! what gets installed is exactly what the user approved.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -253,6 +255,25 @@ pub struct Installed {
     /// installed on this host).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_commands: Vec<String>,
+    /// Non-default `open_in` placements of this plugin's `[[command]]`s, keyed
+    /// by command id. Carried on `Installed` rather than inside `manifest` so
+    /// older clients (whose `PaletteCommand` denies unknown fields) still
+    /// decode `Catalog` and `Installed` replies cleanly (#241).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub command_open_in: BTreeMap<String, crate::commands::OpenIn>,
+}
+
+impl Installed {
+    /// Non-default `open_in` map extracted from `m`'s commands.
+    pub fn command_open_in_map(m: &Manifest) -> BTreeMap<String, crate::commands::OpenIn> {
+        m.commands.iter().filter(|c| !c.open_in.is_default()).map(|c| (c.id.clone(), c.open_in)).collect()
+    }
+
+    /// Effective manifest placement for command `cmd`, honoring the wire-safe
+    /// [`Self::command_open_in`] map when `manifest` came over JSON.
+    pub fn command_open_in_for(&self, cmd: &crate::commands::PaletteCommand) -> crate::commands::OpenIn {
+        self.command_open_in.get(&cmd.id).copied().unwrap_or(cmd.open_in)
+    }
 }
 
 /// One package of an installed plugin, as found on the host.
@@ -552,9 +573,11 @@ publisher = "tests"
             builtin: false,
             packages: vec![],
             unavailable_commands: vec![],
+            command_open_in: BTreeMap::new(),
         };
         let empty_json = serde_json::to_string(&inst).unwrap();
         assert!(!empty_json.contains("unavailable_commands"), "{empty_json}");
+        assert!(!empty_json.contains("command_open_in"), "{empty_json}");
         let mut with_unavail = inst.clone();
         with_unavail.unavailable_commands = vec!["exec".into(), "logs".into()];
         let full_json = serde_json::to_string(&with_unavail).unwrap();
@@ -563,6 +586,52 @@ publisher = "tests"
         assert_eq!(back.unavailable_commands, ["exec", "logs"]);
         let back_empty: Installed = serde_json::from_str(&empty_json).unwrap();
         assert!(back_empty.unavailable_commands.is_empty());
+
+        // `open_in` is carried on `Installed::command_open_in` and omitted from
+        // `manifest.commands`, so older clients with strict `PaletteCommand`
+        // still decode the reply while new clients recover the placement.
+        let m_split: Manifest = toml::from_str(
+            r#"
+schema = 1
+id = "git"
+name = "Git"
+version = "1.0.0"
+summary = "Test"
+publisher = "tests"
+
+[requires]
+commands = ["lazygit"]
+
+[[command]]
+id = "lazygit"
+title = "Open lazygit"
+run = ["lazygit"]
+open_in = "split-right"
+"#,
+        )
+        .unwrap();
+        let inst_split = Installed {
+            id: "git".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            command_open_in: Installed::command_open_in_map(&m_split),
+            manifest: m_split,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec![],
+        };
+        let split_json = serde_json::to_string(&inst_split).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&split_json).unwrap();
+        let cmd_obj = v["manifest"]["command"][0].as_object().expect("serialized command object");
+        assert!(!cmd_obj.contains_key("open_in"), "{split_json}");
+        assert_eq!(v["command_open_in"]["lazygit"], "split-right");
+        let back_split: Installed = serde_json::from_str(&split_json).unwrap();
+        assert_eq!(back_split.command_open_in_for(&back_split.manifest.commands[0]), crate::commands::OpenIn::SplitRight);
 
         let req_json = serde_json::to_string(&Request::Installed).unwrap();
         assert_eq!(req_json, r#"{"op":"installed"}"#);

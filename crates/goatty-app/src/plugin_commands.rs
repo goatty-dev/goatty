@@ -23,15 +23,20 @@
 //! menu leave it out, and a shortcut bound to it goes to the terminal as a
 //! normal key ([`passes_through`]).
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use goatty_config::CommandOpenIn;
 use goatty_plugin::api::{Installed, Reply, Request};
-use goatty_plugin::commands::{CommandInput, MenuWhen, PaletteCommand, command_line, strokes};
+use goatty_plugin::commands::{
+    CommandInput, MenuWhen, OpenIn as PluginOpenIn, PaletteCommand, command_argv, command_line, needs_home_expansion, strokes,
+};
 use gpui::{App, AsyncApp, Global, Window};
 
 use crate::command_palette::input::Loader;
 use crate::command_palette::registry::Source;
 use crate::command_palette::{Answers, Ask, Command, CommandRegistry, Field, ask};
+use crate::settings::AppSettings;
 use crate::settings_window::{HostLink, HostLinkGlobal};
 
 /// Which host the registered plugin commands are from, and the newest fetch.
@@ -41,7 +46,11 @@ struct State {
     generation: u64,
     /// True while a catalog refresh for the active host is in flight.
     stale: bool,
-    active: std::collections::BTreeMap<String, MenuCommand>,
+    active: BTreeMap<String, MenuCommand>,
+    /// Active command ids in registry order (for re-registering on placement overrides).
+    order: Vec<String>,
+    /// Last applied `commands.open_in` overrides from `AppSettings`.
+    open_in_overrides: BTreeMap<String, CommandOpenIn>,
     last_issues: Vec<String>,
 }
 
@@ -83,7 +92,7 @@ pub struct MenuCommands(pub Vec<MenuCommand>);
 
 impl Global for MenuCommands {}
 
-/// Keep the palette's plugin commands in step with the active host.
+/// Keep the palette's plugin commands in step with the active host and placement overrides.
 pub fn init(cx: &mut App) {
     cx.observe_global::<HostLinkGlobal>(|cx| {
         let link = cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone());
@@ -94,6 +103,13 @@ pub fn init(cx: &mut App) {
         };
         if !same {
             refresh(cx);
+        }
+    })
+    .detach();
+    cx.observe_global::<AppSettings>(|cx| {
+        let overrides = cx.global::<AppSettings>().client.commands.open_in.clone();
+        if cx.default_global::<State>().open_in_overrides != overrides {
+            rebuild_from_active(overrides, cx);
         }
     })
     .detach();
@@ -192,13 +208,51 @@ fn report_issues(link: &HostLink, issues: &[String], cx: &mut App) {
     );
 }
 
+/// Map a plugin manifest's `open_in` value to the client settings enum.
+pub fn from_plugin_open_in(open_in: PluginOpenIn) -> CommandOpenIn {
+    match open_in {
+        PluginOpenIn::Current => CommandOpenIn::Current,
+        PluginOpenIn::SplitRight => CommandOpenIn::SplitRight,
+        PluginOpenIn::SplitDown => CommandOpenIn::SplitDown,
+        PluginOpenIn::SplitLeft => CommandOpenIn::SplitLeft,
+        PluginOpenIn::SplitUp => CommandOpenIn::SplitUp,
+        PluginOpenIn::Tab => CommandOpenIn::Tab,
+    }
+}
+
+/// Effective placement for plugin command `id` (`plugin.<plugin>.<command>`),
+/// preferring any user override in `settings.json` (`commands.open_in`).
+/// `keys` commands always send to the focused pane.
+pub fn effective_open_in(id: &str, cmd: &PaletteCommand, cx: &App) -> CommandOpenIn {
+    if !cmd.keys.is_empty() {
+        return CommandOpenIn::Current;
+    }
+    cx.try_global::<AppSettings>()
+        .and_then(|s| s.client.commands.open_in.get(id).copied())
+        .unwrap_or_else(|| from_plugin_open_in(cmd.open_in))
+}
+
+/// Whether the active plugin command `id` sends keys rather than running a
+/// command line (so placement overrides do not apply to it).
+pub fn is_keys_command(id: &str, cx: &App) -> bool {
+    cx.try_global::<State>().and_then(|s| s.active.get(id)).is_some_and(|e| !e.command.keys.is_empty())
+}
+
+/// The active plugin manifest's own default placement for `id`, if loaded.
+pub fn plugin_default_open_in(id: &str, cx: &App) -> Option<CommandOpenIn> {
+    cx.try_global::<State>().and_then(|s| s.active.get(id)).map(|e| from_plugin_open_in(e.command.open_in))
+}
+
 /// Replace the registry's plugin commands with `installed`'s.
 fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
-    let (commands, active, menu) = build_with_active(link.as_ref(), &installed);
+    let overrides = cx.try_global::<AppSettings>().map(|s| s.client.commands.open_in.clone()).unwrap_or_default();
+    let (commands, active, order, menu) = build_with_overrides(link.as_ref(), &installed, &overrides);
     {
         let state = cx.default_global::<State>();
         state.stale = false;
         state.active = active;
+        state.order = order;
+        state.open_in_overrides = overrides;
     }
     cx.set_global(MenuCommands(menu));
     let reg = cx.default_global::<CommandRegistry>();
@@ -208,40 +262,84 @@ fn replace(link: Option<HostLink>, installed: Vec<Installed>, cx: &mut App) {
     }
 }
 
+/// Re-register already-loaded plugin commands after `commands.open_in` changed
+/// so palette detail labels update live without re-fetching from the host.
+fn rebuild_from_active(overrides: BTreeMap<String, CommandOpenIn>, cx: &mut App) {
+    let commands: Vec<Command> = {
+        let state = cx.default_global::<State>();
+        state.open_in_overrides = overrides.clone();
+        state
+            .order
+            .iter()
+            .filter_map(|id| state.active.get(id).map(|e| (id, e)))
+            .map(|(id, e)| {
+                let open_in = if e.command.keys.is_empty() {
+                    overrides.get(id).copied().unwrap_or_else(|| from_plugin_open_in(e.command.open_in))
+                } else {
+                    CommandOpenIn::Current
+                };
+                command(&e.origin, &e.plugin_id, &e.plugin, &e.command, open_in)
+            })
+            .collect()
+    };
+    let reg = cx.default_global::<CommandRegistry>();
+    reg.unregister_plugins();
+    for c in commands {
+        reg.register(c);
+    }
+}
+
 #[cfg_attr(not(test), expect(dead_code, reason = "used by unit tests"))]
 fn build(link: Option<&HostLink>, installed: &[Installed]) -> (Vec<Command>, Vec<MenuCommand>) {
-    let (commands, _, menu) = build_with_active(link, installed);
+    let (commands, _, _, menu) = build_with_overrides(link, installed, &BTreeMap::new());
     (commands, menu)
 }
 
-fn build_with_active(
+#[cfg_attr(not(test), expect(dead_code, reason = "used by unit tests"))]
+fn build_with_active(link: Option<&HostLink>, installed: &[Installed]) -> (Vec<Command>, BTreeMap<String, MenuCommand>, Vec<MenuCommand>) {
+    let (commands, active, _, menu) = build_with_overrides(link, installed, &BTreeMap::new());
+    (commands, active, menu)
+}
+
+fn build_with_overrides(
     link: Option<&HostLink>,
     installed: &[Installed],
-) -> (Vec<Command>, std::collections::BTreeMap<String, MenuCommand>, Vec<MenuCommand>) {
+    overrides: &BTreeMap<String, CommandOpenIn>,
+) -> (Vec<Command>, BTreeMap<String, MenuCommand>, Vec<String>, Vec<MenuCommand>) {
     let Some(link) = link else {
-        return (Vec::new(), std::collections::BTreeMap::new(), Vec::new());
+        return (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new());
     };
     let active_cmds = installed
         .iter()
         .filter(|p| p.enabled && p.incompatible.is_none())
         .flat_map(|p| p.manifest.commands.iter().filter(|c| !p.unavailable_commands.contains(&c.id)).map(move |c| (p, c)));
     let mut commands = Vec::new();
-    let mut active = std::collections::BTreeMap::new();
+    let mut active = BTreeMap::new();
+    let mut order = Vec::new();
     let mut menu = Vec::new();
     for (p, c) in active_cmds {
-        commands.push(command(link, &p.manifest.id, &p.manifest.name, c));
+        let mut hydrated = c.clone();
+        hydrated.open_in = p.command_open_in_for(c);
+        let id = command_id(&p.manifest.id, &hydrated.id);
+        let open_in = if hydrated.keys.is_empty() {
+            overrides.get(&id).copied().unwrap_or_else(|| from_plugin_open_in(hydrated.open_in))
+        } else {
+            CommandOpenIn::Current
+        };
+        commands.push(command(link, &p.manifest.id, &p.manifest.name, &hydrated, open_in));
         let entry = MenuCommand {
             plugin_id: p.manifest.id.clone(),
             plugin: p.manifest.name.clone(),
-            command: Rc::new(c.clone()),
+            command: Rc::new(hydrated),
             origin: link.clone(),
         };
-        active.insert(command_id(&p.manifest.id, &c.id), entry.clone());
+        order.push(id.clone());
+        active.insert(id, entry.clone());
         if c.menu.is_some() {
             menu.push(entry);
         }
     }
-    (commands, active, menu)
+    (commands, active, order, menu)
 }
 
 /// The palette id of a plugin's command: `plugin.<plugin>.<command>`.
@@ -341,14 +439,18 @@ fn can_submit(id: &str, expected: &PaletteCommand, expected_origin: &HostLink, c
         .is_some_and(|(state, reg)| resolve_dispatch(reg, state, id, Some((expected, expected_origin))).is_some())
 }
 
-fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Command {
+fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand, open_in: CommandOpenIn) -> Command {
     let id = command_id(plugin, &c.id);
     let run_id = id.clone();
     let mut out = Command::handler(&id, name, &c.title, move |window, cx| run_by_id(&run_id, None, window, cx)).with_key_action(id);
     let mut words: Vec<&str> = c.keywords.iter().map(String::as_str).collect();
     words.push(plugin);
     out = out.keywords(&words);
-    out.detail = Some(format!("{plugin} plugin").into());
+    out.detail = Some(if open_in == CommandOpenIn::Current {
+        format!("{plugin} plugin").into()
+    } else {
+        format!("{plugin} plugin · {}", open_in.short_label()).into()
+    });
     out.source = Source::Plugin(plugin.to_string().into());
     out.pane = c.pane.clone();
     out
@@ -368,7 +470,8 @@ pub fn start(
     cx: &mut App,
 ) {
     if cmd.inputs.is_empty() {
-        run(cmd, origin, &Answers::new(), window, cx);
+        let id = command_id(plugin_id, &cmd.id);
+        run(&id, cmd, origin, &Answers::new(), window, cx);
         return;
     }
     let (plugin_id, plugin, cmd, origin, selection) =
@@ -417,7 +520,7 @@ fn ask_for(
             crate::toast::show_in(window, cx, unavailable_toast(&id, Some((&then, &then_origin)), true, cx));
             return;
         }
-        run(&then, &then_origin, answers, window, cx);
+        run(&id, &then, &then_origin, answers, window, cx);
     })
     .remote(!origin.is_local())
 }
@@ -446,11 +549,10 @@ fn selection_value(text: &str) -> String {
     line.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Type `c`'s line for `answers` into the focused pane, if it's on the
-/// host the command came from (`origin`) and a shell is waiting there;
-/// otherwise offer to copy it. A command with `keys` sends them to the
-/// pane's program instead, if the pane still fits the command.
-fn run(c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Window, cx: &mut App) {
+/// Run `c` for `answers`: send `keys` to the focused pane's program (#240),
+/// type the command line into the focused pane (`Current`), or launch it
+/// directly in a split pane / new tab on `origin` (#241).
+fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Window, cx: &mut App) {
     if !c.keys.is_empty() {
         let (keys, title, pane, origin) = (strokes(c, answers), c.title.clone(), c.pane.clone(), origin.clone());
         // Only empty optional values: nothing to type.
@@ -466,14 +568,78 @@ fn run(c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Wi
         });
         return;
     }
+    let open_in = effective_open_in(id, c, cx);
     let line = command_line(c, answers);
-    let origin = origin.clone();
-    // Deferred: the palette runs commands from inside the workspace.
+    let pane = c.pane.clone();
+    let title = c.title.clone();
+    if open_in == CommandOpenIn::Current {
+        let origin = origin.clone();
+        // Deferred: the palette runs commands from inside the workspace.
+        window.defer(cx, move |window, cx| {
+            if let Some(view) = crate::typing::target(&origin, &line, crate::typing::What::Command, window, cx) {
+                if let Some(pane) = pane.as_ref()
+                    && !pane_fits_or_warn(pane, &title, Some(&view), window, cx)
+                {
+                    return;
+                }
+                view.update(cx, |v, cx| v.run_line(&line, cx));
+            }
+        });
+        return;
+    }
+    let needs_home = needs_home_expansion(c, answers);
+    let cmd_owned = c.clone();
+    let answers_owned = answers.clone();
+    let origin_check = origin.clone();
+    let label = c.run.first().cloned().unwrap_or_else(|| c.title.clone());
+    let launch = crate::workspace::LaunchCommand {
+        label,
+        open_in,
+        origin: Some(origin.clone()),
+        needs_home,
+        build_argv: Box::new(move |home| {
+            let argv = command_argv(&cmd_owned, &answers_owned, home);
+            if argv.is_empty() { Err("command has no program to run".into()) } else { Ok(argv) }
+        }),
+        fallback_line: line,
+    };
     window.defer(cx, move |window, cx| {
-        if let Some(view) = crate::typing::target(&origin, &line, crate::typing::What::Command, window, cx) {
-            view.update(cx, |v, cx| v.run_line(&line, cx));
+        if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {
+            if let Some(pane) = pane.as_ref() {
+                let same_host = ws.read(cx).active_host_link().is_some_and(|h| h.same(&origin_check));
+                if same_host {
+                    let focused = ws.read(cx).focused_terminal();
+                    if !pane_fits_or_warn(pane, &title, focused.as_ref(), window, cx) {
+                        return;
+                    }
+                }
+            }
+            ws.update(cx, |ws, cx| ws.open_command(launch, window, cx));
         }
     });
+}
+
+fn pane_fits_or_warn(
+    pane: &goatty_plugin::commands::PaneContext,
+    title: &str,
+    view: Option<&gpui::Entity<crate::terminal::TerminalView>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let fits = view.is_some_and(|view| {
+        let v = view.read(cx);
+        pane.matches(v.process(), v.at_prompt())
+    });
+    if !fits {
+        crate::toast::show_in(
+            window,
+            cx,
+            crate::toast::Toast::warning(format!("\u{201c}{title}\u{201d} doesn't fit this pane"))
+                .body(format!("It works {}.", pane.describe()))
+                .key("plugin.command"),
+        );
+    }
+    fits
 }
 
 #[cfg(test)]
@@ -538,6 +704,7 @@ icon = "search"
             builtin: false,
             packages: vec![],
             unavailable_commands: vec!["hidden".into()],
+            command_open_in: BTreeMap::new(),
         };
         let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
         let (cmds, menu) = build(Some(&link), std::slice::from_ref(&inst));
@@ -609,13 +776,22 @@ run = ["docker", "ps"]
             builtin: false,
             packages: vec![],
             unavailable_commands: vec![],
+            command_open_in: BTreeMap::new(),
         };
         let (cmds, active, _) = build_with_active(Some(&link), &[inst]);
         let mut reg = CommandRegistry::default();
         for c in cmds {
             reg.register(c);
         }
-        let mut state = State { link: Some(link.clone()), generation: 1, stale: false, active, last_issues: Vec::new() };
+        let mut state = State {
+            link: Some(link.clone()),
+            generation: 1,
+            stale: false,
+            active,
+            order: vec!["plugin.docker.ps".into()],
+            open_in_overrides: BTreeMap::new(),
+            last_issues: Vec::new(),
+        };
 
         assert!(resolve_dispatch(&reg, &state, "plugin.docker.ps", Some((&orig_cmd, &link))).is_some());
 
@@ -692,5 +868,55 @@ run = ["gh", "pr", "list"]
         assert_eq!(ask.fields[0].spec.id, "pr");
         assert_eq!(ask.fields[0].spec.default.as_deref(), Some("245"));
         assert!(ask.fields[0].loader.is_some());
+    }
+
+    #[test]
+    fn build_with_overrides_shows_placement_in_detail() {
+        let m = goatty_plugin::manifest::parse(
+            r#"
+schema = 1
+id = "git"
+name = "Git"
+version = "1.0.0"
+summary = "Git tools"
+publisher = "tests"
+
+[requires]
+commands = ["lazygit"]
+
+[[command]]
+id = "lazygit"
+title = "Open lazygit"
+run = ["lazygit"]
+open_in = "split-right"
+"#,
+            None,
+        )
+        .unwrap();
+        let inst = Installed {
+            id: "git".into(),
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            command_open_in: Installed::command_open_in_map(&m),
+            manifest: m,
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin: false,
+            packages: vec![],
+            unavailable_commands: vec![],
+        };
+        // Round-trip through JSON to verify remote daemon replies preserve open_in.
+        let inst: Installed = serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
+        let (cmds, active, _, _) = build_with_overrides(Some(&link), std::slice::from_ref(&inst), &BTreeMap::new());
+        assert_eq!(cmds[0].detail.as_deref(), Some("git plugin · split right"));
+        assert_eq!(active["plugin.git.lazygit"].command.open_in, PluginOpenIn::SplitRight);
+
+        let overrides = BTreeMap::from([("plugin.git.lazygit".to_string(), CommandOpenIn::Tab)]);
+        let (cmds, _, _, _) = build_with_overrides(Some(&link), &[inst], &overrides);
+        assert_eq!(cmds[0].detail.as_deref(), Some("git plugin · new tab"));
     }
 }

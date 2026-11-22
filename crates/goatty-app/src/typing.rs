@@ -41,6 +41,16 @@ impl What {
 /// at a prompt; `None` after telling the user why, with a button that
 /// copies the line. Call it deferred, outside the workspace's update.
 pub fn target(origin: &HostLink, line: &str, what: What, window: &mut Window, cx: &mut App) -> Option<Entity<TerminalView>> {
+    target_opt(Some(origin), line, what, window, cx)
+}
+
+/// Like [`target`], for a client-side custom command that works on whichever
+/// host the focused pane is on.
+pub fn target_focused(line: &str, what: What, window: &mut Window, cx: &mut App) -> Option<Entity<TerminalView>> {
+    target_opt(None, line, what, window, cx)
+}
+
+fn target_opt(origin: Option<&HostLink>, line: &str, what: What, window: &mut Window, cx: &mut App) -> Option<Entity<TerminalView>> {
     let ws = window.root::<Workspace>().flatten();
     let found = ws.as_ref().map(|ws| (ws.read(cx).focused_terminal(), ws.read(cx).active_host_link()));
     let copy = line.to_string();
@@ -56,7 +66,9 @@ pub fn target(origin: &HostLink, line: &str, what: What, window: &mut Window, cx
         return None;
     };
     // Listed for another host (the tab changed meanwhile).
-    if !host.is_some_and(|h| h.same(origin)) {
+    if let Some(origin) = origin
+        && !host.is_some_and(|h| h.same(origin))
+    {
         refuse(
             format!("This {} is from {}", what.noun(), origin.label()),
             format!("The active tab is on another host. Use it in a tab on {}: {line}", origin.label()),
