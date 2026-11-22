@@ -2,7 +2,7 @@
 //! write replies and stream frames through a dedicated writer thread.
 
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -101,22 +101,46 @@ pub(crate) fn reap_silent(conns: &parking_lot::Mutex<HashMap<u64, Arc<Liveness>>
     }
 }
 
+/// The writer keeps each lane's frames in order and shares the link fairly
+/// between lanes, so a quiet one jumps ahead of a flooding one
+/// ([`crate::writer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// Replies that belong to no session.
+    Reply,
+    /// A session's stream, and replies about it that must stay in order with it.
+    Session(SessionId),
+    /// `FileData`, so a big file doesn't hold up the replies behind it.
+    File,
+}
+
 pub(crate) struct Outbound {
     pub(crate) frame: Frame,
+    pub(crate) lane: Lane,
     _bytes: Option<ByteGuard>,
     /// Tells the writer to stop: the connection was dropped.
-    stop: bool,
+    pub(crate) stop: bool,
 }
 
 impl From<Frame> for Outbound {
     fn from(frame: Frame) -> Self {
-        Self { frame, _bytes: None, stop: false }
+        Self { frame, lane: Lane::Reply, _bytes: None, stop: false }
     }
 }
 
 impl Outbound {
+    /// A frame of `session`'s stream.
+    pub(crate) fn session(frame: Frame, session: SessionId) -> Self {
+        Self { frame, lane: Lane::Session(session), _bytes: None, stop: false }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file(frame: Frame) -> Self {
+        Self { frame, lane: Lane::File, _bytes: None, stop: false }
+    }
+
     fn stop() -> Self {
-        Self { frame: Frame::from(&[][..]), _bytes: None, stop: true }
+        Self { frame: Frame::from(&[][..]), lane: Lane::Reply, _bytes: None, stop: true }
     }
 }
 
@@ -205,28 +229,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let wstream = stream.try_clone()?;
     let live = Arc::new(Liveness::new(stream.try_clone()?, tx.downgrade()));
     let writer = std::thread::Builder::new().name(format!("c{conn}-writer")).spawn(move || {
-        let mut w = BufWriter::with_capacity(128 << 10, &wstream);
-        while let Ok(out) = rx.recv() {
-            if out.stop {
-                break;
-            }
-            if out.frame.is_empty() {
-                if w.flush().is_err() {
-                    break;
-                }
-                let _ = flushed_tx.try_send(());
-                continue;
-            }
-            if w.write_all(&out.frame).is_err() {
-                break;
-            }
-            // Drop `out` (and any `ByteGuard`) as soon as it is written.
-            drop(out);
-            // Batch under load; flush the moment the queue is idle.
-            if rx.is_empty() && w.flush().is_err() {
-                break;
-            }
-        }
+        crate::writer::run(&rx, &wstream, &flushed_tx);
         let _ = wstream.shutdown(std::net::Shutdown::Both);
     })?;
     let (input_tx, input_rx) = flume::unbounded::<InputJob>();
@@ -446,7 +449,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let rows = s.term.history_rows(before, count as usize);
                         let msg = ServerMsg::History { req, session, before, first: rows.first, oldest: rows.oldest, data: rows.data };
                         if let Ok(f) = encode_server(&msg, features.zstd) {
-                            let _ = tx.send(Outbound::from(f));
+                            let _ = tx.send(Outbound::session(f, session));
                         }
                     }
                     None => reply(ServerMsg::Error { req: Some(req), message: format!("no session {session}") }),
@@ -506,7 +509,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         if let Ok(f) = encode_server(&msg, zstd) {
                             if is_data {
                                 if let Some(byte_guard) = try_reserve_bytes(&file_queued_bytes, f.len(), MAX_QUEUED_FILE_BYTES) {
-                                    let _ = tx.send(Outbound { frame: f, _bytes: Some(byte_guard), stop: false });
+                                    let _ = tx.send(Outbound { frame: f, lane: Lane::File, _bytes: Some(byte_guard), stop: false });
                                 } else if let Ok(err) = encode(&ServerMsg::Error {
                                     req: Some(req),
                                     message: "file transfer queue is full; try again shortly".into(),

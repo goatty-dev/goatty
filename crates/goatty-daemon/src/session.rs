@@ -123,6 +123,7 @@ impl SubFlow {
 /// snapshot of the current screen and streaming resumes.
 pub(crate) struct Subscriber {
     conn: u64,
+    session: SessionId,
     tx: flume::Sender<Outbound>,
     fixed_window: u64,
     flow: Option<SubFlow>,
@@ -194,7 +195,7 @@ impl Subscriber {
             }
             self.sent.fetch_add(stream_len as u64, Ordering::AcqRel);
         }
-        let ok = self.tx.send(Outbound::from(frame)).is_ok();
+        let ok = self.tx.send(Outbound::session(frame, self.session)).is_ok();
         if !ok {
             self.release_flow();
         }
@@ -757,6 +758,7 @@ impl Session {
         };
         let sub = Arc::new(Subscriber {
             conn,
+            session: self.id,
             tx: tx.clone(),
             fixed_window,
             flow,
@@ -867,7 +869,7 @@ impl Session {
                 self.resync(&sub);
             }
             if let Some(f) = &exited {
-                let _ = sub.tx.send(Outbound::from(f.clone()));
+                let _ = sub.tx.send(Outbound::session(f.clone(), self.id));
             }
             // Debit any unacknowledged bytes immediately; `client.rs` may keep
             // `Arc<Subscriber>` until `Detach` or disconnect, and `Drop` skips
@@ -958,6 +960,7 @@ mod tests {
         let (tx, rx) = flume::unbounded();
         let sub = Arc::new(Subscriber {
             conn: 1,
+            session: 1,
             tx,
             fixed_window: 64 << 10,
             flow: None,

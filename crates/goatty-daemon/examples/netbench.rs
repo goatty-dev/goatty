@@ -1,5 +1,6 @@
 //! Headless end-to-end benchmark of the client ⇄ daemon path: keystroke echo
-//! latency, flood throughput, and multi-pane window restore (sequential vs.
+//! latency (alone, and while another pane on the same connection floods),
+//! flood throughput, and multi-pane window restore (sequential vs.
 //! pipelined `attach_many`), with the client feeding a real mirror VT (same
 //! work the GUI does, minus rendering).
 //!
@@ -14,6 +15,7 @@
 //!   FLOOD_MB       (default 200; 0 skips the flood phase)
 //!   RESTORE_PANES  (default 8; 0 skips the multi-pane restore phase)
 //!   RESTORE_LINES  (default 0; lines of scrollback seeded per restored pane)
+//!   CONTEND_PANES  (default 2; panes flooding during the second echo phase; 0 skips it)
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -284,6 +286,62 @@ fn bench_restore(
     Ok(RestoreMetrics { panes, lines, seq_total, seq_attach, pipe_total, pipe_attach })
 }
 
+/// Kills the flooding panes even if the contended-echo phase fails: on ssh
+/// and tailnet hosts they would otherwise keep running.
+struct KillOnDrop<'a> {
+    conn: &'a Connection,
+    ids: Vec<SessionId>,
+}
+
+impl Drop for KillOnDrop<'_> {
+    fn drop(&mut self) {
+        for &id in &self.ids {
+            let _ = self.conn.kill(id);
+        }
+    }
+}
+
+/// Keystroke echo in pane `id` while `flooders` other panes on the same
+/// connection flood: the cross-pane head-of-line delay of the daemon's
+/// writer queue.
+fn bench_contended(
+    conn: &Connection,
+    id: SessionId,
+    sink: &Sink,
+    ws: WinSize,
+    size: TermSize,
+    flooders: usize,
+) -> anyhow::Result<Vec<Duration>> {
+    let mut flood = KillOnDrop { conn, ids: Vec::new() };
+    for _ in 0..flooders {
+        let flood_sink = Sink::new(size);
+        let flooder = conn.create(ws, None, flood_sink.clone())?;
+        flood.ids.push(flooder);
+        conn.input(flooder, b"echo READY-$((2+2))\r");
+        assert!(flood_sink.wait_tail(b"READY-4", Duration::from_secs(10)), "flooding shell did not start");
+    }
+    for &flooder in &flood.ids {
+        conn.input(flooder, b"cat /dev/zero | tr '\\0' x\r");
+    }
+    // Let the flood fill the link, the windows and the queues.
+    std::thread::sleep(Duration::from_secs(1));
+    conn.input(id, b"stty raw -echo; dd bs=1 count=80 status=none; stty sane; echo\r");
+    std::thread::sleep(Duration::from_millis(500));
+    sink.tail.lock().clear();
+    let mut lat = Vec::new();
+    for i in 0..20u8 {
+        let marker = format!("<{i:02}>").into_bytes();
+        let t = Instant::now();
+        conn.input(id, &marker);
+        assert!(sink.wait_tail(&marker, Duration::from_secs(10)), "echo timeout during flood");
+        lat.push(t.elapsed());
+        sink.tail.lock().clear();
+    }
+    drop(flood);
+    lat.sort();
+    Ok(lat)
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("__delay-proxy") {
@@ -295,6 +353,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error,rio_vt=error")).init();
     let flood_mb: u64 = std::env::var("FLOOD_MB").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
     let restore_panes: usize = std::env::var("RESTORE_PANES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let contend_panes: usize = std::env::var("CONTEND_PANES").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
     let restore_lines: usize = std::env::var("RESTORE_LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     // Removed when dropped at the end of main, after the daemon is killed.
@@ -402,6 +461,8 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    let contended = if contend_panes > 0 { Some(bench_contended(&conn, id, &sink, ws, size, contend_panes)?) } else { None };
+
     let active_window = conn.flow_window();
     if active_window != opts.window {
         println!("endpoint            {label} (window {} → {} KiB, history {})", opts.window >> 10, active_window >> 10, opts.history);
@@ -432,6 +493,14 @@ fn main() -> anyhow::Result<()> {
         lat[45].as_secs_f64() * 1e3,
         lat[49].as_secs_f64() * 1e3
     );
+    if let Some(lat) = contended {
+        println!(
+            "echo, {contend_panes} flooding  p50 {:.3} ms  p90 {:.3} ms  max {:.3} ms",
+            lat[lat.len() / 2].as_secs_f64() * 1e3,
+            lat[lat.len() * 9 / 10].as_secs_f64() * 1e3,
+            lat[lat.len() - 1].as_secs_f64() * 1e3
+        );
+    }
     if let Some((flood, received)) = flood_result {
         println!(
             "flood {flood_mb} MB        {:>8.2} s → {:.0} MB/s produced, {:.1} MB delivered, {} resyncs ({:.1} MB skipped)",

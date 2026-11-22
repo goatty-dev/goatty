@@ -94,7 +94,7 @@ Effects:
 - **Fast LAN / loopback proxy:** ramps from 256 KiB up to 8 MiB within ~250 ms and streams at local speed.
 - **High-RTT fast WAN** (e.g. 100 Mbps at 80 ms RTT): grows past the 1 MiB BDP (~1.6 MiB) instead of stalling at 256 KiB.
 - **Slow remote flood** (`cat 1GB.log` over a 500 KB/s–2 MB/s link): shrinks quickly to 64–100 KiB so skip-and-resync triggers early and **Ctrl+C → prompt visible ≈ 50 ms + RTT** (64 KiB at 500 KB/s ≈ 130 ms vs >500 ms at fixed 256 KiB).
-- **Many panes on one link:** worst-case head-of-line delay ≈ Σ windows / bandwidth. Bounded, and see R1 "interactive priority".
+- **Many panes on one link:** the daemon's queue holds up to Σ windows, but its per-connection writer keeps one lane per session (plus one for replies to no session and one for file transfers) and shares the link between them by self-clocked fair queueing (`goatty-daemon/src/writer.rs`, #8). Echo and prompts from a quiet pane jump ahead of a flooding pane's backlog, floods share the link, and each lane stays in order. What it can't reorder is what already left the daemon: the kernel socket buffer, ssh, and the link.
 - **Memory:** daemon queues are bounded by Σ windows. Stage 0 had unbounded per-client queues, which a stalled SSH client could grow to gigabytes.
 - **Cost of skipping:** lines skipped during a flood are missing from the *client's* scrollback until the user scrolls up to the gap; then the client fetches them from the daemon (§4a).
 
@@ -297,7 +297,7 @@ Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow con
 2. ✅ **Remote goattyd install and version negotiation**, plus the plain SSH fallback (§4, §5a).
 3. ✅ **SSH prompts in the GUI** through goatty as `SSH_ASKPASS` (§5b).
 4. ✅ **Daemon as systemd user service** (opt-in, socket-activated) with linger guidance (§5b). FDSTORE: #131.
-5. **Interactive priority in the daemon writer**: small frames (echo, prompts) jump ahead of bulk frames from flooding panes. This removes most cross-pane head-of-line delay on one link.
+5. ✅ **Interactive priority in the daemon writer** (#8, §4): per-session lanes with fair queueing, so echo and prompts jump ahead of flooding panes. Keystroke echo in one pane while 4 others flood through a 20 MB/s proxy (`CONTEND_PANES=4 FLOOD_MB=0 RESTORE_PANES=0 netbench slow 20m`): p50 91 → 1.5 ms, p90 109 → 92–101 ms, max 194 → 102 ms; with 1 flooder, p90 21 → 1 ms. At 2 MB/s, p50 stays ≈ 100 ms: that delay sits in `pv`'s 100 ms rate quantum and the kernel buffers after the daemon. Local and loopback-proxy flood throughput didn't change (≈ 270 / 255 MB/s).
 6. ✅ **Adaptive window** (#9, protocol v15, §4): measure delivery rate from acks and propagation `min_rtt` from pings (`ClientMsg::Rtt`), set `window = clamp(rate × (50 ms + min(min_rtt, 200 ms)), 64 KiB, 8 MiB)`, and notify the client via `ServerMsg::FlowWindow`. Fast LANs ramp to 8 MiB, high-RTT WANs exceed 1 BDP, slow links shrink to 64 KiB and skip early.
 7. ✅ **Lazy history**: `FetchHistory` fills the client's scrollback on demand, for the trimmed attach snapshot and for lines skipped by resync, with stable host line numbers (§4a).
 8. ✅ **Compression** for snapshots and history (zstd, negotiated per connection; §4a). Live output stays uncompressed (it's small, and latency matters more).
