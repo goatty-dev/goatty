@@ -559,8 +559,6 @@ pub struct ColorPicker {
     nums: [Entity<TextInput>; 3],
     history: ColorHistory,
     history_path: Option<PathBuf>,
-    /// A history swatch under the mouse.
-    hover: Option<Color>,
     status: Option<Status>,
     _subs: Vec<gpui::Subscription>,
 }
@@ -613,7 +611,6 @@ impl ColorPicker {
             nums,
             history,
             history_path,
-            hover: None,
             status: None,
             _subs: subs,
         };
@@ -1400,12 +1397,6 @@ impl Render for ColorPicker {
             1.0,
         ));
 
-        let (line, line_color) = match (&self.status, self.hover) {
-            (Some(s), _) => (s.text.clone(), if s.ok { ui.success } else { ui.danger }),
-            (None, Some(c)) => (c.to_string(), ui.muted),
-            (None, None) => ("Paste hex, rgb(), hsl(), hsv(), oklch() or oklab(), or press Ctrl+V here.".to_string(), ui.muted),
-        };
-
         let controls = div()
             .flex()
             .flex_col()
@@ -1422,7 +1413,9 @@ impl Render for ColorPicker {
                     move |_, cx| this.update(cx, |p, cx| p.paste(cx))
                 },
             )))
-            .child(div().text_xs().text_color(line_color).child(SharedString::from(line)))
+            .when_some(self.status.as_ref(), |d, s| {
+                d.child(div().text_xs().text_color(if s.ok { ui.success } else { ui.danger }).child(SharedString::from(s.text.clone())))
+            })
             .child(div().flex().child(segmented("picker-model", &Model::ALL, &model, ui, {
                 let this = this.clone();
                 move |m, _, cx| this.update(cx, |p, cx| p.set_model(m, cx))
@@ -1452,15 +1445,7 @@ impl Render for ColorPicker {
                         .bg(hsla(c))
                         .cursor_pointer()
                         .hover(|s| s.border_color(ui.text))
-                        .on_click(cx.listener(move |p, _: &ClickEvent, _, cx| p.pick_color(c, cx)))
-                        .on_hover(cx.listener(move |p, hovered: &bool, _, cx| {
-                            if *hovered {
-                                p.hover = Some(c);
-                            } else if p.hover == Some(c) {
-                                p.hover = None;
-                            }
-                            cx.notify();
-                        }));
+                        .on_click(cx.listener(move |p, _: &ClickEvent, _, cx| p.pick_color(c, cx)));
                     focus::tab(swatch, &id, ui, Ring::Outer, Scroller::Page)
                 }))
                 .into_any_element()
