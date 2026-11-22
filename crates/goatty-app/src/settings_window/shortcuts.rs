@@ -911,17 +911,20 @@ impl SettingsWindow {
                 let action_key = name.clone();
                 let select_id = format!("sc-open-in-{name}");
                 let select_name = format!("Where {} opens", line.label);
+                let picker_survives_clear = line.available && !plugin_commands::is_keys_command(&name, cx);
                 let (this, page_focus) = (this.clone(), page_focus.clone());
                 let picker = self.select(&select_id, &select_name, opts, &override_val, cx, move |choice, window, cx| {
                     if choice.is_none()
-                        && let Ok(target) = this.update(cx, |v, cx| {
+                        && let Ok((target, hand_over)) = this.update(cx, |v, cx| {
                             let target = v.shortcut_focus_target(&action_key, ShortcutEdit::ClearPlacement, cx);
-                            if target != row_elem_id(&action_key) {
+                            let hand_over = !picker_survives_clear || target != row_elem_id(&action_key);
+                            if hand_over {
+                                // Either the row or the picker trigger is leaving: don't restore focus to the removed trigger.
                                 v.menu_opener = None;
                             }
-                            target
+                            (target, hand_over)
                         })
-                        && target != row_elem_id(&action_key)
+                        && hand_over
                     {
                         focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
                     }

@@ -570,11 +570,18 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
     }
     let open_in = effective_open_in(id, c, cx);
     let line = command_line(c, answers);
+    let pane = c.pane.clone();
+    let title = c.title.clone();
     if open_in == CommandOpenIn::Current {
         let origin = origin.clone();
         // Deferred: the palette runs commands from inside the workspace.
         window.defer(cx, move |window, cx| {
             if let Some(view) = crate::typing::target(&origin, &line, crate::typing::What::Command, window, cx) {
+                if let Some(pane) = pane.as_ref()
+                    && !pane_fits_or_warn(pane, &title, Some(&view), window, cx)
+                {
+                    return;
+                }
                 view.update(cx, |v, cx| v.run_line(&line, cx));
             }
         });
@@ -583,8 +590,6 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
     let needs_home = needs_home_expansion(c, answers);
     let cmd_owned = c.clone();
     let answers_owned = answers.clone();
-    let pane = c.pane.clone();
-    let title = c.title.clone();
     let origin_check = origin.clone();
     let label = c.run.first().cloned().unwrap_or_else(|| c.title.clone());
     let launch = crate::workspace::LaunchCommand {
@@ -603,18 +608,8 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
             if let Some(pane) = pane.as_ref() {
                 let same_host = ws.read(cx).active_host_link().is_some_and(|h| h.same(&origin_check));
                 if same_host {
-                    let fits = ws.read(cx).focused_terminal().is_some_and(|view| {
-                        let v = view.read(cx);
-                        pane.matches(v.process(), v.at_prompt())
-                    });
-                    if !fits {
-                        crate::toast::show_in(
-                            window,
-                            cx,
-                            crate::toast::Toast::warning(format!("\u{201c}{title}\u{201d} doesn't fit this pane"))
-                                .body(format!("It works {}.", pane.describe()))
-                                .key("plugin.command"),
-                        );
+                    let focused = ws.read(cx).focused_terminal();
+                    if !pane_fits_or_warn(pane, &title, focused.as_ref(), window, cx) {
                         return;
                     }
                 }
@@ -622,6 +617,29 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
             ws.update(cx, |ws, cx| ws.open_command(launch, window, cx));
         }
     });
+}
+
+fn pane_fits_or_warn(
+    pane: &goatty_plugin::commands::PaneContext,
+    title: &str,
+    view: Option<&gpui::Entity<crate::terminal::TerminalView>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let fits = view.is_some_and(|view| {
+        let v = view.read(cx);
+        pane.matches(v.process(), v.at_prompt())
+    });
+    if !fits {
+        crate::toast::show_in(
+            window,
+            cx,
+            crate::toast::Toast::warning(format!("\u{201c}{title}\u{201d} doesn't fit this pane"))
+                .body(format!("It works {}.", pane.describe()))
+                .key("plugin.command"),
+        );
+    }
+    fits
 }
 
 #[cfg(test)]
