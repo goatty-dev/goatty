@@ -627,7 +627,8 @@ open_in = "split-right"
         };
         let split_json = serde_json::to_string(&inst_split).unwrap();
         let v: serde_json::Value = serde_json::from_str(&split_json).unwrap();
-        assert!(v["manifest"]["commands"][0].get("open_in").is_none(), "{split_json}");
+        let cmd_obj = v["manifest"]["command"][0].as_object().expect("serialized command object");
+        assert!(!cmd_obj.contains_key("open_in"), "{split_json}");
         assert_eq!(v["command_open_in"]["lazygit"], "split-right");
         let back_split: Installed = serde_json::from_str(&split_json).unwrap();
         assert_eq!(back_split.command_open_in_for(&back_split.manifest.commands[0]), crate::commands::OpenIn::SplitRight);
