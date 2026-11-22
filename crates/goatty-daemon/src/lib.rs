@@ -30,6 +30,7 @@ pub mod server;
 mod session;
 mod settings;
 pub mod systemd;
+mod writer;
 
 pub use proxy::proxy;
 pub use restore::STATE_VERSION;
