@@ -142,6 +142,9 @@ impl SettingsWindow {
                     ui,
                     self.host(cx, |h| h.shell.zsh.integration = !h.shell.zsh.integration),
                 )))
+                .child(row(ui, "Highlight pasted text").desc("Shows a paste in reverse video until you press the next key").disabled(off).control(
+                    toggle("highlight-paste", z.highlight_paste, ui, self.host(cx, |h| h.shell.zsh.highlight_paste = !h.shell.zsh.highlight_paste)),
+                ))
                 .child(
                     row(ui, "Built-in plugins")
                         .icon(Icon::Puzzle)

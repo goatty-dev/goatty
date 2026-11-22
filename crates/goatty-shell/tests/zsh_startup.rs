@@ -1366,6 +1366,34 @@ fn expansions_can_be_turned_off() {
     assert_eq!(out.trim(), "ok user:goatty-expand-space");
 }
 
+/// A paste isn't shown in reverse video (zsh's `zle_highlight` default)
+/// unless `shell.zsh.highlight_paste` asks for it, whichever plugins load:
+/// autosuggestions happens to clear it, so it's off here.
+#[test]
+fn pasted_text_is_not_highlighted_by_default() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    let paste = |highlight: bool| {
+        let mut s = no_highlighting();
+        s.edit_plugin("autosuggestions", |p| p.enabled = false);
+        s.shell.zsh.highlight_paste = highlight;
+        let launch = sb.launch_with(s, None);
+        let mut sh = PtyShell::start(&sb, &launch);
+        let start = sh.out.len();
+        sh.pty.write(b"\x1b[200~echo pasted\x1b[201~").unwrap();
+        sh.wait_for_from(start, b"pasted");
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(chunk) = sh.rx.try_recv() {
+            sh.out.extend(chunk);
+        }
+        String::from_utf8_lossy(&sh.out[start..]).into_owned()
+    };
+    let out = paste(false);
+    assert!(!out.contains("\x1b[7m"), "no standout: {out:?}");
+    let out = paste(true);
+    assert!(out.contains("\x1b[7m"), "standout when asked for: {out:?}");
+}
+
 /// goatty's right-click menu (#186) reads and changes the typed line
 /// through private key sequences bound to zle widgets.
 #[test]
