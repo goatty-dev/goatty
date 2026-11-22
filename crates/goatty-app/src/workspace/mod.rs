@@ -1075,8 +1075,9 @@ impl Workspace {
         let tab_id = tab.id;
         let focused_id = tab.focused;
         let min = self.min_pane_size(cx);
-        let (placement, return_focus) = match spec.open_in {
-            goatty_config::CommandOpenIn::Tab | goatty_config::CommandOpenIn::Current => (Placement::NewTab, None),
+        let return_focus = Some(focused_id);
+        let placement = match spec.open_in {
+            goatty_config::CommandOpenIn::Tab | goatty_config::CommandOpenIn::Current => Placement::NewTab,
             dir_choice => {
                 let dir = match dir_choice {
                     goatty_config::CommandOpenIn::SplitRight => Direction::Right,
@@ -1089,9 +1090,9 @@ impl Workspace {
                     let toast =
                         Toast::info("Opened in a new tab").body("Not enough room for another split pane here.").key("workspace.command");
                     toast::show_in(window, cx, toast);
-                    (Placement::NewTab, None)
+                    Placement::NewTab
                 } else {
-                    (Placement::Split { tab: tab_id, of: focused_id, dir }, Some(focused_id))
+                    Placement::Split { tab: tab_id, of: focused_id, dir }
                 }
             }
         };
@@ -1213,7 +1214,7 @@ impl Workspace {
             Placement::NewTab => None,
         };
         let mut pane = self.make_pane(session, window, cx);
-        pane.return_focus = if target.is_some() { return_focus } else { None };
+        pane.return_focus = return_focus;
         pane.launched = launched;
         let id = pane.id;
         let index = match target {
@@ -1341,7 +1342,19 @@ impl Workspace {
         if index >= self.tabs.len() {
             return;
         }
+        let return_focus = if index == self.active {
+            let tab = &self.tabs[index];
+            tab.pane(tab.focused).and_then(|p| p.return_focus)
+        } else {
+            None
+        };
         self.take_tab(index, window, cx);
+        if let Some(origin) = return_focus
+            && let Some((origin_tab, _)) = self.find_pane(origin)
+        {
+            self.active = origin_tab;
+            self.tabs[origin_tab].focused = origin;
+        }
         self.finish_removing_tabs(window, cx);
     }
 

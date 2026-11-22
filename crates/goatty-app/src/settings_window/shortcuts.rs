@@ -911,7 +911,20 @@ impl SettingsWindow {
                 let action_key = name.clone();
                 let select_id = format!("sc-open-in-{name}");
                 let select_name = format!("Where {} opens", line.label);
-                let picker = self.select(&select_id, &select_name, opts, &override_val, cx, move |choice, _, cx| {
+                let (this, page_focus) = (this.clone(), page_focus.clone());
+                let picker = self.select(&select_id, &select_name, opts, &override_val, cx, move |choice, window, cx| {
+                    if choice.is_none()
+                        && let Ok(target) = this.update(cx, |v, cx| {
+                            let target = v.shortcut_focus_target(&action_key, ShortcutEdit::ClearPlacement, cx);
+                            if target != row_elem_id(&action_key) {
+                                v.menu_opener = None;
+                            }
+                            target
+                        })
+                        && target != row_elem_id(&action_key)
+                    {
+                        focus::hand_over(&page_focus, focus::Handover::Control(target), window, cx);
+                    }
                     AppSettings::update(cx, |s| match choice {
                         Some(p) => {
                             s.commands.open_in.insert(action_key.clone(), p);
@@ -1494,6 +1507,7 @@ impl SettingsWindow {
 enum ShortcutEdit<'a> {
     Remove(&'a str),
     Reset,
+    ClearPlacement,
     DeleteCustom,
 }
 
@@ -1576,6 +1590,9 @@ fn focus_target_after_edit(
         ShortcutEdit::Remove(key) => keys::set_binding(&mut after_keys, key, None),
         ShortcutEdit::Reset => {
             keys::reset_action(&mut after_keys, action);
+            after_cmds.open_in.remove(action);
+        }
+        ShortcutEdit::ClearPlacement => {
             after_cmds.open_in.remove(action);
         }
         ShortcutEdit::DeleteCustom => {
@@ -2170,5 +2187,26 @@ mod tests {
         let (title, desc) = empty_state_message(&all, Filter::All, "", Some("ctrl-alt-q"));
         assert!(title.contains("Nothing uses Ctrl+Alt+Q"), "{title}");
         assert!(desc.contains("goes to the shell"), "{desc}");
+    }
+
+    #[test]
+    fn clear_placement_on_inactive_plugin_row_hands_focus_to_neighbor() {
+        let overrides = BTreeMap::new();
+        let mut commands = CommandSettings::default();
+        commands.open_in.insert("plugin.alpha.run".into(), CommandOpenIn::SplitRight);
+        commands.open_in.insert("plugin.beta.run".into(), CommandOpenIn::Tab);
+        let target = focus_target_after_edit(
+            "plugin.alpha.run",
+            ShortcutEdit::ClearPlacement,
+            &overrides,
+            &commands,
+            None,
+            Filter::All,
+            Sort::Group,
+            &HashSet::new(),
+            "",
+            None,
+        );
+        assert_eq!(target, row_elem_id("plugin.beta.run"));
     }
 }

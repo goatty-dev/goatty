@@ -583,6 +583,9 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
     let needs_home = needs_home_expansion(c, answers);
     let cmd_owned = c.clone();
     let answers_owned = answers.clone();
+    let pane = c.pane.clone();
+    let title = c.title.clone();
+    let origin_check = origin.clone();
     let label = c.run.first().cloned().unwrap_or_else(|| c.title.clone());
     let launch = crate::workspace::LaunchCommand {
         label,
@@ -597,6 +600,25 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
     };
     window.defer(cx, move |window, cx| {
         if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {
+            if let Some(pane) = pane.as_ref() {
+                let same_host = ws.read(cx).active_host_link().is_some_and(|h| h.same(&origin_check));
+                if same_host {
+                    let fits = ws.read(cx).focused_terminal().is_some_and(|view| {
+                        let v = view.read(cx);
+                        pane.matches(v.process(), v.at_prompt())
+                    });
+                    if !fits {
+                        crate::toast::show_in(
+                            window,
+                            cx,
+                            crate::toast::Toast::warning(format!("\u{201c}{title}\u{201d} doesn't fit this pane"))
+                                .body(format!("It works {}.", pane.describe()))
+                                .key("plugin.command"),
+                        );
+                        return;
+                    }
+                }
+            }
             ws.update(cx, |ws, cx| ws.open_command(launch, window, cx));
         }
     });
