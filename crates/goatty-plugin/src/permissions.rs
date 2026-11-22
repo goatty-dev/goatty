@@ -101,7 +101,7 @@ impl Permission {
             Permission::Env => "These variables are set in every goatty shell.",
             Permission::ConfigFiles => "goatty writes these files into its own shell configuration; nothing in your home directory.",
             Permission::Commands => {
-                "Picking one asks for its values, then types its command line into your terminal, where you see it run. Values are quoted: they can't become shell code."
+                "Picking one asks for its values, then types its command line into your terminal, where you see it run (values are quoted: they can't become shell code), or sends the listed keys to the program running there."
             }
             Permission::Snippets => {
                 "Nothing runs: a snippet's line is put on your prompt for you to read and run, and an expansion rewrites words you typed (shown before it runs, Backspace undoes it)."

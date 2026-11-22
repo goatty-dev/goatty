@@ -2739,15 +2739,27 @@ fn encode_strokes(strokes: &[Stroke], mode: TermMode, opts: KeyOptions) -> Vec<u
     };
     for stroke in strokes {
         match stroke {
+            // As the keyboard reports them: shifted text with Shift held
+            // (the kitty protocol reports the unshifted key plus Shift).
             Stroke::Text(text) => {
                 for ch in text.chars() {
                     let mut buf = [0; 4];
-                    press(stroke_key(KeyName::Char(ch), &mut buf), Mods::default());
+                    press(stroke_key(KeyName::Char(ch), &mut buf), Mods { shift: ch.is_uppercase(), ..Mods::default() });
                 }
             }
             Stroke::Press(p) => {
+                let mut key = p.key;
+                let mut shift = p.shift;
+                if let KeyName::Char(c) = key {
+                    let mut upper = c.to_uppercase();
+                    if let (true, Some(u), None) = (p.shift, upper.next(), upper.next()) {
+                        key = KeyName::Char(u);
+                    }
+                    // `<M-A>` is Alt+Shift+a; `<C-A>` stays Ctrl+a.
+                    shift |= !p.ctrl && c.is_uppercase();
+                }
                 let mut buf = [0; 4];
-                press(stroke_key(p.key, &mut buf), Mods { ctrl: p.ctrl, alt: p.alt, shift: p.shift, logo: false });
+                press(stroke_key(key, &mut buf), Mods { ctrl: p.ctrl, alt: p.alt, shift, logo: false });
             }
         }
     }
@@ -2795,6 +2807,14 @@ mod tests {
         // The kitty protocol reports Esc unambiguously.
         let kitty = encode_strokes(&strokes, TermMode::KITTY_DISAMBIGUATE, KeyOptions::default());
         assert!(kitty.starts_with(b"\x1b[27u:wq x\r"), "{:?}", String::from_utf8_lossy(&kitty));
+
+        // Shift and capitals, as a keyboard would send them.
+        let cmd: goatty_plugin::commands::PaletteCommand =
+            serde_json::from_str(r#"{"id": "s", "title": "S", "keys": ["<S-a><M-S-a><M-A><C-A>Z"]}"#).unwrap();
+        let strokes = goatty_plugin::commands::strokes(&cmd, &Default::default());
+        assert_eq!(encode_strokes(&strokes, TermMode::SHOW_CURSOR, KeyOptions::default()), b"A\x1bA\x1bA\x01Z");
+        let kitty = encode_strokes(&strokes, TermMode::KITTY_DISAMBIGUATE | TermMode::KITTY_ALL_KEYS, KeyOptions::default());
+        assert_eq!(String::from_utf8_lossy(&kitty), "\x1b[97;2u\x1b[97;4u\x1b[97;4u\x1b[97;5u\x1b[122;2u");
     }
 
     #[test]

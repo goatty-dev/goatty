@@ -657,6 +657,9 @@ fn check_keys(c: &PaletteCommand, inputs: &BTreeSet<&str>, at: &str) -> Vec<Prob
     let mut out = Vec::new();
     for (k, entry) in c.keys.iter().enumerate() {
         let at = format!("{at}.keys[{k}]");
+        if entry.is_empty() {
+            out.push(Problem { path: at.clone(), message: "empty".into() });
+        }
         if entry.chars().any(char::is_control) {
             out.push(Problem { path: at.clone(), message: "control characters: name the key instead (<Esc>, <Enter>, <C-c>)".into() });
         }
@@ -1173,6 +1176,7 @@ choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
         let p = bad("keys = [\"q\"]\n[command.pane]\nprograms = [\"/usr/bin/vim\"]\nat = \"prompt\"");
         assert!(has(&p, "not a path") && has(&p, "not at a prompt"), "{p:?}");
         assert!(has(&bad("keys = [\"q\"]\n[command.pane]"), "say which programs"));
+        assert!(has(&bad("keys = [\"\"]"), "keys[0]: empty"));
         // A run command may be for prompts only; keys need no program on the host.
         with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\n[command.pane]\nat = \"prompt\"\n").unwrap();
         with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nkeys = [\"q\"]\n").unwrap();
