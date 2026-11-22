@@ -16,11 +16,17 @@
 //! the host runs the plugin's own definition (`Request::CommandSuggest`;
 //! the client only names the plugin, command and input) in the focused
 //! pane's directory, and the palette lists the results.
+//!
+//! A command can send keys to the program in the focused pane instead of
+//! typing a line (`keys`, #240), and say where it applies (`[command.pane]`:
+//! which programs, or at a prompt or not). Elsewhere the palette and the
+//! menu leave it out, and a shortcut bound to it goes to the terminal as a
+//! normal key ([`passes_through`]).
 
 use std::rc::Rc;
 
 use goatty_plugin::api::{Installed, Reply, Request};
-use goatty_plugin::commands::{CommandInput, MenuWhen, PaletteCommand, command_line};
+use goatty_plugin::commands::{CommandInput, MenuWhen, PaletteCommand, command_line, strokes};
 use gpui::{App, AsyncApp, Global, Window};
 
 use crate::command_palette::input::Loader;
@@ -55,6 +61,12 @@ pub struct MenuCommand {
 impl MenuCommand {
     pub fn when(&self) -> MenuWhen {
         self.command.menu.as_ref().map(|m| m.when).unwrap_or_default()
+    }
+
+    /// Whether it applies to a pane running `process`, `at_prompt` or not
+    /// (`[command.pane]`; without one, everywhere).
+    pub fn fits(&self, process: Option<&str>, at_prompt: bool) -> bool {
+        self.command.pane.as_ref().is_none_or(|p| p.matches(process, at_prompt))
     }
 
     /// Its icon: the manifest's, else the plugin icon.
@@ -262,6 +274,14 @@ fn resolve_dispatch<'a>(
     Some(entry)
 }
 
+/// Whether a shortcut bound to `id` should go to the terminal as a normal
+/// key: the command is the active host's and says where it applies, and
+/// the focused pane (running `process`, `at_prompt` or not) isn't such a
+/// place (#240).
+pub fn passes_through(id: &str, process: Option<&str>, at_prompt: bool, cx: &App) -> bool {
+    cx.try_global::<State>().and_then(|s| s.active.get(id)).is_some_and(|c| !c.fits(process, at_prompt))
+}
+
 /// Run the active plugin command with id `id` (`plugin.<plugin>.<command>`),
 /// or tell the user why it isn't available on the current host.
 pub fn run_by_id(id: &str, selection: Option<&str>, window: &mut Window, cx: &mut App) {
@@ -330,6 +350,7 @@ fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand) -> Co
     out = out.keywords(&words);
     out.detail = Some(format!("{plugin} plugin").into());
     out.source = Source::Plugin(plugin.to_string().into());
+    out.pane = c.pane.clone();
     out
 }
 
@@ -427,8 +448,18 @@ fn selection_value(text: &str) -> String {
 
 /// Type `c`'s line for `answers` into the focused pane, if it's on the
 /// host the command came from (`origin`) and a shell is waiting there;
-/// otherwise offer to copy it.
+/// otherwise offer to copy it. A command with `keys` sends them to the
+/// pane's program instead, if the pane still fits the command.
 fn run(c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Window, cx: &mut App) {
+    if !c.keys.is_empty() {
+        let (keys, title, pane, origin) = (strokes(c, answers), c.title.clone(), c.pane.clone(), origin.clone());
+        window.defer(cx, move |window, cx| {
+            if let Some(view) = crate::typing::keys_target(&origin, &title, pane.as_ref(), window, cx) {
+                view.update(cx, |v, cx| v.send_strokes(&keys, cx));
+            }
+        });
+        return;
+    }
     let line = command_line(c, answers);
     let origin = origin.clone();
     // Deferred: the palette runs commands from inside the workspace.

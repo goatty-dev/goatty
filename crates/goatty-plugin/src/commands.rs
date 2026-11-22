@@ -62,6 +62,23 @@
 //! when = "selection"     # always (default) | selection | prompt
 //! fill = "container"
 //! ```
+//!
+//! Instead of `run`, a command can send keys into the focused pane (#240),
+//! to the program running there: `keys` is text with vim-style key names
+//! (`<Esc>`, `<Enter>`, `<C-c>`, `<lt>` for a literal `<`) and `{input}`
+//! values, which are typed as text. `[command.pane]` says where a command
+//! applies: while one of `programs` is in the pane's foreground, or `at` a
+//! shell prompt or inside a program. Elsewhere it isn't offered, and a
+//! shortcut bound to it goes to the terminal as a normal key:
+//!
+//! ```toml
+//! [[command]]
+//! id = "write-quit"
+//! title = "Save and exit Vim"
+//! keys = ["<Esc>", ":wq", "<Enter>"]
+//! [command.pane]
+//! programs = ["vim", "nvim"]
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -84,8 +101,18 @@ pub struct PaletteCommand {
     /// The command line as words. The first is one of the plugin's package
     /// executables or required commands (no template); the others may use
     /// `{input}` (the value, or nothing for an empty optional value as a
-    /// whole word), inside a word too (`--name={name}`).
+    /// whole word), inside a word too (`--name={name}`). Empty when the
+    /// command sends `keys` instead.
+    #[serde(default)]
     pub run: Vec<String>,
+    /// Instead of `run`: keys sent to the program in the focused pane, as
+    /// text with `<Key>` names and `{input}` values (see [`strokes`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// Where the command applies (see [`PaneContext`]); elsewhere it's
+    /// hidden and a shortcut bound to it passes its key to the terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<PaneContext>,
     /// Asked in this order.
     #[serde(default, rename = "input")]
     pub inputs: Vec<CommandInput>,
@@ -96,6 +123,206 @@ pub struct PaletteCommand {
     /// Also in the terminal's right-click menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<CommandMenu>,
+}
+
+/// Where in a pane a command applies, from what the focused pane runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneContext {
+    /// One of these programs is in the foreground (`vim`, `nvim`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<String>,
+    /// At a shell prompt, or inside a program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<PaneAt>,
+}
+
+/// A shell waits at its prompt, or another program runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneAt {
+    Prompt,
+    Program,
+}
+
+impl PaneContext {
+    /// Whether a pane whose foreground program is `process` (when the host
+    /// can tell), `at_prompt` or not, is one this command applies to.
+    pub fn matches(&self, process: Option<&str>, at_prompt: bool) -> bool {
+        let program = self.programs.is_empty() || process.is_some_and(|p| self.programs.iter().any(|q| q == p));
+        let at = match self.at {
+            None => true,
+            Some(PaneAt::Prompt) => at_prompt,
+            Some(PaneAt::Program) => !at_prompt,
+        };
+        program && at
+    }
+
+    /// "while vim or nvim runs", for the install plan and messages.
+    pub fn describe(&self) -> String {
+        match (self.programs.as_slice(), self.at) {
+            ([], Some(PaneAt::Prompt)) => "at a shell prompt".into(),
+            ([], _) => "while a program runs".into(),
+            ([one], _) => format!("while {one} runs"),
+            ([init @ .., last], _) => format!("while {} or {last} runs", init.join(", ")),
+        }
+    }
+}
+
+/// One step of a command's `keys`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stroke {
+    /// Typed as text (the author's, or an input's value).
+    Text(String),
+    /// A key press (`<Esc>`, `<C-c>`).
+    Press(KeyPress),
+}
+
+/// A key with modifiers, as named in `keys` (`<C-S-Tab>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyPress {
+    pub key: KeyName,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+/// The keys `keys` can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyName {
+    /// A character key (`<C-c>`: `c`).
+    Char(char),
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Space,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    /// F1 to F12.
+    F(u8),
+}
+
+/// The key names `keys` understands (case doesn't matter), for messages.
+const KEY_NAMES: &str = "Esc, Enter, Tab, BS, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, Insert, Del, F1-F12, \
+lt; modifiers C- (Ctrl), A- or M- (Alt), S- (Shift)";
+
+fn key_name(name: &str) -> Option<KeyName> {
+    let mut chars = name.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return (!c.is_control()).then_some(KeyName::Char(c));
+    }
+    Some(match name.to_ascii_lowercase().as_str() {
+        "esc" | "escape" => KeyName::Escape,
+        "enter" | "cr" | "return" => KeyName::Enter,
+        "tab" => KeyName::Tab,
+        "bs" | "backspace" => KeyName::Backspace,
+        "space" => KeyName::Space,
+        "up" => KeyName::Up,
+        "down" => KeyName::Down,
+        "left" => KeyName::Left,
+        "right" => KeyName::Right,
+        "home" => KeyName::Home,
+        "end" => KeyName::End,
+        "pageup" => KeyName::PageUp,
+        "pagedown" => KeyName::PageDown,
+        "insert" => KeyName::Insert,
+        "del" | "delete" => KeyName::Delete,
+        f => match f.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+            Some(n @ 1..=12) => KeyName::F(n),
+            _ => return None,
+        },
+    })
+}
+
+/// `<C-S-Tab>`'s inside (`C-S-Tab`) as a key press.
+fn key_press(spec: &str) -> Option<KeyPress> {
+    let mut p = KeyPress { key: KeyName::Escape, ctrl: false, alt: false, shift: false };
+    let mut rest = spec;
+    while rest.len() > 2 && rest.as_bytes()[1] == b'-' {
+        match rest.as_bytes()[0].to_ascii_lowercase() {
+            b'c' => p.ctrl = true,
+            b'a' | b'm' => p.alt = true,
+            b's' => p.shift = true,
+            _ => break,
+        }
+        rest = &rest[2..];
+    }
+    p.key = key_name(rest)?;
+    Some(p)
+}
+
+/// One `keys` entry split into text (still with `{input}`s) and key
+/// presses. `<lt>` is a literal `<`.
+fn lex_keys(entry: &str) -> Result<Vec<Result<String, KeyPress>>, String> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut rest = entry;
+    while let Some(i) = rest.find('<') {
+        text.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        let spec = tail.find('>').map(|end| &tail[..end]);
+        match spec {
+            Some(s) if s.eq_ignore_ascii_case("lt") => text.push('<'),
+            Some(s) => match key_press(s) {
+                Some(k) => {
+                    if !text.is_empty() {
+                        out.push(Ok(std::mem::take(&mut text)));
+                    }
+                    out.push(Err(k));
+                }
+                None => return Err(format!("<{s}>: not a key ({KEY_NAMES}; write a literal < as <lt>)")),
+            },
+            None => return Err(format!("{entry:?}: '<' without '>' (write a literal < as <lt>)")),
+        }
+        rest = &tail[spec.map_or(0, |s| s.len() + 1)..];
+    }
+    text.push_str(rest);
+    if !text.is_empty() {
+        out.push(Ok(text));
+    }
+    Ok(out)
+}
+
+/// What `c`'s `keys` send for `values` (by input id): the author's text
+/// and each value as typed text, and the named keys as presses.
+pub fn strokes(c: &PaletteCommand, values: &BTreeMap<String, String>) -> Vec<Stroke> {
+    let mut out = Vec::new();
+    for entry in &c.keys {
+        // Checked at validation.
+        let Ok(segments) = lex_keys(entry) else { continue };
+        for seg in segments {
+            match seg {
+                Err(k) => out.push(Stroke::Press(k)),
+                Ok(t) => {
+                    let Ok(ps) = parts(&t) else { continue };
+                    let text: String = ps
+                        .iter()
+                        .map(|p| match p {
+                            Part::Text(s) => s.as_str(),
+                            Part::Var(v) => values.get(*v).map(String::as_str).unwrap_or_default(),
+                        })
+                        .collect();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match out.last_mut() {
+                        Some(Stroke::Text(prev)) => prev.push_str(&text),
+                        _ => out.push(Stroke::Text(text)),
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A command's entry in the terminal's right-click menu.
@@ -411,9 +638,70 @@ pub fn source_argv(c: &PaletteCommand, input: &CommandInput, values: &BTreeMap<S
     crate::snippets::source_argv(&src.run, values)
 }
 
-/// The command line with `{input}` placeholders, for the install plan.
+/// The command line with `{input}` placeholders (or the keys it sends,
+/// and where), for the install plan.
 pub fn describe(c: &PaletteCommand) -> String {
-    c.run.join(" ")
+    let what = if c.keys.is_empty() { c.run.join(" ") } else { format!("sends the keys {}", c.keys.concat()) };
+    match &c.pane {
+        Some(p) => format!("{what} ({})", p.describe()),
+        None => what,
+    }
+}
+
+/// A program name in `[command.pane].programs`.
+fn is_program_name(s: &str) -> bool {
+    (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+}
+
+fn check_keys(c: &PaletteCommand, inputs: &BTreeSet<&str>, at: &str) -> Vec<Problem> {
+    let mut out = Vec::new();
+    for (k, entry) in c.keys.iter().enumerate() {
+        let at = format!("{at}.keys[{k}]");
+        if entry.chars().any(char::is_control) {
+            out.push(Problem { path: at.clone(), message: "control characters: name the key instead (<Esc>, <Enter>, <C-c>)".into() });
+        }
+        let segments = match lex_keys(entry) {
+            Ok(s) => s,
+            Err(e) => {
+                out.push(Problem { path: at, message: e });
+                continue;
+            }
+        };
+        for t in segments.iter().filter_map(|s| s.as_ref().ok()) {
+            match parts(t) {
+                Err(e) => out.push(Problem { path: at.clone(), message: e }),
+                Ok(ps) => {
+                    for p in ps {
+                        if let Part::Var(v) = p
+                            && !inputs.contains(v)
+                        {
+                            out.push(Problem { path: at.clone(), message: format!("{{{v}}}: no input {v:?}") });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn check_pane(c: &PaletteCommand, at: &str) -> Vec<Problem> {
+    let mut out = Vec::new();
+    let Some(pane) = &c.pane else { return out };
+    let mut err = |message: &str| out.push(Problem { path: format!("{at}.pane"), message: message.into() });
+    if pane.programs.is_empty() && pane.at.is_none() {
+        err("say which programs, or at = \"prompt\" or \"program\"");
+    }
+    if !pane.programs.is_empty() && pane.at == Some(PaneAt::Prompt) {
+        err("programs run inside a program, not at a prompt");
+    }
+    if let Some(p) = pane.programs.iter().find(|p| !is_program_name(p)) {
+        err(&format!("{p:?}: a program's name (letters, digits, . _ + -), not a path"));
+    }
+    if c.keys.is_empty() && (!pane.programs.is_empty() || pane.at == Some(PaneAt::Program)) {
+        err("a run line is typed at a shell prompt; inside a program, send keys instead");
+    }
+    out
 }
 
 /// Problems with one input's definition (labels, limits, pattern,
@@ -534,8 +822,13 @@ pub(crate) fn check(m: &Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
                 _ => {}
             }
         }
+        for p in check_pane(c, &at).into_iter().chain(check_keys(c, &inputs, &at)) {
+            err(p.path, p.message);
+        }
         match c.run.first() {
-            None => err(format!("{at}.run"), "empty".into()),
+            None if !c.keys.is_empty() => {}
+            Some(_) if !c.keys.is_empty() => err(format!("{at}.run"), "run and keys: a command does one of them".into()),
+            None => err(format!("{at}.run"), "empty (or send keys instead)".into()),
             Some(p) if !programs.contains(p.as_str()) => {
                 err(format!("{at}.run"), format!("{p:?} is neither a package executable nor in requires.commands"))
             }
@@ -799,6 +1092,92 @@ fill = "filter"
         assert!(!derived(&parse(EXAMPLE, None).unwrap()).contains(&Permission::Commands));
     }
 
+    const VIM: &str = r#"
+[[command]]
+id = "quit"
+title = "Exit Vim"
+keys = ["<Esc>", ":{how}", "<Enter>"]
+[command.pane]
+programs = ["vim", "nvim"]
+
+[[command.input]]
+id = "how"
+label = "How"
+type = "choice"
+choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
+"#;
+
+    #[test]
+    fn keys_go_to_the_program_in_the_pane() {
+        let m = with_commands(VIM).unwrap();
+        let c = &m.commands[0];
+        let v = BTreeMap::from([("how".to_string(), "wq".to_string())]);
+        let esc = KeyPress { key: KeyName::Escape, ctrl: false, alt: false, shift: false };
+        let enter = KeyPress { key: KeyName::Enter, ..esc };
+        assert_eq!(strokes(c, &v), [Stroke::Press(esc), Stroke::Text(":wq".into()), Stroke::Press(enter)]);
+
+        // Key names, modifiers, a literal `<`, values typed as they are.
+        let k = PaletteCommand { keys: vec!["a<lt>b <C-c><m-S-tab><F5><C-->{how}".into()], ..c.clone() };
+        let v = BTreeMap::from([("how".to_string(), "<Esc>".to_string())]);
+        let ctrl = |key| Stroke::Press(KeyPress { key, ctrl: true, alt: false, shift: false });
+        assert_eq!(
+            strokes(&k, &v),
+            [
+                Stroke::Text("a<b ".into()),
+                ctrl(KeyName::Char('c')),
+                Stroke::Press(KeyPress { key: KeyName::Tab, ctrl: false, alt: true, shift: true }),
+                Stroke::Press(KeyPress { key: KeyName::F(5), ..esc }),
+                ctrl(KeyName::Char('-')),
+                Stroke::Text("<Esc>".into()),
+            ],
+            "a value is text, never a key"
+        );
+
+        // Where it applies.
+        let pane = c.pane.as_ref().unwrap();
+        assert!(pane.matches(Some("nvim"), false));
+        assert!(!pane.matches(Some("zsh"), true) && !pane.matches(None, false));
+        let prompt = PaneContext { programs: vec![], at: Some(PaneAt::Prompt) };
+        assert!(prompt.matches(Some("zsh"), true) && !prompt.matches(Some("htop"), false));
+        let program = PaneContext { programs: vec![], at: Some(PaneAt::Program) };
+        assert!(program.matches(Some("htop"), false) && !program.matches(None, true));
+
+        // The install plan says what's sent and where.
+        use crate::permissions::{Permission, describe};
+        let g = describe(&m).into_iter().find(|g| g.permission == Permission::Commands).unwrap();
+        assert_eq!(g.details, ["Exit Vim: sends the keys <Esc>:{how}<Enter> (while vim or nvim runs)"]);
+
+        // Round-trips (the catalog goes to clients as JSON); `run` commands keep their shape.
+        let json = serde_json::to_string(c).unwrap();
+        assert_eq!(&serde_json::from_str::<PaletteCommand>(&json).unwrap(), c);
+        let plain = serde_json::to_value(&with_commands(COMMANDS).unwrap().commands[0]).unwrap();
+        assert!(plain.get("keys").is_none() && plain.get("pane").is_none());
+    }
+
+    #[test]
+    fn keys_validation() {
+        let bad = |extra: &str| -> Vec<String> {
+            let toml = format!("[[command]]\nid = \"x\"\ntitle = \"X\"\n{extra}\n");
+            with_commands(&toml).unwrap_err().0.iter().map(|p| format!("{}: {}", p.path, p.message)).collect()
+        };
+        let has = |p: &[String], s: &str| p.iter().any(|x| x.contains(s));
+        let p = bad("keys = [\"<Esc>\", \"<Bogus>\", \"a < b\", \"{nope}\", \"\\u001b\"]");
+        assert!(has(&p, "keys[1]: <Bogus>: not a key"), "{p:?}");
+        assert!(has(&p, "keys[2]: \"a < b\": '<' without '>'"), "{p:?}");
+        assert!(has(&p, "keys[3]: {nope}: no input"), "{p:?}");
+        assert!(has(&p, "keys[4]: control characters"), "{p:?}");
+        assert!(has(&bad("run = [\"eza\"]\nkeys = [\"q\"]"), "run and keys"));
+        assert!(has(&bad(""), "command[0].run: empty"));
+        let p = bad("run = [\"eza\"]\n[command.pane]\nprograms = [\"vim\"]");
+        assert!(has(&p, "pane: a run line is typed at a shell prompt"), "{p:?}");
+        let p = bad("keys = [\"q\"]\n[command.pane]\nprograms = [\"/usr/bin/vim\"]\nat = \"prompt\"");
+        assert!(has(&p, "not a path") && has(&p, "not at a prompt"), "{p:?}");
+        assert!(has(&bad("keys = [\"q\"]\n[command.pane]"), "say which programs"));
+        // A run command may be for prompts only; keys need no program on the host.
+        with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\n[command.pane]\nat = \"prompt\"\n").unwrap();
+        with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nkeys = [\"q\"]\n").unwrap();
+    }
+
     #[test]
     fn when_conditions() {
         let m = with_commands("[[command]]\nid = \"t\"\ntitle = \"T\"\nrun = [\"eza\"]\nwhen = \"replace_ls\"\n").unwrap();
@@ -831,6 +1210,8 @@ fill = "filter"
             title: "x".into(),
             keywords: Vec::new(),
             run: vec!["printf".into(), "%s\\n".into(), "{a}".into(), "pre-{b}".into()],
+            keys: Vec::new(),
+            pane: None,
             inputs: Vec::new(),
             when: None,
             menu: None,
