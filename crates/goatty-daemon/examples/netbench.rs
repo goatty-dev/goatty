@@ -286,6 +286,21 @@ fn bench_restore(
     Ok(RestoreMetrics { panes, lines, seq_total, seq_attach, pipe_total, pipe_attach })
 }
 
+/// Kills the flooding panes even if the contended-echo phase fails: on ssh
+/// and tailnet hosts they would otherwise keep running.
+struct KillOnDrop<'a> {
+    conn: &'a Connection,
+    ids: Vec<SessionId>,
+}
+
+impl Drop for KillOnDrop<'_> {
+    fn drop(&mut self) {
+        for &id in &self.ids {
+            let _ = self.conn.kill(id);
+        }
+    }
+}
+
 /// Keystroke echo in pane `id` while `flooders` other panes on the same
 /// connection flood: the cross-pane head-of-line delay of the daemon's
 /// writer queue.
@@ -297,15 +312,15 @@ fn bench_contended(
     size: TermSize,
     flooders: usize,
 ) -> anyhow::Result<Vec<Duration>> {
-    let mut ids = Vec::new();
+    let mut flood = KillOnDrop { conn, ids: Vec::new() };
     for _ in 0..flooders {
         let flood_sink = Sink::new(size);
         let flooder = conn.create(ws, None, flood_sink.clone())?;
+        flood.ids.push(flooder);
         conn.input(flooder, b"echo READY-$((2+2))\r");
         assert!(flood_sink.wait_tail(b"READY-4", Duration::from_secs(10)), "flooding shell did not start");
-        ids.push(flooder);
     }
-    for &flooder in &ids {
+    for &flooder in &flood.ids {
         conn.input(flooder, b"cat /dev/zero | tr '\\0' x\r");
     }
     // Let the flood fill the link, the windows and the queues.
@@ -322,9 +337,7 @@ fn bench_contended(
         lat.push(t.elapsed());
         sink.tail.lock().clear();
     }
-    for flooder in ids {
-        let _ = conn.kill(flooder);
-    }
+    drop(flood);
     lat.sort();
     Ok(lat)
 }
