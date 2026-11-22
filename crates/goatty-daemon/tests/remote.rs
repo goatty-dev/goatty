@@ -390,10 +390,12 @@ fn run_finds_managed_bin_tool_and_uses_cwd() {
             _ => {}
         }
     }
-    let text = String::from_utf8_lossy(&out);
-    assert!(text.contains(&format!("ran-in:{work_str}")), "{text:?}");
-    assert_eq!(exit_code, Some(Some(0)));
-
     let _ = daemon.kill();
     let _ = daemon.wait();
+
+    let text = String::from_utf8_lossy(&out);
+    let expected_work = work.canonicalize().unwrap_or_else(|_| work.clone());
+    let expected_str = expected_work.to_string_lossy();
+    assert!(text.contains(&format!("ran-in:{expected_str}")) || text.contains(&format!("ran-in:{work_str}")), "{text:?}");
+    assert_eq!(exit_code, Some(Some(0)));
 }
