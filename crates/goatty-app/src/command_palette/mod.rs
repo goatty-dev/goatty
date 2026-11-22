@@ -379,6 +379,20 @@ pub struct Entry<'a> {
     pub only_when_searched: bool,
 }
 
+/// Whether `c` applies to the focused pane (`pane`: its program and
+/// whether it's at a prompt; `None`: no pane, so only commands for any).
+fn fits_pane(c: &Command, pane: Option<&(Option<String>, bool)>) -> bool {
+    let process = pane.and_then(|(p, _)| p.as_deref());
+    if !c.matches_program(process) {
+        return false;
+    }
+    match (&c.pane, pane) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(ctx), Some((process, at_prompt))) => ctx.matches(process.as_deref(), *at_prompt),
+    }
+}
+
 /// Rank `entries` for `query`. An empty query lists recently used commands
 /// (most recent first), then the rest alphabetically.
 /// [`rank`], except that a host's sessions keep their own order until
@@ -494,9 +508,6 @@ pub fn label_spans(title_start: usize, matches: &[Range<usize>]) -> Vec<(Range<u
 
 pub struct CommandPalette {
     scope: Scope,
-    /// Foreground program in the focused pane when the palette opened, used to
-    /// filter context-scoped custom commands (`when_program`).
-    active_program: Option<String>,
     input: Entity<TextInput>,
     /// The listed commands, then (in [`Scope::Hosts`]) the typed host.
     commands: Vec<Rc<Command>>,
@@ -524,6 +535,9 @@ pub struct CommandPalette {
     /// The session the next Shift+Delete ends (the first one asks).
     ending: Option<SharedString>,
     asking: Option<Asking>,
+    /// The focused pane's foreground program and whether a shell waits at
+    /// its prompt, for commands that apply only in some panes (#240).
+    pane: Option<(Option<String>, bool)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -536,19 +550,12 @@ impl Focusable for CommandPalette {
 }
 
 impl CommandPalette {
-    /// A palette over `scope`, with the user's history and optional active
-    /// foreground program for filtering context-scoped commands.
-    pub fn new(scope: Scope, active_program: Option<String>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
-        Self::with_history(scope, active_program, goatty_config::command_history::history_file(), window, cx)
+    /// A palette over `scope`, with the user's history.
+    pub fn new(scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        Self::with_history(scope, goatty_config::command_history::history_file(), window, cx)
     }
 
-    pub fn with_history(
-        scope: Scope,
-        active_program: Option<String>,
-        history_path: Option<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) -> Self {
+    pub fn with_history(scope: Scope, history_path: Option<PathBuf>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         // A small file, read once per opening (like the color picker's history).
         let history = history_path.as_deref().map(CommandHistory::load).unwrap_or_default();
         let input = cx.new(|cx| TextInput::new(placeholder(&scope), "", cx));
@@ -565,7 +572,6 @@ impl CommandPalette {
         input.focus_handle(cx).focus(window, cx);
         let mut this = Self {
             scope,
-            active_program,
             input,
             commands: Vec::new(),
             listed: 0,
@@ -585,6 +591,7 @@ impl CommandPalette {
             _load: None,
             ending: None,
             asking: None,
+            pane: None,
             _subscriptions: vec![sub, hosts_changed, tailnet_changed, commands_changed],
         };
         // A host's sessions are fetched; the other scopes list what's here.
@@ -600,7 +607,7 @@ impl CommandPalette {
 
     /// A palette that asks for `ask`'s fields.
     pub fn asking(ask: Ask, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
-        let mut this = Self::new(Scope::All, None, window, cx);
+        let mut this = Self::new(Scope::All, window, cx);
         this.asking = Some(Asking {
             title: ask.title,
             fields: ask.fields,
@@ -652,6 +659,13 @@ impl CommandPalette {
         this
     }
 
+    /// List only the commands that apply to the focused pane: one running
+    /// `process`, `at_prompt` or not (#240).
+    pub fn set_pane(&mut self, process: Option<String>, at_prompt: bool, cx: &mut Context<'_, Self>) {
+        self.pane = Some((process, at_prompt));
+        self.reload_commands(cx);
+    }
+
     /// The registry or the hosts changed: list them again, keeping the
     /// query (not while asking: the suggestions are the field's).
     fn reload_commands(&mut self, cx: &mut Context<'_, Self>) {
@@ -672,7 +686,7 @@ impl CommandPalette {
         let tailnet: Vec<_> = crate::tailnet::current(cx).iter().map(|e| Rc::new(crate::tailnet::command(e))).collect();
         let hosts = hosts::current(cx).into_iter().map(|e| Rc::new(hosts::command(&e))).chain(tailnet);
         self.commands = match self.scope {
-            Scope::All => registry.into_iter().filter(|c| c.matches_program(self.active_program.as_deref())).chain(hosts).collect(),
+            Scope::All => registry.into_iter().filter(|c| fits_pane(c, self.pane.as_ref())).chain(hosts).collect(),
             Scope::Hosts => std::iter::once(Rc::new(hosts::local_command()))
                 .chain(hosts)
                 .chain(registry.into_iter().filter(|c| c.id == MANAGE_HOSTS))
@@ -1749,6 +1763,19 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_for_other_panes_are_left_out() {
+        let mut vim = Command::handler("plugin.vim.quit", "Vim", "Exit", |_, _| {});
+        vim.pane = Some(goatty_plugin::commands::PaneContext { programs: vec!["vim".into(), "nvim".into()], at: None });
+        let plain = Command::handler("x.y", "X", "Y", |_, _| {});
+        let nvim = (Some("nvim".to_string()), false);
+        let zsh = (Some("zsh".to_string()), true);
+        assert!(fits_pane(&vim, Some(&nvim)));
+        assert!(!fits_pane(&vim, Some(&zsh)));
+        assert!(!fits_pane(&vim, None), "no pane: only commands for any");
+        assert!(fits_pane(&plain, Some(&zsh)) && fits_pane(&plain, None));
+    }
 
     fn entries<'a>(labels: &'a [(&'a str, &'a [SharedString], Option<usize>)]) -> Vec<Entry<'a>> {
         labels

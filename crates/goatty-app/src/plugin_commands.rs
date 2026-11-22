@@ -16,6 +16,12 @@
 //! the host runs the plugin's own definition (`Request::CommandSuggest`;
 //! the client only names the plugin, command and input) in the focused
 //! pane's directory, and the palette lists the results.
+//!
+//! A command can send keys to the program in the focused pane instead of
+//! typing a line (`keys`, #240), and say where it applies (`[command.pane]`:
+//! which programs, or at a prompt or not). Elsewhere the palette and the
+//! menu leave it out, and a shortcut bound to it goes to the terminal as a
+//! normal key ([`passes_through`]).
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -23,7 +29,7 @@ use std::rc::Rc;
 use goatty_config::CommandOpenIn;
 use goatty_plugin::api::{Installed, Reply, Request};
 use goatty_plugin::commands::{
-    CommandInput, MenuWhen, OpenIn as PluginOpenIn, PaletteCommand, command_argv, command_line, needs_home_expansion,
+    CommandInput, MenuWhen, OpenIn as PluginOpenIn, PaletteCommand, command_argv, command_line, needs_home_expansion, strokes,
 };
 use gpui::{App, AsyncApp, Global, Window};
 
@@ -64,6 +70,12 @@ pub struct MenuCommand {
 impl MenuCommand {
     pub fn when(&self) -> MenuWhen {
         self.command.menu.as_ref().map(|m| m.when).unwrap_or_default()
+    }
+
+    /// Whether it applies to a pane running `process`, `at_prompt` or not
+    /// (`[command.pane]`; without one, everywhere).
+    pub fn fits(&self, process: Option<&str>, at_prompt: bool) -> bool {
+        self.command.pane.as_ref().is_none_or(|p| p.matches(process, at_prompt))
     }
 
     /// Its icon: the manifest's, else the plugin icon.
@@ -210,10 +222,20 @@ pub fn from_plugin_open_in(open_in: PluginOpenIn) -> CommandOpenIn {
 
 /// Effective placement for plugin command `id` (`plugin.<plugin>.<command>`),
 /// preferring any user override in `settings.json` (`commands.open_in`).
+/// `keys` commands always send to the focused pane.
 pub fn effective_open_in(id: &str, cmd: &PaletteCommand, cx: &App) -> CommandOpenIn {
+    if !cmd.keys.is_empty() {
+        return CommandOpenIn::Current;
+    }
     cx.try_global::<AppSettings>()
         .and_then(|s| s.client.commands.open_in.get(id).copied())
         .unwrap_or_else(|| from_plugin_open_in(cmd.open_in))
+}
+
+/// Whether the active plugin command `id` sends keys rather than running a
+/// command line (so placement overrides do not apply to it).
+pub fn is_keys_command(id: &str, cx: &App) -> bool {
+    cx.try_global::<State>().and_then(|s| s.active.get(id)).is_some_and(|e| !e.command.keys.is_empty())
 }
 
 /// The active plugin manifest's own default placement for `id`, if loaded.
@@ -251,7 +273,11 @@ fn rebuild_from_active(overrides: BTreeMap<String, CommandOpenIn>, cx: &mut App)
             .iter()
             .filter_map(|id| state.active.get(id).map(|e| (id, e)))
             .map(|(id, e)| {
-                let open_in = overrides.get(id).copied().unwrap_or_else(|| from_plugin_open_in(e.command.open_in));
+                let open_in = if e.command.keys.is_empty() {
+                    overrides.get(id).copied().unwrap_or_else(|| from_plugin_open_in(e.command.open_in))
+                } else {
+                    CommandOpenIn::Current
+                };
                 command(&e.origin, &e.plugin_id, &e.plugin, &e.command, open_in)
             })
             .collect()
@@ -295,7 +321,11 @@ fn build_with_overrides(
         let mut hydrated = c.clone();
         hydrated.open_in = p.command_open_in_for(c);
         let id = command_id(&p.manifest.id, &hydrated.id);
-        let open_in = overrides.get(&id).copied().unwrap_or_else(|| from_plugin_open_in(hydrated.open_in));
+        let open_in = if hydrated.keys.is_empty() {
+            overrides.get(&id).copied().unwrap_or_else(|| from_plugin_open_in(hydrated.open_in))
+        } else {
+            CommandOpenIn::Current
+        };
         commands.push(command(link, &p.manifest.id, &p.manifest.name, &hydrated, open_in));
         let entry = MenuCommand {
             plugin_id: p.manifest.id.clone(),
@@ -340,6 +370,14 @@ fn resolve_dispatch<'a>(
         return None;
     }
     Some(entry)
+}
+
+/// Whether a shortcut bound to `id` should go to the terminal as a normal
+/// key: the command is the active host's and says where it applies, and
+/// the focused pane (running `process`, `at_prompt` or not) isn't such a
+/// place (#240).
+pub fn passes_through(id: &str, process: Option<&str>, at_prompt: bool, cx: &App) -> bool {
+    cx.try_global::<State>().and_then(|s| s.active.get(id)).is_some_and(|c| !c.fits(process, at_prompt))
 }
 
 /// Run the active plugin command with id `id` (`plugin.<plugin>.<command>`),
@@ -414,6 +452,7 @@ fn command(_link: &HostLink, plugin: &str, name: &str, c: &PaletteCommand, open_
         format!("{plugin} plugin · {}", open_in.short_label()).into()
     });
     out.source = Source::Plugin(plugin.to_string().into());
+    out.pane = c.pane.clone();
     out
 }
 
@@ -510,9 +549,25 @@ fn selection_value(text: &str) -> String {
     line.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Run `c` for `answers`: either typed into the focused pane (`Current`), or
-/// launched directly in a split pane / new tab on `origin` (#241).
+/// Run `c` for `answers`: send `keys` to the focused pane's program (#240),
+/// type the command line into the focused pane (`Current`), or launch it
+/// directly in a split pane / new tab on `origin` (#241).
 fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Window, cx: &mut App) {
+    if !c.keys.is_empty() {
+        let (keys, title, pane, origin) = (strokes(c, answers), c.title.clone(), c.pane.clone(), origin.clone());
+        // Only empty optional values: nothing to type.
+        if keys.is_empty() {
+            let toast = crate::toast::Toast::info(format!("\u{201c}{title}\u{201d} had no keys to send")).body("Its values were empty.");
+            crate::toast::show_in(window, cx, toast.key("plugin.command"));
+            return;
+        }
+        window.defer(cx, move |window, cx| {
+            if let Some(view) = crate::typing::keys_target(&origin, &title, pane.as_ref(), window, cx) {
+                view.update(cx, |v, cx| v.send_strokes(&keys, cx));
+            }
+        });
+        return;
+    }
     let open_in = effective_open_in(id, c, cx);
     let line = command_line(c, answers);
     if open_in == CommandOpenIn::Current {

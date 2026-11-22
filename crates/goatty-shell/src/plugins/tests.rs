@@ -607,6 +607,13 @@ run = ["present-tool", "--extra"]
 id = "missing-bin"
 title = "Missing bin"
 run = ["goatty-test-needed-tool-xyz", "--help"]
+
+[[command]]
+id = "keys"
+title = "Keys (#240): nothing runs on the host, so always available"
+keys = ["<Esc>:q<Enter>"]
+[command.pane]
+programs = ["vim"]
 "#;
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     let p = w.plugins();

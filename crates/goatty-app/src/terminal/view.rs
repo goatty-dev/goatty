@@ -34,8 +34,10 @@ use goatty_config::{
     ClientSettings, CtrlBackspace, CtrlDelete, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, RemoteFileOpen, Renderer,
     RightClick,
 };
+use goatty_plugin::commands::{KeyName, Stroke};
 use goatty_term::input::{
-    Key, KeyKind, KeyOptions, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event_with, encode_mouse, encode_paste,
+    Key, KeyEvent, KeyKind, KeyOptions, LineEdit, Mods, MouseAction, MouseButton, encode_key, encode_key_event_with, encode_mouse,
+    encode_paste,
 };
 use goatty_term::paste::{self, PasteRisk};
 use goatty_term::{CursorKind, Frame, Link, LinkKind, ProgramStatus, PromptJump, PromptJumped, SelectKind, TermMode, UiEvent};
@@ -836,6 +838,22 @@ impl TerminalView {
         self.send(b"\x05\x15", cx);
         self.paste_text(line, cx);
         self.send(b"\r", cx);
+    }
+
+    /// Whether a shell waits at its prompt here: no other program is in the
+    /// foreground and shell integration doesn't report a running command.
+    pub fn at_prompt(&self) -> bool {
+        !self.session.terminal.command_running() && self.process().is_none_or(crate::workspace::icons::is_shell)
+    }
+
+    /// Send a plugin command's keys (#240) to the program running here, each
+    /// encoded as the program's keyboard mode wants it (as if typed).
+    pub fn send_strokes(&mut self, strokes: &[Stroke], cx: &mut Context<'_, Self>) {
+        let bytes = encode_strokes(strokes, self.session.terminal.mode(), self.key_options);
+        self.session.terminal.selection_clear();
+        self.poke_cursor();
+        self.send(&bytes, cx);
+        cx.notify();
     }
 
     // ---- the command line (#186) ----------------------------------------------
@@ -2711,9 +2729,93 @@ fn edges(p: goatty_config::Padding) -> gpui::Edges<Pixels> {
     gpui::Edges { top: px(p.top), right: px(p.right), bottom: px(p.bottom), left: px(p.left) }
 }
 
+/// A plugin command's keys as the bytes typing them sends in `mode`.
+fn encode_strokes(strokes: &[Stroke], mode: TermMode, opts: KeyOptions) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut press = |key: Key<'_>, mods: Mods| {
+        if let Some(b) = encode_key_event_with(&KeyEvent::press(key, mods), mode, opts) {
+            bytes.extend_from_slice(&b);
+        }
+    };
+    for stroke in strokes {
+        match stroke {
+            // As the keyboard reports them: shifted text with Shift held
+            // (the kitty protocol reports the unshifted key plus Shift).
+            Stroke::Text(text) => {
+                for ch in text.chars() {
+                    let mut buf = [0; 4];
+                    press(stroke_key(KeyName::Char(ch), &mut buf), Mods { shift: ch.is_uppercase(), ..Mods::default() });
+                }
+            }
+            Stroke::Press(p) => {
+                let mut key = p.key;
+                let mut shift = p.shift;
+                if let KeyName::Char(c) = key {
+                    let mut upper = c.to_uppercase();
+                    if let (true, Some(u), None) = (p.shift, upper.next(), upper.next()) {
+                        key = KeyName::Char(u);
+                    }
+                    // `<M-A>` is Alt+Shift+a; `<C-A>` stays Ctrl+a.
+                    shift |= !p.ctrl && c.is_uppercase();
+                }
+                let mut buf = [0; 4];
+                press(stroke_key(key, &mut buf), Mods { ctrl: p.ctrl, alt: p.alt, shift, logo: false });
+            }
+        }
+    }
+    bytes
+}
+
+/// The terminal key for a key a plugin command names.
+fn stroke_key(key: KeyName, buf: &mut [u8; 4]) -> Key<'_> {
+    match key {
+        KeyName::Char(' ') => Key::Space,
+        KeyName::Char(c) => Key::Text(c.encode_utf8(buf)),
+        KeyName::Enter => Key::Enter,
+        KeyName::Escape => Key::Escape,
+        KeyName::Tab => Key::Tab,
+        KeyName::Backspace => Key::Backspace,
+        KeyName::Space => Key::Space,
+        KeyName::Up => Key::Up,
+        KeyName::Down => Key::Down,
+        KeyName::Left => Key::Left,
+        KeyName::Right => Key::Right,
+        KeyName::Home => Key::Home,
+        KeyName::End => Key::End,
+        KeyName::PageUp => Key::PageUp,
+        KeyName::PageDown => Key::PageDown,
+        KeyName::Insert => Key::Insert,
+        KeyName::Delete => Key::Delete,
+        KeyName::F(n) => Key::F(n),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_keys_are_typed_in_the_programs_keyboard_mode() {
+        let cmd: goatty_plugin::commands::PaletteCommand =
+            serde_json::from_str(r#"{"id": "q", "title": "Q", "keys": ["<Esc>:{cmd} x<Enter>", "<C-c><Up><S-Tab>"]}"#).unwrap();
+        let values = [("cmd".to_string(), "wq".to_string())].into();
+        let strokes = goatty_plugin::commands::strokes(&cmd, &values);
+        let legacy = encode_strokes(&strokes, TermMode::SHOW_CURSOR, KeyOptions::default());
+        assert_eq!(legacy, b"\x1b:wq x\r\x03\x1b[A\x1b[Z");
+        let app = encode_strokes(&strokes, TermMode::APP_CURSOR, KeyOptions::default());
+        assert!(app.windows(3).any(|w| w == b"\x1bOA"), "arrows follow the application cursor mode: {app:?}");
+        // The kitty protocol reports Esc unambiguously.
+        let kitty = encode_strokes(&strokes, TermMode::KITTY_DISAMBIGUATE, KeyOptions::default());
+        assert!(kitty.starts_with(b"\x1b[27u:wq x\r"), "{:?}", String::from_utf8_lossy(&kitty));
+
+        // Shift and capitals, as a keyboard would send them.
+        let cmd: goatty_plugin::commands::PaletteCommand =
+            serde_json::from_str(r#"{"id": "s", "title": "S", "keys": ["<S-a><M-S-a><M-A><C-A>Z"]}"#).unwrap();
+        let strokes = goatty_plugin::commands::strokes(&cmd, &Default::default());
+        assert_eq!(encode_strokes(&strokes, TermMode::SHOW_CURSOR, KeyOptions::default()), b"A\x1bA\x1bA\x01Z");
+        let kitty = encode_strokes(&strokes, TermMode::KITTY_DISAMBIGUATE | TermMode::KITTY_ALL_KEYS, KeyOptions::default());
+        assert_eq!(String::from_utf8_lossy(&kitty), "\x1b[97;2u\x1b[97;4u\x1b[97;4u\x1b[97;5u\x1b[122;2u");
+    }
 
     #[test]
     fn utf16_offsets_map_to_bytes() {

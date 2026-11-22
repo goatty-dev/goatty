@@ -614,7 +614,7 @@ fn plugin_entries(view: &Entity<TerminalView>, cx: &gpui::App) -> Vec<Entry> {
     let Some(commands) = cx.try_global::<MenuCommands>() else { return Vec::new() };
     let v = view.read(cx);
     let selection = v.session().terminal.selection_text().filter(|t| !t.trim().is_empty());
-    let at_prompt = !v.session().terminal.command_running() && v.process().is_none_or(super::icons::is_shell);
+    let at_prompt = v.at_prompt();
     let mut out = Vec::new();
     let mut last_plugin: Option<&str> = None;
     for c in &commands.0 {
@@ -623,7 +623,7 @@ fn plugin_entries(view: &Entity<TerminalView>, cx: &gpui::App) -> Vec<Entry> {
             MenuWhen::Selection => selection.is_some(),
             MenuWhen::Prompt => at_prompt,
         };
-        if !fits {
+        if !fits || !c.fits(v.process(), at_prompt) {
             continue;
         }
         if last_plugin != Some(c.plugin.as_str()) {

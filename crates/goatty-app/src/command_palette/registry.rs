@@ -63,6 +63,9 @@ pub struct Command {
     /// means always shown.
     pub when_program: Vec<SharedString>,
     pub source: Source,
+    /// Where in a pane it applies (a plugin command's `[command.pane]`,
+    /// #240): the palette leaves it out elsewhere.
+    pub pane: Option<goatty_plugin::commands::PaneContext>,
     /// Its name in `goatty_config::keys`, for showing shortcuts (`None` when
     /// not bindable).
     key_action: Option<Cow<'static, str>>,
@@ -91,6 +94,7 @@ impl Command {
             only_when_searched: false,
             when_program: Vec::new(),
             source: Source::Builtin,
+            pane: None,
             key_action: None,
             run,
         }

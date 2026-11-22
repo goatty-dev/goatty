@@ -893,38 +893,42 @@ impl SettingsWindow {
                     d.opacity(0.).group_hover(group_id.clone(), |s| s.opacity(1.)).in_focus(|s| s.opacity(1.))
                 }),
             );
-        // Optional placement override picker for plugin commands (#241).
-        let plugin_placement = line.plugin_open_in.filter(|ov| line.available || ov.is_some()).map(|override_val| {
-            let default_open = plugin_commands::plugin_default_open_in(&name, cx);
-            let default_label = match default_open {
-                Some(p) => format!("Plugin default ({})", p.label()),
-                None => "Plugin default".to_string(),
-            };
-            let mut opts = vec![opt(None, default_label).desc("Use what the plugin specifies")];
-            for p in CommandOpenIn::ALL {
-                opts.push(opt(Some(p), p.label()).desc(p.description()));
-            }
-            let action_key = name.clone();
-            let select_id = format!("sc-open-in-{name}");
-            let select_name = format!("Where {} opens", line.label);
-            let picker = self.select(&select_id, &select_name, opts, &override_val, cx, move |choice, _, cx| {
-                AppSettings::update(cx, |s| match choice {
-                    Some(p) => {
-                        s.commands.open_in.insert(action_key.clone(), p);
-                    }
-                    None => {
-                        s.commands.open_in.remove(&action_key);
-                    }
+        // Optional placement override picker for `run` plugin commands (#241);
+        // `keys` commands always send to the focused pane.
+        let plugin_placement = line
+            .plugin_open_in
+            .filter(|ov| ov.is_some() || (line.available && !plugin_commands::is_keys_command(&name, cx)))
+            .map(|override_val| {
+                let default_open = plugin_commands::plugin_default_open_in(&name, cx);
+                let default_label = match default_open {
+                    Some(p) => format!("Plugin default ({})", p.label()),
+                    None => "Plugin default".to_string(),
+                };
+                let mut opts = vec![opt(None, default_label).desc("Use what the plugin specifies")];
+                for p in CommandOpenIn::ALL {
+                    opts.push(opt(Some(p), p.label()).desc(p.description()));
+                }
+                let action_key = name.clone();
+                let select_id = format!("sc-open-in-{name}");
+                let select_name = format!("Where {} opens", line.label);
+                let picker = self.select(&select_id, &select_name, opts, &override_val, cx, move |choice, _, cx| {
+                    AppSettings::update(cx, |s| match choice {
+                        Some(p) => {
+                            s.commands.open_in.insert(action_key.clone(), p);
+                        }
+                        None => {
+                            s.commands.open_in.remove(&action_key);
+                        }
+                    });
                 });
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .pt(px(4.))
+                    .child(div().text_size(px(text::CAPTION)).text_color(ui.muted).child("Opens in"))
+                    .child(picker)
             });
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .pt(px(4.))
-                .child(div().text_size(px(text::CAPTION)).text_color(ui.muted).child("Opens in"))
-                .child(picker)
-        });
         // The row is a tab stop: Enter records a new shortcut, Delete removes the last one.
         let row_id = row_elem;
         let last_key = line.keys.last().cloned();

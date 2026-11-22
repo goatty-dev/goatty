@@ -2,7 +2,8 @@
 //! the host the command is for and a shell is waiting there. Otherwise
 //! the user gets the command to copy instead. Plugins' palette commands
 //! (`plugin_commands`) and snippets (`snippets`) both go through
-//! [`target`].
+//! [`target`]. A palette command that sends keys (#240) goes to the
+//! program in the pane instead, through [`keys_target`].
 
 use gpui::{App, ClipboardItem, Entity, Window};
 
@@ -85,6 +86,45 @@ fn target_opt(origin: Option<&HostLink>, line: &str, what: What, window: &mut Wi
     };
     if let Some(program) = busy {
         refuse(format!("{program} is running in this pane"), format!("Use it at a prompt: {line}"), window, cx);
+        return None;
+    }
+    Some(view)
+}
+
+/// The focused pane to send a plugin command's keys to (#240): on
+/// `origin`'s host and, when the command says where it applies (`pane`),
+/// running what it expects. `None` after telling the user why. Call it
+/// deferred, outside the workspace's update.
+pub fn keys_target(
+    origin: &HostLink,
+    title: &str,
+    pane: Option<&goatty_plugin::commands::PaneContext>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<TerminalView>> {
+    let ws = window.root::<Workspace>().flatten();
+    let found = ws.as_ref().map(|ws| (ws.read(cx).focused_terminal(), ws.read(cx).active_host_link()));
+    let refuse = |title: String, body: String, window: &mut Window, cx: &mut App| {
+        toast::show_in(window, cx, Toast::warning(title).body(body).key("plugin.command"));
+    };
+    let Some((Some(view), host)) = found else {
+        refuse(format!("No terminal for \u{201c}{title}\u{201d}"), "Focus a pane and try again.".into(), window, cx);
+        return None;
+    };
+    if !host.is_some_and(|h| h.same(origin)) {
+        refuse(
+            format!("This command is from {}", origin.label()),
+            format!("The active tab is on another host. Use it in a tab on {}.", origin.label()),
+            window,
+            cx,
+        );
+        return None;
+    }
+    let v = view.read(cx);
+    if let Some(pane) = pane
+        && !pane.matches(v.process(), v.at_prompt())
+    {
+        refuse(format!("\u{201c}{title}\u{201d} doesn't fit this pane"), format!("It works {}.", pane.describe()), window, cx);
         return None;
     }
     Some(view)
