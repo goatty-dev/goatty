@@ -313,6 +313,10 @@ setopt interactive_comments no_beep
 # Ctrl+S/Ctrl+Q are keys, not XOFF/XON (the PTY has ixon off too).
 setopt no_flow_control
 setopt complete_in_word always_to_end
+# A paste looks like typed text (shell.zsh.highlight_paste is off): zsh
+# would show it in reverse video until the next key. Set here, not left to
+# a plugin, so it holds whichever plugins load; your .zshrc can change it.
+_goatty_on highlight-paste || zle_highlight=(${zle_highlight:#paste:*} paste:none)
 
 # --- History (settings: history.*) -------------------------------------------
 # Same file plain zsh would use, so existing history keeps working.

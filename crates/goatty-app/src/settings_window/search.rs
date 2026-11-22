@@ -157,6 +157,8 @@ pub const INDEX: &[Entry] = &[
     e(Page::Path, "Your folders", "Add a folder", "path bin directory folder add export programs").keys(&["shell.path"]),
     e(Page::Path, "PATH in a new shell", "PATH in a new shell", "path where which find check folder origin zprofile missing"),
     e(Page::Shell, "Integration", "Shell integration", "osc 133 osc 7 prompt marks directory").keys(&["shell.zsh.integration"]),
+    e(Page::Shell, "Integration", "Highlight pasted text", "paste selected marked reverse video zle_highlight bracketed")
+        .keys(&["shell.zsh.highlight_paste"]),
     e(Page::Prompt, "Prompt", "Starship", "prompt git").keys(&["plugins.starship.enabled"]),
     e(Page::Prompt, "Prompt", "Use my own starship.toml", "starship config").keys(&["plugins.starship.settings.prefer_user_config"]),
     e(Page::Prompt, "Style", "Style", "starship lean classic rainbow powerline p10k powerlevel look theme").keys(&["prompt.style"]),

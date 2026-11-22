@@ -86,6 +86,7 @@ XDG variables are respected. History stays in the file plain zsh would use (`${Z
 | `shell.import.enabled`: apply the PATH folders and variables your own shell sets up ([below](#importing-your-shell-setup)) | on | |
 | `shell.import.from` (`auto`/`zsh`/`bash`), `shell.import.skip_vars` | auto, none | |
 | `shell.zsh.integration` | on | |
+| `shell.zsh.highlight_paste`: show a paste in reverse video until the next key (plain zsh's `zle_highlight` default); off sets `paste:none` | off | |
 | `shell.path`: folders added to the end of PATH (before goatty's `bin/`), `~/…` = home, missing ones skipped; edited on Settings → PATH and with the palette's "Shell: Add a folder to PATH…" | none | |
 | `prompt.style` (`rich`/`lean`/`classic`/`rainbow`), `prompt.symbols` (`nerd`/`emoji`/`text`/`none`), `prompt.show` (`all`/`essential`) | rich, nerd, all | |
 | `prompt.two_line`, `prompt.newline_before`, `prompt.transient`, `prompt.duration_threshold_ms` (0 = never) | on, off, off, 2000 | |

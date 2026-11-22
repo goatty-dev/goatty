@@ -241,11 +241,15 @@ pub struct ZshSettings {
     pub user_rc: bool,
     /// OSC 133 prompt marks and OSC 7 working directory reports.
     pub integration: bool,
+    /// Show pasted text in reverse video until the next key, as plain zsh
+    /// does (`zle_highlight` `paste:standout`). Off: a paste looks like
+    /// typed text. Bracketed paste keeps a paste from running either way.
+    pub highlight_paste: bool,
 }
 
 impl Default for ZshSettings {
     fn default() -> Self {
-        Self { user_env: true, user_rc: false, integration: true }
+        Self { user_env: true, user_rc: false, integration: true, highlight_paste: false }
     }
 }
 

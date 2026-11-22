@@ -132,7 +132,7 @@ fn render_plugins(cfg: &ZshConfig<'_>) -> Vec<GeneratedFile> {
 /// goatty's own features (not plugins) as the `.zshrc` knows them, for the
 /// enabled ones.
 pub fn enabled_features(s: &HostSettings) -> Vec<&'static str> {
-    [("integration", s.shell.zsh.integration), ("expansions", s.shell.expansions)]
+    [("integration", s.shell.zsh.integration), ("expansions", s.shell.expansions), ("highlight-paste", s.shell.zsh.highlight_paste)]
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect()
