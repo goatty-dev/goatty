@@ -125,16 +125,60 @@ pub fn find_action(name: &str) -> Option<&'static ActionInfo> {
 pub fn parse_plugin_action(name: &str) -> Option<(&str, &str)> {
     let rest = name.strip_prefix("plugin.")?;
     let (plugin, cmd) = rest.split_once('.')?;
-    let valid_cmd = (1..=40).contains(&cmd.len())
-        && cmd.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && cmd.as_bytes()[0].is_ascii_lowercase();
-    (crate::host::is_plugin_id(plugin) && valid_cmd).then_some((plugin, cmd))
+    (crate::host::is_plugin_id(plugin) && is_custom_command_id(cmd)).then_some((plugin, cmd))
 }
 
-/// Whether `name` names a built-in action or a well-formed plugin command
-/// action (`plugin.<plugin>.<command>`).
+/// Valid id for a command (`[a-z][a-z0-9-]{0,39}`), shared by plugin commands
+/// and user-defined custom commands (`custom.<id>`).
+pub fn is_custom_command_id(s: &str) -> bool {
+    (1..=40).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.as_bytes()[0].is_ascii_lowercase()
+}
+
+/// Extract `<id>` from a user-defined custom command action (`custom.<id>`).
+pub fn parse_custom_action(name: &str) -> Option<&str> {
+    let id = name.strip_prefix("custom.")?;
+    is_custom_command_id(id).then_some(id)
+}
+
+/// Action name for a user-defined custom command id: `custom.<id>`.
+pub fn custom_command_action(id: &str) -> String {
+    format!("custom.{id}")
+}
+
+/// Turn a human title (like `"Open Lazygit!"`) into a valid custom command id
+/// (`"open-lazygit"`). Falls back to `"command"` if the title has no ASCII
+/// letters or digits.
+pub fn slugify_command_id(title: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            let c = ch.to_ascii_lowercase();
+            if out.is_empty() && c.is_ascii_digit() {
+                out.push_str("cmd-");
+            } else if dash && !out.is_empty() {
+                out.push('-');
+            }
+            dash = false;
+            out.push(c);
+        } else if !out.is_empty() {
+            dash = true;
+        }
+    }
+    out.truncate(40);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if is_custom_command_id(&out) { out } else { "command".into() }
+}
+
+/// Whether `name` names a built-in action, a well-formed plugin command
+/// action (`plugin.<plugin>.<command>`), or a custom command action
+/// (`custom.<id>`).
 pub fn is_valid_action(name: &str) -> bool {
-    find_action(name).is_some() || parse_plugin_action(name).is_some()
+    find_action(name).is_some() || parse_plugin_action(name).is_some() || parse_custom_action(name).is_some()
 }
 
 /// Default keystroke → action table (canonical spellings).
@@ -581,5 +625,21 @@ mod tests {
         assert_eq!(keys_for("plugin.docker.exec", &o), ["ctrl-alt-e"]);
         reset_action(&mut o, "plugin.docker.exec");
         assert!(o.is_empty(), "{o:?}");
+    }
+
+    #[test]
+    fn custom_command_actions_and_slugs() {
+        assert_eq!(parse_custom_action("custom.lazygit"), Some("lazygit"));
+        assert_eq!(parse_custom_action("custom.vim-save-quit"), Some("vim-save-quit"));
+        assert_eq!(custom_command_action("lazygit"), "custom.lazygit");
+        assert!(is_valid_action("custom.lazygit"));
+        for bad in ["custom.", "custom.Bad", "custom.1abc", "custom.a_b", "custom.a.b", "custom."] {
+            assert_eq!(parse_custom_action(bad), None, "{bad:?}");
+            assert!(!is_valid_action(bad), "{bad:?}");
+        }
+        assert_eq!(slugify_command_id("Open Lazygit!"), "open-lazygit");
+        assert_eq!(slugify_command_id("2nd Monitor"), "cmd-2nd-monitor");
+        assert_eq!(slugify_command_id("   ---  "), "command");
+        assert!(is_custom_command_id(&slugify_command_id(&"a".repeat(80))));
     }
 }

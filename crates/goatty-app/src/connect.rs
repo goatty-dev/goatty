@@ -646,7 +646,7 @@ impl ConnectView {
 pub fn plain_ssh(host: &str) -> Result<Ready> {
     let argv = plain_ssh_argv(host);
     match pool::open(Endpoint::Local) {
-        Ok(conn) => match Session::daemon_run(conn.clone(), initial_size(), argv.clone()) {
+        Ok(conn) => match Session::daemon_run(conn.clone(), initial_size(), argv.clone(), None) {
             Ok(session) => {
                 let spawner = Spawner::Plain { host: host.to_string(), base: Box::new(Spawner::Daemon(conn)) };
                 return Ok((Startup::Session(session), spawner));
@@ -655,7 +655,7 @@ pub fn plain_ssh(host: &str) -> Result<Ready> {
         },
         Err(e) => log::warn!("no local goattyd ({e:#}); running ssh in this window"),
     }
-    let session = Session::local_command(initial_size(), argv).context("couldn't start ssh")?;
+    let session = Session::local_command(initial_size(), None, argv, None).context("couldn't start ssh")?;
     let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
     let base = Spawner::Local(Arc::new(HostService::from_env(daemon)));
     Ok((Startup::Session(session), Spawner::Plain { host: host.to_string(), base: Box::new(base) }))

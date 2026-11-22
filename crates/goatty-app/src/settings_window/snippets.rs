@@ -214,6 +214,7 @@ impl SettingsWindow {
             || self.create_theme_open
             || self.aliases_modal_open()
             || self.prompt_modal_open()
+            || self.shortcuts_modal_open()
         {
             return;
         }

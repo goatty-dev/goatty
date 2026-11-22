@@ -98,12 +98,39 @@ const DIVIDER: f32 = 1.0;
 /// The grab area around it.
 const DIVIDER_GRAB: f32 = 6.0;
 
+/// Builds the final argv once the target host's `$HOME` (if requested) is resolved.
+pub type BuildArgv = Box<dyn FnOnce(Option<&str>) -> Result<Vec<String>, String> + Send>;
+
+/// A direct program launch into a split pane or new tab (#241, #242).
+pub struct LaunchCommand {
+    /// Program name / label for error and exit toasts (e.g. `lazygit`).
+    pub label: String,
+    /// Where to place the pane (a split direction or `Tab`).
+    pub open_in: goatty_config::CommandOpenIn,
+    /// For plugin commands: the host the plugin belongs to. `None` for
+    /// client-side custom commands (which run on whichever host is active).
+    pub origin: Option<crate::settings_window::HostLink>,
+    /// Whether `build_argv` needs the target host's `$HOME` for `~` expansion.
+    pub needs_home: bool,
+    /// Builds the final argv once `home` (if requested) has been resolved.
+    pub build_argv: BuildArgv,
+    /// Shell command line offered via "Copy the command" when direct launch
+    /// isn't available (plain SSH tab or host mismatch).
+    pub fallback_line: String,
+}
+
 struct Pane {
     id: PaneId,
     view: Entity<TerminalView>,
     /// The newest program status report the user has seen (its tab was on
     /// screen in the focused window): `done`/`error` up to it aren't shown.
     seen: u64,
+    /// Pane to focus again when this pane closes (set for launched splits).
+    return_focus: Option<PaneId>,
+    /// Set for panes opened directly for a command/program: `(label, started)`.
+    /// If the process exits very quickly with a non-zero exit code, a toast
+    /// explains why the split closed.
+    launched: Option<(String, std::time::Instant)>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -1014,6 +1041,102 @@ impl Workspace {
         .detach();
     }
 
+    /// Launch a program directly in a split pane or new tab on the active tab's
+    /// host, in the focused pane's working directory (#241, #242).
+    pub fn open_command(&mut self, spec: LaunchCommand, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        let Some(spawner) = tab.host.clone() else {
+            let toast = Toast::info("Still connecting")
+                .body("Commands can open in a split or tab once this tab is connected.")
+                .key("workspace.command");
+            toast::show_in(window, cx, toast);
+            return;
+        };
+        if let Some(origin) = &spec.origin
+            && !spawner.host_link().same(origin)
+        {
+            let copy = spec.fallback_line;
+            let toast = Toast::info(format!("That command belongs to {}", origin.label()))
+                .body(format!("Switch to a tab on {}, or copy the command to run it here.", origin.label()))
+                .action("Copy the command", move |_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone())))
+                .key("workspace.command");
+            toast::show_in(window, cx, toast);
+            return;
+        }
+        if let Spawner::Plain { host, .. } = &spawner {
+            let copy = spec.fallback_line;
+            let toast = Toast::info(format!("Can't launch programs directly on plain SSH ({host})"))
+                .body("Install goattyd on that host to open programs in splits or tabs, or copy the command.")
+                .action("Copy the command", move |_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone())))
+                .key("workspace.command");
+            toast::show_in(window, cx, toast);
+            return;
+        }
+        let tab_id = tab.id;
+        let focused_id = tab.focused;
+        let min = self.min_pane_size(cx);
+        let (placement, return_focus) = match spec.open_in {
+            goatty_config::CommandOpenIn::Tab | goatty_config::CommandOpenIn::Current => (Placement::NewTab, None),
+            dir_choice => {
+                let dir = match dir_choice {
+                    goatty_config::CommandOpenIn::SplitRight => Direction::Right,
+                    goatty_config::CommandOpenIn::SplitDown => Direction::Down,
+                    goatty_config::CommandOpenIn::SplitLeft => Direction::Left,
+                    goatty_config::CommandOpenIn::SplitUp => Direction::Up,
+                    _ => Direction::Right,
+                };
+                if tab.connecting.is_none() && !tab.tree.can_split(focused_id, dir, min) {
+                    let toast =
+                        Toast::info("Opened in a new tab").body("Not enough room for another split pane here.").key("workspace.command");
+                    toast::show_in(window, cx, toast);
+                    (Placement::NewTab, None)
+                } else {
+                    (Placement::Split { tab: tab_id, of: focused_id, dir }, Some(focused_id))
+                }
+            }
+        };
+        let spawn_epoch = self.host_epoch(&groups::HostKey::of(&spawner));
+        let (size, cwd) = match self.focused_view() {
+            Some(v) => {
+                let v = v.read(cx);
+                let (cols, rows) = v.session().terminal.size();
+                (TermSize::new(cols, rows), v.cwd().map(|p| p.to_string_lossy().into_owned()))
+            }
+            None => (TermSize::new(100, 30), None),
+        };
+        let label = spec.label;
+        let needs_home = spec.needs_home;
+        let build_argv = spec.build_argv;
+        let task = {
+            let spawner = spawner.clone();
+            cx.background_executor().spawn(async move {
+                let home = if needs_home { spawner.resolve_home() } else { None };
+                let argv = build_argv(home.as_deref()).map_err(anyhow::Error::msg)?;
+                spawner.spawn_command(size, argv, cwd)
+            })
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(session) => this.insert_pane_launched(
+                    session,
+                    placement,
+                    spawner,
+                    Some(spawn_epoch),
+                    return_focus,
+                    Some((label, std::time::Instant::now())),
+                    window,
+                    cx,
+                ),
+                Err(e) => {
+                    let toast = Toast::error(format!("Couldn't start {label}")).body(format!("{e:#}")).key("workspace.command");
+                    toast::show_in(window, cx, toast);
+                }
+            });
+        })
+        .detach();
+    }
+
     fn make_pane(&mut self, session: Arc<Session>, window: &mut Window, cx: &mut Context<'_, Self>) -> Pane {
         let id = self.next_id();
         let view = cx.new(|cx| TerminalView::new(session, window, cx));
@@ -1022,7 +1145,7 @@ impl Workspace {
         let focus = view.focus_handle(cx);
         // Focus inside counts too: the output viewer covers the pane.
         let focused = cx.on_focus_in(&focus, window, move |this, window, cx| this.pane_focused(id, window, cx));
-        Pane { id, view, seen: 0, _subscriptions: [events, focused] }
+        Pane { id, view, seen: 0, return_focus: None, launched: None, _subscriptions: [events, focused] }
     }
 
     /// Clean up a newly spawned `session` whose target host group or tab was
@@ -1044,6 +1167,21 @@ impl Workspace {
         placement: Placement,
         spawner: Spawner,
         spawn_epoch: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.insert_pane_launched(session, placement, spawner, spawn_epoch, None, None, window, cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_pane_launched(
+        &mut self,
+        session: Arc<Session>,
+        placement: Placement,
+        spawner: Spawner,
+        spawn_epoch: Option<u64>,
+        return_focus: Option<PaneId>,
+        launched: Option<(String, std::time::Instant)>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1074,7 +1212,9 @@ impl Workspace {
             }
             Placement::NewTab => None,
         };
-        let pane = self.make_pane(session, window, cx);
+        let mut pane = self.make_pane(session, window, cx);
+        pane.return_focus = if target.is_some() { return_focus } else { None };
+        pane.launched = launched;
         let id = pane.id;
         let index = match target {
             Some((i, of, dir)) => {
@@ -1122,6 +1262,7 @@ impl Workspace {
         }
         let order = tab.tree.leaves();
         let pos = order.iter().position(|&p| p == id).unwrap_or(0);
+        let return_focus = tab.pane(id).and_then(|p| p.return_focus);
         tab.tree.remove(id);
         tab.panes.retain(|p| p.id != id);
         self.forget_notices(id, cx);
@@ -1134,7 +1275,7 @@ impl Workspace {
         }
         if tab.focused == id {
             let left = tab.tree.leaves();
-            tab.focused = left[pos.saturating_sub(1).min(left.len() - 1)];
+            tab.focused = return_focus.filter(|rf| left.contains(rf)).unwrap_or_else(|| left[pos.saturating_sub(1).min(left.len() - 1)]);
             tab.zoomed = false;
         }
         if index == self.active {
@@ -1742,7 +1883,25 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            TerminalEvent::Exited => self.remove_pane(id, window, cx),
+            TerminalEvent::Exited => {
+                if let Some((_, pane)) = self.find_pane(id)
+                    && let Some((label, started)) = pane.launched.clone()
+                    && started.elapsed() < std::time::Duration::from_secs(2)
+                {
+                    let session = pane.view.read(cx).session();
+                    if let Some(code) = session.exit_code()
+                        && code != 0
+                    {
+                        let body = match last_non_empty_line(&session.terminal) {
+                            Some(line) => format!("Exited with status {code}: {line}"),
+                            None => format!("Exited immediately with status {code}."),
+                        };
+                        let toast = Toast::warning(format!("{label} exited")).body(body).key("workspace.command.exit");
+                        toast::show_in(window, cx, toast);
+                    }
+                }
+                self.remove_pane(id, window, cx);
+            }
             TerminalEvent::ConfirmPaste(request) => self.confirm_paste(id, request.clone(), window, cx),
             TerminalEvent::Activity(activity) => self.mark_activity(id, *activity, cx),
             TerminalEvent::ContextMenu { at, keyboard } => self.open_pane_menu(id, *at, *keyboard, window, cx),
@@ -2418,7 +2577,8 @@ impl Workspace {
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_recent(window, cx);
         self.snippets = None;
-        let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
+        let active_program = self.focused_view().and_then(|v| v.read(cx).process().map(str::to_string));
+        let palette = cx.new(|cx| CommandPalette::new(scope, active_program, window, cx));
         self.show_palette(palette, window, cx);
     }
 
@@ -2649,6 +2809,18 @@ fn modal(dialog: impl IntoElement) -> impl IntoElement {
     div().absolute().inset_0().bg(gpui::black().opacity(0.35)).flex().items_center().justify_center().px_4().child(dialog)
 }
 
+/// Last non-empty line on a terminal screen, trimmed and truncated for a toast.
+fn last_non_empty_line(term: &goatty_term::Terminal) -> Option<String> {
+    let tr = term.transcript();
+    tr.lines.iter().rev().map(|l| l.text.trim()).find(|l| !l.is_empty()).map(|s| {
+        let mut out: String = s.chars().take(160).collect();
+        if s.chars().count() > 160 {
+            out.push('…');
+        }
+        out
+    })
+}
+
 /// The programs running in `panes`, other than shells (one entry per busy
 /// pane). Panes whose program isn't known yet count as idle.
 fn busy_programs<'a>(panes: impl Iterator<Item = &'a Pane>, cx: &gpui::App) -> Vec<String> {
@@ -2826,6 +2998,17 @@ impl Render for Workspace {
                 let sel = this.focused_view().and_then(|v| v.read(cx).session().terminal.selection_text()).filter(|t| !t.trim().is_empty());
                 w.defer(cx, move |window, cx| {
                     crate::plugin_commands::run_by_id(&id, sel.as_deref(), window, cx);
+                });
+            }))
+            .on_action(cx.listener(|this, act: &crate::actions::RunCustomCommand, w, cx| {
+                let prog = this.focused_view().and_then(|v| v.read(cx).process().map(str::to_string));
+                if !crate::custom_commands::matches_focused_program(&act.id, prog.as_deref(), cx) {
+                    cx.propagate();
+                    return;
+                }
+                let id = act.id.clone();
+                w.defer(cx, move |window, cx| {
+                    crate::custom_commands::run_by_id(&id, true, window, cx);
                 });
             }))
             .children(self.render_menu())

@@ -171,6 +171,13 @@ pub struct RunPluginCommand {
     pub id: String,
 }
 
+/// Run a user-defined custom command (`custom.<id>`), bound as a user shortcut (#242).
+#[derive(Clone, PartialEq, Eq, Debug, gpui::Action)]
+#[action(namespace = custom, no_json)]
+pub struct RunCustomCommand {
+    pub id: String,
+}
+
 /// The GPUI action for a settings name (`goatty_config::keys::ACTIONS`, or
 /// `plugin.<plugin>.<command>`).
 pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
@@ -258,8 +265,13 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "rotate_panes" => Box::new(RotatePanes),
         "rotate_panes_back" => Box::new(RotatePanesBack),
         _ => {
-            return goatty_config::keys::parse_plugin_action(name)
-                .map(|_| Box::new(RunPluginCommand { id: name.to_string() }) as Box<dyn Action>);
+            if goatty_config::keys::parse_plugin_action(name).is_some() {
+                return Some(Box::new(RunPluginCommand { id: name.to_string() }));
+            }
+            if goatty_config::keys::parse_custom_action(name).is_some() {
+                return Some(Box::new(RunCustomCommand { id: name.to_string() }));
+            }
+            return None;
         }
     })
 }
@@ -339,5 +351,11 @@ mod tests {
         assert!(action_by_name("plugin.d.exec").is_none());
         assert!(action_by_name("plugin.docker.Bad").is_none());
         assert!(action_by_name("unknown_action").is_none());
+
+        let custom = action_by_name("custom.lazygit").expect("valid custom action resolves");
+        assert_eq!(custom.name(), "custom::RunCustomCommand");
+        let run = custom.as_any().downcast_ref::<RunCustomCommand>().expect("downcasts to RunCustomCommand");
+        assert_eq!(run.id, "custom.lazygit");
+        assert!(action_by_name("custom.Bad").is_none());
     }
 }

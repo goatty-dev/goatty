@@ -130,6 +130,8 @@ pub const INDEX: &[Entry] = &[
         .keys(&["tailnet.all_devices"]),
     e(Page::Plugins, "Updates", "Tell me about plugin updates", "plugin update notify notification new version")
         .keys(&["plugins.notify_updates"]),
+    e(Page::Shortcuts, "Custom", "Custom commands", "custom command shortcut lazygit split tab send keys open in")
+        .keys(&["commands.custom", "commands.open_in"]),
     e(Page::Shell, "", "goatty's managed zsh", "zsh managed dotfiles").keys(&["shell.managed"]),
     e(Page::Snippets, "Expansions", "Expand plain words while typing", "expansion abbreviation space first lines head rewrite")
         .keys(&["shell.expansions", "expansions"]),

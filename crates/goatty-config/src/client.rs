@@ -18,6 +18,8 @@ pub struct ClientSettings {
     /// Keystroke → action name, or `null` to unbind a default
     /// (see [`keys::effective_bindings`]).
     pub keybindings: BTreeMap<String, Option<String>>,
+    /// User-defined custom commands and per-command placement overrides (#241, #242).
+    pub commands: CommandSettings,
     pub workspace: WorkspaceSettings,
     pub window: WindowSettings,
     pub tabs: TabSettings,
@@ -32,6 +34,144 @@ pub struct ClientSettings {
     pub plugins: PluginNotifySettings,
     pub notifications: NotificationSettings,
     pub debug: DebugSettings,
+}
+
+/// Where a command opens when run (#241, #242).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOpenIn {
+    /// Type the command line into the focused pane's idle shell prompt.
+    #[default]
+    Current,
+    /// Launch the program directly in a new split pane to the right.
+    SplitRight,
+    /// Launch the program directly in a new split pane below.
+    SplitDown,
+    /// Launch the program directly in a new split pane to the left.
+    SplitLeft,
+    /// Launch the program directly in a new split pane above.
+    SplitUp,
+    /// Launch the program directly in a new tab on the same host.
+    Tab,
+}
+
+impl CommandOpenIn {
+    pub const ALL: [Self; 6] = [Self::SplitRight, Self::SplitDown, Self::SplitLeft, Self::SplitUp, Self::Tab, Self::Current];
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::Current
+    }
+
+    /// Whether this placement spawns the program directly in a new pane or tab
+    /// instead of typing into the active pane's shell prompt.
+    pub fn launches_direct(self) -> bool {
+        self != Self::Current
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current pane",
+            Self::SplitRight => "Split right",
+            Self::SplitDown => "Split down",
+            Self::SplitLeft => "Split left",
+            Self::SplitUp => "Split up",
+            Self::Tab => "New tab",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Current => "current pane",
+            Self::SplitRight => "split right",
+            Self::SplitDown => "split down",
+            Self::SplitLeft => "split left",
+            Self::SplitUp => "split up",
+            Self::Tab => "new tab",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Current => "Type into the focused pane's idle shell prompt",
+            Self::SplitRight => "New pane to the right; closes when the program exits",
+            Self::SplitDown => "New pane below; closes when the program exits",
+            Self::SplitLeft => "New pane to the left; closes when the program exits",
+            Self::SplitUp => "New pane above; closes when the program exits",
+            Self::Tab => "New tab on the same host; closes when the program exits",
+        }
+    }
+}
+
+/// A user-defined custom command in `settings.json` (#242).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct UserCommand {
+    /// Name shown in the Command Palette and Settings → Shortcuts.
+    pub title: String,
+    /// Program/command to run (e.g. `lazygit` or `btop`). Mutually exclusive
+    /// with [`Self::send_keys`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// Where `run` opens: current pane, a split direction, or a new tab.
+    #[serde(skip_serializing_if = "CommandOpenIn::is_default")]
+    pub open_in: CommandOpenIn,
+    /// Keystrokes and text to send directly into the focused pane (even when
+    /// a TUI or foreground program is running), e.g. `["escape", ":wq", "enter"]`.
+    /// Mutually exclusive with [`Self::run`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub send_keys: Vec<String>,
+    /// Optional foreground program names when this command applies
+    /// (e.g. `["vim", "nvim"]`). Empty means always active.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub when_program: Vec<String>,
+    /// Extra search words for the Command Palette.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+}
+
+impl UserCommand {
+    /// Whether this command sends keystrokes instead of launching a program.
+    pub fn is_send_keys(&self) -> bool {
+        !self.send_keys.is_empty()
+    }
+
+    /// Split [`Self::run`] into an `argv` for direct launch (no shell).
+    /// Returns `None` if `run` is empty or has an unterminated quote.
+    pub fn argv(&self) -> Option<Vec<String>> {
+        let line = self.run.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+        split_command_words(line).filter(|w| !w.is_empty())
+    }
+
+    /// Whether this command applies when `program` is running in the focused
+    /// pane. An empty [`Self::when_program`] matches everything.
+    pub fn matches_program(&self, program: Option<&str>) -> bool {
+        if self.when_program.is_empty() {
+            return true;
+        }
+        let Some(prog) = program.map(str::trim).filter(|p| !p.is_empty()) else {
+            return false;
+        };
+        let base = prog.rsplit('/').next().unwrap_or(prog);
+        self.when_program.iter().any(|w| w.eq_ignore_ascii_case(prog) || w.eq_ignore_ascii_case(base))
+    }
+}
+
+/// User-defined commands and placement overrides in `settings.json` (#241, #242).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CommandSettings {
+    /// Custom commands by id (`[a-z][a-z0-9-]{0,39}`); their shortcut action
+    /// name is `custom.<id>`.
+    pub custom: BTreeMap<String, UserCommand>,
+    /// User placement overrides for plugin commands (`plugin.<plugin>.<command>`),
+    /// overriding the plugin manifest's `open_in`.
+    pub open_in: BTreeMap<String, CommandOpenIn>,
+}
+
+/// Split a command string into words: whitespace separates, `'…'` and `"…"`
+/// quote, backslash escapes. `None` for an unterminated quote.
+pub fn split_command_words(s: &str) -> Option<Vec<String>> {
+    split_words(s)
 }
 
 /// When goatty tells about something that happened in a pane.
@@ -1074,7 +1214,8 @@ pub struct DebugSettings {
 impl Document for ClientSettings {
     const NAME: &'static str = "settings";
     const VERSION: u32 = 3;
-    const OPEN_MAPS: &'static [&'static str] = &["keybindings", "theme.overrides", "tabs.host_colors"];
+    const OPEN_MAPS: &'static [&'static str] =
+        &["keybindings", "commands.custom", "commands.open_in", "theme.overrides", "tabs.host_colors"];
 
     fn migrations() -> &'static [Migration] {
         &[(1, global_theme_overrides_became_per_theme), (2, copy_on_select_became_auto_copy)]
@@ -1180,6 +1321,49 @@ impl Document for ClientSettings {
             {
                 issues.push(Issue::new(format!("keybindings.{key}"), format!("unknown action {a:?}")));
             }
+        }
+        let bad_custom: Vec<(String, String)> = self
+            .commands
+            .custom
+            .iter_mut()
+            .filter_map(|(id, cmd)| {
+                if !keys::is_custom_command_id(id) {
+                    return Some((id.clone(), "id must use lowercase letters, digits and '-' (1–40 chars)".into()));
+                }
+                cmd.title = cmd.title.trim().to_string();
+                if cmd.title.is_empty() {
+                    return Some((id.clone(), "title is empty".into()));
+                }
+                cmd.run = cmd.run.take().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+                cmd.send_keys.retain(|k| !k.is_empty());
+                cmd.when_program = cmd.when_program.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+                let mut seen_progs = std::collections::HashSet::new();
+                cmd.when_program.retain(|p| seen_progs.insert(p.to_lowercase()));
+                cmd.keywords = cmd.keywords.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
+                match (&cmd.run, cmd.send_keys.is_empty()) {
+                    (None, true) => return Some((id.clone(), "set either run or send_keys".into())),
+                    (Some(_), false) => return Some((id.clone(), "cannot set both run and send_keys".into())),
+                    (Some(line), true) => {
+                        if line.contains(['\n', '\r']) {
+                            return Some((id.clone(), "run must be a single line".into()));
+                        }
+                        if cmd.open_in.launches_direct() && split_words(line).is_none_or(|w| w.is_empty()) {
+                            return Some((id.clone(), "run has an unterminated quote".into()));
+                        }
+                    }
+                    (None, false) => {}
+                }
+                None
+            })
+            .collect();
+        for (id, why) in bad_custom {
+            issues.push(Issue::new(format!("commands.custom.{id}"), format!("{why}; ignored")));
+            self.commands.custom.remove(&id);
+        }
+        let bad_open: Vec<String> = self.commands.open_in.keys().filter(|k| keys::parse_plugin_action(k).is_none()).cloned().collect();
+        for k in bad_open {
+            issues.push(Issue::new(format!("commands.open_in.{k}"), "must name a plugin command (plugin.<plugin>.<command>); ignored"));
+            self.commands.open_in.remove(&k);
         }
         issues
     }
@@ -1872,5 +2056,57 @@ mod tests {
             })
             .collect();
         assert!(colors.len() > 2, "names spread over the colors: {colors:?}");
+    }
+
+    #[test]
+    fn custom_commands_and_placement_overrides_round_trip_and_validate() {
+        use crate::store;
+        let json = r#"{
+            "commands": {
+                "custom": {
+                    "lazygit": {"title": "Open Lazygit", "run": "lazygit -p ~/repo", "open_in": "split_right"},
+                    "vim-wq": {"title": "Save and quit", "send_keys": ["escape", ":wq", "enter"], "when_program": ["vim", "NVIM", "vim"]},
+                    "BadId": {"title": "Bad", "run": "ls"},
+                    "empty": {"title": "Nothing"},
+                    "both": {"title": "Both", "run": "ls", "send_keys": ["enter"]},
+                    "bad-quote": {"title": "Quote", "run": "echo 'oops", "open_in": "tab"}
+                },
+                "open_in": {
+                    "plugin.docker.ps": "split_down",
+                    "not_a_plugin": "tab"
+                }
+            },
+            "keybindings": {
+                "ctrl-shift-g": "custom.lazygit"
+            }
+        }"#;
+        let loaded = store::parse::<ClientSettings>(json);
+        let cmds = &loaded.value.commands;
+        assert_eq!(cmds.custom.len(), 2);
+        let lg = &cmds.custom["lazygit"];
+        assert_eq!(lg.open_in, CommandOpenIn::SplitRight);
+        assert_eq!(lg.argv().unwrap(), ["lazygit", "-p", "~/repo"]);
+        assert!(lg.matches_program(None));
+        assert!(lg.matches_program(Some("nvim")));
+
+        let wq = &cmds.custom["vim-wq"];
+        assert!(wq.is_send_keys());
+        assert_eq!(wq.when_program, ["vim", "NVIM"]);
+        assert!(wq.matches_program(Some("nvim")));
+        assert!(wq.matches_program(Some("/usr/bin/vim")));
+        assert!(!wq.matches_program(Some("zsh")));
+        assert!(!wq.matches_program(None));
+
+        assert_eq!(cmds.open_in.get("plugin.docker.ps"), Some(&CommandOpenIn::SplitDown));
+        assert!(!cmds.open_in.contains_key("not_a_plugin"));
+        assert!(loaded.issues.iter().any(|i| i.path == "commands.custom.BadId"));
+        assert!(loaded.issues.iter().any(|i| i.path == "commands.custom.empty"));
+        assert!(loaded.issues.iter().any(|i| i.path == "commands.custom.both"));
+        assert!(loaded.issues.iter().any(|i| i.path == "commands.custom.bad-quote"));
+        assert!(loaded.issues.iter().any(|i| i.path == "commands.open_in.not_a_plugin"));
+        assert!(!loaded.issues.iter().any(|i| i.path.starts_with("keybindings")));
+
+        let out = store::to_json(&loaded.value, &loaded.unknown);
+        assert!(out.contains("\"lazygit\"") && out.contains("\"split_right\"") && out.contains("\"split_down\""), "{out}");
     }
 }

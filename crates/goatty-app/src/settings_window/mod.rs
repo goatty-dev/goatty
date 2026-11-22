@@ -1164,6 +1164,8 @@ impl SettingsWindow {
             Some(self.snippets.modal_focus.clone())
         } else if self.prompt_modal_open() {
             Some(self.prompt.modal_focus.clone())
+        } else if self.shortcuts_modal_open() {
+            Some(self.shortcuts.modal_focus.clone())
         } else if self.menu.is_some() {
             Some(self.menu_focus.clone())
         } else if self.drawer && f32::from(window.viewport_size().width) < chrome::RAIL_BELOW {
@@ -1198,7 +1200,12 @@ impl SettingsWindow {
     /// Ctrl+PageDown / Ctrl+PageUp: the next or previous page.
     fn step_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
         // The page behind a dialog isn't reachable.
-        if self.create_theme_open || self.aliases_modal_open() || self.snippets_modal_open() || self.prompt_modal_open() {
+        if self.create_theme_open
+            || self.aliases_modal_open()
+            || self.snippets_modal_open()
+            || self.prompt_modal_open()
+            || self.shortcuts_modal_open()
+        {
             return;
         }
         let at = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);

@@ -597,6 +597,8 @@ impl SettingsWindow {
                 self.close_snippet_form(true, cx);
             } else if self.prompt_modal_open() {
                 self.close_module_dialog(cx);
+            } else if self.shortcuts_modal_open() {
+                self.close_custom_command_form(true, cx);
             } else if !self.search.read(cx).text().is_empty() {
                 self.search.update(cx, |i, cx| i.set_text("", cx));
                 window.focus(&self.focus, cx);
@@ -635,6 +637,7 @@ impl Render for SettingsWindow {
             .or_else(|| self.aliases.restore.take())
             .or_else(|| self.snippets.restore.take())
             .or_else(|| self.prompt.restore.take())
+            .or_else(|| self.shortcuts.restore.take())
         {
             window.focus(&back, cx);
         }
@@ -673,7 +676,8 @@ impl Render for SettingsWindow {
             .create_theme_modal(ui, cx)
             .or_else(|| self.alias_modal(ui, window, cx))
             .or_else(|| self.snippet_modal(ui, cx))
-            .or_else(|| self.module_modal(ui, cx));
+            .or_else(|| self.module_modal(ui, cx))
+            .or_else(|| self.custom_command_modal(ui, window, cx));
         let compact = f32::from(window.viewport_size().width) < RAIL_BELOW;
         let gutter = if compact { 24. } else { 40. };
         let nav = if compact {
@@ -713,7 +717,7 @@ impl Render for SettingsWindow {
             .bg(ui.bg)
             .text_color(ui.text)
             .font_family(cx.global::<AppSettings>().ui_font.clone())
-            .key_context(if self.recording.is_some() || self.shortcuts.listening { "SettingsWindow recording" } else { super::CONTEXT })
+            .key_context(if self.is_recording_shortcut() { "SettingsWindow recording" } else { super::CONTEXT })
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::close))
             .on_action(cx.listener(Self::focus_next_control))

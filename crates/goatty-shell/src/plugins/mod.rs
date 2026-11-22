@@ -873,11 +873,14 @@ impl Plugins<'_> {
                 .filter(|c| {
                     !manifest::applies(&c.when, &values)
                         || c.run.first().is_none_or(|prog| {
-                            !ZSH_BUILTINS.contains(&prog.as_str())
-                                && !*found.entry(prog.clone()).or_insert_with(|| {
+                            if !c.open_in.launches_direct() && ZSH_BUILTINS.contains(&prog.as_str()) {
+                                false
+                            } else {
+                                !*found.entry(prog.clone()).or_insert_with(|| {
                                     let p = managed_path.get_or_init(|| crate::snippets::managed_path_with(self.dirs, settings, env_path));
                                     crate::snippets::find_in(p, prog).is_some()
                                 })
+                            }
                         })
                 })
                 .map(|c| c.id.clone())

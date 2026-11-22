@@ -101,7 +101,7 @@ impl Permission {
             Permission::Env => "These variables are set in every goatty shell.",
             Permission::ConfigFiles => "goatty writes these files into its own shell configuration; nothing in your home directory.",
             Permission::Commands => {
-                "Picking one asks for its values, then types its command line into your terminal, where you see it run. Values are quoted: they can't become shell code."
+                "Picking one asks for its values, then types its command line into your terminal or runs the program directly in a new split or tab. Values are quoted or passed as plain arguments: they can't become shell code."
             }
             Permission::Snippets => {
                 "Nothing runs: a snippet's line is put on your prompt for you to read and run, and an expansion rewrites words you typed (shown before it runs, Backspace undoes it)."
@@ -257,8 +257,9 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                     .commands
                     .iter()
                     .map(|c| {
+                        let place = if c.open_in.is_default() { String::new() } else { format!(" (in {})", c.open_in.short_label()) };
                         let menu = if c.menu.is_some() { " (also in the right-click menu)" } else { "" };
-                        format!("{}: {}{menu}", c.title, crate::commands::describe(c))
+                        format!("{}: {}{place}{menu}", c.title, crate::commands::describe(c))
                     })
                     .collect(),
                 Permission::Snippets => m

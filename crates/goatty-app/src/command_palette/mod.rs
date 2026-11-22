@@ -494,6 +494,9 @@ pub fn label_spans(title_start: usize, matches: &[Range<usize>]) -> Vec<(Range<u
 
 pub struct CommandPalette {
     scope: Scope,
+    /// Foreground program in the focused pane when the palette opened, used to
+    /// filter context-scoped custom commands (`when_program`).
+    active_program: Option<String>,
     input: Entity<TextInput>,
     /// The listed commands, then (in [`Scope::Hosts`]) the typed host.
     commands: Vec<Rc<Command>>,
@@ -533,12 +536,19 @@ impl Focusable for CommandPalette {
 }
 
 impl CommandPalette {
-    /// A palette over `scope`, with the user's history.
-    pub fn new(scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
-        Self::with_history(scope, goatty_config::command_history::history_file(), window, cx)
+    /// A palette over `scope`, with the user's history and optional active
+    /// foreground program for filtering context-scoped commands.
+    pub fn new(scope: Scope, active_program: Option<String>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        Self::with_history(scope, active_program, goatty_config::command_history::history_file(), window, cx)
     }
 
-    pub fn with_history(scope: Scope, history_path: Option<PathBuf>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+    pub fn with_history(
+        scope: Scope,
+        active_program: Option<String>,
+        history_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
         // A small file, read once per opening (like the color picker's history).
         let history = history_path.as_deref().map(CommandHistory::load).unwrap_or_default();
         let input = cx.new(|cx| TextInput::new(placeholder(&scope), "", cx));
@@ -555,6 +565,7 @@ impl CommandPalette {
         input.focus_handle(cx).focus(window, cx);
         let mut this = Self {
             scope,
+            active_program,
             input,
             commands: Vec::new(),
             listed: 0,
@@ -589,7 +600,7 @@ impl CommandPalette {
 
     /// A palette that asks for `ask`'s fields.
     pub fn asking(ask: Ask, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
-        let mut this = Self::new(Scope::All, window, cx);
+        let mut this = Self::new(Scope::All, None, window, cx);
         this.asking = Some(Asking {
             title: ask.title,
             fields: ask.fields,
@@ -661,7 +672,7 @@ impl CommandPalette {
         let tailnet: Vec<_> = crate::tailnet::current(cx).iter().map(|e| Rc::new(crate::tailnet::command(e))).collect();
         let hosts = hosts::current(cx).into_iter().map(|e| Rc::new(hosts::command(&e))).chain(tailnet);
         self.commands = match self.scope {
-            Scope::All => registry.into_iter().chain(hosts).collect(),
+            Scope::All => registry.into_iter().filter(|c| c.matches_program(self.active_program.as_deref())).chain(hosts).collect(),
             Scope::Hosts => std::iter::once(Rc::new(hosts::local_command()))
                 .chain(hosts)
                 .chain(registry.into_iter().filter(|c| c.id == MANAGE_HOSTS))
