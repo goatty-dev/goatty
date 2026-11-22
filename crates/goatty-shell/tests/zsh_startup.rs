@@ -424,6 +424,29 @@ fn transient_prompt_shrinks_accepted_prompts() {
     let _ = sh.pty.write(b"exit\r");
 }
 
+/// #250: Tab on an empty line completes a command instead of inserting a
+/// tab. (No fzf on the sandbox's PATH, so this is zsh's own menu, which asks
+/// before listing all of PATH; fzf-tab gets the same matches.)
+#[test]
+fn tab_on_an_empty_line_completes_commands() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    let launch = sb.launch_with(no_highlighting(), None);
+    let mut sh = PtyShell::start(&sb, &launch);
+    let start = sh.out.len();
+    sh.pty.write(b"\t").unwrap();
+    sh.wait_for_from(start, b"possibilities");
+    sh.pty.write(b"n").unwrap();
+    // The line stays empty: no tab was inserted.
+    sh.run("print -r -- done");
+    let typed = String::from_utf8_lossy(&sh.out[start..]).into_owned();
+    assert!(!typed.contains('\t'), "no tab inserted: {typed:?}");
+    // On a continuation line Tab still indents: the heredoc gets the tab.
+    sh.pty.write(b"cat <<EOF\r\tx\rEOF\r").unwrap();
+    sh.wait_for(b"\tx\r\n");
+    let _ = sh.pty.write(b"exit\r");
+}
+
 #[test]
 fn dismissed_hint_stays_quiet() {
     let Some(zsh) = zsh() else { return };

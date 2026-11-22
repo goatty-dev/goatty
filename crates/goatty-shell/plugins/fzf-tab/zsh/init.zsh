@@ -53,8 +53,14 @@ if [[ $goatty_settings[previews] == true ]]; then
   zstyle ':fzf-tab:complete:(kill|ps):argument-rest' fzf-preview 'ps -p $word -o args= -ww 2>/dev/null'
   zstyle ':fzf-tab:complete:(kill|ps):argument-rest' fzf-flags --preview-window=down:3:wrap
 
+  # The command itself: its man page; a directory (auto_cd): its contents.
+  zstyle ':fzf-tab:complete:-command-:*' fzf-preview "
+    if [[ -d \$realpath ]]; then ${dir:-:}
+    else MANWIDTH=\$FZF_PREVIEW_COLUMNS man \$word 2>/dev/null
+    fi"
+
   # Variables: their value.
-  zstyle ':fzf-tab:complete:(-command-|-parameter-|-brace-parameter-|export|unset|expand):*' fzf-preview 'print -r -- ${(P)word}'
+  zstyle ':fzf-tab:complete:(-parameter-|-brace-parameter-|export|unset|expand):*' fzf-preview 'print -r -- ${(P)word}'
 
   # git: the diff of a changed file, the last commit of a branch or tag.
   zstyle ':fzf-tab:complete:git-(add|diff|restore):*' fzf-preview 'git diff --color=always -- $word 2>/dev/null'

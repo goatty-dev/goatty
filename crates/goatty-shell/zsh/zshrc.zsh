@@ -392,6 +392,14 @@ zstyle ':completion:*' group-name ''
 zstyle ':completion:*:descriptions' format '%F{yellow}-- %d --%f'
 zstyle ':completion:*' use-cache on
 zstyle ':completion:*' cache-path "$_goatty_cache/zcompcache"
+# Tab on an empty prompt completes the command instead of inserting a tab
+# (#250); on a continuation line (PS2: a `for` body, a heredoc) it still
+# indents. In command position: commands, builtins, aliases, your functions
+# and (auto_cd) directories; no parameters to assign and none of the
+# completion system's own `_` functions.
+zstyle -e ':completion:*' insert-tab '[[ -n $PREBUFFER ]] && reply=(true) || reply=(false)'
+zstyle ':completion:*:-command-:*' tag-order '!parameters'
+zstyle ':completion:*:-command-:*:functions' ignored-patterns '[_.]*'
 
 # --- Expansions (shell.expansions) -------------------------------------------
 # Plain words that turn into a command on Space (`| first 20 lines` →
