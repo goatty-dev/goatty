@@ -1135,6 +1135,8 @@ choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
             ],
             "a value is text, never a key"
         );
+        let only_value = PaletteCommand { keys: vec!["{how}".into()], ..c.clone() };
+        assert!(strokes(&only_value, &BTreeMap::from([("how".to_string(), String::new())])).is_empty(), "the app says so instead");
 
         // Where it applies.
         let pane = c.pane.as_ref().unwrap();

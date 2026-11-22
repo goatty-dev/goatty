@@ -453,6 +453,12 @@ fn selection_value(text: &str) -> String {
 fn run(c: &PaletteCommand, origin: &HostLink, answers: &Answers, window: &mut Window, cx: &mut App) {
     if !c.keys.is_empty() {
         let (keys, title, pane, origin) = (strokes(c, answers), c.title.clone(), c.pane.clone(), origin.clone());
+        // Only empty optional values: nothing to type.
+        if keys.is_empty() {
+            let toast = crate::toast::Toast::info(format!("\u{201c}{title}\u{201d} had no keys to send")).body("Its values were empty.");
+            crate::toast::show_in(window, cx, toast.key("plugin.command"));
+            return;
+        }
         window.defer(cx, move |window, cx| {
             if let Some(view) = crate::typing::keys_target(&origin, &title, pane.as_ref(), window, cx) {
                 view.update(cx, |v, cx| v.send_strokes(&keys, cx));
