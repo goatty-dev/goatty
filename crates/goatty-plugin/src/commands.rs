@@ -95,7 +95,10 @@ pub struct PaletteCommand {
     pub when: Option<String>,
     /// Where this command opens: typed into the current pane's prompt
     /// (default), or launched directly in a new split or tab (#241).
-    #[serde(default, skip_serializing_if = "OpenIn::is_default")]
+    /// Skipped on serialization so `Installed.manifest` never emits `open_in`
+    /// to older clients whose `PaletteCommand` denies unknown fields; wire
+    /// replies carry non-default placements on `Installed::command_open_in`.
+    #[serde(default, skip_serializing)]
     pub open_in: OpenIn,
     /// Also in the terminal's right-click menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -997,9 +1000,11 @@ optional = true
         let c = &m.commands[0];
         assert_eq!(c.open_in, OpenIn::SplitRight);
         assert!(c.open_in.launches_direct());
-        assert!(serde_json::to_string(c).unwrap().contains("\"split-right\""));
+        // `open_in` is never serialized inside `PaletteCommand` (wire replies
+        // carry it on `Installed::command_open_in`) so older clients whose
+        // `PaletteCommand` denies unknown fields still decode the catalog.
+        assert!(!serde_json::to_string(c).unwrap().contains("open_in"));
 
-        // Default placement (`current`) is omitted from JSON for older goatty builds.
         let plain = with_commands(COMMANDS).unwrap();
         assert_eq!(plain.commands[0].open_in, OpenIn::Current);
         assert!(!serde_json::to_string(&plain.commands[0]).unwrap().contains("open_in"));

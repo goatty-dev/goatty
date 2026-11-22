@@ -27,6 +27,11 @@ pub trait Document: Serialize + DeserializeOwned + Default + Clone {
     const VERSION: u32;
     /// Dotted paths of maps whose keys are user-chosen (not unknown settings).
     const OPEN_MAPS: &'static [&'static str];
+    /// Subset of [`Self::OPEN_MAPS`] whose entries are flat map keys that may
+    /// themselves contain dots (e.g. `commands.open_in` keyed by
+    /// `plugin.<id>.<cmd>`), so dotted CLI paths preserve the remainder as one
+    /// literal key.
+    const LITERAL_KEY_MAPS: &'static [&'static str] = &[];
     fn migrations() -> &'static [Migration];
     /// Version assumed when the document omits `"version"`.
     fn default_version(_user: &Value) -> u32 {
@@ -365,23 +370,38 @@ pub fn backups(path: &Path) -> Vec<PathBuf> {
     v.into_iter().map(|(_, p)| p).collect()
 }
 
+/// Split a dotted settings path into JSON object keys, keeping the remainder
+/// after any [`Document::LITERAL_KEY_MAPS`] prefix as one literal map key.
+fn key_segments<T: Document>(key: &str) -> Vec<String> {
+    for prefix in T::LITERAL_KEY_MAPS {
+        if let Some(rest) = key.strip_prefix(prefix).and_then(|r| r.strip_prefix('.'))
+            && !rest.is_empty()
+        {
+            let mut segs: Vec<String> = prefix.split('.').map(str::to_owned).collect();
+            segs.push(rest.to_owned());
+            return segs;
+        }
+    }
+    key.split('.').map(str::to_owned).collect()
+}
+
 /// Whether `key` (dotted) names a setting of `T` (or an entry of an open map).
 pub fn is_known_key<T: Document>(key: &str) -> bool {
     let default = serde_json::to_value(T::default()).expect("defaults serialize");
     let mut cur = &default;
     let mut path = String::new();
-    for seg in key.split('.') {
+    for seg in key_segments::<T>(key) {
         if T::OPEN_MAPS.contains(&path.as_str()) {
             return !seg.is_empty();
         }
-        match cur.get(seg) {
+        match cur.get(seg.as_str()) {
             Some(next) => cur = next,
             None => return false,
         }
         if !path.is_empty() {
             path.push('.');
         }
-        path.push_str(seg);
+        path.push_str(&seg);
     }
     !key.is_empty()
 }
@@ -460,7 +480,7 @@ pub fn set_key<T: Document>(text: &str, key: &str, raw: &str) -> Result<Loaded<T
     }
     let mut root = migrated_root::<T>(text)?;
     let value = serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
-    let parts: Vec<String> = key.split('.').map(str::to_owned).collect();
+    let parts = key_segments::<T>(key);
     let (last, parents) = parts.split_last().expect("non-empty key");
     let mut cur = &mut root;
     for p in parents {
@@ -480,18 +500,18 @@ pub fn unset_key<T: Document>(text: &str, key: &str) -> Result<Loaded<T>, String
         return Err(format!("unknown setting {key:?}"));
     }
     let mut root = migrated_root::<T>(text)?;
-    let parts: Vec<&str> = key.split('.').collect();
-    fn remove(m: &mut Map<String, Value>, parts: &[&str]) {
+    let parts = key_segments::<T>(key);
+    fn remove(m: &mut Map<String, Value>, parts: &[String]) {
         match parts {
             [] => {}
             [last] => {
-                m.remove(*last);
+                m.remove(last.as_str());
             }
             [first, rest @ ..] => {
-                if let Some(Value::Object(child)) = m.get_mut(*first) {
+                if let Some(Value::Object(child)) = m.get_mut(first.as_str()) {
                     remove(child, rest);
                     if child.is_empty() {
-                        m.remove(*first);
+                        m.remove(first.as_str());
                     }
                 }
             }
@@ -504,8 +524,8 @@ pub fn unset_key<T: Document>(text: &str, key: &str) -> Result<Loaded<T>, String
 /// The value at `key` in `value` (for `show KEY`).
 pub fn get_key<T: Document>(value: &T, key: &str) -> Option<Value> {
     let mut cur = serde_json::to_value(value).ok()?;
-    for seg in key.split('.').filter(|s| !s.is_empty()) {
-        cur = cur.get(seg)?.clone();
+    for seg in key_segments::<T>(key).into_iter().filter(|s| !s.is_empty()) {
+        cur = cur.get(&seg)?.clone();
     }
     Some(cur)
 }

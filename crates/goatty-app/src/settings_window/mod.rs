@@ -70,8 +70,9 @@ actions!(settings_window, [CloseSettings, FocusNextControl, FocusPrevControl, Ne
 
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
-        KeyBinding::new("ctrl-w", CloseSettings, Some(CONTEXT)),
-        KeyBinding::new("ctrl-,", CloseSettings, Some(CONTEXT)),
+        // Disabled while recording a shortcut so Ctrl+W / Ctrl+, can be bound.
+        KeyBinding::new("ctrl-w", CloseSettings, Some(NAVIGATING)),
+        KeyBinding::new("ctrl-,", CloseSettings, Some(NAVIGATING)),
         // Not while a shortcut is being recorded: then these are the keys to record.
         KeyBinding::new("tab", FocusNextControl, Some(NAVIGATING)),
         KeyBinding::new("shift-tab", FocusPrevControl, Some(NAVIGATING)),
@@ -1156,7 +1157,9 @@ impl SettingsWindow {
 
     /// Tab and Shift+Tab. A dialog, an open menu or the drawer keeps focus to itself.
     fn move_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let trap = if self.create_theme_open {
+        let trap = if self.menu.is_some() {
+            Some(self.menu_focus.clone())
+        } else if self.create_theme_open {
             Some(self.create_theme_modal_focus.clone())
         } else if self.aliases_modal_open() {
             Some(self.aliases.modal_focus.clone())
@@ -1166,8 +1169,6 @@ impl SettingsWindow {
             Some(self.prompt.modal_focus.clone())
         } else if self.shortcuts_modal_open() {
             Some(self.shortcuts.modal_focus.clone())
-        } else if self.menu.is_some() {
-            Some(self.menu_focus.clone())
         } else if self.drawer && f32::from(window.viewport_size().width) < chrome::RAIL_BELOW {
             Some(self.drawer_trap.clone())
         } else {

@@ -439,36 +439,72 @@ pub fn pretty_step(raw: &str) -> String {
     }
 }
 
-/// Parse comma-separated key steps from the Settings UI input (`\,` escapes a
-/// literal comma, `\\` escapes a backslash).
+/// Parse comma-separated key steps from the Settings UI input.
+///
+/// Escapes supported: `\,` (literal comma), `\\` (literal backslash), and
+/// `\ ` (literal space preserved at step boundaries). Unescaped whitespace
+/// immediately before or after a comma separator is treated as formatting.
 pub fn parse_key_steps(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut started = false;
+    // Byte length of `cur` up through the last non-whitespace or escaped char.
+    let mut trimmed_len = 0;
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\\' && matches!(chars.peek(), Some(',' | '\\')) {
-            cur.push(chars.next().unwrap());
+        if c == '\\' && matches!(chars.peek(), Some(',' | '\\' | ' ')) {
+            let escaped = chars.next().unwrap();
+            started = true;
+            cur.push(escaped);
+            trimmed_len = cur.len();
         } else if c == ',' {
-            let s = cur.trim().to_string();
-            if !s.is_empty() {
-                out.push(s);
+            cur.truncate(trimmed_len);
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
             }
-            cur.clear();
+            started = false;
+            trimmed_len = 0;
+        } else if !started && c.is_whitespace() {
+            // Skip formatting whitespace after a comma or at the start.
         } else {
+            started = true;
             cur.push(c);
+            if !c.is_whitespace() {
+                trimmed_len = cur.len();
+            }
         }
     }
-    let s = cur.trim().to_string();
-    if !s.is_empty() {
-        out.push(s);
+    cur.truncate(trimmed_len);
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
 
 /// Format stored `send_keys` steps back into the Settings UI's comma-separated
-/// representation, escaping literal commas and backslashes.
+/// representation, escaping literal commas, backslashes, and leading/trailing
+/// spaces so editing never strips literal whitespace.
 pub fn format_key_steps(steps: &[String]) -> String {
-    steps.iter().map(|s| s.replace('\\', r"\\").replace(',', r"\,")).collect::<Vec<_>>().join(", ")
+    steps
+        .iter()
+        .map(|s| {
+            let mut escaped = String::with_capacity(s.len());
+            let chars: Vec<char> = s.chars().collect();
+            let first_non_ws = chars.iter().position(|c| !c.is_whitespace()).unwrap_or(chars.len());
+            let last_non_ws = chars.iter().rposition(|c| !c.is_whitespace());
+            for (idx, ch) in chars.into_iter().enumerate() {
+                let at_edge = idx < first_non_ws || last_non_ws.is_some_and(|last| idx > last);
+                match ch {
+                    '\\' => escaped.push_str(r"\\"),
+                    ',' => escaped.push_str(r"\,"),
+                    ' ' if at_edge => escaped.push_str(r"\ "),
+                    _ => escaped.push(ch),
+                }
+            }
+            escaped
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -503,6 +539,10 @@ mod tests {
         let formatted = format_key_steps(&steps);
         assert_eq!(formatted, r"escape, a\,b, enter");
         assert_eq!(parse_key_steps(&formatted), steps);
+
+        let spaced = vec!["text:git ".into(), "text: status".into(), " ".into(), "enter".into()];
+        let formatted_spaced = format_key_steps(&spaced);
+        assert_eq!(parse_key_steps(&formatted_spaced), spaced);
     }
 
     #[test]

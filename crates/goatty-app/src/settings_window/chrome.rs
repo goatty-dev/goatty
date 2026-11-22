@@ -629,16 +629,16 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
-        self.take_pending_snippet(window, cx);
+        let opened_snippet = self.take_pending_snippet(window, cx);
         focus::begin(cx, window, &self.scroll, &self.menu_scroll);
-        if let Some(back) = self
+        let restore = self
             .create_theme_restore
             .take()
             .or_else(|| self.aliases.restore.take())
             .or_else(|| self.snippets.restore.take())
             .or_else(|| self.prompt.restore.take())
-            .or_else(|| self.shortcuts.restore.take())
-        {
+            .or_else(|| self.shortcuts.restore.take());
+        if !opened_snippet && let Some(back) = restore {
             window.focus(&back, cx);
         }
         let focus_row = self.highlighted(cx);

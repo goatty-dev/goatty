@@ -1216,6 +1216,7 @@ impl Document for ClientSettings {
     const VERSION: u32 = 3;
     const OPEN_MAPS: &'static [&'static str] =
         &["keybindings", "commands.custom", "commands.open_in", "theme.overrides", "tabs.host_colors"];
+    const LITERAL_KEY_MAPS: &'static [&'static str] = &["commands.open_in"];
 
     fn migrations() -> &'static [Migration] {
         &[(1, global_theme_overrides_became_per_theme), (2, copy_on_select_became_auto_copy)]
@@ -2108,5 +2109,13 @@ mod tests {
 
         let out = store::to_json(&loaded.value, &loaded.unknown);
         assert!(out.contains("\"lazygit\"") && out.contains("\"split_right\"") && out.contains("\"split_down\""), "{out}");
+
+        // CLI dotted keys preserve plugin command ids inside `commands.open_in`.
+        let set = store::set_key::<ClientSettings>("", "commands.open_in.plugin.docker.ps", "tab").unwrap();
+        assert_eq!(set.value.commands.open_in.get("plugin.docker.ps"), Some(&CommandOpenIn::Tab));
+        assert_eq!(store::get_key(&set.value, "commands.open_in.plugin.docker.ps"), Some(serde_json::Value::String("tab".into())));
+        let saved = store::to_json(&set.value, &set.unknown);
+        let unset = store::unset_key::<ClientSettings>(&saved, "commands.open_in.plugin.docker.ps").unwrap();
+        assert!(!unset.value.commands.open_in.contains_key("plugin.docker.ps"));
     }
 }

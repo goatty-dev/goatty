@@ -437,7 +437,20 @@ impl Session {
                 host.untrack_shell(pid);
             }
             if let Backend::Local(pty) = &s2.backend {
-                *s2.exit_code.lock() = pty.lock().try_wait();
+                // On Unix, PTY EOF can arrive slightly before the child is
+                // reapable; poll briefly so immediate non-zero exits still
+                // report their status before `exited` is published.
+                let mut code = None;
+                for i in 0..40 {
+                    if let Some(c) = pty.lock().try_wait() {
+                        code = Some(c);
+                        break;
+                    }
+                    if i + 1 < 40 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                *s2.exit_code.lock() = code;
             }
             s2.exited.store(true, Ordering::Release);
             s2.waker.wake();

@@ -115,16 +115,16 @@ impl SnippetsPage {
     }
 }
 
-/// A command line waiting to become a snippet ("Save the last command as
-/// a snippet"): the Snippets page opens its editor with it.
+/// Command lines waiting to become snippets ("Save the last command as
+/// a snippet"): the Snippets page opens its editor for each in order.
 #[derive(Default)]
-pub struct Pending(pub Option<String>);
+pub struct Pending(pub std::collections::VecDeque<String>);
 
 impl gpui::Global for Pending {}
 
 /// Open Settings → Snippets with a new snippet for `line`.
 pub fn new_from_line(line: String, cx: &mut App) {
-    cx.set_global(Pending(Some(line)));
+    cx.default_global::<Pending>().0.push_back(line);
     super::open_at(cx, Some(Page::Snippets));
 }
 
@@ -207,7 +207,8 @@ fn friendly(problem: &str, s: &Snippet) -> String {
 
 impl SettingsWindow {
     /// A line from "Save the last command as a snippet" opens the editor.
-    pub(super) fn take_pending_snippet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+    /// Returns whether a snippet editor was opened in this render.
+    pub(super) fn take_pending_snippet(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> bool {
         if self.page != Page::Snippets
             || self.host_value().is_none()
             || self.snippets.form.is_some()
@@ -216,10 +217,15 @@ impl SettingsWindow {
             || self.prompt_modal_open()
             || self.shortcuts_modal_open()
         {
-            return;
+            return false;
         }
-        let Some(line) = cx.try_global::<Pending>().and_then(|p| p.0.clone()) else { return };
-        cx.set_global(Pending(None));
+        let Some(line) = cx
+            .try_global::<Pending>()
+            .and_then(|p| (!p.0.is_empty()).then_some(()))
+            .and_then(|()| cx.global_mut::<Pending>().0.pop_front())
+        else {
+            return false;
+        };
         let s = Snippet {
             id: String::new(),
             title: String::new(),
@@ -231,6 +237,7 @@ impl SettingsWindow {
             inputs: Vec::new(),
         };
         self.open_snippet_form(None, s, window, cx);
+        true
     }
 
     fn text_of(&self, e: &Entity<TextInput>, cx: &App) -> String {

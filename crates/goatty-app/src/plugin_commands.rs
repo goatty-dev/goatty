@@ -292,13 +292,15 @@ fn build_with_overrides(
     let mut order = Vec::new();
     let mut menu = Vec::new();
     for (p, c) in active_cmds {
-        let id = command_id(&p.manifest.id, &c.id);
-        let open_in = overrides.get(&id).copied().unwrap_or_else(|| from_plugin_open_in(c.open_in));
-        commands.push(command(link, &p.manifest.id, &p.manifest.name, c, open_in));
+        let mut hydrated = c.clone();
+        hydrated.open_in = p.command_open_in_for(c);
+        let id = command_id(&p.manifest.id, &hydrated.id);
+        let open_in = overrides.get(&id).copied().unwrap_or_else(|| from_plugin_open_in(hydrated.open_in));
+        commands.push(command(link, &p.manifest.id, &p.manifest.name, &hydrated, open_in));
         let entry = MenuCommand {
             plugin_id: p.manifest.id.clone(),
             plugin: p.manifest.name.clone(),
-            command: Rc::new(c.clone()),
+            command: Rc::new(hydrated),
             origin: link.clone(),
         };
         order.push(id.clone());
@@ -607,6 +609,7 @@ icon = "search"
             builtin: false,
             packages: vec![],
             unavailable_commands: vec!["hidden".into()],
+            command_open_in: BTreeMap::new(),
         };
         let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
         let (cmds, menu) = build(Some(&link), std::slice::from_ref(&inst));
@@ -678,6 +681,7 @@ run = ["docker", "ps"]
             builtin: false,
             packages: vec![],
             unavailable_commands: vec![],
+            command_open_in: BTreeMap::new(),
         };
         let (cmds, active, _) = build_with_active(Some(&link), &[inst]);
         let mut reg = CommandRegistry::default();
@@ -799,6 +803,7 @@ open_in = "split-right"
             version: "1.0.0".into(),
             source: "test".into(),
             verified: true,
+            command_open_in: Installed::command_open_in_map(&m),
             manifest: m,
             enabled: true,
             incompatible: None,
@@ -808,9 +813,12 @@ open_in = "split-right"
             packages: vec![],
             unavailable_commands: vec![],
         };
+        // Round-trip through JSON to verify remote daemon replies preserve open_in.
+        let inst: Installed = serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
         let link = HostLink::Local(std::sync::Arc::new(goatty_shell::HostService::new(goatty_shell::Launcher::new(None, None), None)));
-        let (cmds, _, _, _) = build_with_overrides(Some(&link), std::slice::from_ref(&inst), &BTreeMap::new());
+        let (cmds, active, _, _) = build_with_overrides(Some(&link), std::slice::from_ref(&inst), &BTreeMap::new());
         assert_eq!(cmds[0].detail.as_deref(), Some("git plugin · split right"));
+        assert_eq!(active["plugin.git.lazygit"].command.open_in, PluginOpenIn::SplitRight);
 
         let overrides = BTreeMap::from([("plugin.git.lazygit".to_string(), CommandOpenIn::Tab)]);
         let (cmds, _, _, _) = build_with_overrides(Some(&link), &[inst], &overrides);

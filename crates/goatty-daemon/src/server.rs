@@ -210,7 +210,19 @@ impl Daemon {
             let daemon = self.clone();
             std::thread::Builder::new().name(format!("s{id}-reader")).spawn(move || {
                 pump_output(&s, reader);
-                let code = s.pty.lock().try_wait();
+                // The PTY master can hit EOF/EIO slightly before the child is
+                // reapable via WNOHANG; retry briefly so short-lived `Run`
+                // sessions report their exit code reliably.
+                let mut code = None;
+                for attempt in 0..40 {
+                    if let Some(status) = s.pty.lock().try_wait() {
+                        code = Some(status);
+                        break;
+                    }
+                    if attempt + 1 < 40 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
                 log::info!("session {}: exited ({code:?})", s.id);
                 daemon.sessions.lock().remove(&s.id);
                 if crate::systemd::has_fd_store() {

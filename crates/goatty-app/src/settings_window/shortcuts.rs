@@ -58,6 +58,9 @@ struct CustomCommandForm {
     recording: bool,
     /// Conflict note if `shortcut` will be moved from another action.
     shortcut_note: Option<String>,
+    /// Conflict `(keystroke, owner_action)` already shown to the user and
+    /// confirmed for takeover on the next Save.
+    confirmed_conflict: Option<(String, String)>,
     /// Validation error from the last Save attempt.
     error: Option<String>,
 }
@@ -339,7 +342,11 @@ fn action_label(name: &str, cx: &App) -> String {
 }
 
 fn parse_when_programs(raw: &str) -> Vec<String> {
-    raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+    parse_key_steps(raw)
+}
+
+fn format_when_programs(programs: &[String]) -> String {
+    format_key_steps(programs)
 }
 
 /// Validate the custom command form before saving it to `settings.json`.
@@ -362,10 +369,12 @@ fn check_custom_command_form(
             if line.is_empty() {
                 return Err("Command: what program or command should this run?".into());
             }
-            match split_command_words(line) {
-                Some(words) if !words.is_empty() => {}
-                Some(_) => return Err("Command: what program or command should this run?".into()),
-                None => return Err("Command: unterminated quote.".into()),
+            if open_in.launches_direct() {
+                match split_command_words(line) {
+                    Some(words) if !words.is_empty() => {}
+                    Some(_) => return Err("Command: what program or command should this run?".into()),
+                    None => return Err("Command: unterminated quote.".into()),
+                }
             }
             Ok(UserCommand {
                 title: title.to_string(),
@@ -393,19 +402,24 @@ fn check_custom_command_form(
     }
 }
 
-/// Choose a unique id in `commands.custom` derived from `title`.
-fn unique_custom_id(title: &str, existing: &BTreeMap<String, UserCommand>) -> String {
+/// Choose a valid, unused id in `commands.custom` derived from `title`,
+/// reserving room for any numeric suffix within the 40-character limit.
+fn unique_custom_id(title: &str, existing: &BTreeMap<String, UserCommand>) -> Result<String, String> {
+    const MAX_ID_LEN: usize = 40;
     let base = keys::slugify_command_id(title);
-    if !existing.contains_key(&base) {
-        return base;
+    if keys::is_custom_command_id(&base) && !existing.contains_key(&base) {
+        return Ok(base);
     }
     for n in 2..10_000 {
-        let candidate = format!("{base}-{n}");
-        if !existing.contains_key(&candidate) {
-            return candidate;
+        let suffix = format!("-{n}");
+        let prefix_len = MAX_ID_LEN.saturating_sub(suffix.len());
+        let prefix = base[..base.len().min(prefix_len)].trim_end_matches('-');
+        let candidate = if prefix.is_empty() { format!("cmd{suffix}") } else { format!("{prefix}{suffix}") };
+        if keys::is_custom_command_id(&candidate) && !existing.contains_key(&candidate) {
+            return Ok(candidate);
         }
     }
-    format!("{base}-new")
+    Err("Too many commands already use this title; pick a more specific title.".into())
 }
 
 impl SettingsWindow {
@@ -466,7 +480,7 @@ impl SettingsWindow {
                     cmd.run.unwrap_or_default(),
                     format_key_steps(&cmd.send_keys),
                     if kind == CustomKind::Run { cmd.open_in } else { CommandOpenIn::SplitRight },
-                    cmd.when_program.join(", "),
+                    format_when_programs(&cmd.when_program),
                     bound,
                 )
             }
@@ -487,6 +501,7 @@ impl SettingsWindow {
             initial_shortcut,
             recording: false,
             shortcut_note: None,
+            confirmed_conflict: None,
             error: None,
         });
         cx.notify();
@@ -501,8 +516,14 @@ impl SettingsWindow {
 
     fn save_custom_command(&mut self, cx: &mut Context<'_, Self>) {
         let Some(form) = self.shortcuts.custom_form.as_ref() else { return };
-        let (editing, kind, open_in, initial_shortcut, shortcut) =
-            (form.editing.clone(), form.kind, form.open_in, form.initial_shortcut.clone(), form.shortcut.clone());
+        let (editing, kind, open_in, initial_shortcut, shortcut, confirmed_conflict) = (
+            form.editing.clone(),
+            form.kind,
+            form.open_in,
+            form.initial_shortcut.clone(),
+            form.shortcut.clone(),
+            form.confirmed_conflict.clone(),
+        );
         let i = &self.shortcuts.custom_inputs;
         let title = i.title.read(cx).text().to_owned();
         let run = i.run.read(cx).text().to_owned();
@@ -518,18 +539,58 @@ impl SettingsWindow {
                 return;
             }
         };
-        AppSettings::update(cx, |s| {
-            let id = match &editing {
-                Some(existing_id) => {
-                    // Preserve any keywords hand-edited in settings.json.
-                    if let Some(prev) = s.commands.custom.get(existing_id) {
-                        cmd.keywords = prev.keywords.clone();
+
+        let current_settings = &cx.global::<AppSettings>().file.value;
+        // If an edited command was deleted externally while the modal was open,
+        // don't silently resurrect it under the deleted id; offer saving as new.
+        let id = match &editing {
+            Some(existing_id) => {
+                let Some(prev) = current_settings.commands.custom.get(existing_id) else {
+                    if let Some(f) = &mut self.shortcuts.custom_form {
+                        f.editing = None;
+                        f.initial_shortcut = None;
+                        f.error = Some(
+                            "This command was removed from settings.json while open. Click \"Add command\" to save it as a new command."
+                                .into(),
+                        );
                     }
-                    existing_id.clone()
+                    cx.notify();
+                    return;
+                };
+                // Preserve any keywords hand-edited in settings.json.
+                cmd.keywords = prev.keywords.clone();
+                existing_id.clone()
+            }
+            None => match unique_custom_id(&cmd.title, &current_settings.commands.custom) {
+                Ok(id) => id,
+                Err(e) => {
+                    if let Some(f) = &mut self.shortcuts.custom_form {
+                        f.error = Some(e);
+                    }
+                    cx.notify();
+                    return;
                 }
-                None => unique_custom_id(&cmd.title, &s.commands.custom),
-            };
-            let action = keys::custom_command_action(&id);
+            },
+        };
+        let action = keys::custom_command_action(&id);
+
+        // Recheck the new shortcut's current owner in case settings.json changed
+        // after recording; require one extra confirmation if the owner changed.
+        if shortcut != initial_shortcut
+            && let Some(new_key) = &shortcut
+            && let Some(owner) = keys::action_for(new_key, &current_settings.keybindings).filter(|a| a != &action)
+            && confirmed_conflict.as_ref() != Some(&(new_key.clone(), owner.clone()))
+        {
+            let label = action_label(&owner, cx);
+            if let Some(f) = &mut self.shortcuts.custom_form {
+                f.shortcut_note = Some(format!("{} is now bound to \"{label}\". Save again to move it here.", pretty_keys(new_key)));
+                f.confirmed_conflict = Some((new_key.clone(), owner));
+            }
+            cx.notify();
+            return;
+        }
+
+        AppSettings::update(cx, |s| {
             s.commands.custom.insert(id, cmd);
             if shortcut != initial_shortcut {
                 if let Some(old) = &initial_shortcut
@@ -600,12 +661,14 @@ impl SettingsWindow {
         if modal_recording {
             let overrides = &cx.global::<AppSettings>().file.value.keybindings;
             let self_action = self.shortcuts.custom_form.as_ref().and_then(|f| f.editing.as_deref()).map(keys::custom_command_action);
-            let note = keys::action_for(&keystroke, overrides).filter(|a| self_action.as_deref() != Some(a.as_str())).map(|prev| {
-                let label = action_label(&prev, cx);
+            let conflict = keys::action_for(&keystroke, overrides).filter(|a| self_action.as_deref() != Some(a.as_str()));
+            let note = conflict.as_deref().map(|prev| {
+                let label = action_label(prev, cx);
                 format!("{} is currently bound to \"{label}\" and will be moved here on save.", pretty_keys(&keystroke))
             });
             if let Some(form) = &mut self.shortcuts.custom_form {
                 form.recording = false;
+                form.confirmed_conflict = conflict.map(|prev| (keystroke.clone(), prev));
                 form.shortcut = Some(keystroke);
                 form.shortcut_note = note;
             }
@@ -1071,7 +1134,7 @@ impl SettingsWindow {
                         search_field(ui, "sc-search", &st.query, window, cx).into_any_element()
                     }))
                     .child(listen)
-                    .child(add_cmd),
+                    .child(kit::focus_target(ui, "Custom commands", div().child(add_cmd))),
             )
             .child(
                 div()
@@ -1084,10 +1147,12 @@ impl SettingsWindow {
                     .child(div().flex_1())
                     .when(changed_n > 0, |d| {
                         let confirming = st.confirm_reset;
+                        let has_placements = !app.file.value.commands.open_in.is_empty();
+                        let confirm_label = if has_placements { "Reset shortcuts & placements?" } else { "Reset every shortcut?" };
                         d.child(button_with(
                             "sc-reset-all",
                             Some(Icon::RotateCcw),
-                            if confirming { "Reset every shortcut?" } else { "Reset all" },
+                            if confirming { confirm_label } else { "Reset all" },
                             if confirming { ButtonKind::Danger } else { ButtonKind::Ghost },
                             ui,
                             self.act(cx, |v, cx| {
@@ -1105,6 +1170,7 @@ impl SettingsWindow {
             );
 
         let mut table = card(ui).overflow_hidden().child(self.column_header(ui, cx)).child(div().h(px(1.)).bg(ui.divider));
+        let mut has_plugins_group = false;
         if shown.is_empty() {
             let (title, desc) = empty_state_message(&all, st.filter, &query, st.pressed.as_deref());
             table = table.child(kit::empty(ui, Icon::Keyboard, title, desc));
@@ -1140,7 +1206,13 @@ impl SettingsWindow {
                         v.sync_recording(cx);
                         cx.notify();
                     }));
-                table = table.child(focus::tab(head, &head_id, ui, Ring::Inner, Scroller::Page));
+                let head = focus::tab(head, &head_id, ui, Ring::Inner, Scroller::Page);
+                if g == PLUGINS_GROUP {
+                    has_plugins_group = true;
+                    table = table.child(kit::focus_target(ui, "Plugin command placement", div().child(head)));
+                } else {
+                    table = table.child(head);
+                }
                 if !folded {
                     for (i, l) in rows.iter().enumerate() {
                         if i > 0 {
@@ -1158,6 +1230,8 @@ impl SettingsWindow {
                 table = table.child(self.shortcut_row(ui, l, cx));
             }
         }
+
+        let table = if has_plugins_group { table } else { kit::focus_target(ui, "Plugin command placement", table) };
 
         let mut page = div().flex().flex_col().gap(px(16.)).child(toolbar);
         if !app.key_errors.is_empty() {
@@ -1243,15 +1317,11 @@ impl SettingsWindow {
                             .child(*label)
                             .on_click(move |_, window, cx| {
                                 input.update(cx, |inp, cx| {
-                                    let cur = inp.text().trim_end();
-                                    let next = if cur.is_empty() {
-                                        token.clone()
-                                    } else if cur.ends_with(',') {
-                                        format!("{cur} {token}")
-                                    } else {
-                                        format!("{cur}, {token}")
-                                    };
-                                    inp.set_text(next, cx);
+                                    let mut steps = parse_key_steps(inp.text());
+                                    steps.push(token.clone());
+                                    let next = format_key_steps(&steps);
+                                    inp.set_text(next.clone(), cx);
+                                    cx.emit(TextInputEvent::Changed(next));
                                 });
                                 window.focus(&input.focus_handle(cx), cx);
                             });
@@ -1334,10 +1404,12 @@ impl SettingsWindow {
                     Icon::Close,
                     "Clear shortcut",
                     ui,
-                    self.act(cx, |v, cx| {
+                    self.act_window(cx, |v, window, cx| {
                         if let Some(f) = &mut v.shortcuts.custom_form {
                             f.shortcut = None;
                             f.shortcut_note = None;
+                            f.confirmed_conflict = None;
+                            focus::hand_over(&v.shortcuts.modal_focus, focus::Handover::Control("sc-cmd-rec".into()), window, cx);
                             cx.notify();
                         }
                     }),
@@ -2044,22 +2116,42 @@ mod tests {
         assert!(check_custom_command_form("Broken", CustomKind::Run, "git 'unterminated", "", CommandOpenIn::SplitRight, "").is_err());
         assert!(check_custom_command_form("Save", CustomKind::SendKeys, "", "", CommandOpenIn::Current, "").is_err());
 
+        // Current-pane commands run via the shell and may use shell quoting that
+        // `split_command_words` doesn't parse as plain argv.
+        let shell_line = r#"echo "$(printf '%s' '"')""#;
+        let current_ok = check_custom_command_form("Shell quote", CustomKind::Run, shell_line, "", CommandOpenIn::Current, "").unwrap();
+        assert_eq!(current_ok.run.as_deref(), Some(shell_line));
+        assert!(check_custom_command_form("Shell quote", CustomKind::Run, shell_line, "", CommandOpenIn::SplitRight, "").is_err());
+
         let run = check_custom_command_form("Lazygit", CustomKind::Run, "lazygit", "", CommandOpenIn::SplitRight, " ").unwrap();
         assert_eq!(run.run.as_deref(), Some("lazygit"));
         assert_eq!(run.open_in, CommandOpenIn::SplitRight);
         assert!(run.when_program.is_empty());
 
+        // Escaped commas inside `when_program` round-trip cleanly.
+        let formatted_when = format_when_programs(&["tool,debug".into(), "nvim".into()]);
         let keys =
-            check_custom_command_form("Save & quit", CustomKind::SendKeys, "", "escape, :wq, enter", CommandOpenIn::Tab, "vim, nvim")
+            check_custom_command_form("Save & quit", CustomKind::SendKeys, "", "escape, :wq, enter", CommandOpenIn::Tab, &formatted_when)
                 .unwrap();
         assert_eq!(keys.send_keys, ["escape", ":wq", "enter"]);
-        assert_eq!(keys.when_program, ["vim", "nvim"]);
+        assert_eq!(keys.when_program, ["tool,debug", "nvim"]);
         assert_eq!(keys.open_in, CommandOpenIn::Current);
 
         let mut existing = BTreeMap::new();
-        assert_eq!(unique_custom_id("Lazygit", &existing), "lazygit");
-        existing.insert("lazygit".into(), run);
-        assert_eq!(unique_custom_id("Lazygit", &existing), "lazygit-2");
+        assert_eq!(unique_custom_id("Lazygit", &existing).unwrap(), "lazygit");
+        existing.insert("lazygit".into(), run.clone());
+        assert_eq!(unique_custom_id("Lazygit", &existing).unwrap(), "lazygit-2");
+
+        // A 40-character slug reserves space for the `-2` suffix so the id stays valid.
+        let long_title = "a".repeat(45);
+        let first = unique_custom_id(&long_title, &existing).unwrap();
+        assert_eq!(first.len(), 40);
+        assert!(keys::is_custom_command_id(&first));
+        existing.insert(first, run);
+        let second = unique_custom_id(&long_title, &existing).unwrap();
+        assert!(second.len() <= 40, "{second}");
+        assert!(second.ends_with("-2"), "{second}");
+        assert!(keys::is_custom_command_id(&second));
     }
 
     #[test]

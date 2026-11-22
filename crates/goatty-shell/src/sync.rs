@@ -562,6 +562,7 @@ mod tests {
             builtin: false,
             packages: Vec::new(),
             unavailable_commands: Vec::new(),
+            command_open_in: Default::default(),
         }
     }
 
