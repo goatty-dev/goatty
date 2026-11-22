@@ -2418,7 +2418,17 @@ impl Workspace {
     fn open_palette(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.close_recent(window, cx);
         self.snippets = None;
-        let palette = cx.new(|cx| CommandPalette::new(scope, window, cx));
+        let pane = self.focused_view().map(|v| {
+            let v = v.read(cx);
+            (v.process().map(str::to_string), v.at_prompt())
+        });
+        let palette = cx.new(|cx| {
+            let mut p = CommandPalette::new(scope, window, cx);
+            if let Some((process, at_prompt)) = pane {
+                p.set_pane(process, at_prompt, cx);
+            }
+            p
+        });
         self.show_palette(palette, window, cx);
     }
 
@@ -2822,6 +2832,16 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ShowAllHosts, _, cx| this.show_all_groups(cx)))
             .on_action(cx.listener(|this, act: &crate::actions::RunPluginCommand, w, cx| {
+                // Bound to a command for another program (vim's, outside vim):
+                // the key goes to the terminal as if nothing were bound.
+                let fits_not = this.focused_view().is_some_and(|v| {
+                    let v = v.read(cx);
+                    crate::plugin_commands::passes_through(&act.id, v.process(), v.at_prompt(), cx)
+                });
+                if fits_not {
+                    cx.propagate();
+                    return;
+                }
                 let id = act.id.clone();
                 let sel = this.focused_view().and_then(|v| v.read(cx).session().terminal.selection_text()).filter(|t| !t.trim().is_empty());
                 w.defer(cx, move |window, cx| {

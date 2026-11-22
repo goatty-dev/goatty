@@ -871,14 +871,17 @@ impl Plugins<'_> {
             m.commands
                 .iter()
                 .filter(|c| {
+                    // A command that sends keys runs nothing on the host.
                     !manifest::applies(&c.when, &values)
-                        || c.run.first().is_none_or(|prog| {
-                            !ZSH_BUILTINS.contains(&prog.as_str())
-                                && !*found.entry(prog.clone()).or_insert_with(|| {
-                                    let p = managed_path.get_or_init(|| crate::snippets::managed_path_with(self.dirs, settings, env_path));
-                                    crate::snippets::find_in(p, prog).is_some()
-                                })
-                        })
+                        || (c.keys.is_empty()
+                            && c.run.first().is_none_or(|prog| {
+                                !ZSH_BUILTINS.contains(&prog.as_str())
+                                    && !*found.entry(prog.clone()).or_insert_with(|| {
+                                        let p =
+                                            managed_path.get_or_init(|| crate::snippets::managed_path_with(self.dirs, settings, env_path));
+                                        crate::snippets::find_in(p, prog).is_some()
+                                    })
+                            }))
                 })
                 .map(|c| c.id.clone())
                 .collect()

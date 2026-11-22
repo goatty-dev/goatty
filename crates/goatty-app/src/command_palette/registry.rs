@@ -58,6 +58,9 @@ pub struct Command {
     /// hosts, which would otherwise crowd the full list.
     pub only_when_searched: bool,
     pub source: Source,
+    /// Where in a pane it applies (a plugin command's `[command.pane]`,
+    /// #240): the palette leaves it out elsewhere.
+    pub pane: Option<goatty_plugin::commands::PaneContext>,
     /// Its name in `goatty_config::keys`, for showing shortcuts (`None` when
     /// not bindable).
     key_action: Option<Cow<'static, str>>,
@@ -85,6 +88,7 @@ impl Command {
             detail: None,
             only_when_searched: false,
             source: Source::Builtin,
+            pane: None,
             key_action: None,
             run,
         }
