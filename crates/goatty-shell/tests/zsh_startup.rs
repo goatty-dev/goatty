@@ -143,7 +143,7 @@ impl Sandbox {
 
     /// `zsh -l -i -c script` with the managed config.
     fn run(&self, launch: &Launch, script: &str) -> Output {
-        Command::new(&launch.program)
+        detached(Command::new(&launch.program))
             .args(["-l", "-i", "-c", script])
             .env_clear()
             .envs(self.base_env())
@@ -175,6 +175,21 @@ fn has_system_copy(builtin_id: &str) -> bool {
         .iter()
         .flat_map(|p| &p.system_paths)
         .any(|p| Path::new(p).is_file())
+}
+
+/// `cmd` in a session of its own: an interactive zsh (and the ones it
+/// starts) must not take over the terminal `cargo test` runs in, or it
+/// stops on SIGTTOU.
+fn detached(mut cmd: Command) -> Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe and only changes the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd
 }
 
 fn exe(p: &Path, body: &str) {
@@ -2028,7 +2043,7 @@ impl Sandbox {
     /// A plain `zsh ARGS` as another terminal starts it: no ZDOTDIR, only
     /// the sandbox's environment plus `env`.
     fn plain(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
-        Command::new(&self.zsh)
+        detached(Command::new(&self.zsh))
             .args(args)
             .env_clear()
             .envs(self.base_env())

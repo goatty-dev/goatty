@@ -70,8 +70,16 @@ impl EverywhereState {
 }
 
 /// goatty's lines in the terminal's font, with a Copy button: what the user
-/// agrees to, or adds by hand when goatty can't.
-pub fn code_lines(ui: Ui, id: &str, mono: SharedString, lines: &[String]) -> impl IntoElement {
+/// agrees to, or adds by hand when goatty can't. `copied`: show a check
+/// instead (the caller's `on_copy` set it, or showed a toast).
+pub fn code_lines(
+    ui: Ui,
+    id: &str,
+    mono: SharedString,
+    lines: &[String],
+    copied: bool,
+    on_copy: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
     let text = lines.join("\n");
     div()
         .flex()
@@ -94,10 +102,16 @@ pub fn code_lines(ui: Ui, id: &str, mono: SharedString, lines: &[String]) -> imp
                 .text_color(ui.text)
                 .children(lines.iter().map(|l| div().min_w_0().child(SharedString::from(l.clone())))),
         )
-        .child(icon_button(SharedString::from(format!("{id}-copy")), Icon::Copy, "Copy the lines", ui, move |_, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-            toast::show(cx, Toast::success("Copied the lines").key("shell.everywhere.copy"));
-        }))
+        .child(icon_button(
+            SharedString::from(format!("{id}-copy")),
+            if copied { Icon::Check } else { Icon::Copy },
+            if copied { "Copied" } else { "Copy the lines" },
+            ui,
+            move |window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                on_copy(window, cx);
+            },
+        ))
 }
 
 /// One point of what changes, with its icon.
@@ -123,6 +137,35 @@ pub fn warning_line(ui: Ui, t: String) -> impl IntoElement {
         .text_color(ui.warning)
         .child(Icon::TriangleAlert.svg().flex_shrink_0().size(px(13.)).mt(px(2.)).text_color(ui.warning))
         .child(div().min_w_0().child(SharedString::from(t)))
+}
+
+/// "starts" or "start", for one file or more.
+pub fn starts(s: &Status) -> &'static str {
+    if s.files.len() == 1 { "starts" } else { "start" }
+}
+
+/// What happens to the user's `~/.zshrc` in those shells, as (title, text),
+/// from their settings: run guarded or not, imported or not.
+pub fn zshrc_note(user_rc: bool, import: bool) -> (&'static str, &'static str) {
+    match (user_rc, import) {
+        (true, _) => (
+            "Your ~/.zshrc runs guarded there",
+            "As in goatty's tabs: its functions and key bindings run; prompt and plugin frameworks that would fight goatty's are skipped.",
+        ),
+        (false, true) => (
+            "Your ~/.zshrc stops running there",
+            "As in goatty's tabs. The PATH folders and variables it sets up still come along. Put functions and key bindings in ~/.config/goatty/zshrc, or run ~/.zshrc guarded under Settings → Dotfiles.",
+        ),
+        (false, false) => (
+            "Your ~/.zshrc stops running there",
+            "As in goatty's tabs. Settings → Dotfiles can bring the PATH folders and variables it sets up, or run it guarded; your own additions go in ~/.config/goatty/zshrc.",
+        ),
+    }
+}
+
+/// An error's lines without goatty's two lines (shown above it already).
+pub fn error_lines(err: &str, s: &Status) -> Vec<String> {
+    err.lines().filter(|l| !s.lines.iter().any(|g| g == l)).map(str::to_owned).collect()
 }
 
 impl SettingsWindow {
@@ -206,7 +249,11 @@ impl SettingsWindow {
                         v.everywhere.error = None;
                     }
                     // In the dialog (or under the row): it may hold the lines to add by hand.
-                    Err(err) => v.everywhere.action_error = Some(too_old(&format!("{err:#}"), &label)),
+                    Err(err) => {
+                        v.everywhere.action_error = Some(too_old(&format!("{err:#}"), &label));
+                        // The file may have changed under us (edited by hand): show what it has.
+                        v.load_everywhere(cx);
+                    }
                 }
                 cx.notify();
             });
@@ -262,14 +309,24 @@ impl SettingsWindow {
         };
         if s.state == State::Changed {
             let at = s.changed.first().map_or_else(|| s.files_text(), ToString::to_string);
-            return r.desc(format!("A goatty line was edited by hand ({at}). Edit or remove it there")).control(check_again());
+            let r = r
+                .desc(format!("A goatty line was edited by hand ({at}). Remove or fix it in the file, then check again"))
+                .control(check_again());
+            let more: Vec<String> =
+                s.changed.iter().skip(1).map(|c| format!("Also edited by hand: {c}")).chain(s.warnings.iter().cloned()).collect();
+            return if more.is_empty() {
+                r
+            } else {
+                r.below(div().flex().flex_col().gap(px(6.)).children(more.into_iter().map(|w| warning_line(ui, w))))
+            };
         }
         let (desc, can_toggle) = match s.state {
             State::On if s.active && zsh_managed => {
-                (format!("{} starts goatty's shell in every new interactive zsh", s.files_text()), true)
+                (format!("{} {} goatty's shell in every new interactive zsh", s.files_text(), starts(s)), true)
             }
             State::On => {
-                (format!("Inactive while goatty's managed zsh is off · switch this off to remove the lines from {}", s.files_text()), true)
+                let why = s.unavailable.clone().unwrap_or_else(|| "goatty's managed zsh is off".to_owned());
+                (format!("Inactive ({why}) · switch this off to remove the lines from {}", s.files_text()), true)
             }
             _ => match &s.unavailable {
                 Some(why) => (why.clone(), false),
@@ -304,11 +361,9 @@ impl SettingsWindow {
         if notes.is_empty() && error.is_none() {
             return r;
         }
-        r.below(
-            div().flex().flex_col().gap(px(6.)).children(notes.into_iter().map(|w| warning_line(ui, w))).when_some(error, |d, err| {
-                d.child(banner(ui, Tone::Danger, "Couldn't change it", err.lines().map(str::to_owned).collect()))
-            }),
-        )
+        r.below(div().flex().flex_col().gap(px(6.)).children(notes.into_iter().map(|w| warning_line(ui, w))).when_some(error, |d, err| {
+            d.child(banner(ui, Tone::Danger, "Couldn't remove the lines", err.lines().map(str::to_owned).collect()))
+        }))
     }
 
     /// The consent dialog: the exact lines and files, what changes, and the
@@ -324,8 +379,8 @@ impl SettingsWindow {
         let mut points = div().flex().flex_col().gap(px(14.)).child(point(
             ui,
             Icon::FileText,
-            "Your ~/.zshrc stops running there",
-            "As in goatty's tabs today. The PATH folders and variables it sets up still come along. Put functions and key bindings in ~/.config/goatty/zshrc, or run ~/.zshrc guarded under Settings → Dotfiles.",
+            zshrc_note(h.shell.zsh.user_rc, h.shell.import.enabled).0,
+            zshrc_note(h.shell.zsh.user_rc, h.shell.import.enabled).1,
         ));
         if h.prompt.plain_elsewhere() {
             points = points.child(point(
@@ -356,11 +411,13 @@ impl SettingsWindow {
                     .child(div().text_size(px(text::LABEL)).font_weight(FontWeight::MEDIUM).text_color(ui.text).child(SharedString::from(
                         format!("goatty adds these lines to the end of {}", s.files_text()),
                     )))
-                    .child(code_lines(ui, "everywhere-lines", mono, &s.lines)),
+                    .child(code_lines(ui, "everywhere-lines", mono, &s.lines, false, |_, cx| {
+                        toast::show(cx, Toast::success("Copied the lines").key("shell.everywhere.copy"));
+                    })),
             )
             .child(points)
-            .when_some(self.everywhere.action_error.clone(), |d, err| {
-                d.child(banner(ui, Tone::Danger, "Couldn't add the lines", err.lines().map(str::to_owned).collect()))
+            .when_some(self.everywhere.action_error.as_deref(), |d, err| {
+                d.child(banner(ui, Tone::Danger, "Couldn't add the lines", error_lines(err, s)))
             });
         let busy = self.everywhere.busy;
         let footer = div()

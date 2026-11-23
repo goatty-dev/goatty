@@ -63,7 +63,8 @@ impl SettingsWindow {
                 Some("fish") => "fish",
                 Some(_) => "custom",
             };
-            let zsh = matches!(choice, "auto" | "zsh");
+            // A path to zsh (/opt/homebrew/bin/zsh) is zsh too.
+            let zsh = program.as_deref().filter(|p| !p.trim().is_empty()).is_none_or(goatty_shell::launch::is_zsh);
             let z = &h.shell.zsh;
             let managed = h.shell.managed;
             let hero = group(ui)

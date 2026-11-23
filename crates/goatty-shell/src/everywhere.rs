@@ -218,12 +218,10 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
 
 /// A line that assigns or unsets `ZDOTDIR` (not one that only reads it).
 fn sets_zdotdir(line: &str) -> bool {
-    let code = line.split(" #").next().unwrap_or(line).trim_start();
-    if code.starts_with('#') {
-        return false;
-    }
-    code.split([';', '&', '|', ' ', '\t', '(', '{']).any(|word| word.starts_with("ZDOTDIR=") || word.starts_with("ZDOTDIR+="))
-        || (code.contains("unset") && code.split_whitespace().any(|w| w == "ZDOTDIR"))
+    let code = line.split([' ', '\t']).take_while(|w| !w.starts_with('#')).collect::<Vec<_>>().join(" ");
+    let words: Vec<&str> = code.split([';', '&', '|', ' ', '(', ')', '{', '}']).filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| w.starts_with("ZDOTDIR=") || w.starts_with("ZDOTDIR+="))
+        || (words.contains(&"unset") && words.contains(&"ZDOTDIR"))
 }
 
 /// What one file's `text` says about goatty's `lines`: whether goatty's line
@@ -231,6 +229,9 @@ fn sets_zdotdir(line: &str) -> bool {
 /// goatty's that set `ZDOTDIR`.
 fn scan(text: &str, lines: &[String; 2]) -> (bool, Vec<(usize, String)>, Vec<usize>) {
     let hook = lines[1].as_str();
+    // goatty's entry.zsh as the line spells it (a data folder without
+    // "goatty" in its path still counts).
+    let entry = hook.strip_prefix("[[ -r ").and_then(|r| r.split(" ]]").next()).unwrap_or("entry.zsh");
     let mut on = false;
     let mut changed = Vec::new();
     let mut late_zdotdir = Vec::new();
@@ -238,7 +239,7 @@ fn scan(text: &str, lines: &[String; 2]) -> (bool, Vec<(usize, String)>, Vec<usi
         let t = line.trim_end();
         if t == hook {
             on = true;
-        } else if t.contains("goatty") && t.contains("entry.zsh") {
+        } else if t.contains(entry) || (t.contains("goatty") && t.contains("entry.zsh")) {
             changed.push((i + 1, t.to_owned()));
         } else if on && sets_zdotdir(t) {
             late_zdotdir.push(i + 1);
@@ -295,7 +296,7 @@ fn backup(dirs: &Dirs, file: &Path, shown: &str) -> Result<Option<PathBuf>> {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let name: String = shown.chars().map(|c| if c == '/' { '%' } else { c }).collect();
-    let path = dir.join(format!("{:010}.{:09}-{}-{}.{name}", now.as_secs(), now.subsec_nanos(), std::process::id(), unique()));
+    let path = dir.join(format!("{:010}.{:09}-{:010}-{:06}.{name}", now.as_secs(), now.subsec_nanos(), std::process::id(), unique()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -403,14 +404,27 @@ impl<'a> Hook<'a> {
     /// `unavailable`: why it can't be turned on.
     pub fn status(&self, active: bool, unavailable: Option<String>) -> Status {
         let mut all_on = true;
+        let mut any_on = false;
         let mut changed_only = false;
         let mut changed = Vec::new();
         let mut warnings = Vec::new();
+        let mut missing = Vec::new();
         for f in &self.files {
-            let (on, ch, late) = scan(&read(f).unwrap_or_default(), &self.lines);
             let file = shown(f, self.home);
+            let text = match read(f) {
+                Ok(t) => t,
+                Err(e) => {
+                    warnings.push(format!("{file} can't be read ({e:#}), so goatty can't tell or change what it has."));
+                    String::new()
+                }
+            };
+            let (on, ch, late) = scan(&text, &self.lines);
             all_on &= on;
+            any_on |= on;
             changed_only |= !on && !ch.is_empty();
+            if !on {
+                missing.push(file.clone());
+            }
             for n in late {
                 warnings.push(format!(
                     "{file}, line {n}: it sets ZDOTDIR after goatty's line, so goatty's shell doesn't load. Move goatty's line below it."
@@ -420,7 +434,14 @@ impl<'a> Hook<'a> {
         }
         let state = if changed_only {
             State::Changed
-        } else if all_on && !self.files.is_empty() {
+        } else if any_on {
+            // Partly (a file edited by hand): on, so switching it off cleans up.
+            if !all_on {
+                warnings.push(format!(
+                    "{} doesn't have goatty's line, so shells that read it stay plain. Switch this off and on again to add it.",
+                    missing.join(" and ")
+                ));
+            }
             State::On
         } else {
             State::Off
@@ -454,10 +475,21 @@ impl<'a> Hook<'a> {
             }
             todo.push((f, text));
         }
+        // All or nothing: a file that can't be written puts back the ones
+        // written before it, so no shell is left half switched.
+        let mut written: Vec<(&PathBuf, String)> = Vec::new();
         for (f, text) in todo {
             let Some(new) = with_lines(&text, &self.lines) else { continue };
-            backup(self.dirs, f, &shown(f, self.home))?;
-            write(f, &new).map_err(|e| self.manual(f, e, "add these lines at its end"))?;
+            let done = backup(self.dirs, f, &shown(f, self.home)).and_then(|_| write(f, &new));
+            if let Err(e) = done {
+                for (back, old) in written.iter().rev() {
+                    if let Err(e) = write(back, old) {
+                        log::warn!("couldn't put {} back: {e:#}", back.display());
+                    }
+                }
+                return Err(self.manual(f, e, "add these lines at its end"));
+            }
+            written.push((f, text));
         }
         Ok(())
     }
@@ -471,12 +503,15 @@ impl<'a> Hook<'a> {
         let mut changed = None;
         for f in &self.files {
             let text = read(f)?;
-            match without_lines(&text, &self.lines) {
-                Some(new) => todo.push((f, new)),
-                None => {
-                    let (_, ch, _) = scan(&text, &self.lines);
-                    changed = changed.or(ch.into_iter().next().map(|c| (f, c)));
-                }
+            let (on, ch, _) = scan(&text, &self.lines);
+            // A file whose goatty line was edited by hand stays as it is,
+            // goatty's comment above it included.
+            if !on && !ch.is_empty() {
+                changed = changed.or(ch.into_iter().next().map(|c| (f, c)));
+                continue;
+            }
+            if let Some(new) = without_lines(&text, &self.lines) {
+                todo.push((f, new));
             }
         }
         if todo.is_empty()
@@ -540,6 +575,13 @@ impl HostService {
                 hook.enable()?;
             }
             Action::Off => hook.disable()?,
+        }
+        if action != Action::Status {
+            // The .zshenv changed: bring the import up to date now (and note
+            // it), so the next terminal doesn't stop to ask for a refresh.
+            if let Err(e) = self.launcher.refresh(&host) {
+                log::warn!("after changing .zshenv: {e:#}");
+            }
         }
         Ok(hook.status(active, unavailable))
     }
@@ -609,7 +651,10 @@ mod tests {
         ] {
             assert_eq!(scan(&format!("{}\n{late}\n", l[1]), &l).2, [2], "{late}");
         }
-        for harmless in ["fpath+=($ZDOTDIR/functions)", "export A=1 # ZDOTDIR=x", "# export ZDOTDIR=/z", "print $ZDOTDIR"] {
+        assert_eq!(scan(&format!("{}\nunset ZDOTDIR; true\n", l[1]), &l).2, [2]);
+        for harmless in
+            ["fpath+=($ZDOTDIR/functions)", "export A=1 # ZDOTDIR=x", "echo ok\t# ZDOTDIR=x", "# export ZDOTDIR=/z", "print $ZDOTDIR"]
+        {
             assert!(scan(&format!("{}\n{harmless}\n", l[1]), &l).2.is_empty(), "{harmless}");
         }
         assert!(scan(&format!("export ZDOTDIR=/z\n{}\n", l[1]), &l).2.is_empty(), "before goatty's line it's the user's");
@@ -699,6 +744,17 @@ mod tests {
         hook.disable().unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), changed);
         assert_eq!(hook.status(true, None).state, State::Changed);
+
+        // goatty's comment above a line edited by hand: off leaves both.
+        let edited = format!("{}\n# {}\n", hook.lines[0], hook.lines[1]);
+        std::fs::write(&file, &edited).unwrap();
+        assert_eq!(hook.status(true, None).state, State::Changed);
+        assert!(hook.disable().is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+        // Only goatty's comment left: off tidies it away.
+        std::fs::write(&file, format!("a\n{}\n", hook.lines[0])).unwrap();
+        hook.disable().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\n");
     }
 
     #[test]
@@ -737,11 +793,42 @@ mod tests {
         let s = hook.status(true, None);
         assert_eq!((s.state, s.files_text()), (State::On, "~/.zshenv and ~/.config/zsh/.zshenv".to_owned()));
         assert!(s.warnings.is_empty(), "{:?}", s.warnings);
-        // Only one of them has it: off, and on again adds the missing one.
+        // Only one of them has it (edited by hand): on, with a warning, so
+        // switching it off cleans up.
         std::fs::write(&files[1], "").unwrap();
-        assert_eq!(hook.status(true, None).state, State::Off);
+        let s = hook.status(true, None);
+        assert_eq!(s.state, State::On);
+        assert!(s.warnings.iter().any(|w| w.starts_with("~/.config/zsh/.zshenv doesn't have")), "{:?}", s.warnings);
         hook.disable().unwrap();
         assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "export ZDOTDIR=~/.config/zsh\n");
+    }
+
+    #[test]
+    fn a_file_that_cant_be_written_puts_the_others_back() {
+        if nix_root() {
+            return;
+        }
+        let (tmp, home, dirs) = sandbox();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("zshenv"), "").unwrap();
+        std::os::unix::fs::symlink(store.join("zshenv"), home.join(".zshenv2")).unwrap();
+        std::fs::write(home.join(".zshenv"), "export A=1\n").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let hook = Hook::new(&dirs, &home, vec![home.join(".zshenv"), home.join(".zshenv2")]);
+        let err = hook.enable();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_to_string(home.join(".zshenv")).unwrap(), "export A=1\n", "the first file is back as it was");
+        assert_eq!(hook.status(true, None).state, State::Off);
+    }
+
+    #[test]
+    fn unreadable_files_are_reported() {
+        let (_tmp, home, dirs) = sandbox();
+        std::fs::create_dir_all(home.join(".zshenv")).unwrap();
+        let s = Hook::new(&dirs, &home, vec![home.join(".zshenv")]).status(true, None);
+        assert!(s.warnings.iter().any(|w| w.contains("can't be read")), "{:?}", s.warnings);
     }
 
     #[test]
