@@ -608,6 +608,8 @@ impl PromptSettings {
         if has_private_use(&p.directory.home_symbol) {
             p.directory.home_symbol = d.home_symbol;
         }
+        // Shown in place of a path, so a Nerd Font glyph there needs the font too.
+        p.directory.substitutions.retain(|s| !has_private_use(&s.to));
         for s in [&mut p.character.success, &mut p.character.error, &mut p.character.vicmd] {
             if has_private_use(s) {
                 s.clear();

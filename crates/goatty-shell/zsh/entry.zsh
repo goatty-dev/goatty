@@ -11,9 +11,6 @@
 [[ -o interactive ]] || builtin return 0
 (( ${+_goatty_dir} || ${+GOATTY_IMPORT} )) && builtin return 0
 [[ ${(L)GOATTY_SHELL_MANAGED-} == (0|false|no|off) ]] && builtin return 0
-# 1 while shell.managed is on and the shell is zsh (the settings window can
-# turn goatty's zsh off; this line then stays and does nothing).
-(( @MANAGED@ )) || builtin return 0
 
 # Keep it current. goatty's sessions rebuild the configuration and re-read
 # what your startup files set up whenever one starts; nobody does that for
@@ -47,7 +44,9 @@
 # Hand over to goatty's .zshenv. It runs right here, inside your .zshenv
 # (so it doesn't source that again), and points ZDOTDIR at goatty's
 # directory: zsh reads goatty's .zprofile and .zshrc next, which run yours
-# with your own ZDOTDIR as in goatty's sessions.
+# with your own ZDOTDIR as in goatty's sessions. It reads the settings of
+# the (maybe just refreshed) generation first: with goatty's managed zsh
+# turned off there, it hands ZDOTDIR back and the shell stays plain.
 if (( ${+ZDOTDIR} )); then
   typeset -g GOATTY_ORIG_ZDOTDIR=$ZDOTDIR
 else

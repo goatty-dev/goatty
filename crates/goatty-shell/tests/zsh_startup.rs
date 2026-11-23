@@ -2023,7 +2023,7 @@ impl Sandbox {
     fn hook(&self, zshenv: &str) -> goatty_shell::everywhere::Hook<'_> {
         self.launch_with(no_highlighting(), None);
         self.file(".zshenv", zshenv);
-        let files = goatty_shell::everywhere::zshenv_files(Some(&self.zsh), &self.home, &self.base_env(), &self.dirs.zsh_dir());
+        let files = goatty_shell::everywhere::zshenv_files(Some(&self.zsh), &self.home, &self.base_env(), &self.dirs.zsh_dir(), None);
         let hook = goatty_shell::everywhere::Hook::new(&self.dirs, &self.home, files);
         hook.enable().unwrap();
         self.refreshed_at(SystemTime::now() + Duration::from_secs(3600));
@@ -2166,6 +2166,9 @@ fn harvest_with_the_hook_reads_the_users_own_files() {
 /// typing each line, then `exit`.
 fn pty_raw(sb: &Sandbox, args: &[&str], env: &[(&str, &str)], marker: &[u8], input: &[&str]) -> String {
     let mut all = sb.base_env();
+    // The PTY passes the test runner's environment on: a developer's ZDOTDIR
+    // must not lead zsh to their own startup files (callers may set one).
+    all.push(("ZDOTDIR".into(), sb.home.to_string_lossy().into_owned()));
     all.extend(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let mut cmd = ShellCommand::new(sb.zsh.clone(), args.iter().map(|a| a.to_string()).collect(), all);
     cmd.cwd = Some(sb.home.clone());

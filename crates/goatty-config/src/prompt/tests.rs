@@ -216,6 +216,8 @@ fn plain_prompt_needs_no_nerd_font() {
         c.color = Some("red".into());
     });
     p.edit_module("rust", |c| c.symbol = Some("R ".into()));
+    p.directory.substitutions =
+        vec![Substitution { from: "goatty".into(), to: "\u{f418}".into() }, Substitution { from: "work".into(), to: "w".into() }];
     assert!(p.needs_nerd_font() && p.plain_elsewhere());
     let plain = p.plain();
     assert_eq!(plain.symbols, Symbols::Text);
@@ -225,6 +227,7 @@ fn plain_prompt_needs_no_nerd_font() {
     assert_eq!(plain.modules["git_branch"].symbol, None, "a Nerd Font symbol goes back to the default");
     assert_eq!(plain.modules["git_branch"].color.as_deref(), Some("red"), "the rest stays");
     assert_eq!(plain.modules["rust"].symbol.as_deref(), Some("R "));
+    assert_eq!(plain.directory.substitutions.len(), 1, "a Nerd Font glyph in a substitution goes, the others stay");
     assert!(!plain.needs_nerd_font());
     assert_eq!(plain.plain(), plain);
 

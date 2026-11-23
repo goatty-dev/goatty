@@ -93,7 +93,6 @@ pub fn hook_active(s: &HostSettings) -> bool {
 fn render_entry(cfg: &ZshConfig<'_>) -> String {
     let d = cfg.dirs;
     ENTRY
-        .replace("@MANAGED@", flag(hook_active(cfg.settings)))
         .replace("@STAMP@", &quote(&d.refresh_stamp().to_string_lossy()))
         .replace("@DAEMON@", &quote(&cfg.daemon_exe.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()))
         .replace("@HOST_FILE@", &quote(&d.host_file().to_string_lossy()))
@@ -195,6 +194,8 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_daemon", &cfg.daemon_exe.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
     scalar("_goatty_user_env", flag(s.shell.zsh.user_env));
     scalar("_goatty_user_rc", flag(s.shell.zsh.user_rc));
+    // Shells that come in through the line in .zshenv (crate::everywhere).
+    scalar("_goatty_hook_active", flag(hook_active(s)));
     let imp = &s.shell.import;
     scalar("_goatty_import", flag(imp.enabled));
     scalar("_goatty_import_file", &d.import_file().to_string_lossy());

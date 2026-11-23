@@ -84,6 +84,13 @@ impl HostService {
         Self::new(Launcher::from_env(daemon_exe), goatty_config::host_file())
     }
 
+    /// Bring the configuration and the import up to date, as a new session
+    /// would (`goattyd shell refresh`; see [`Launcher::refresh`]).
+    pub fn refresh(&self) -> Result<()> {
+        let started = std::time::SystemTime::now();
+        self.launcher.refresh(&self.settings(), started)
+    }
+
     /// The settings as of now: the file plus the environment.
     pub fn settings(&self) -> Effective<HostSettings> {
         let file = self.host_file.as_deref().map(store::load).unwrap_or_default();
@@ -135,13 +142,14 @@ impl HostService {
         store::save(path, &host.file.value, &host.file.unknown)
             .with_context(|| format!("built generation {} but couldn't save {}", activated.generation, path.display()))?;
         log::info!("host settings saved; generation {} active", activated.generation);
+        // This save, right after writing it (a later one by someone else stays newer).
+        let saved = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(started).max(started);
         // Shells reloaded after this apply read the import straight away.
         self.launcher.prepare_import(&host.value);
         // Current now, host.json included: shells outside goatty needn't ask
         // for a refresh because of this save.
         if let Some(dirs) = self.launcher.dirs() {
-            let saved = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(started);
-            crate::launch::touch_stamp(dirs, saved.max(started));
+            crate::launch::touch_stamp(dirs, saved);
         }
         Ok(ApplyOutcome { issues, diff, applied: true, generation: Some(activated.generation) })
     }

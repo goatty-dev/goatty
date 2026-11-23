@@ -154,10 +154,11 @@ impl Launcher {
     /// to date, as a new session would, and note when
     /// ([`Dirs::refresh_stamp`]): `goattyd shell refresh`, which shells
     /// outside goatty ask for when a startup file changed
-    /// ([`crate::everywhere`]). May run the user's shell: off the UI thread.
-    pub fn refresh(&self, host: &Effective<HostSettings>) -> Result<()> {
+    /// ([`crate::everywhere`]). `started`: taken before `host` was read, so
+    /// a change to `host.json` after that still counts as newer. May run the
+    /// user's shell: off the UI thread.
+    pub fn refresh(&self, host: &Effective<HostSettings>, started: SystemTime) -> Result<()> {
         let dirs = self.dirs.as_ref().context("$HOME is not set, so goatty has nowhere to keep its shell environment")?;
-        let started = SystemTime::now();
         // Also with goatty's zsh off: entry.zsh then says so.
         let built = self.apply(host).map(|_| ());
         self.prepare_import(&host.value);

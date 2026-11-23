@@ -181,7 +181,7 @@ impl SettingsWindow {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let label = link.label();
-            let result = cx.background_executor().spawn(async move { link.everywhere(Action::Status) }).await;
+            let result = cx.background_executor().spawn(async move { link.everywhere(Action::Status, None) }).await;
             let _ = this.update(cx, |v, cx| {
                 let e = &mut v.everywhere;
                 if e.request != request {
@@ -219,12 +219,16 @@ impl SettingsWindow {
         }
         self.everywhere.busy = true;
         self.everywhere.action_error = None;
+        // This replaces a status request still running: it won't clear `loading`.
+        self.everywhere.loading = false;
         self.everywhere.request += 1;
         let request = self.everywhere.request;
+        // What the dialog showed: nothing is written when the files are others now.
+        let shown = self.everywhere.status.as_ref().map(|s| s.files.clone()).filter(|_| action == Action::On);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let label = link.label();
-            let result = cx.background_executor().spawn(async move { link.everywhere(action) }).await;
+            let result = cx.background_executor().spawn(async move { link.everywhere(action, shown) }).await;
             let _ = this.update(cx, |v, cx| {
                 if v.everywhere.request != request {
                     return;
@@ -373,7 +377,8 @@ impl SettingsWindow {
             return None;
         }
         let s = self.everywhere.status.as_ref()?;
-        let h = self.host_value()?;
+        // The applied settings, not the draft: those are what new terminals get.
+        let h = &self.host.as_ref()?.loaded.value;
         let host = self.host_label();
         let mono = kit::mono(cx);
         let mut points = div().flex().flex_col().gap(px(14.)).child(point(

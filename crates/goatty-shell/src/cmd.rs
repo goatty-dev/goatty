@@ -118,7 +118,7 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
         println!("  {:<10}  {}: {what}", if i == 0 { "your files" } else { "" }, f.path);
     }
     println!("  additions   {}{}", s.additions, if s.additions_exist { "" } else { " (create it for your own aliases etc.)" });
-    if let Ok(e) = svc.everywhere(crate::everywhere::Action::Status) {
+    if let Ok(e) = svc.everywhere(crate::everywhere::Action::Status, None) {
         let state = match e.state {
             crate::everywhere::State::On => format!("on ({})", e.files_text()),
             crate::everywhere::State::Off => "off (`goattyd shell everywhere on` uses goatty's shell in every terminal)".into(),
@@ -444,7 +444,11 @@ fn confirm(prompt: &str, verb: &str) -> Result<bool> {
     print!("{prompt}");
     std::io::stdout().flush()?;
     let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
+    // End of input (Ctrl+D) is no; an empty line (Enter) is the default yes.
+    if stdin.lock().read_line(&mut line)? == 0 {
+        println!();
+        return Ok(false);
+    }
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
 }
 
@@ -649,8 +653,9 @@ pub fn settings_unset(svc: &crate::HostService, key: &str) -> Result<()> {
 /// asks first (`yes`: don't ask).
 pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, yes: bool) -> Result<()> {
     use crate::everywhere::{Action, State};
-    let before = svc.everywhere(Action::Status)?;
-    if action == Action::On && before.state != State::On {
+    let before = svc.everywhere(Action::Status, None)?;
+    // Asks whenever a file would change (also to fill in one that's missing the line).
+    if action == Action::On && (before.state != State::On || !before.todo.is_empty()) {
         if let Some(why) = &before.unavailable {
             bail!("{why}");
         }
@@ -658,7 +663,8 @@ pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, y
             let at = before.changed.first().map_or_else(|| before.files_text(), ToString::to_string);
             bail!("a goatty line was edited by hand ({at}). Edit or remove it there, then try again");
         }
-        println!("goatty adds these lines to the end of {}:\n", before.files_text());
+        let todo = if before.todo.is_empty() { before.files_text() } else { before.todo.join(" and ") };
+        println!("goatty adds these lines to the end of {todo}:\n");
         for l in &before.lines {
             println!("    {l}");
         }
@@ -673,7 +679,7 @@ pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, y
             return Ok(());
         }
     }
-    let s = if action == Action::Status { before.clone() } else { svc.everywhere(action)? };
+    let s = if action == Action::Status { before.clone() } else { svc.everywhere(action, Some(&before.files))? };
     let state = match (s.state, s.active) {
         (State::On, true) => "on: new interactive zsh shells on this host run goatty's shell",
         (State::On, false) => "on, but goatty's managed zsh is off here, so the line does nothing",
@@ -710,7 +716,7 @@ pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, y
 /// in this process, as a new goatty session would. (With one, goattyd does
 /// it: the import compares against goattyd's environment.)
 pub fn refresh(svc: &crate::HostService) -> Result<()> {
-    svc.launcher.refresh(&svc.settings())
+    svc.refresh()
 }
 
 /// `goattyd shell refresh --wait SECS`, which shells outside goatty run

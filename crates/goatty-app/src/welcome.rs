@@ -314,9 +314,11 @@ impl Welcome {
         }
         self.everywhere_busy = true;
         self.everywhere_error = None;
+        // The files shown with the switch: nothing is written when they're others now.
+        let shown = self.everywhere.as_ref().map(|s| s.files.clone()).filter(|_| action == goatty_shell::everywhere::Action::On);
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { link.everywhere(action) }).await;
+            let result = cx.background_executor().spawn(async move { link.everywhere(action, shown) }).await;
             let _ = this.update(cx, |v, cx| {
                 v.everywhere_busy = false;
                 match result {

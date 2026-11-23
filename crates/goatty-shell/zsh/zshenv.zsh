@@ -49,11 +49,14 @@ _goatty_user_file() {
   [[ ${dir:A} != ${_goatty_dir:A} && -r $REPLY ]]
 }
 
-if ! builtin source -- "$ZDOTDIR/settings.zsh"; then
+if ! builtin source -- "$ZDOTDIR/settings.zsh" || (( ${+_goatty_hooked} && ! ${_goatty_hook_active:-1} )); then
   # Without settings, behave like plain zsh: zsh reads the rest of the
-  # user's startup files from their own ZDOTDIR.
+  # user's startup files from their own ZDOTDIR. The same through the hook
+  # while goatty's managed zsh is off (the line stays and does nothing).
   _goatty_zdotdir_user
   builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file
+  # Not goatty's shell: a later source of the user's .zshenv may hand over.
+  (( ${+_goatty_hooked} )) && builtin unset _goatty_dir
   builtin return
 fi
 _goatty_zdotdir_user

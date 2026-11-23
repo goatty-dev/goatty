@@ -70,7 +70,13 @@ pub enum Request {
     },
     /// goatty's shell in every terminal: the line in the user's `.zshenv`
     /// (`status`, `on`, `off`). Reply: `Everywhere`.
-    Everywhere { action: crate::everywhere::Action },
+    Everywhere {
+        action: crate::everywhere::Action,
+        /// The files the user agreed to (`Status::files`): with `on`,
+        /// nothing is written when they're others now.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shown: Option<Vec<String>>,
+    },
     /// Bring the configuration and the import up to date as a new session
     /// would (shells outside goatty ask when a startup file changed).
     /// Reply: `Done`.
@@ -287,9 +293,9 @@ impl HostService {
             Request::GenerationDiff { number } => Ok(Reply::Diff { files: history::file_diff(dirs_of(self)?, number)? }),
             Request::Path => Ok(Reply::Path(Box::new(self.path_report()))),
             Request::Import { refresh } => Ok(Reply::Import(Box::new(self.import_status(refresh)?))),
-            Request::Everywhere { action } => Ok(Reply::Everywhere(Box::new(self.everywhere(action)?))),
+            Request::Everywhere { action, shown } => Ok(Reply::Everywhere(Box::new(self.everywhere(action, shown.as_deref())?))),
             Request::Refresh => {
-                self.launcher.refresh(&self.settings())?;
+                self.refresh()?;
                 Ok(Reply::Done)
             }
         }
@@ -563,9 +569,9 @@ mod tests {
         // zsh from the sandbox's PATH (when the host has it), never the real home.
         let path = crate::launch::which("zsh").map(|z| std::path::Path::new(&z).parent().unwrap().to_string_lossy().into_owned());
         let env = vec![("HOME".into(), home.to_string_lossy().into_owned()), ("PATH".into(), path.clone().unwrap_or_default())];
-        let ctx = crate::import::Context::new(home.clone(), Some("/bin/zsh".into()), env, &dirs.zsh_dir());
+        let ctx = crate::import::Context::new(home.clone(), crate::launch::which("zsh"), env, &dirs.zsh_dir());
         let svc = HostService::new(Launcher::new(Some(dirs.clone()), None).with_import_context(ctx), Some(dirs.host_file()));
-        let ask = |action| match svc.shell_request(Request::Everywhere { action }) {
+        let ask = |action| match svc.shell_request(Request::Everywhere { action, shown: None }) {
             Ok(Reply::Everywhere(s)) => Ok(*s),
             Ok(other) => panic!("{other:?}"),
             Err(e) => Err(e),
@@ -589,8 +595,8 @@ mod tests {
         let s = ask(Action::Status).unwrap();
         assert!(!s.active && s.unavailable.is_some(), "{s:?}");
         assert!(ask(Action::On).is_err());
-        let entry = std::fs::read_to_string(dirs.zsh_dir().join("entry.zsh")).unwrap();
-        assert!(entry.contains("(( 0 )) || builtin return 0"), "the hook does nothing then: {entry}");
+        let settings = std::fs::read_to_string(dirs.zsh_dir().join("settings.zsh")).unwrap();
+        assert!(settings.contains("_goatty_hook_active='0'"), "the hook does nothing then: {settings}");
     }
 
     #[test]
@@ -603,7 +609,7 @@ mod tests {
         assert!(dirs.zsh_dir().join("entry.zsh").is_file());
         let stamp = std::fs::metadata(dirs.refresh_stamp()).unwrap().modified().unwrap();
         assert!(stamp >= before && stamp <= std::time::SystemTime::now(), "{stamp:?}");
-        let json = serde_json::to_string(&Request::Everywhere { action: crate::everywhere::Action::On }).unwrap();
+        let json = serde_json::to_string(&Request::Everywhere { action: crate::everywhere::Action::On, shown: None }).unwrap();
         assert_eq!(json, r#"{"op":"everywhere","action":"on"}"#);
     }
 

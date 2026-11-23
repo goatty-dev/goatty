@@ -107,6 +107,10 @@ pub struct Status {
     /// The newest backup, for people.
     #[serde(default)]
     pub backup: Option<String>,
+    /// The files turning it on would add the line to (for people): all of
+    /// them when it's off, the ones missing it when it's partly on.
+    #[serde(default)]
+    pub todo: Vec<String>,
 }
 
 impl Status {
@@ -142,11 +146,15 @@ const MARK: &str = "goatty-zdotdir:";
 /// 2. `$ZDOTDIR/.zshenv` when that file sets `ZDOTDIR` (the `~/.config/zsh`
 ///    pattern): shells started from a shell inherit it and read that file;
 /// 3. `$ZDOTDIR/.zshenv` when `env` (goattyd's, so the desktop session's)
-///    sets `ZDOTDIR`: new terminals start with it.
+///    sets `ZDOTDIR`: new terminals start with it;
+/// 4. `$ZDOTDIR/.zshenv` for `known`, the `ZDOTDIR` the import's last
+///    harvest saw after a whole interactive login startup (one only
+///    interactive shells set, say in `.zshrc`).
 ///
 /// `env` minus goatty's own variables and `ZDOTDIR` (`goatty_dir`). Without
-/// zsh, or when asking it fails, decides from `env`.
-pub fn zshenv_files(zsh: Option<&str>, home: &Path, env: &[(String, String)], goatty_dir: &Path) -> Vec<PathBuf> {
+/// zsh, or when asking it fails, decides from `env`. A shell started with
+/// yet another `ZDOTDIR` (`ZDOTDIR=~/work zsh`) isn't covered.
+pub fn zshenv_files(zsh: Option<&str>, home: &Path, env: &[(String, String)], goatty_dir: &Path, known: Option<&str>) -> Vec<PathBuf> {
     let usable = |dir: &str| {
         let p = Path::new(dir);
         (!dir.is_empty() && !dir.contains(['\n', '\r', '\0']) && p.is_absolute() && p != goatty_dir).then(|| p.to_path_buf())
@@ -181,6 +189,7 @@ pub fn zshenv_files(zsh: Option<&str>, home: &Path, env: &[(String, String)], go
         None => dirs.push(home.to_path_buf()),
     }
     dirs.extend(env_zd);
+    dirs.extend(known.and_then(usable));
     let mut files: Vec<PathBuf> = Vec::new();
     for f in dirs.into_iter().map(|d| d.join(".zshenv")) {
         if !files.contains(&f) {
@@ -196,17 +205,20 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut child = cmd.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    // Read on a thread of its own: a background process the startup left
+    // behind may keep stdout open after zsh exits. The deadline covers that too.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
-        buf
+        let _ = tx.send(buf);
     });
-    let start = Instant::now();
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return reader.join().ok(),
+            Ok(Some(status)) if status.success() => return rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok(),
             Ok(Some(_)) => return None,
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -289,8 +301,11 @@ fn unique() -> u64 {
 
 /// Copy `file` (`shown` for people) to the backups (private), keeping the
 /// newest [`BACKUPS_KEPT`]. Named `<time>-<n>.<file>`, so names sort by age.
-fn backup(dirs: &Dirs, file: &Path, shown: &str) -> Result<Option<PathBuf>> {
-    let Ok(text) = std::fs::read(file) else { return Ok(None) };
+fn backup(dirs: &Dirs, file: &Path, text: &str, shown: &str) -> Result<Option<PathBuf>> {
+    if !file.exists() {
+        return Ok(None);
+    }
+    let text = text.as_bytes();
     let dir = dirs.zshenv_backups();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -303,7 +318,7 @@ fn backup(dirs: &Dirs, file: &Path, shown: &str) -> Result<Option<PathBuf>> {
         .mode(0o600)
         .open(&path)
         .with_context(|| format!("create {}", path.display()))?;
-    std::io::Write::write_all(&mut f, &text)?;
+    std::io::Write::write_all(&mut f, text)?;
     let mut all = backups(dirs);
     while all.len() > BACKUPS_KEPT {
         let _ = std::fs::remove_file(all.remove(0));
@@ -351,6 +366,21 @@ fn write(file: &Path, text: &str) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// The files goatty added its line to (they may not be where a new shell
+/// looks any more: a `ZDOTDIR` that moved).
+fn recorded(dirs: &Dirs) -> Vec<PathBuf> {
+    std::fs::read_to_string(dirs.zshenv_record()).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
+}
+
+/// Stop when `file` changed since goatty read `text` (an editor or a
+/// dotfiles tool saved it meanwhile): never replace someone's newer edit.
+fn unchanged(file: &Path, text: &str) -> Result<()> {
+    if read(file)? != text {
+        bail!("{} changed while goatty was editing it. Nothing was written to it; try again", file.display());
+    }
+    Ok(())
 }
 
 /// For people: `~/…` under `home`.
@@ -455,6 +485,7 @@ impl<'a> Hook<'a> {
             active,
             unavailable,
             backup: backups(self.dirs).pop().map(|p| shown(&p, self.home)),
+            todo: if changed_only { Vec::new() } else { missing },
         }
     }
 
@@ -480,7 +511,7 @@ impl<'a> Hook<'a> {
         let mut written: Vec<(&PathBuf, String)> = Vec::new();
         for (f, text) in todo {
             let Some(new) = with_lines(&text, &self.lines) else { continue };
-            let done = backup(self.dirs, f, &shown(f, self.home)).and_then(|_| write(f, &new));
+            let done = unchanged(f, &text).and_then(|()| backup(self.dirs, f, &text, &shown(f, self.home))).and_then(|_| write(f, &new));
             if let Err(e) = done {
                 for (back, old) in written.iter().rev() {
                     if let Err(e) = write(back, old) {
@@ -491,6 +522,7 @@ impl<'a> Hook<'a> {
             }
             written.push((f, text));
         }
+        self.record(|r| r.extend(self.files.iter().cloned()));
         Ok(())
     }
 
@@ -511,7 +543,7 @@ impl<'a> Hook<'a> {
                 continue;
             }
             if let Some(new) = without_lines(&text, &self.lines) {
-                todo.push((f, new));
+                todo.push((f, text, new));
             }
         }
         if todo.is_empty()
@@ -519,11 +551,32 @@ impl<'a> Hook<'a> {
         {
             bail!("{}, line {n} has a changed goatty line ({line}). Remove it there yourself", shown(f, self.home));
         }
-        for (f, new) in todo {
-            backup(self.dirs, f, &shown(f, self.home))?;
+        for (f, text, new) in todo {
+            unchanged(f, &text)?;
+            backup(self.dirs, f, &text, &shown(f, self.home))?;
             write(f, &new).map_err(|e| self.manual(f, e, "remove these lines from it"))?;
         }
+        // Files that still have goatty's line (one that couldn't be written) stay recorded.
+        self.record(|r| r.retain(|f| read(f).is_ok_and(|t| scan(&t, &self.lines).0)));
         Ok(())
+    }
+
+    /// Change the record of the files goatty added its line to.
+    fn record(&self, f: impl FnOnce(&mut Vec<PathBuf>)) {
+        let mut files = recorded(self.dirs);
+        f(&mut files);
+        let mut seen = Vec::new();
+        files.retain(|p| {
+            !seen.contains(p) && {
+                seen.push(p.clone());
+                true
+            }
+        });
+        let path = self.dirs.zshenv_record();
+        let text: String = files.iter().map(|p| format!("{}\n", p.display())).collect();
+        if let Err(e) = std::fs::create_dir_all(&self.dirs.state).and_then(|()| std::fs::write(&path, text)) {
+            log::warn!("couldn't note where goatty's line is ({}): {e}", path.display());
+        }
     }
 
     /// A write to `file` that failed: say what to do by hand.
@@ -540,9 +593,13 @@ impl<'a> Hook<'a> {
 impl HostService {
     /// goatty's shell in every terminal on this host: the line's state,
     /// after turning it on or off.
-    pub fn everywhere(&self, action: Action) -> Result<Status> {
+    /// `shown`: the files the user agreed to (the dialog, the CLI's
+    /// question): when the files to change are others now, nothing is
+    /// written.
+    pub fn everywhere(&self, action: Action, shown_files: Option<&[String]>) -> Result<Status> {
         let dirs = self.launcher.dirs().context("$HOME is not set, so goatty has nowhere to keep its shell environment")?;
         let ctx = self.launcher.import_context().context("no home directory on this host")?;
+        let started = SystemTime::now();
         let host = self.settings();
         let zsh = host
             .value
@@ -552,8 +609,24 @@ impl HostService {
             .filter(|p| crate::launch::is_zsh(p) && Path::new(p).is_file())
             .or_else(|| ctx.which("zsh"))
             .or_else(|| ctx.login_shell.clone().filter(|s| crate::launch::is_zsh(s) && Path::new(s).is_file()));
-        let files = zshenv_files(zsh.as_deref(), &ctx.home, &ctx.env, &dirs.zsh_dir());
+        let known = crate::import::Record::load(dirs).harvest.and_then(|h| h.zdotdir);
+        let mut files = zshenv_files(zsh.as_deref(), &ctx.home, &ctx.env, &dirs.zsh_dir(), known.as_deref());
+        // Where goatty put its line before and it's still there: shown, and removed when off.
+        let lines = lines(&dirs.zsh_dir().join("entry.zsh"), &ctx.home);
+        for f in recorded(dirs) {
+            if !files.contains(&f) && read(&f).is_ok_and(|t| scan(&t, &lines).0) {
+                files.push(f);
+            }
+        }
         let hook = Hook::new(dirs, &ctx.home, files);
+        if action == Action::On
+            && let Some(agreed) = shown_files
+        {
+            let now: Vec<String> = hook.files.iter().map(|f| shown(f, &ctx.home)).collect();
+            if now != agreed {
+                bail!("The files to change are {} now, not the ones shown. Nothing was written; look again", now.join(" and "));
+            }
+        }
         let active = crate::zsh::hook_active(&host.value);
         let unavailable = if zsh.is_none() {
             Some("zsh isn't installed on this host".to_owned())
@@ -579,7 +652,7 @@ impl HostService {
         if action != Action::Status {
             // The .zshenv changed: bring the import up to date now (and note
             // it), so the next terminal doesn't stop to ask for a refresh.
-            if let Err(e) = self.launcher.refresh(&host) {
+            if let Err(e) = self.launcher.refresh(&host, started) {
                 log::warn!("after changing .zshenv: {e:#}");
             }
         }
@@ -824,6 +897,29 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_edit_is_never_overwritten() {
+        let (_tmp, home, _dirs) = sandbox();
+        let file = home.join(".zshenv");
+        std::fs::write(&file, "mine\n").unwrap();
+        unchanged(&file, "mine\n").unwrap();
+        // Another editor saved after goatty read it.
+        std::fs::write(&file, "mine\nnewer\n").unwrap();
+        assert!(unchanged(&file, "mine\n").unwrap_err().to_string().contains("changed while goatty was editing it"));
+    }
+
+    #[test]
+    fn the_files_goatty_changed_are_recorded() {
+        let (_tmp, home, dirs) = sandbox();
+        let files = vec![home.join(".zshenv"), home.join("old/.zshenv")];
+        let hook = Hook::new(&dirs, &home, files.clone());
+        hook.enable().unwrap();
+        assert_eq!(recorded(&dirs), files);
+        // Off removes them from the record once their line is gone.
+        hook.disable().unwrap();
+        assert!(recorded(&dirs).is_empty());
+    }
+
+    #[test]
     fn unreadable_files_are_reported() {
         let (_tmp, home, dirs) = sandbox();
         std::fs::create_dir_all(home.join(".zshenv")).unwrap();
@@ -837,21 +933,24 @@ mod tests {
         let goatty = Path::new("/home/u/.local/share/goatty/current/zsh");
         let env = |z: &str| vec![("ZDOTDIR".to_owned(), z.to_owned())];
         // Without zsh: from the environment, never goatty's own directory.
-        assert_eq!(zshenv_files(None, home, &[], goatty), [Path::new("/home/u/.zshenv")]);
+        assert_eq!(zshenv_files(None, home, &[], goatty, None), [Path::new("/home/u/.zshenv")]);
         assert_eq!(
-            zshenv_files(None, home, &env("/home/u/.config/zsh"), goatty),
+            zshenv_files(None, home, &env("/home/u/.config/zsh"), goatty, None),
             [Path::new("/home/u/.zshenv"), Path::new("/home/u/.config/zsh/.zshenv")]
         );
-        assert_eq!(zshenv_files(None, home, &env(&goatty.to_string_lossy()), goatty), [Path::new("/home/u/.zshenv")]);
+        assert_eq!(zshenv_files(None, home, &env(&goatty.to_string_lossy()), goatty, None), [Path::new("/home/u/.zshenv")]);
         // zsh agrees (when it's here), and a .zshenv that moves ZDOTDIR adds its target.
         if let Some(zsh) = crate::launch::which("zsh") {
             let tmp = tempfile::tempdir().unwrap();
             let h = tmp.path();
-            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty), [h.join(".zshenv")]);
+            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty, None), [h.join(".zshenv")]);
             let zd = h.join("zd");
-            assert_eq!(zshenv_files(Some(&zsh), h, &env(&zd.to_string_lossy()), goatty), [h.join(".zshenv"), zd.join(".zshenv")]);
+            assert_eq!(zshenv_files(Some(&zsh), h, &env(&zd.to_string_lossy()), goatty, None), [h.join(".zshenv"), zd.join(".zshenv")]);
+            // One only interactive startup sets, from the import's last harvest.
+            let late = h.join("late").to_string_lossy().into_owned();
+            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty, Some(&late)), [h.join(".zshenv"), h.join("late/.zshenv")]);
             std::fs::write(h.join(".zshenv"), "echo noise\nexport ZDOTDIR=$HOME/.config/zsh\n").unwrap();
-            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty), [h.join(".zshenv"), h.join(".config/zsh/.zshenv")]);
+            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty, None), [h.join(".zshenv"), h.join(".config/zsh/.zshenv")]);
         }
     }
 }

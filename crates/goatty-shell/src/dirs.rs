@@ -109,6 +109,11 @@ impl Dirs {
     pub fn refresh_stamp(&self) -> PathBuf {
         self.state.join("shell-refreshed")
     }
+    /// The files goatty added its line to (one path a line), so turning it
+    /// off finds them after `ZDOTDIR` moved ([`crate::everywhere`]).
+    pub fn zshenv_record(&self) -> PathBuf {
+        self.state.join("zshenv-hooked")
+    }
     /// Copies of the user's `.zshenv` from before goatty added or removed
     /// its line ([`crate::everywhere`]).
     pub fn zshenv_backups(&self) -> PathBuf {
