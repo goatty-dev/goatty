@@ -159,7 +159,7 @@ struct InputJob {
 /// through a weak sender so a stuck write never keeps the writer alive.
 fn input_loop(rx: flume::Receiver<InputJob>, replies: flume::WeakSender<Outbound>) {
     while let Ok(job) = rx.recv() {
-        let _ = job.session.pty.lock().write(&job.data);
+        let _ = job.session.input.lock().write(&job.data);
         match job.reply {
             Some(req) => {
                 if let (Some(tx), Ok(f)) = (replies.upgrade(), encode(&ServerMsg::Ok { req })) {

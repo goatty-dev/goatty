@@ -148,7 +148,6 @@ fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: 
     std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut saved = Vec::new();
     for s in sessions.values() {
-        // Not through `s.pty`: an input write may hold its lock.
         let Some(pid) = s.pid else { continue };
         let snapshot = format!("s{}.vt", s.id);
         write_private(&dir.join(&snapshot), &s.term.restore_snapshot())?;

@@ -81,8 +81,18 @@ fn disable_flow_control(fd: RawFd) {
 /// A running child process attached to a PTY.
 pub struct Pty {
     master: OwnedFd,
-    writer: File,
     process: Process,
+}
+
+/// Input to a PTY: its own handle on the master (see [`Pty::input`]).
+pub struct PtyInput(File);
+
+impl PtyInput {
+    /// Blocks while the PTY's input queue is full (the program doesn't read).
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(bytes)?;
+        self.0.flush()
+    }
 }
 
 /// Duplicate `fd` with `FD_CLOEXEC` set.
@@ -137,9 +147,8 @@ impl Pty {
     }
 
     fn from_parts(master: OwnedFd, process: Process) -> Result<(Self, File)> {
-        let writer = File::from(dup(master.as_fd())?);
         let reader = File::from(dup(master.as_fd())?);
-        Ok((Self { master, writer, process }, reader))
+        Ok((Self { master, process }, reader))
     }
 
     /// The master side, e.g. to pass it on to the next goattyd.
@@ -147,9 +156,11 @@ impl Pty {
         self.master.as_fd()
     }
 
-    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+    /// A handle for writing input, separate from the `Pty`: a write that
+    /// blocks (the program stopped reading) must not hold up [`Pty::kill`]
+    /// or the other calls behind whatever lock guards the `Pty` (#233).
+    pub fn input(&self) -> std::io::Result<PtyInput> {
+        Ok(PtyInput(File::from(dup(self.master.as_fd())?)))
     }
 
     pub fn resize(&self, size: TermSize) -> Result<()> {
@@ -347,7 +358,7 @@ mod tests {
         pty.resize(TermSize { cols: 100, rows: 30, cell_width: 9, cell_height: 18 }).unwrap();
         let ws = window_size(pty.master_fd()).unwrap();
         assert_eq!((ws.cols, ws.rows, ws.cell_width, ws.cell_height), (100, 30, 9, 18));
-        pty.write(b"hello\r").unwrap();
+        pty.input().unwrap().write(b"hello\r").unwrap();
         assert!(read_until(&mut reader, "got:hello").contains("got:hello"));
         pty.kill();
         // Still our child: the exit status is there (SIGHUP).
