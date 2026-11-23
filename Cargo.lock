@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flume",
@@ -2077,7 +2077,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2111,7 +2111,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -2126,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-plugin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2148,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "postcard",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-shell"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "goatty-term"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "flume",
