@@ -506,6 +506,9 @@ impl<'a> Hook<'a> {
             }
             todo.push((f, text));
         }
+        // Noted before any file changes, so turning it off finds every one
+        // even after ZDOTDIR moved (a noted file without the line is skipped).
+        self.record(|r| r.extend(self.files.iter().cloned()))?;
         // All or nothing: a file that can't be written puts back the ones
         // written before it, so no shell is left half switched.
         let mut written: Vec<(&PathBuf, String)> = Vec::new();
@@ -522,7 +525,6 @@ impl<'a> Hook<'a> {
             }
             written.push((f, text));
         }
-        self.record(|r| r.extend(self.files.iter().cloned()));
         Ok(())
     }
 
@@ -556,13 +558,14 @@ impl<'a> Hook<'a> {
             backup(self.dirs, f, &text, &shown(f, self.home))?;
             write(f, &new).map_err(|e| self.manual(f, e, "remove these lines from it"))?;
         }
-        // Files that still have goatty's line (one that couldn't be written) stay recorded.
-        self.record(|r| r.retain(|f| read(f).is_ok_and(|t| scan(&t, &self.lines).0)));
+        // Files that still have goatty's line, or can't be read now, stay noted.
+        self.record(|r| r.retain(|f| read(f).map_or(true, |t| scan(&t, &self.lines).0)))?;
         Ok(())
     }
 
     /// Change the record of the files goatty added its line to.
-    fn record(&self, f: impl FnOnce(&mut Vec<PathBuf>)) {
+    /// Readers see the old record or the new one (temporary file, renamed).
+    fn record(&self, f: impl FnOnce(&mut Vec<PathBuf>)) -> Result<()> {
         let mut files = recorded(self.dirs);
         f(&mut files);
         let mut seen = Vec::new();
@@ -574,9 +577,13 @@ impl<'a> Hook<'a> {
         });
         let path = self.dirs.zshenv_record();
         let text: String = files.iter().map(|p| format!("{}\n", p.display())).collect();
-        if let Err(e) = std::fs::create_dir_all(&self.dirs.state).and_then(|()| std::fs::write(&path, text)) {
-            log::warn!("couldn't note where goatty's line is ({}): {e}", path.display());
+        std::fs::create_dir_all(&self.dirs.state).with_context(|| format!("create {}", self.dirs.state.display()))?;
+        let tmp = self.dirs.state.join(format!(".zshenv-hooked.{}-{}", std::process::id(), unique()));
+        let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
+        written.with_context(|| format!("note where goatty's line goes in {}", path.display()))
     }
 
     /// A write to `file` that failed: say what to do by hand.
@@ -614,7 +621,9 @@ impl HostService {
         // Where goatty put its line before and it's still there: shown, and removed when off.
         let lines = lines(&dirs.zsh_dir().join("entry.zsh"), &ctx.home);
         for f in recorded(dirs) {
-            if !files.contains(&f) && read(&f).is_ok_and(|t| scan(&t, &lines).0) {
+            // One that can't be read stays in: status says so, and off fails
+            // rather than claim it's gone.
+            if !files.contains(&f) && read(&f).map_or(true, |t| scan(&t, &lines).0) {
                 files.push(f);
             }
         }
@@ -917,6 +926,13 @@ mod tests {
         // Off removes them from the record once their line is gone.
         hook.disable().unwrap();
         assert!(recorded(&dirs).is_empty());
+        // One that can't be read stays noted.
+        hook.enable().unwrap();
+        std::fs::remove_file(&files[1]).unwrap();
+        std::fs::create_dir_all(&files[1]).unwrap();
+        let only_first = Hook::new(&dirs, &home, vec![files[0].clone()]);
+        only_first.disable().unwrap();
+        assert_eq!(recorded(&dirs), [files[1].clone()]);
     }
 
     #[test]

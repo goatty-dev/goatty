@@ -313,7 +313,10 @@ impl Welcome {
             return;
         }
         self.everywhere_busy = true;
-        self.everywhere_error = None;
+        // A status check after a failed change keeps its error on screen.
+        if action != goatty_shell::everywhere::Action::Status {
+            self.everywhere_error = None;
+        }
         // The files shown with the switch: nothing is written when they're others now.
         let shown = self.everywhere.as_ref().map(|s| s.files.clone()).filter(|_| action == goatty_shell::everywhere::Action::On);
         cx.notify();
@@ -325,7 +328,11 @@ impl Welcome {
                     Ok(s) => v.everywhere = Some(s),
                     // An older goattyd: no question about it.
                     Err(e) if action == goatty_shell::everywhere::Action::Status => log::info!("every terminal: {e:#}"),
-                    Err(e) => v.everywhere_error = Some(format!("{e:#}")),
+                    Err(e) => {
+                        v.everywhere_error = Some(format!("{e:#}"));
+                        // Show what the host has now (the files may have changed).
+                        v.everywhere(goatty_shell::everywhere::Action::Status, cx);
+                    }
                 }
                 cx.notify();
             });
