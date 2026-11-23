@@ -111,6 +111,24 @@ pub struct Plugins<'a> {
     pub builtin: &'a [Source],
 }
 
+/// A warning when a registry's index is past its `expires` (#100): a newer
+/// one may exist that something keeps from reaching this host (a freeze
+/// attack hiding a yanked version), or the registry stopped re-signing.
+/// Plugins keep working; only the warning tells.
+fn expiry_warning(index: &goatty_plugin::index::Index, now: u64) -> Option<String> {
+    let expires = index.expires.filter(|_| index.expired(now))?;
+    let days = now.saturating_sub(expires) / (24 * 60 * 60);
+    let ago = match days {
+        0 => "today".to_string(),
+        1 => "a day ago".to_string(),
+        n => format!("{n} days ago"),
+    };
+    Some(format!(
+        "registry {}: its index expired {ago}. Updates from it may be held back, so a yanked version could still be offered. Refresh it, and if this stays, check the connection to the registry.",
+        index.registry
+    ))
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -180,7 +198,7 @@ impl Plugins<'_> {
     /// Every registry's snapshot: fetched when `refresh`, when never
     /// fetched, or (with `refresh_stale`) when older than a day.
     pub fn snapshots(&self, refresh: bool, refresh_stale: bool) -> (Vec<Snapshot>, Vec<RegistryStatus>, Vec<String>) {
-        let (sources, issues) = self.sources();
+        let (sources, mut issues) = self.sources();
         let mut snaps = Vec::new();
         let mut status = Vec::new();
         for s in sources {
@@ -202,6 +220,10 @@ impl Plugins<'_> {
                     }
                     Err(e) => error = Some(format!("{e:#}")),
                 }
+            }
+            if let Some(warning) = snap.as_ref().and_then(|x| expiry_warning(&x.index, now())) {
+                log::warn!("{warning}");
+                issues.push(warning);
             }
             status.push(RegistryStatus {
                 name: s.name.clone(),

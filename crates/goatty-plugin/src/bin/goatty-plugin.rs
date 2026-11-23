@@ -99,7 +99,7 @@ fn run(cli: Cli) -> Result<bool> {
                 let idx = index::build(&dir)?;
                 let versions: usize = idx.plugins.values().map(|e| e.versions.len()).sum();
                 std::fs::write(dir.join(index::INDEX), idx.to_bytes())?;
-                println!("index.json: {} plugins, {versions} versions, sequence {}", idx.plugins.len(), idx.sequence);
+                println!("index.json: {} plugins, {versions} versions, sequence {}, {}", idx.plugins.len(), idx.sequence, expiry(&idx));
                 println!("sign it next: goatty-plugin index sign --key <secret key file>");
                 Ok(true)
             }
@@ -117,19 +117,42 @@ fn run(cli: Cli) -> Result<bool> {
                 let dir = dir_or_cwd(dir);
                 let trusted = if trust.is_empty() { index::read_meta(&dir)?.keys } else { trust };
                 let idx = index::verify_snapshot(&dir, &trusted, 0)?;
-                println!("index.json: signature ok, {} plugins, every file matches (sequence {})", idx.plugins.len(), idx.sequence);
+                println!(
+                    "index.json: signature ok, {} plugins, every file matches (sequence {}, {})",
+                    idx.plugins.len(),
+                    idx.sequence,
+                    expiry(&idx)
+                );
                 Ok(true)
             }
             IndexCmd::Check { dir } => {
-                let current = index::is_current(&dir_or_cwd(dir))?;
+                let dir = dir_or_cwd(dir);
+                let current = index::is_current(&dir)?;
+                let committed: Option<index::Index> =
+                    std::fs::read(dir.join(index::INDEX)).ok().and_then(|b| serde_json::from_slice(&b).ok());
                 if current {
                     println!("index.json is current");
+                } else if let Some(c) = committed.filter(|c| index::build(&dir).is_ok_and(|b| b.plugins == c.plugins)) {
+                    let why = if c.expires.is_some() { expiry(&c) } else { "it has no expiry yet".into() };
+                    println!("index.json is due for renewal ({why}): run `goatty-plugin index build` and sign it");
                 } else {
                     println!("index.json doesn't match the plugins: run `goatty-plugin index build` and sign it");
                 }
                 Ok(current)
             }
         },
+    }
+}
+
+/// "expires in N days" (or "expired N days ago", "never expires").
+fn expiry(idx: &index::Index) -> String {
+    let Some(expires) = idx.expires else { return "never expires".into() };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    const DAY: u64 = 24 * 60 * 60;
+    if idx.expired(now) {
+        format!("expired {} days ago", (now - expires) / DAY)
+    } else {
+        format!("expires in {} days", (expires - now) / DAY)
     }
 }
 

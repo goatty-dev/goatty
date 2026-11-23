@@ -775,3 +775,29 @@ fn installed_reports_lock_and_manifest_issues_without_hiding_valid_entries() {
     assert!(!entries.is_empty());
     assert!(issues.iter().any(|i| i.contains("installed/lock.json")), "{issues:?}");
 }
+
+/// An index past its `expires` (#100) still works, with a warning in the
+/// catalog's issues; a re-published one clears it.
+#[test]
+fn an_expired_index_warns_but_keeps_working() {
+    let w = world();
+    let reg = w.tmp.path().join("registry");
+    let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+    let path = reg.join(goatty_plugin::index::INDEX);
+    let mut index: goatty_plugin::index::Index = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    index.expires = Some(now() - 3 * 24 * 60 * 60);
+    std::fs::write(&path, index.to_bytes()).unwrap();
+    goatty_plugin::index::sign_dir(&reg, &key).unwrap();
+
+    let settings = HostSettings::default();
+    let cat = w.plugins().catalog(true, &settings);
+    assert!(cat.available.iter().any(|a| a.id == "demo"), "the expired index is still used");
+    let warning = cat.issues.iter().find(|i| i.contains("expired")).expect("an expiry warning");
+    assert!(warning.starts_with("registry test: its index expired 3 days ago"), "{warning}");
+
+    // Re-published: renewed (new sequence and expiry), and the warning is gone.
+    super::registry::tests::publish(&reg, &key);
+    let cat = w.plugins().catalog(true, &settings);
+    assert!(!cat.issues.iter().any(|i| i.contains("expired")), "{:?}", cat.issues);
+    assert_eq!(cat.registries[0].sequence, Some(2));
+}
