@@ -230,7 +230,7 @@ impl Launcher {
 
 /// Note that the configuration and the import were current as of `at`
 /// (the check's start, so a file changed while it ran still counts as newer).
-fn touch_stamp(dirs: &Dirs, at: SystemTime) {
+pub(crate) fn touch_stamp(dirs: &Dirs, at: SystemTime) {
     let path = dirs.refresh_stamp();
     let touched = path
         .parent()

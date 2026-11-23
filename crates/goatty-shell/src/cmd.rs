@@ -120,9 +120,9 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
     println!("  additions   {}{}", s.additions, if s.additions_exist { "" } else { " (create it for your own aliases etc.)" });
     if let Ok(e) = svc.everywhere(crate::everywhere::Action::Status) {
         let state = match e.state {
-            crate::everywhere::State::On => format!("on ({})", e.file),
+            crate::everywhere::State::On => format!("on ({})", e.files_text()),
             crate::everywhere::State::Off => "off (`goattyd shell everywhere on` uses goatty's shell in every terminal)".into(),
-            crate::everywhere::State::Changed => format!("{} has a goatty line goatty didn't write", e.file),
+            crate::everywhere::State::Changed => "a goatty line in your .zshenv was edited by hand (`goattyd shell everywhere`)".into(),
         };
         println!("  everywhere  {state}");
     }
@@ -654,15 +654,19 @@ pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, y
         if let Some(why) = &before.unavailable {
             bail!("{why}");
         }
-        println!("goatty adds these lines to the end of {}:\n", before.file);
+        if before.state == State::Changed {
+            let at = before.changed.first().map_or_else(|| before.files_text(), ToString::to_string);
+            bail!("a goatty line was edited by hand ({at}). Edit or remove it there, then try again");
+        }
+        println!("goatty adds these lines to the end of {}:\n", before.files_text());
         for l in &before.lines {
             println!("    {l}");
         }
         println!();
-        println!("Every interactive zsh on this host then runs goatty's shell: IDE terminals, other terminals,");
+        println!("Every new interactive zsh on this host then runs goatty's shell: IDE terminals, other terminals,");
         println!("tmux, SSH logins. Scripts and `zsh -c` stay plain, and your login shell doesn't change.");
-        println!("  - Your ~/.zshrc stops running there, as in goatty's tabs. Its PATH folders and variables still");
-        println!("    come along; put functions, aliases and key bindings in ~/.config/goatty/zshrc.");
+        println!("  - Your ~/.zshrc stops running there, as in goatty's tabs. The PATH folders and variables it sets up");
+        println!("    still come along; put functions, aliases and key bindings in ~/.config/goatty/zshrc.");
         println!("  - Plain zsh for one shell: GOATTY_SHELL_MANAGED=0 zsh. Undo: goattyd shell everywhere off.");
         if !yes && !confirm("\nAdd them? [Y/n] ", "add them")? {
             println!("Nothing changed.");
@@ -674,22 +678,22 @@ pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, y
         (State::On, true) => "on: new interactive zsh shells on this host run goatty's shell",
         (State::On, false) => "on, but goatty's managed zsh is off here, so the line does nothing",
         (State::Off, _) => "off: only goatty's own sessions run goatty's shell",
-        (State::Changed, _) => "changed: the file has a goatty line goatty didn't write",
+        (State::Changed, _) => "changed: a goatty line was edited by hand",
     };
     println!("goatty's shell in every terminal");
     println!("  state       {state}");
-    println!("  file        {}", s.file);
-    for (n, line) in &s.changed {
-        println!("  changed     line {n}: {line}");
+    println!("  {:<10}  {}", if s.files.len() == 1 { "file" } else { "files" }, s.files_text());
+    for c in &s.changed {
+        println!("  changed     {c}");
     }
     for w in &s.warnings {
-        println!("  \u{26a0}           {w}");
+        println!("  \u{26a0} warning   {w}");
     }
     if let Some(why) = s.unavailable.as_deref().filter(|_| s.state != State::On) {
-        println!("  can't turn on: {why}");
+        println!("  unavailable {why}");
     }
     if action != Action::Status && before.state != s.state {
-        if let Some(b) = &s.backup {
+        if let Some(b) = s.backup.as_ref().filter(|b| before.backup.as_ref() != Some(*b)) {
             println!("  backup      {b}");
         }
         if s.state == State::Off {

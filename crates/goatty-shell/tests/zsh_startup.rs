@@ -2008,9 +2008,12 @@ impl Sandbox {
     fn hook(&self, zshenv: &str) -> goatty_shell::everywhere::Hook<'_> {
         self.launch_with(no_highlighting(), None);
         self.file(".zshenv", zshenv);
-        let hook = goatty_shell::everywhere::Hook::new(&self.dirs, &self.home, self.home.join(".zshenv"));
+        let files = goatty_shell::everywhere::zshenv_files(Some(&self.zsh), &self.home, &self.base_env(), &self.dirs.zsh_dir());
+        let hook = goatty_shell::everywhere::Hook::new(&self.dirs, &self.home, files);
         hook.enable().unwrap();
         self.refreshed_at(SystemTime::now() + Duration::from_secs(3600));
+        // Finding the files ran the user's .zshenv once.
+        let _ = std::fs::remove_file(self.home.join("trace"));
         hook
     }
 
@@ -2084,13 +2087,19 @@ fn hooked_zshenv_keeps_the_users_zdotdir() {
     let sb = Sandbox::new(zsh);
     // The common ~/.config/zsh pattern: ~/.zshenv sets ZDOTDIR, the rest lives there.
     let zd = sb.home.join(".config/zsh");
-    sb.hook(&format!("{}export ZDOTDIR={}\n", traced("zshenv", ""), zd.display()));
+    let hook_line = sb.hook(&format!("{}export ZDOTDIR={}\n", traced("zshenv", ""), zd.display())).lines[1].clone();
     sb.file(".config/zsh/.zprofile", &traced("zprofile", ""));
     sb.file(".config/zsh/.zlogin", &traced("zlogin", ""));
     let o = sb.plain(&["-l", "-i", "-c", MANAGED], &[]);
     assert_eq!(stdout(&o).trim(), format!("managed=1 zd={}", zd.display()), "stderr: {}", String::from_utf8_lossy(&o.stderr));
-    let zd = zd.display();
-    assert_eq!(sb.trace(), ["zshenv:unset".to_owned(), format!("zprofile:{zd}"), format!("zlogin:{zd}")]);
+    let zd_shown = zd.display();
+    assert_eq!(sb.trace(), ["zshenv:unset".to_owned(), format!("zprofile:{zd_shown}"), format!("zlogin:{zd_shown}")]);
+
+    // goatty's line went into both files: shells started from a shell
+    // inherit ZDOTDIR and read ~/.config/zsh/.zshenv, and stay goatty's.
+    assert!(std::fs::read_to_string(zd.join(".zshenv")).unwrap().contains(&hook_line));
+    let o = sb.plain(&["-l", "-i", "-c", &format!("{} -i -c '{MANAGED}'", sb.zsh)], &[]);
+    assert_eq!(stdout(&o).trim(), format!("managed=1 zd={zd_shown}"), "stderr: {}", String::from_utf8_lossy(&o.stderr));
 }
 
 #[test]
@@ -2282,6 +2291,22 @@ fn hook_chains_with_kitty_shell_integration() {
         &env,
     );
     assert_eq!(stdout(&o).trim(), "goatty=1 kitty=1 marks=0", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    // kitty asked not to mark prompts: goatty does.
+    let mut quiet = env;
+    quiet[1] = ("KITTY_SHELL_INTEGRATION", "enabled no-prompt-mark");
+    let probe = "print -r -- goatty=${+functions[goatty-reload]} kitty=${+functions[_ksi_deferred_init]} marks=$_goatty_marks";
+    assert_eq!(stdout(&sb.plain(&["-i", "-c", probe], &quiet)).trim(), "goatty=1 kitty=1 marks=1");
+}
+
+#[test]
+fn inherited_integration_variables_dont_turn_goattys_marks_off() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook("");
+    // tmux started from kitty: the variable came along, kitty's integration didn't.
+    let env = [("KITTY_SHELL_INTEGRATION", "enabled"), ("TERM_PROGRAM", "tmux")];
+    let o = sb.plain(&["-i", "-c", "print -r -- marks=$_goatty_marks"], &env);
+    assert_eq!(stdout(&o).trim(), "marks=1", "stderr: {}", String::from_utf8_lossy(&o.stderr));
 }
 
 #[test]

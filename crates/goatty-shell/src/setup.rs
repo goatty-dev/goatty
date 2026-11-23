@@ -575,7 +575,7 @@ mod tests {
             return;
         }
         let s = ask(Action::Status).unwrap();
-        assert_eq!((s.state, s.file.as_str(), s.active, s.unavailable.as_deref()), (State::Off, "~/.zshenv", true, None));
+        assert_eq!((s.state, s.files_text(), s.active, s.unavailable.as_deref()), (State::Off, "~/.zshenv".to_owned(), true, None));
         let s = ask(Action::On).unwrap();
         assert_eq!(s.state, State::On);
         assert!(dirs.zsh_dir().join("entry.zsh").is_file(), "entry.zsh comes with the generation");

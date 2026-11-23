@@ -130,12 +130,19 @@ impl HostService {
         if !apply {
             return Ok(ApplyOutcome { issues, diff, applied: false, generation: self.active_generation() });
         }
+        let started = std::time::SystemTime::now();
         let activated = self.launcher.apply(&host).context("not applied")?;
         store::save(path, &host.file.value, &host.file.unknown)
             .with_context(|| format!("built generation {} but couldn't save {}", activated.generation, path.display()))?;
         log::info!("host settings saved; generation {} active", activated.generation);
         // Shells reloaded after this apply read the import straight away.
         self.launcher.prepare_import(&host.value);
+        // Current now, host.json included: shells outside goatty needn't ask
+        // for a refresh because of this save.
+        if let Some(dirs) = self.launcher.dirs() {
+            let saved = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(started);
+            crate::launch::touch_stamp(dirs, saved.max(started));
+        }
         Ok(ApplyOutcome { issues, diff, applied: true, generation: Some(activated.generation) })
     }
 

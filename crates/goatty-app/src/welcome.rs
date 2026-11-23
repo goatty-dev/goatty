@@ -329,46 +329,53 @@ impl Welcome {
     }
 
     /// "Use goatty's shell in every terminal", with the exact lines and
-    /// file shown above the switch: turning it on is the consent.
+    /// files shown with the switch: turning it on is the consent.
     fn everywhere_section(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<impl IntoElement> {
         use goatty_shell::everywhere::{Action, State};
+        use settings_window::everywhere::{LABEL, code_lines, warning_line};
         let s = self.everywhere.as_ref()?;
         let on = s.state == State::On;
         let (desc, can) = match (&s.state, &s.unavailable) {
-            (State::On, _) => (format!("On · {} starts goatty's shell in every new zsh", s.file), true),
-            (State::Changed, _) => (format!("{} has a goatty line goatty didn't write: edit it there", s.file), false),
+            (State::On, _) => (format!("{} starts goatty's shell in every new interactive zsh", s.files_text()), true),
+            (State::Changed, _) => {
+                let at = s.changed.first().map_or_else(|| s.files_text(), ToString::to_string);
+                (format!("A goatty line was edited by hand ({at}). Edit or remove it there"), false)
+            }
             (State::Off, Some(why)) => (why.clone(), false),
             (State::Off, None) => ("VS Code and other editors, other terminals, tmux and SSH logins get this shell too".to_owned(), true),
         };
         let busy = self.everywhere_busy;
-        let mut sec = settings_section(ui, "Every terminal").child(
-            settings_row(ui, settings_window::everywhere::LABEL)
+        let mut below = div().flex().flex_col().gap(px(6.));
+        // The lines only where the switch can add or has added them.
+        if can {
+            below = below
+                .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(format!(
+                    "{} {}:",
+                    if on { "goatty added these lines to the end of" } else { "Turning it on adds these lines to the end of" },
+                    s.files_text()
+                ))))
+                .child(code_lines(ui, "everywhere-lines", crate_mono(cx), &s.lines));
+        }
+        below = below.children(s.warnings.iter().map(|w| warning_line(ui, w.clone())));
+        if let Some(e) = &self.everywhere_error {
+            below = below.child(banner(ui, Tone::Danger, "Couldn't change it", e.lines().map(str::to_owned).collect()));
+        }
+        let sec = settings_section(ui, "Every terminal").child(
+            settings_row(ui, LABEL)
                 .desc(desc)
                 .disabled(!can || busy)
                 .control(
                     toggle("everywhere", on, ui, self.act(cx, move |v, cx| v.everywhere(if on { Action::Off } else { Action::On }, cx)))
-                        .aria_label(settings_window::everywhere::LABEL),
+                        .aria_label(LABEL),
                 )
-                .below(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.))
-                        .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(format!(
-                            "{} {}:",
-                            if on { "goatty added these lines to the end of" } else { "Turning it on adds these lines to the end of" },
-                            s.file
-                        ))))
-                        .child(settings_window::everywhere::code_lines(ui, crate_mono(cx), &s.lines)),
-                ),
+                .below(below),
         );
         let icons = self.host.as_ref().is_some_and(|h| h.prompt.plain_elsewhere());
-        sec = sec.footer(match &self.everywhere_error {
-            Some(e) => format!("Couldn't change it: {e}"),
-            None if icons => "Your ~/.zshrc stops running there, as in goatty's tabs; the PATH folders and variables it sets up still come along. Prompt icons show as text in other terminals. Off again under Settings → Shell: goatty removes exactly these lines.".to_owned(),
-            None => "Your ~/.zshrc stops running there, as in goatty's tabs; the PATH folders and variables it sets up still come along. Off again under Settings → Shell: goatty removes exactly these lines.".to_owned(),
-        });
-        Some(sec)
+        Some(sec.footer(if icons {
+            "Your ~/.zshrc won't run there (its PATH folders and variables still come along), and prompt icons fall back to text. Change it any time under Settings → Shell."
+        } else {
+            "Your ~/.zshrc won't run there (its PATH folders and variables still come along). Change it any time under Settings → Shell."
+        }))
     }
 
     /// Turn the import on or off on the host.
@@ -708,7 +715,7 @@ impl Welcome {
         let mut page = div().flex().flex_col().gap(px(24.)).child(Self::title(
             ui,
             format!("Your shell{host}"),
-            "goatty runs zsh with suggestions as you type, syntax colors, a clear prompt and searchable history. Your own dotfiles stay as they are.",
+            "goatty runs zsh with suggestions as you type, syntax colors, a clear prompt and searchable history. It doesn't change your dotfiles unless you ask it to.",
         ));
         if self.link.is_none() {
             return page.child(loading_card(ui, "Waiting for the terminal window to connect…"));

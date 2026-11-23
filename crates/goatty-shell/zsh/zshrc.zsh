@@ -336,8 +336,13 @@ _goatty_on highlight-paste || zle_highlight=(${zle_highlight:#paste:*} paste:non
 # The same for macOS Terminal's session files (/etc/zshrc_Apple_Terminal
 # keeps them in "${ZDOTDIR:-$HOME}/.zsh_sessions", read while ZDOTDIR is goatty's).
 if [[ -n ${SHELL_SESSION_DIR-} && ${SHELL_SESSION_DIR:h:A} == ${_goatty_dir:A} ]]; then
-  SHELL_SESSION_DIR=${_goatty_user_zdotdir:-$HOME}/.zsh_sessions
-  [[ -n ${SHELL_SESSION_FILE-} ]] && SHELL_SESSION_FILE=$SHELL_SESSION_DIR/${SHELL_SESSION_FILE:t}
+  () {
+    local old=$SHELL_SESSION_DIR v
+    SHELL_SESSION_DIR=${_goatty_user_zdotdir:-$HOME}/.zsh_sessions
+    for v in SHELL_SESSION_FILE SHELL_SESSION_HISTFILE SHELL_SESSION_HISTFILE_NEW SHELL_SESSION_HISTFILE_SHARED; do
+      [[ ${(P)v-} == $old/* ]] && typeset -g $v=$SHELL_SESSION_DIR/${${(P)v}#$old/}
+    done
+  }
 fi
 HISTSIZE=$_goatty_hist_size
 SAVEHIST=$_goatty_hist_size

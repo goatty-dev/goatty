@@ -19,7 +19,8 @@
 
 typeset -gi _goatty_running=0
 typeset -gi _goatty_marks=1
-if (( ! ${_goatty_inside:-0} )) && { (( ${+VSCODE_SHELL_INTEGRATION} )) || [[ -n ${KITTY_SHELL_INTEGRATION-} ]] ||
+if (( ! ${_goatty_inside:-0} )) && { (( ${+VSCODE_SHELL_INTEGRATION} )) ||
+     { (( ${+functions[_ksi_deferred_init]} )) && [[ ${KITTY_SHELL_INTEGRATION-} != *no-prompt-mark* ]]; } ||
      (( ${+functions[_ghostty_deferred_init]} )); }; then
   _goatty_marks=0
 fi

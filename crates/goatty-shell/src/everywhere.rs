@@ -39,7 +39,7 @@ use crate::zsh::quote;
 /// The comment goatty writes above its line.
 pub const COMMENT: &str = "# goatty: use goatty's managed zsh in every terminal (Settings → Shell). Delete these 2 lines to stop.";
 
-/// Backups of the `.zshenv` kept.
+/// Backups of `.zshenv` files kept (all files together).
 const BACKUPS_KEPT: usize = 10;
 
 /// What to do with the line.
@@ -51,34 +51,52 @@ pub enum Action {
     Off,
 }
 
-/// Whether the user's `.zshenv` has goatty's line.
+/// Whether the user's `.zshenv` files have goatty's line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
-    /// Not there: only goatty's own sessions run goatty's shell.
+    /// Not in every file: only goatty's own sessions (and shells reading a
+    /// file that has it) run goatty's shell.
     Off,
-    /// Exactly goatty's line is there (wherever in the file).
+    /// Exactly goatty's line is in every file (wherever in it).
     On,
     /// A line mentions goatty's `entry.zsh` but isn't goatty's line (the
-    /// user edited, commented out or copied it): goatty leaves it alone.
+    /// user edited, commented out or copied it), in a file without goatty's
+    /// line: goatty leaves it alone.
     Changed,
+}
+
+/// A line that mentions goatty's `entry.zsh` but isn't goatty's line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedLine {
+    /// For people (`~/.zshenv`).
+    pub file: String,
+    /// From 1.
+    pub line: usize,
+    pub text: String,
+}
+
+impl std::fmt::Display for ChangedLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, line {}: {}", self.file, self.line, self.text)
+    }
 }
 
 /// The line in the user's `.zshenv`, for the settings window and
 /// `goattyd shell everywhere status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
-    /// The file goatty adds its line to, for people (`~/.zshenv`).
-    pub file: String,
+    /// The files goatty adds its line to, for people: `~/.zshenv`, and a
+    /// second one when that file moves `ZDOTDIR` (shells started from a
+    /// shell read `$ZDOTDIR/.zshenv`).
+    pub files: Vec<String>,
     pub state: State,
     /// Exactly what goatty adds: the comment and the line.
     pub lines: Vec<String>,
-    /// Lines that mention goatty's `entry.zsh` but aren't its line:
-    /// (line number from 1, the line).
+    /// Lines that mention goatty's `entry.zsh` but aren't its line.
     #[serde(default)]
-    pub changed: Vec<(usize, String)>,
-    /// Things to fix by hand: a line after goatty's that sets `ZDOTDIR`
-    /// (it would take effect after goatty's shell took over).
+    pub changed: Vec<ChangedLine>,
+    /// Things to fix by hand: a line after goatty's that sets `ZDOTDIR`.
     #[serde(default)]
     pub warnings: Vec<String>,
     /// goatty's managed zsh is on and goatty's shell is zsh: the line
@@ -86,9 +104,20 @@ pub struct Status {
     pub active: bool,
     /// Why it can't be turned on here; turning it off always works.
     pub unavailable: Option<String>,
-    /// The newest backup of the file, for people.
+    /// The newest backup, for people.
     #[serde(default)]
     pub backup: Option<String>,
+}
+
+impl Status {
+    /// `~/.zshenv`, or `~/.zshenv and ~/.config/zsh/.zshenv`.
+    pub fn files_text(&self) -> String {
+        match self.files.as_slice() {
+            [] => "~/.zshenv".to_owned(),
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        }
+    }
 }
 
 /// goatty's two lines for `entry` (the `entry.zsh` of the `current`
@@ -103,32 +132,62 @@ pub fn lines(entry: &Path, home: &Path) -> [String; 2] {
     [COMMENT.to_owned(), format!("[[ -r {shown} ]] && source {shown}")]
 }
 
-/// The `.zshenv` a new interactive zsh reads: `$ZDOTDIR/.zshenv` when the
-/// environment (or `/etc/zshenv`) sets `ZDOTDIR`, else `~/.zshenv`. Asks
-/// `zsh` itself (`zsh -f` still reads `/etc/zshenv`), with `env` minus
-/// goatty's own `ZDOTDIR` (`goatty_dir`); without zsh, or when that fails,
-/// decides from `env`.
-pub fn zshenv_file(zsh: Option<&str>, home: &Path, env: &[(String, String)], goatty_dir: &Path) -> PathBuf {
-    let env: Vec<&(String, String)> =
-        env.iter().filter(|(k, v)| !k.starts_with("GOATTY_") && !(k == "ZDOTDIR" && Path::new(v) == goatty_dir)).collect();
-    let probed = zsh.and_then(|zsh| {
+const MARK: &str = "goatty-zdotdir:";
+
+/// The `.zshenv` files interactive zsh shells on this host read, in order:
+///
+/// 1. what a shell with a clean environment (an SSH login) reads:
+///    `$ZDOTDIR/.zshenv` when `/etc/zshenv` sets `ZDOTDIR`, else `~/.zshenv`
+///    (asked from `zsh -f`, which still reads `/etc/zshenv`);
+/// 2. `$ZDOTDIR/.zshenv` when that file sets `ZDOTDIR` (the `~/.config/zsh`
+///    pattern): shells started from a shell inherit it and read that file;
+/// 3. `$ZDOTDIR/.zshenv` when `env` (goattyd's, so the desktop session's)
+///    sets `ZDOTDIR`: new terminals start with it.
+///
+/// `env` minus goatty's own variables and `ZDOTDIR` (`goatty_dir`). Without
+/// zsh, or when asking it fails, decides from `env`.
+pub fn zshenv_files(zsh: Option<&str>, home: &Path, env: &[(String, String)], goatty_dir: &Path) -> Vec<PathBuf> {
+    let usable = |dir: &str| {
+        let p = Path::new(dir);
+        (!dir.is_empty() && !dir.contains(['\n', '\r', '\0']) && p.is_absolute() && p != goatty_dir).then(|| p.to_path_buf())
+    };
+    let env_zd = env.iter().find(|(k, _)| k == "ZDOTDIR").and_then(|(_, v)| usable(v));
+    // Without ZDOTDIR: what the startup files decide on their own.
+    let clean: Vec<&(String, String)> = env.iter().filter(|(k, _)| !k.starts_with("GOATTY_") && k != "ZDOTDIR").collect();
+    let ask = |zsh: &str, args: &[&str]| -> Option<PathBuf> {
         let mut cmd = Command::new(zsh);
-        cmd.args(["-f", "-c", "builtin print -rn -- ${ZDOTDIR:-$HOME}"])
+        cmd.args(args)
+            .arg(format!("builtin print -rn -- {MARK}${{ZDOTDIR:-$HOME}}"))
             .env_clear()
-            .envs(env.iter().map(|(k, v)| (k, v)))
+            .envs(clean.iter().map(|(k, v)| (k, v)))
             .env("HOME", home)
+            // entry.zsh does nothing in the import's runs (and this isn't interactive anyway).
+            .env(crate::import::MARKER_ENV, "1")
             .current_dir(home)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let out = output_within(cmd, Duration::from_secs(3))?;
-        let dir = String::from_utf8(out).ok()?;
-        (!dir.is_empty() && Path::new(&dir).is_absolute() && Path::new(&dir) != goatty_dir).then(|| PathBuf::from(dir))
-    });
-    let dir = probed.unwrap_or_else(|| {
-        env.iter().find(|(k, v)| k == "ZDOTDIR" && Path::new(v).is_absolute()).map_or_else(|| home.to_path_buf(), |(_, v)| PathBuf::from(v))
-    });
-    dir.join(".zshenv")
+        let out = String::from_utf8(output_within(cmd, Duration::from_secs(3))?).ok()?;
+        usable(out.rsplit_once(MARK)?.1)
+    };
+    let mut dirs = Vec::new();
+    match zsh {
+        Some(zsh) => {
+            let first = ask(zsh, &["-f", "-c"]).unwrap_or_else(|| home.to_path_buf());
+            dirs.push(first);
+            // Runs the user's .zshenv (not interactive): where it leaves ZDOTDIR.
+            dirs.extend(ask(zsh, &["-c"]));
+        }
+        None => dirs.push(home.to_path_buf()),
+    }
+    dirs.extend(env_zd);
+    let mut files: Vec<PathBuf> = Vec::new();
+    for f in dirs.into_iter().map(|d| d.join(".zshenv")) {
+        if !files.contains(&f) {
+            files.push(f);
+        }
+    }
+    files
 }
 
 /// Run `cmd` and return its stdout, or `None` when it fails or takes
@@ -157,31 +216,35 @@ fn output_within(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
     }
 }
 
-/// What `text` (a `.zshenv`) says about goatty's `lines`.
-fn scan(text: &str, lines: &[String; 2]) -> (State, Vec<(usize, String)>, Vec<String>) {
+/// A line that assigns or unsets `ZDOTDIR` (not one that only reads it).
+fn sets_zdotdir(line: &str) -> bool {
+    let code = line.split(" #").next().unwrap_or(line).trim_start();
+    if code.starts_with('#') {
+        return false;
+    }
+    code.split([';', '&', '|', ' ', '\t', '(', '{']).any(|word| word.starts_with("ZDOTDIR=") || word.starts_with("ZDOTDIR+="))
+        || (code.contains("unset") && code.split_whitespace().any(|w| w == "ZDOTDIR"))
+}
+
+/// What one file's `text` says about goatty's `lines`: whether goatty's line
+/// is there, the changed goatty lines (line, text), and the lines after
+/// goatty's that set `ZDOTDIR`.
+fn scan(text: &str, lines: &[String; 2]) -> (bool, Vec<(usize, String)>, Vec<usize>) {
     let hook = lines[1].as_str();
     let mut on = false;
     let mut changed = Vec::new();
-    let mut warnings = Vec::new();
+    let mut late_zdotdir = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let t = line.trim_end();
         if t == hook {
             on = true;
         } else if t.contains("goatty") && t.contains("entry.zsh") {
             changed.push((i + 1, t.to_owned()));
-        } else if on && t.contains("ZDOTDIR") && !t.trim_start().starts_with('#') {
-            warnings.push(format!(
-                "Line {} sets ZDOTDIR after goatty's line, so it only applies once goatty's shell has taken over: move goatty's line below it",
-                i + 1
-            ));
+        } else if on && sets_zdotdir(t) {
+            late_zdotdir.push(i + 1);
         }
     }
-    let state = match (on, changed.is_empty()) {
-        (true, _) => State::On,
-        (false, false) => State::Changed,
-        (false, true) => State::Off,
-    };
-    (state, changed, warnings)
+    (on, changed, late_zdotdir)
 }
 
 /// `text` with goatty's line added at the end (after everything else, so a
@@ -217,15 +280,22 @@ fn without_lines(text: &str, lines: &[String; 2]) -> Option<String> {
     removed.then_some(out)
 }
 
-/// Copy `file` to the backups (private), keeping the newest [`BACKUPS_KEPT`].
-fn backup(dirs: &Dirs, file: &Path) -> Result<Option<PathBuf>> {
+/// A number no other writer in this process uses (temporary files, backups).
+fn unique() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Copy `file` (`shown` for people) to the backups (private), keeping the
+/// newest [`BACKUPS_KEPT`]. Named `<time>-<n>.<file>`, so names sort by age.
+fn backup(dirs: &Dirs, file: &Path, shown: &str) -> Result<Option<PathBuf>> {
     let Ok(text) = std::fs::read(file) else { return Ok(None) };
     let dir = dirs.zshenv_backups();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("zshenv").trim_start_matches('.');
-    let path = dir.join(format!("{name}.{}.{:09}", now.as_secs(), now.subsec_nanos()));
+    let name: String = shown.chars().map(|c| if c == '/' { '%' } else { c }).collect();
+    let path = dir.join(format!("{:010}.{:09}-{}-{}.{name}", now.as_secs(), now.subsec_nanos(), std::process::id(), unique()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -244,13 +314,13 @@ fn backup(dirs: &Dirs, file: &Path) -> Result<Option<PathBuf>> {
 fn backups(dirs: &Dirs) -> Vec<PathBuf> {
     let mut all: Vec<PathBuf> =
         std::fs::read_dir(dirs.zshenv_backups()).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
-    all.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+    all.sort();
     all
 }
 
 /// Replace `file` with `text`: through a temporary file next to the real
 /// file (a link from a dotfiles repository stays a link), with the old
-/// file's permissions (new: 0644).
+/// file's permissions (new: 0644, its folder created).
 fn write(file: &Path, text: &str) -> Result<()> {
     let real = if file.is_symlink() {
         std::fs::canonicalize(file).with_context(|| format!("{} is a link to a file that isn't there", file.display()))?
@@ -259,8 +329,11 @@ fn write(file: &Path, text: &str) -> Result<()> {
     };
     let mode = std::fs::metadata(&real).map_or(0o644, |m| m.permissions().mode() & 0o7777);
     let dir = real.parent().context("the file has no folder")?;
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
     let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("zshenv");
-    let tmp = dir.join(format!(".{name}.goatty-{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.goatty-{}-{}", std::process::id(), unique()));
     let written = (|| -> Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -287,27 +360,73 @@ fn shown(p: &Path, home: &Path) -> String {
     }
 }
 
-/// Where the hook lives on one host: its `.zshenv`, goatty's lines.
+/// `path`'s text; a missing file is empty.
+fn read(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Where the hook lives on one host: its `.zshenv` files, goatty's lines.
 pub struct Hook<'a> {
     pub dirs: &'a Dirs,
     pub home: &'a Path,
-    pub file: PathBuf,
+    pub files: Vec<PathBuf>,
     pub lines: [String; 2],
 }
 
 impl<'a> Hook<'a> {
-    pub fn new(dirs: &'a Dirs, home: &'a Path, file: PathBuf) -> Self {
+    pub fn new(dirs: &'a Dirs, home: &'a Path, files: Vec<PathBuf>) -> Self {
         let lines = lines(&dirs.zsh_dir().join("entry.zsh"), home);
-        Self { dirs, home, file, lines }
+        Self { dirs, home, files, lines }
     }
 
-    /// What the file has now. `active`: goatty's zsh is on here;
+    /// Serializes changes to the files (the GUI, the CLI and goattyd's
+    /// threads may ask at once).
+    fn lock(&self) -> Result<std::fs::File> {
+        std::fs::create_dir_all(&self.dirs.state).with_context(|| format!("create {}", self.dirs.state.display()))?;
+        let path = self.dirs.state.join(".zshenv.lock");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        f.lock()?;
+        Ok(f)
+    }
+
+    /// What the files have now. `active`: goatty's zsh is on here;
     /// `unavailable`: why it can't be turned on.
     pub fn status(&self, active: bool, unavailable: Option<String>) -> Status {
-        let text = std::fs::read_to_string(&self.file).unwrap_or_default();
-        let (state, changed, warnings) = scan(&text, &self.lines);
+        let mut all_on = true;
+        let mut changed_only = false;
+        let mut changed = Vec::new();
+        let mut warnings = Vec::new();
+        for f in &self.files {
+            let (on, ch, late) = scan(&read(f).unwrap_or_default(), &self.lines);
+            let file = shown(f, self.home);
+            all_on &= on;
+            changed_only |= !on && !ch.is_empty();
+            for n in late {
+                warnings.push(format!(
+                    "{file}, line {n}: it sets ZDOTDIR after goatty's line, so goatty's shell doesn't load. Move goatty's line below it."
+                ));
+            }
+            changed.extend(ch.into_iter().map(|(line, text)| ChangedLine { file: file.clone(), line, text }));
+        }
+        let state = if changed_only {
+            State::Changed
+        } else if all_on && !self.files.is_empty() {
+            State::On
+        } else {
+            State::Off
+        };
         Status {
-            file: shown(&self.file, self.home),
+            files: self.files.iter().map(|f| shown(f, self.home)).collect(),
             state,
             lines: self.lines.to_vec(),
             changed,
@@ -318,54 +437,65 @@ impl<'a> Hook<'a> {
         }
     }
 
-    /// Add goatty's lines at the end (a backup first). Refuses when a
-    /// changed goatty line is there: that's the user's to sort out.
+    /// Add goatty's lines at the end of every file that doesn't have them
+    /// (a backup first). Refuses, before writing anything, when a file has
+    /// a changed goatty line instead: that's the user's to sort out.
     pub fn enable(&self) -> Result<()> {
-        let text = match std::fs::read_to_string(&self.file) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e).with_context(|| format!("read {}", self.file.display())),
-        };
-        let (_, changed, _) = scan(&text, &self.lines);
-        if let Some((n, line)) = changed.first() {
-            bail!(
-                "{} has a goatty line that was changed (line {n}: {line}). Fix or remove it there, then try again",
-                shown(&self.file, self.home)
-            );
-        }
-        let Some(new) = with_lines(&text, &self.lines) else { return Ok(()) };
-        backup(self.dirs, &self.file)?;
-        write(&self.file, &new).map_err(|e| self.manual(e, "add these lines at its end"))
-    }
-
-    /// Remove exactly goatty's lines (a backup first); the rest of the file
-    /// stays byte for byte. Refuses when only a changed goatty line is
-    /// there.
-    pub fn disable(&self) -> Result<()> {
-        let text = match std::fs::read_to_string(&self.file) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).with_context(|| format!("read {}", self.file.display())),
-        };
-        let Some(new) = without_lines(&text, &self.lines) else {
-            let (_, changed, _) = scan(&text, &self.lines);
-            if let Some((n, line)) = changed.first() {
-                bail!(
-                    "{} has a goatty line goatty didn't write (line {n}: {line}). Remove it there yourself",
-                    shown(&self.file, self.home)
-                );
+        let _lock = self.lock()?;
+        let mut todo = Vec::new();
+        for f in &self.files {
+            let text = read(f)?;
+            let (on, changed, _) = scan(&text, &self.lines);
+            if on {
+                continue;
             }
-            return Ok(());
-        };
-        backup(self.dirs, &self.file)?;
-        write(&self.file, &new).map_err(|e| self.manual(e, "remove these lines from it"))
+            if let Some((n, line)) = changed.first() {
+                bail!("{}, line {n} has a changed goatty line ({line}). Edit or remove it there, then try again", shown(f, self.home));
+            }
+            todo.push((f, text));
+        }
+        for (f, text) in todo {
+            let Some(new) = with_lines(&text, &self.lines) else { continue };
+            backup(self.dirs, f, &shown(f, self.home))?;
+            write(f, &new).map_err(|e| self.manual(f, e, "add these lines at its end"))?;
+        }
+        Ok(())
     }
 
-    /// A write that failed: say what to do by hand.
-    fn manual(&self, e: anyhow::Error, what: &str) -> anyhow::Error {
+    /// Remove exactly goatty's lines from every file (a backup first); the
+    /// rest of each file stays byte for byte. Refuses when no file has
+    /// goatty's line but one has a changed goatty line.
+    pub fn disable(&self) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut todo = Vec::new();
+        let mut changed = None;
+        for f in &self.files {
+            let text = read(f)?;
+            match without_lines(&text, &self.lines) {
+                Some(new) => todo.push((f, new)),
+                None => {
+                    let (_, ch, _) = scan(&text, &self.lines);
+                    changed = changed.or(ch.into_iter().next().map(|c| (f, c)));
+                }
+            }
+        }
+        if todo.is_empty()
+            && let Some((f, (n, line))) = changed
+        {
+            bail!("{}, line {n} has a changed goatty line ({line}). Remove it there yourself", shown(f, self.home));
+        }
+        for (f, new) in todo {
+            backup(self.dirs, f, &shown(f, self.home))?;
+            write(f, &new).map_err(|e| self.manual(f, e, "remove these lines from it"))?;
+        }
+        Ok(())
+    }
+
+    /// A write to `file` that failed: say what to do by hand.
+    fn manual(&self, file: &Path, e: anyhow::Error, what: &str) -> anyhow::Error {
         anyhow::anyhow!(
-            "couldn't change {} ({e:#}). If a dotfiles tool manages it, {what} there:\n{}\n{}",
-            shown(&self.file, self.home),
+            "Couldn't change {} ({e:#}). If a dotfiles tool manages it, {what} there:\n{}\n{}",
+            shown(file, self.home),
             self.lines[0],
             self.lines[1]
         )
@@ -379,9 +509,16 @@ impl HostService {
         let dirs = self.launcher.dirs().context("$HOME is not set, so goatty has nowhere to keep its shell environment")?;
         let ctx = self.launcher.import_context().context("no home directory on this host")?;
         let host = self.settings();
-        let zsh = ctx.which("zsh").or_else(|| ctx.login_shell.clone().filter(|s| crate::launch::is_zsh(s)));
-        let file = zshenv_file(zsh.as_deref(), &ctx.home, &ctx.env, &dirs.zsh_dir());
-        let hook = Hook::new(dirs, &ctx.home, file);
+        let zsh = host
+            .value
+            .shell
+            .program
+            .clone()
+            .filter(|p| crate::launch::is_zsh(p) && Path::new(p).is_file())
+            .or_else(|| ctx.which("zsh"))
+            .or_else(|| ctx.login_shell.clone().filter(|s| crate::launch::is_zsh(s) && Path::new(s).is_file()));
+        let files = zshenv_files(zsh.as_deref(), &ctx.home, &ctx.env, &dirs.zsh_dir());
+        let hook = Hook::new(dirs, &ctx.home, files);
         let active = crate::zsh::hook_active(&host.value);
         let unavailable = if zsh.is_none() {
             Some("zsh isn't installed on this host".to_owned())
@@ -435,7 +572,7 @@ mod tests {
             assert!(added.starts_with(original));
             assert!(added.ends_with(&format!("{}\n{}\n", l[0], l[1])), "{added:?}");
             assert_eq!(with_lines(&added, &l), None, "never twice");
-            assert_eq!(scan(&added, &l).0, State::On);
+            assert!(scan(&added, &l).0);
             let removed = without_lines(&added, &l).unwrap();
             // A missing last newline was added before goatty's lines.
             let expected = if original.is_empty() || original.ends_with('\n') { original.to_owned() } else { format!("{original}\n") };
@@ -451,27 +588,44 @@ mod tests {
     fn changed_lines_are_reported_not_guessed() {
         let l = hook_lines();
         let edited = format!("{}\n[[ -r ~/elsewhere/goatty/entry.zsh ]] && source ~/elsewhere/goatty/entry.zsh\n", l[0]);
-        let (state, changed, _) = scan(&edited, &l);
-        assert_eq!(state, State::Changed);
+        let (on, changed, _) = scan(&edited, &l);
+        assert!(!on);
         assert_eq!(changed[0].0, 2);
-        let commented = format!("# {}\n", l[1]);
-        assert_eq!(scan(&commented, &l).0, State::Changed);
-        assert_eq!(scan("export GOATTY_X=1\n", &l).0, State::Off);
+        assert_eq!(scan(&format!("# {}\n", l[1]), &l).1.len(), 1, "commented out");
+        assert!(scan("export GOATTY_X=1\n", &l).1.is_empty());
         // Removing takes goatty's comment along but leaves the changed line.
         assert_eq!(without_lines(&edited, &l).unwrap(), edited.lines().nth(1).unwrap().to_owned() + "\n");
-        // A ZDOTDIR set after goatty's line is worth a warning.
-        let late = format!("{}\nexport ZDOTDIR=~/.config/zsh\n", l[1]);
-        assert_eq!(scan(&late, &l).2.len(), 1);
-        let early = format!("export ZDOTDIR=~/.config/zsh\n{}\n", l[1]);
-        assert!(scan(&early, &l).2.is_empty());
     }
 
     #[test]
-    fn files_keep_permissions_links_and_backups() {
+    fn zdotdir_set_after_goattys_line_is_found() {
+        let l = hook_lines();
+        for late in [
+            "export ZDOTDIR=~/.config/zsh",
+            "ZDOTDIR=$HOME/z",
+            "typeset -gx ZDOTDIR=/z",
+            "[[ -d /z ]] && export ZDOTDIR=/z",
+            "unset ZDOTDIR",
+        ] {
+            assert_eq!(scan(&format!("{}\n{late}\n", l[1]), &l).2, [2], "{late}");
+        }
+        for harmless in ["fpath+=($ZDOTDIR/functions)", "export A=1 # ZDOTDIR=x", "# export ZDOTDIR=/z", "print $ZDOTDIR"] {
+            assert!(scan(&format!("{}\n{harmless}\n", l[1]), &l).2.is_empty(), "{harmless}");
+        }
+        assert!(scan(&format!("export ZDOTDIR=/z\n{}\n", l[1]), &l).2.is_empty(), "before goatty's line it's the user's");
+    }
+
+    fn sandbox() -> (tempfile::TempDir, PathBuf, Dirs) {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let dirs = Dirs::under(&tmp.path().join("xdg"));
+        (tmp, home, dirs)
+    }
+
+    #[test]
+    fn files_keep_permissions_links_and_backups() {
+        let (tmp, home, dirs) = sandbox();
         // A dotfiles repository, linked into home.
         let repo = tmp.path().join("dotfiles");
         std::fs::create_dir_all(&repo).unwrap();
@@ -479,7 +633,7 @@ mod tests {
         std::fs::set_permissions(repo.join("zshenv"), std::fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::symlink(repo.join("zshenv"), home.join(".zshenv")).unwrap();
 
-        let hook = Hook::new(&dirs, &home, home.join(".zshenv"));
+        let hook = Hook::new(&dirs, &home, vec![home.join(".zshenv")]);
         assert_eq!(hook.status(true, None).state, State::Off);
         hook.enable().unwrap();
         hook.enable().unwrap();
@@ -489,48 +643,128 @@ mod tests {
         assert_eq!(std::fs::metadata(repo.join("zshenv")).unwrap().permissions().mode() & 0o777, 0o640);
         let status = hook.status(true, None);
         assert_eq!(status.state, State::On);
-        assert_eq!(status.file, "~/.zshenv");
-        assert!(status.backup.is_some());
+        assert_eq!(status.files_text(), "~/.zshenv");
+        assert!(status.backup.as_deref().is_some_and(|b| b.ends_with(".~%.zshenv")), "{:?}", status.backup);
 
         hook.disable().unwrap();
         assert_eq!(std::fs::read_to_string(repo.join("zshenv")).unwrap(), "export EDITOR=vi\n");
-        assert_eq!(backups(&dirs).len(), 2);
-        let first = std::fs::read_to_string(&backups(&dirs)[0]).unwrap();
-        assert_eq!(first, "export EDITOR=vi\n", "the backup is the file before goatty changed it");
+        let all = backups(&dirs);
+        assert_eq!(all.len(), 2);
+        assert_eq!(std::fs::read_to_string(&all[0]).unwrap(), "export EDITOR=vi\n", "the backup is the file before goatty changed it");
+        assert!(
+            std::fs::read_dir(&repo).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("goatty")),
+            "no temporary files left"
+        );
 
-        // No file yet: created (0644); off again leaves it empty, not gone.
-        let fresh = Hook::new(&dirs, &home, home.join("zd/.zshenv"));
-        std::fs::create_dir_all(home.join("zd")).unwrap();
-        fresh.enable().unwrap();
-        assert_eq!(std::fs::metadata(home.join("zd/.zshenv")).unwrap().permissions().mode() & 0o777, 0o644);
-        fresh.disable().unwrap();
-        assert_eq!(std::fs::read_to_string(home.join("zd/.zshenv")).unwrap(), "");
-
-        // A changed line: neither on nor off touches the file.
-        let changed = "[[ -r ~/x/entry.zsh ]] && source ~/x/entry.zsh # goatty\n";
-        std::fs::write(home.join("zd/.zshenv"), changed).unwrap();
-        assert!(fresh.enable().unwrap_err().to_string().contains("line 1"));
-        assert!(fresh.disable().unwrap_err().to_string().contains("didn't write"));
-        assert_eq!(std::fs::read_to_string(home.join("zd/.zshenv")).unwrap(), changed);
+        // Older backups go once there are more than BACKUPS_KEPT.
+        for _ in 0..BACKUPS_KEPT {
+            hook.enable().unwrap();
+            hook.disable().unwrap();
+        }
+        assert_eq!(backups(&dirs).len(), BACKUPS_KEPT);
     }
 
     #[test]
-    fn the_file_follows_zdotdir() {
+    fn new_files_and_folders_are_created() {
+        let (_tmp, home, dirs) = sandbox();
+        // ZDOTDIR's folder doesn't exist yet.
+        let fresh = Hook::new(&dirs, &home, vec![home.join("zd/.zshenv")]);
+        fresh.enable().unwrap();
+        assert_eq!(std::fs::metadata(home.join("zd/.zshenv")).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(fresh.status(true, None).backup, None, "nothing to back up");
+        fresh.disable().unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("zd/.zshenv")).unwrap(), "", "off again leaves it empty, not gone");
+    }
+
+    #[test]
+    fn changed_lines_block_both_ways() {
+        let (_tmp, home, dirs) = sandbox();
+        let file = home.join(".zshenv");
+        let hook = Hook::new(&dirs, &home, vec![file.clone()]);
+        let changed = "[[ -r ~/x/entry.zsh ]] && source ~/x/entry.zsh # goatty\n";
+        std::fs::write(&file, changed).unwrap();
+        let s = hook.status(true, None);
+        assert_eq!(s.state, State::Changed);
+        assert_eq!(s.changed[0].to_string(), format!("~/.zshenv, line 1: {}", changed.trim_end()));
+        assert!(hook.enable().unwrap_err().to_string().contains("line 1"));
+        assert!(hook.disable().unwrap_err().to_string().contains("yourself"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), changed, "neither touched the file");
+
+        // goatty's line next to a changed one: on, with the changed one shown;
+        // off removes goatty's and leaves the other.
+        std::fs::write(&file, format!("{changed}{}\n", hook.lines[1])).unwrap();
+        let s = hook.status(true, None);
+        assert_eq!((s.state, s.changed.len()), (State::On, 1));
+        hook.enable().unwrap();
+        hook.disable().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), changed);
+        assert_eq!(hook.status(true, None).state, State::Changed);
+    }
+
+    #[test]
+    fn read_only_files_say_what_to_add_by_hand() {
+        let (tmp, home, dirs) = sandbox();
+        // Like a Nix store: a link into a folder nobody may write.
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("zshenv"), "export A=1\n").unwrap();
+        std::os::unix::fs::symlink(store.join("zshenv"), home.join(".zshenv")).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let hook = Hook::new(&dirs, &home, vec![home.join(".zshenv")]);
+        let err = hook.enable();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if nix_root() {
+            return;
+        }
+        let err = err.unwrap_err().to_string();
+        assert!(err.contains("add these lines") && err.contains(&hook.lines[1]), "{err}");
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 1, "no temporary file left");
+    }
+
+    /// root can write anywhere: the read-only case can't be tested.
+    fn nix_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn two_files_when_zshenv_moves_zdotdir() {
+        let (_tmp, home, dirs) = sandbox();
+        let files = vec![home.join(".zshenv"), home.join(".config/zsh/.zshenv")];
+        let hook = Hook::new(&dirs, &home, files.clone());
+        std::fs::write(&files[0], "export ZDOTDIR=~/.config/zsh\n").unwrap();
+        hook.enable().unwrap();
+        let s = hook.status(true, None);
+        assert_eq!((s.state, s.files_text()), (State::On, "~/.zshenv and ~/.config/zsh/.zshenv".to_owned()));
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        // Only one of them has it: off, and on again adds the missing one.
+        std::fs::write(&files[1], "").unwrap();
+        assert_eq!(hook.status(true, None).state, State::Off);
+        hook.disable().unwrap();
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "export ZDOTDIR=~/.config/zsh\n");
+    }
+
+    #[test]
+    fn the_files_follow_zdotdir() {
         let home = Path::new("/home/u");
         let goatty = Path::new("/home/u/.local/share/goatty/current/zsh");
         let env = |z: &str| vec![("ZDOTDIR".to_owned(), z.to_owned())];
         // Without zsh: from the environment, never goatty's own directory.
-        assert_eq!(zshenv_file(None, home, &[], goatty), Path::new("/home/u/.zshenv"));
-        assert_eq!(zshenv_file(None, home, &env("/home/u/.config/zsh"), goatty), Path::new("/home/u/.config/zsh/.zshenv"));
-        assert_eq!(zshenv_file(None, home, &env(&goatty.to_string_lossy()), goatty), Path::new("/home/u/.zshenv"));
-        // zsh agrees (when it's here).
+        assert_eq!(zshenv_files(None, home, &[], goatty), [Path::new("/home/u/.zshenv")]);
+        assert_eq!(
+            zshenv_files(None, home, &env("/home/u/.config/zsh"), goatty),
+            [Path::new("/home/u/.zshenv"), Path::new("/home/u/.config/zsh/.zshenv")]
+        );
+        assert_eq!(zshenv_files(None, home, &env(&goatty.to_string_lossy()), goatty), [Path::new("/home/u/.zshenv")]);
+        // zsh agrees (when it's here), and a .zshenv that moves ZDOTDIR adds its target.
         if let Some(zsh) = crate::launch::which("zsh") {
             let tmp = tempfile::tempdir().unwrap();
             let h = tmp.path();
-            assert_eq!(zshenv_file(Some(&zsh), h, &[], goatty), h.join(".zshenv"));
+            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty), [h.join(".zshenv")]);
             let zd = h.join("zd");
-            assert_eq!(zshenv_file(Some(&zsh), h, &env(&zd.to_string_lossy()), goatty), zd.join(".zshenv"));
-            assert_eq!(zshenv_file(Some(&zsh), h, &env(&goatty.to_string_lossy()), goatty), h.join(".zshenv"));
+            assert_eq!(zshenv_files(Some(&zsh), h, &env(&zd.to_string_lossy()), goatty), [h.join(".zshenv"), zd.join(".zshenv")]);
+            std::fs::write(h.join(".zshenv"), "echo noise\nexport ZDOTDIR=$HOME/.config/zsh\n").unwrap();
+            assert_eq!(zshenv_files(Some(&zsh), h, &[], goatty), [h.join(".zshenv"), h.join(".config/zsh/.zshenv")]);
         }
     }
 }

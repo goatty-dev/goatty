@@ -24,13 +24,16 @@
 () {
   builtin emulate -L zsh
   local stamp=@STAMP@ daemon=@DAEMON@ f
-  [[ -n $daemon && -x $daemon ]] || return 0
+  # The goattyd that built this, else the one on PATH (it moved, or this
+  # was built by `goatty --local`).
+  [[ -n $daemon && -x $daemon ]] || daemon=${commands[goattyd]-}
+  [[ -n $daemon ]] || return 0
   local zd=${ZDOTDIR:-$HOME}
   local -a files=(@HOST_FILE@ $daemon $zd/.zshenv $zd/.zprofile $zd/.zshrc $zd/.zlogin
     $HOME/.zshenv $HOME/.zprofile $HOME/.zshrc $HOME/.zlogin
     $HOME/.bashrc $HOME/.bash_profile $HOME/.bash_login $HOME/.profile
     /etc/zshenv /etc/zsh/zshenv /etc/zprofile /etc/zsh/zprofile /etc/zshrc /etc/zsh/zshrc
-    /etc/profile /etc/bash.bashrc /etc/bashrc)
+    /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bashrc)
   if [[ -e $stamp ]]; then
     for f in $files; do
       [[ $f -nt $stamp ]] && break

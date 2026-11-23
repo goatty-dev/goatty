@@ -1285,9 +1285,7 @@ impl SettingsWindow {
                         view.sync_prompt_inputs(cx);
                         view.path_host_changed(cx);
                         view.dotfiles_host_changed(cx);
-                        if view.page == Page::Shell && view.everywhere.status.is_none() {
-                            view.load_everywhere(cx);
-                        }
+                        view.everywhere_host_changed(cx);
                     }
                     Err(e) => view.host_error = Some(format!("{e:#}")),
                 }

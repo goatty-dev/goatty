@@ -587,12 +587,18 @@ impl PromptSettings {
         if p.symbols == Symbols::Nerd {
             p.symbols = Symbols::Text;
         }
-        if has_private_use(p.separator.glyph(Side::Left)) || has_private_use(p.separator.glyph(Side::Right)) {
+        // Only the shapes the style draws: separators in Classic, segment
+        // ends in Classic and Rainbow (the others keep defaults nobody sees).
+        if p.style == PromptStyle::Classic
+            && (has_private_use(p.separator.glyph(Side::Left)) || has_private_use(p.separator.glyph(Side::Right)))
+        {
             p.separator = Separator::Vertical;
         }
-        for edge in [&mut p.heads, &mut p.tails] {
-            if has_private_use(edge.glyph(Side::Left)) || has_private_use(edge.glyph(Side::Right)) {
-                *edge = Edge::Flat;
+        if p.style.has_segments() {
+            for edge in [&mut p.heads, &mut p.tails] {
+                if has_private_use(edge.glyph(Side::Left)) || has_private_use(edge.glyph(Side::Right)) {
+                    *edge = Edge::Flat;
+                }
             }
         }
         let d = DirectoryPrompt::default();

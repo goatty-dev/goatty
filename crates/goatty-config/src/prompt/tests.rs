@@ -219,7 +219,7 @@ fn plain_prompt_needs_no_nerd_font() {
     assert!(p.needs_nerd_font() && p.plain_elsewhere());
     let plain = p.plain();
     assert_eq!(plain.symbols, Symbols::Text);
-    assert_eq!((plain.separator, plain.heads, plain.tails), (Separator::Vertical, Edge::Flat, Edge::Blurred));
+    assert_eq!((plain.separator, plain.heads, plain.tails), (Separator::Angled, Edge::Flat, Edge::Blurred), "Rainbow draws no separators");
     assert_eq!(plain.directory.home_symbol, "~");
     assert!(plain.character.success.is_empty());
     assert_eq!(plain.modules["git_branch"].symbol, None, "a Nerd Font symbol goes back to the default");
@@ -230,6 +230,16 @@ fn plain_prompt_needs_no_nerd_font() {
 
     let emoji = PromptSettings { symbols: Symbols::Emoji, separator: Separator::Slanted, heads: Edge::Flat, ..Default::default() };
     assert!(!emoji.needs_nerd_font(), "emoji and box drawing are in common fonts");
+    // Shapes a style doesn't draw don't count (the defaults are Powerline glyphs).
+    for (style, symbols) in [(PromptStyle::Rich, Symbols::Text), (PromptStyle::Lean, Symbols::Emoji), (PromptStyle::Rich, Symbols::None)] {
+        let p = PromptSettings { style, symbols, ..Default::default() };
+        assert!(!p.needs_nerd_font(), "{style:?} with {symbols:?}");
+        assert_eq!(p.plain(), p);
+    }
+    let rainbow = PromptSettings { style: PromptStyle::Rainbow, symbols: Symbols::Text, heads: Edge::Flat, ..Default::default() };
+    assert!(!rainbow.needs_nerd_font(), "Rainbow has no separators");
+    let classic = PromptSettings { style: PromptStyle::Classic, symbols: Symbols::Text, heads: Edge::Flat, ..Default::default() };
+    assert!(classic.needs_nerd_font(), "Classic draws the Angled separator");
     let kept = PromptSettings { icons_elsewhere: true, ..Default::default() };
     assert!(kept.needs_nerd_font() && !kept.plain_elsewhere());
 }

@@ -543,17 +543,26 @@ fn main() -> Result<()> {
 
 /// `goattyd shell refresh` through the running goattyd, which harvests with
 /// its own environment (the one the import compares against). `None`: no
-/// goattyd here (or one too old to ask), so this process does it.
+/// goattyd here, or one that couldn't do it (older than `refresh`, or it
+/// failed), so this process does it: the refresh stamp has to move on, or
+/// every new shell outside goatty would ask again.
 fn refresh_via_daemon() -> Option<Result<()>> {
     let request = serde_json::to_string(&goatty_shell::setup::Request::Refresh).ok()?;
     let mut c = Control::connect_within(&goatty_proto::socket_path(), CLIENT, Some(std::time::Duration::from_secs(2))).ok()?;
     if c.protocol_version() < goatty_proto::SHELL_SINCE {
         return None;
     }
-    Some(c.shell(request).and_then(|reply| match serde_json::from_str(&reply)? {
+    let done = c.shell(request).and_then(|reply| match serde_json::from_str(&reply)? {
         goatty_shell::setup::Reply::Done => Ok(()),
         other => anyhow::bail!("unexpected reply from goattyd: {other:?}"),
-    }))
+    });
+    match done {
+        Ok(()) => Some(Ok(())),
+        Err(e) => {
+            log::info!("goattyd didn't refresh ({e:#}); doing it here");
+            None
+        }
+    }
 }
 
 /// goattyd's completion script for `shell`.
