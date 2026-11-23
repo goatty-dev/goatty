@@ -175,16 +175,7 @@ pub fn link_owner(dirs: &Dirs, name: &str) -> Option<String> {
 /// `tools/<id>/`. Returns
 /// whether there was anything to remove.
 pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool> {
-    let mut had = false;
-    for b in bins {
-        let name = goatty_plugin::manifest::bin_name(b);
-        if link_owner(dirs, name).as_deref() == Some(id) {
-            std::fs::remove_file(dirs.bin_dir().join(name)).with_context(|| format!("remove bin/{name}"))?;
-            crate::completions::remove(dirs, name)?;
-            invalidate_init_cache(dirs, name);
-            had = true;
-        }
-    }
+    let mut had = remove_links(id, bins, dirs)?;
     let tool_dir = dirs.tools_dir().join(id);
     let plugin_link = dirs.plugins_dir().join(id);
     if std::fs::read_link(&plugin_link).is_ok_and(|t| t.starts_with(&tool_dir)) {
@@ -194,6 +185,22 @@ pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool>
     if tool_dir.exists() {
         std::fs::remove_dir_all(&tool_dir).with_context(|| format!("remove {}", tool_dir.display()))?;
         had = true;
+    }
+    Ok(had)
+}
+
+/// Remove the `bin/` links (and completions) of package `id` among `bins`,
+/// keeping the package itself. True when there was one.
+pub fn remove_links(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool> {
+    let mut had = false;
+    for b in bins {
+        let name = goatty_plugin::manifest::bin_name(b);
+        if link_owner(dirs, name).as_deref() == Some(id) {
+            std::fs::remove_file(dirs.bin_dir().join(name)).with_context(|| format!("remove bin/{name}"))?;
+            crate::completions::remove(dirs, name)?;
+            invalidate_init_cache(dirs, name);
+            had = true;
+        }
     }
     Ok(had)
 }

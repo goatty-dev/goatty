@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use goatty_proto::{Frame, ReqId, ServerMsg, SessionId, SessionInfo, StreamOpts, TopLineCause, WinSize, encode, encode_server};
 use goatty_term::process::ForegroundWatch;
-use goatty_term::pty::Pty;
+use goatty_term::pty::{Pty, PtyInput};
 use goatty_term::{TermSize, Terminal, UiEvent};
 use parking_lot::{Condvar, Mutex};
 
@@ -373,7 +373,12 @@ impl CwdCoordinator {
 pub(crate) struct Session {
     pub(crate) id: SessionId,
     pub(crate) term: Terminal,
+    /// Process control (kill, wait, foreground). Never held across I/O.
     pub(crate) pty: Mutex<Pty>,
+    /// Input writes, through their own handle on the master: a write blocks
+    /// while the program doesn't read, and that mustn't hold up `pty`
+    /// (closing the tab of a hung program, #233).
+    pub(crate) input: Mutex<PtyInput>,
     /// Held while feeding + broadcasting, so taking a snapshot and
     /// (un)subscribing are atomic with respect to the output stream: no gap,
     /// no overlap. Also acquired before `cwd.state` when notifying CWD changes.
@@ -388,8 +393,7 @@ pub(crate) struct Session {
     pub(crate) managed: bool,
     /// Lets a restart stop the output pump between two reads.
     pub(crate) pause: Pause,
-    /// The process and the PTY master, known without `pty`'s lock (an
-    /// input write can hold it for as long as the program doesn't read).
+    /// The process and the PTY master, known without taking a lock.
     /// The fd is open as long as `pty` is.
     pub(crate) pid: Option<u32>,
     pub(crate) master_fd: RawFd,

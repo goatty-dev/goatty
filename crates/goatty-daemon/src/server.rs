@@ -156,6 +156,7 @@ impl Daemon {
         let NewSession { id, pty, reader, term, chans, created_unix, managed, creator } = n;
         let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
         let proc_cwd = pty.cwd();
+        let input = pty.input().context("duplicate the PTY for input")?;
         let init_cwd = term
             .current_directory()
             .map(|p| p.to_string_lossy().into_owned())
@@ -167,6 +168,7 @@ impl Daemon {
             id,
             term,
             pty: Mutex::new(pty),
+            input: Mutex::new(input),
             subs,
             created_unix,
             process: Mutex::new(None),
@@ -199,7 +201,7 @@ impl Daemon {
                 while let Ok(bytes) = chans.replies.recv() {
                     let Some(s) = s.upgrade() else { break };
                     s.replies_taken.fetch_add(1, Ordering::SeqCst);
-                    let _ = s.pty.lock().write(&bytes);
+                    let _ = s.input.lock().write(&bytes);
                     s.replies_written.fetch_add(1, Ordering::SeqCst);
                 }
             })?;

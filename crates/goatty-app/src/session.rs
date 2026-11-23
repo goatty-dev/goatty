@@ -16,7 +16,7 @@ use goatty_proto::WinSize;
 use goatty_shell::HostService;
 use goatty_term::predict::Predictor;
 use goatty_term::process::ForegroundWatch;
-use goatty_term::pty::{Pty, ShellCommand};
+use goatty_term::pty::{Pty, PtyInput, ShellCommand};
 use goatty_term::{Frame, HistoryRows, Palette, TermMode, TermSize, Terminal, UiEvent};
 use parking_lot::Mutex;
 
@@ -67,8 +67,17 @@ pub enum LinkStatus {
 }
 
 enum Backend {
-    Local(Mutex<Pty>),
-    Daemon { conn: Arc<Connection>, id: AtomicU64, sink: Arc<dyn PaneSink> },
+    /// Input has its own handle, so a write blocked on a program that
+    /// doesn't read never holds up `kill` and the rest (#233).
+    Local {
+        pty: Mutex<Pty>,
+        input: Mutex<PtyInput>,
+    },
+    Daemon {
+        conn: Arc<Connection>,
+        id: AtomicU64,
+        sink: Arc<dyn PaneSink>,
+    },
 }
 
 pub struct Session {
@@ -392,12 +401,13 @@ impl Session {
         if let (Some(pid), Some(host)) = (managed_pid, &host) {
             host.track_shell(pid);
         }
+        let input = Mutex::new(pty.input().context("duplicate the PTY for input")?);
         let (terminal, chans) = Terminal::new(size, true, Arc::new(Palette::default()));
-        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Local(Mutex::new(pty)), None, None));
+        let s = Arc::new(Self::new(terminal, chans.ui, Backend::Local { pty: Mutex::new(pty), input }, None, None));
         let probe = {
             let weak = Arc::downgrade(&s);
             move || match &weak.upgrade()?.backend {
-                Backend::Local(pty) => pty.lock().foreground_name(),
+                Backend::Local { pty, .. } => pty.lock().foreground_name(),
                 Backend::Daemon { .. } => None,
             }
         };
@@ -436,7 +446,7 @@ impl Session {
             if let (Some(pid), Some(host)) = (managed_pid, &host) {
                 host.untrack_shell(pid);
             }
-            if let Backend::Local(pty) = &s2.backend {
+            if let Backend::Local { pty, .. } = &s2.backend {
                 // On Unix, PTY EOF can arrive slightly before the child is
                 // reapable; poll briefly so immediate non-zero exits still
                 // report their status before `exited` is published.
@@ -596,8 +606,8 @@ impl Session {
 
     fn write_raw(&self, bytes: &[u8]) {
         match &self.backend {
-            Backend::Local(pty) => {
-                let _ = pty.lock().write(bytes);
+            Backend::Local { input, .. } => {
+                let _ = input.lock().write(bytes);
                 if let Some(fg) = self.fg.get() {
                     fg.poke();
                 }
@@ -643,7 +653,7 @@ impl Session {
         }
         let rtt = match &self.backend {
             Backend::Daemon { conn, .. } => conn.rtt(),
-            Backend::Local(_) => None,
+            Backend::Local { .. } => None,
         };
         let slow = rtt.max(p.echo_delay());
         p.set_visible(setting.wanted(slow));
@@ -712,7 +722,7 @@ impl Session {
     pub fn take_size(&self) -> bool {
         match &self.backend {
             Backend::Daemon { conn, id, .. } => conn.take_size(id.load(Ordering::Relaxed)),
-            Backend::Local(_) => false,
+            Backend::Local { .. } => false,
         }
     }
 
@@ -751,7 +761,7 @@ impl Session {
         }
         drop(view);
         match &self.backend {
-            Backend::Local(pty) => {
+            Backend::Local { pty, .. } => {
                 let _ = pty.lock().resize(size);
             }
             Backend::Daemon { conn, id, .. } => conn.resize(id.load(Ordering::Relaxed), win(size)),
@@ -772,7 +782,7 @@ impl Session {
     /// call it off the UI thread.
     pub fn kill(&self) {
         match &self.backend {
-            Backend::Local(pty) => pty.lock().kill(),
+            Backend::Local { pty, .. } => pty.lock().kill(),
             Backend::Daemon { conn, id, .. } => {
                 if let Err(e) = conn.kill(id.load(Ordering::Relaxed)) {
                     log::warn!("closing session: {e:#}");
@@ -791,7 +801,7 @@ impl Session {
     /// Returns `false` for a window-owned local PTY (`--local`).
     pub fn detach(&self) -> bool {
         match &self.backend {
-            Backend::Local(_) => false,
+            Backend::Local { .. } => false,
             Backend::Daemon { conn, id, sink } => {
                 conn.detach_sink(id.load(Ordering::Relaxed), sink);
                 true
@@ -802,7 +812,7 @@ impl Session {
     /// The goattyd session id; `None` for local PTYs.
     pub fn daemon_id(&self) -> Option<u64> {
         match &self.backend {
-            Backend::Local(_) => None,
+            Backend::Local { .. } => None,
             Backend::Daemon { id, .. } => Some(id.load(Ordering::Relaxed)),
         }
     }
@@ -810,7 +820,7 @@ impl Session {
     /// The goattyd connection behind this session, if any.
     pub fn connection(&self) -> Option<&Arc<Connection>> {
         match &self.backend {
-            Backend::Local(_) => None,
+            Backend::Local { .. } => None,
             Backend::Daemon { conn, .. } => Some(conn),
         }
     }
@@ -825,7 +835,7 @@ impl Session {
     /// else local PTY's `/proc` cwd.
     pub fn cwd(&self) -> Option<PathBuf> {
         self.remote_cwd.lock().as_deref().map(PathBuf::from).or_else(|| self.terminal.current_directory()).or_else(|| match &self.backend {
-            Backend::Local(pty) => pty.lock().cwd(),
+            Backend::Local { pty, .. } => pty.lock().cwd(),
             Backend::Daemon { .. } => None,
         })
     }

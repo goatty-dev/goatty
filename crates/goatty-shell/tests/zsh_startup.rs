@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 use goatty_config::{Effective, HostSettings, ZshSettings};
 use goatty_shell::{Dirs, Launch, Launcher};
 use goatty_term::TermSize;
-use goatty_term::pty::{Pty, ShellCommand};
+use goatty_term::pty::{Pty, PtyInput, ShellCommand};
 
 fn zsh() -> Option<String> {
     let found = goatty_shell::launch::which("zsh");
@@ -350,7 +350,8 @@ fn pty_session(sb: &Sandbox, launch: &Launch, input: &[&str]) -> String {
     env.extend(launch.env.iter().cloned());
     let mut cmd = ShellCommand::new(launch.program.clone(), launch.args.clone(), env);
     cmd.cwd = Some(sb.home.clone());
-    let (mut pty, mut reader) = Pty::spawn(&cmd, TermSize::new(120, 40)).unwrap();
+    let (pty, mut reader) = Pty::spawn(&cmd, TermSize::new(120, 40)).unwrap();
+    let mut keys = pty.input().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -375,7 +376,7 @@ fn pty_session(sb: &Sandbox, launch: &Launch, input: &[&str]) -> String {
     let mut prompts = 1;
     wait_for(b"\x1b]133;B", &mut out);
     for line in input {
-        pty.write(format!("{line}\r").as_bytes()).unwrap();
+        keys.write(format!("{line}\r").as_bytes()).unwrap();
         prompts += 1;
         let deadline = Instant::now() + Duration::from_secs(10);
         while out.windows(7).filter(|w| w == b"\x1b]133;B").count() < prompts {
@@ -385,7 +386,7 @@ fn pty_session(sb: &Sandbox, launch: &Launch, input: &[&str]) -> String {
             }
         }
     }
-    pty.write(b"exit\r").unwrap();
+    keys.write(b"exit\r").unwrap();
     while let Ok(chunk) = rx.recv_timeout(Duration::from_secs(5)) {
         out.extend(chunk);
     }
@@ -422,12 +423,12 @@ fn transient_prompt_shrinks_accepted_prompts() {
     // Accepting a line redraws its prompt as the bold prompt character
     // (marked as a prompt), colored by the status that prompt showed.
     let after_false = sh.prompts() + 2;
-    sh.pty.write(b"false\r").unwrap();
+    sh.input.write(b"false\r").unwrap();
     sh.wait_for(b"\x1b]133;A\x07\x1b[1m\x1b[32m\xe2\x9d\xaf");
     sh.wait_for(b"\x1b]133;D;1\x07");
     sh.wait_for_prompts(after_false);
     let after_true = sh.prompts() + 2;
-    sh.pty.write(b"true\r").unwrap();
+    sh.input.write(b"true\r").unwrap();
     sh.wait_for("\x1b[31m✗".as_bytes());
     sh.wait_for(b"\x1b]133;D;0\x07");
     // The next prompt is the full one again (it shows the directory).
@@ -436,7 +437,7 @@ fn transient_prompt_shrinks_accepted_prompts() {
     let last = &out[out.rfind("\x1b]133;D;0").unwrap()..];
     assert!(last.contains('~'), "the full prompt is back: {last:?}");
     assert!(!out.contains("command not found") && !out.contains("no such"), "{out:?}");
-    let _ = sh.pty.write(b"exit\r");
+    let _ = sh.input.write(b"exit\r");
 }
 
 /// #250: Tab on an empty line completes a command instead of inserting a
@@ -449,17 +450,17 @@ fn tab_on_an_empty_line_completes_commands() {
     let launch = sb.launch_with(no_highlighting(), None);
     let mut sh = PtyShell::start(&sb, &launch);
     let start = sh.out.len();
-    sh.pty.write(b"\t").unwrap();
+    sh.input.write(b"\t").unwrap();
     sh.wait_for_from(start, b"possibilities");
-    sh.pty.write(b"n").unwrap();
+    sh.input.write(b"n").unwrap();
     // The line stays empty: no tab was inserted.
     sh.run("print -r -- done");
     let typed = String::from_utf8_lossy(&sh.out[start..]).into_owned();
     assert!(!typed.contains('\t'), "no tab inserted: {typed:?}");
     // On a continuation line Tab still indents: the heredoc gets the tab.
-    sh.pty.write(b"cat <<EOF\r\tx\rEOF\r").unwrap();
+    sh.input.write(b"cat <<EOF\r\tx\rEOF\r").unwrap();
     sh.wait_for(b"\tx\r\n");
-    let _ = sh.pty.write(b"exit\r");
+    let _ = sh.input.write(b"exit\r");
 }
 
 #[test]
@@ -498,6 +499,7 @@ fn hint_stays_quiet_once_the_gui_offered_the_install() {
 /// An interactive managed shell in a PTY, driven prompt by prompt.
 struct PtyShell {
     pty: Pty,
+    input: PtyInput,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     out: Vec<u8>,
 }
@@ -509,6 +511,7 @@ impl PtyShell {
         let mut cmd = ShellCommand::new(launch.program.clone(), launch.args.clone(), env);
         cmd.cwd = Some(sb.home.clone());
         let (pty, mut reader) = Pty::spawn(&cmd, TermSize::new(120, 40)).unwrap();
+        let input = pty.input().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -518,7 +521,7 @@ impl PtyShell {
                 }
             }
         });
-        let mut sh = Self { pty, rx, out: Vec::new() };
+        let mut sh = Self { pty, input, rx, out: Vec::new() };
         sh.wait_for_prompts(1);
         sh.wait_for_idle();
         sh
@@ -604,7 +607,7 @@ impl PtyShell {
     /// Type `line` + Enter and wait for the next idle prompt.
     fn run(&mut self, line: &str) {
         let n = self.prompts() + 1;
-        self.pty.write(format!("{line}\r").as_bytes()).unwrap();
+        self.input.write(format!("{line}\r").as_bytes()).unwrap();
         self.wait_for_prompts(n);
         self.wait_for_idle();
     }
@@ -637,7 +640,7 @@ fn reloads_on_request() {
     sh.run("y=1");
     let n = sh.prompts();
     let offset = sh.out.len();
-    sh.pty.write(b"while [[ ! -e $HOME/busy-done ]]; do /bin/sleep 0.02; done\r").unwrap();
+    sh.input.write(b"while [[ ! -e $HOME/busy-done ]]; do /bin/sleep 0.02; done\r").unwrap();
     sh.wait_for_from(offset, b"\x1b]133;C");
     assert_eq!(svc.reload_shells(), 1);
     assert_eq!(sh.prompts(), n, "no reload while a command is running");
@@ -653,7 +656,7 @@ fn reloads_on_request() {
     sh.run("z=1");
     let n = sh.prompts();
     let offset = sh.out.len();
-    sh.pty.write(b"print -r -- typed").unwrap();
+    sh.input.write(b"print -r -- typed").unwrap();
     sh.wait_for_from(offset, b"typed");
     assert_eq!(svc.reload_shells(), 1);
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -682,7 +685,7 @@ fn reloads_on_request() {
     assert!(text.contains("once your jobs are done") && text.contains("W=1"), "{text}");
 
     // Gone: no longer signaled.
-    sh.pty.write(b"exit\r").unwrap();
+    sh.input.write(b"exit\r").unwrap();
     while sh.rx.recv_timeout(Duration::from_secs(2)).is_ok() {}
     let _ = sh.pty.try_wait();
     svc.untrack_shell(pid);
@@ -1017,7 +1020,7 @@ fn reloads_when_signaled_while_the_prompt_draws() {
 
     sh.run("x=1");
     let n = sh.prompts();
-    sh.pty.write(b"print -r -- drawing-next\r").unwrap();
+    sh.input.write(b"print -r -- drawing-next\r").unwrap();
     sh.wait_for(b"drawing-next\r\n");
     // The next prompt is now being drawn (its $(sleep) runs for 0.6 s).
     std::thread::sleep(Duration::from_millis(200));
@@ -1028,7 +1031,7 @@ fn reloads_when_signaled_while_the_prompt_draws() {
     sh.wait_for_idle();
     sh.run("print -r -- X=${x:-unset} P=$$");
     assert!(sh.text().contains(&format!("X=unset P={pid}")), "{}", sh.text());
-    sh.pty.write(b"exit\r").unwrap();
+    sh.input.write(b"exit\r").unwrap();
 }
 
 /// The import of the user's shell setup in a real managed shell: the PATH
@@ -1312,7 +1315,7 @@ fn expansions_rewrite_words_on_space_and_enter() {
 
     // Enter on a line ending in a rule expands it and stops; Enter again runs it.
     let before = sh.prompts();
-    sh.pty.write(b"printf 'L%s\\n' 1 2 3 | last 1 lines\r").unwrap();
+    sh.input.write(b"printf 'L%s\\n' 1 2 3 | last 1 lines\r").unwrap();
     sh.wait_for(b"| tail -n 1");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(sh.prompts(), before, "not run yet");
@@ -1321,7 +1324,7 @@ fn expansions_rewrite_words_on_space_and_enter() {
     assert!(out.contains("L3") && !out.contains("L1"), "{out:?}");
 
     // Backspace right after an expansion brings back what was typed.
-    sh.pty.write(b"echo | sorted \x7f").unwrap();
+    sh.input.write(b"echo | sorted \x7f").unwrap();
     std::thread::sleep(Duration::from_millis(200));
     sh.run("x");
     assert!(last_output(&sh).contains("sortedx"), "{:?}", last_output(&sh));
@@ -1364,7 +1367,7 @@ fn expansions_rewrite_words_on_space_and_enter() {
     sh.run("printf 'L%s\\n' apple banana | only lines with ban ");
     let out = last_output(&sh);
     assert!(out.contains("Lbanana") && !out.contains("Lapple"), "{out:?}");
-    let _ = sh.pty.write(b"exit\r");
+    let _ = sh.input.write(b"exit\r");
 }
 
 #[test]
@@ -1395,7 +1398,7 @@ fn pasted_text_is_not_highlighted_by_default() {
         let launch = sb.launch_with(s, None);
         let mut sh = PtyShell::start(&sb, &launch);
         let start = sh.out.len();
-        sh.pty.write(b"\x1b[200~echo pasted\x1b[201~").unwrap();
+        sh.input.write(b"\x1b[200~echo pasted\x1b[201~").unwrap();
         sh.wait_for_from(start, b"pasted");
         std::thread::sleep(Duration::from_millis(300));
         while let Ok(chunk) = sh.rx.try_recv() {
@@ -1423,43 +1426,43 @@ fn command_line_widgets_report_and_change_the_line() {
 
     // The typed line comes back percent-encoded, multibyte and all.
     let start = sh.out.len();
-    sh.pty.write("echo 'a%b' ✓".as_bytes()).unwrap();
-    sh.pty.write(b"\x1b[7337;1~").unwrap();
+    sh.input.write("echo 'a%b' ✓".as_bytes()).unwrap();
+    sh.input.write(b"\x1b[7337;1~").unwrap();
     sh.wait_for_from(start, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93\x07");
 
     // sudo goes in front, and comes off again; the line stays as typed.
-    sh.pty.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
     sh.wait_for_from(start, b"\x1b]7337;line=sudo echo %27a%25b%27 %E2%9C%93\x07");
-    sh.pty.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
     let again = sh.out.len();
     sh.wait_for_from(again, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93\x07");
 
     // Taking sudo away with the cursor at the end keeps it at the end.
-    sh.pty.write(b"\x1b[7337;2~X\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;2~X\x1b[7337;1~").unwrap();
     let again = sh.out.len();
     sh.wait_for_from(again, b"\x1b]7337;line=sudo echo %27a%25b%27 %E2%9C%93X\x07");
-    sh.pty.write(b"\x1b[7337;2~Y\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;2~Y\x1b[7337;1~").unwrap();
     let again = sh.out.len();
     sh.wait_for_from(again, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93XY\x07");
 
     // The editor owns the terminal while it runs: goatty hears so.
     let start = sh.out.len();
-    sh.pty.write(b"\x1b[7337;3~").unwrap();
+    sh.input.write(b"\x1b[7337;3~").unwrap();
     sh.wait_for_from(start, b"\x1b]7337;zle=0\x07");
     sh.wait_for_from(start, b"\x1b]7337;zle=1\x07");
     sh.wait_for_idle();
-    sh.pty.write(b"\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;1~").unwrap();
     sh.wait_for_from(start, b"\x1b]7337;line=echo %27a%25b%27 %E2%9C%93XY\x07");
 
     // Clearing empties it; on an empty line, sudo takes the last command.
-    sh.pty.write(b"\x1b[7337;4~\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;4~\x1b[7337;1~").unwrap();
     sh.wait_for_from(again, b"\x1b]7337;line=\x07");
     sh.run("true marker");
     let start = sh.out.len();
-    sh.pty.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
+    sh.input.write(b"\x1b[7337;2~\x1b[7337;1~").unwrap();
     sh.wait_for_from(start, b"\x1b]7337;line=sudo true marker\x07");
-    sh.pty.write(b"\x1b[7337;4~").unwrap();
-    let _ = sh.pty.write(b"exit\r");
+    sh.input.write(b"\x1b[7337;4~").unwrap();
+    let _ = sh.input.write(b"exit\r");
 }
 
 fn cached_entries(init_dir: &Path, prefix: &str, zwc: bool) -> Vec<PathBuf> {
@@ -2172,7 +2175,8 @@ fn pty_raw(sb: &Sandbox, args: &[&str], env: &[(&str, &str)], marker: &[u8], inp
     all.extend(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let mut cmd = ShellCommand::new(sb.zsh.clone(), args.iter().map(|a| a.to_string()).collect(), all);
     cmd.cwd = Some(sb.home.clone());
-    let (mut pty, mut reader) = Pty::spawn(&cmd, TermSize::new(120, 40)).unwrap();
+    let (pty, mut reader) = Pty::spawn(&cmd, TermSize::new(120, 40)).unwrap();
+    let mut keys = pty.input().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -2194,10 +2198,10 @@ fn pty_raw(sb: &Sandbox, args: &[&str], env: &[(&str, &str)], marker: &[u8], inp
     };
     wait_prompts(1, &mut out);
     for (i, line) in input.iter().enumerate() {
-        pty.write(format!("{line}\r").as_bytes()).unwrap();
+        keys.write(format!("{line}\r").as_bytes()).unwrap();
         wait_prompts(i + 2, &mut out);
     }
-    pty.write(b"exit\r").unwrap();
+    keys.write(b"exit\r").unwrap();
     while let Ok(chunk) = rx.recv_timeout(Duration::from_secs(3)) {
         out.extend(chunk);
     }

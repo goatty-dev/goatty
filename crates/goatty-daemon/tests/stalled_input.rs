@@ -1,7 +1,7 @@
 //! A program that stops reading its input fills the PTY, and writing more
 //! blocks. That must not block the connection: it still answers pings, so
 //! a live client isn't taken for a dead one, and still sees its own EOF, so
-//! a dead one is detached (#13).
+//! a dead one is detached (#13). Nor may it hold up `Kill` (#233).
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -68,23 +68,29 @@ fn attached(d: &Daemon) -> u32 {
     }
 }
 
+/// Start `sleep 60` and send it far more input than the PTY holds (a few
+/// KiB), in lines so none is dropped. Returns the session.
+fn flood_sleeper(s: &mut UnixStream) -> u64 {
+    let size = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
+    let argv = vec!["sleep".into(), "60".into()];
+    send(s, &ClientMsg::Run { req: 1, size, cwd: None, argv, opts: StreamOpts::LOCAL });
+    let session = loop {
+        if let ServerMsg::Attached { session, .. } = read_msg::<_, ServerMsg>(s).unwrap() {
+            break session;
+        }
+    };
+    let line = [b"x".repeat(1023), b"\n".to_vec()].concat();
+    for _ in 0..256 {
+        send(s, &ClientMsg::Input { session, data: line.clone() });
+    }
+    session
+}
+
 #[test]
 fn input_to_a_program_that_doesnt_read_doesnt_block_the_connection() {
     let d = start_daemon();
     let mut s = connect(&d);
-    let size = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
-    let argv = vec!["sleep".into(), "60".into()];
-    send(&mut s, &ClientMsg::Run { req: 1, size, cwd: None, argv, opts: StreamOpts::LOCAL });
-    let session = loop {
-        if let ServerMsg::Attached { session, .. } = read_msg::<_, ServerMsg>(&mut s).unwrap() {
-            break session;
-        }
-    };
-    // Far more than the PTY holds (a few KiB), in lines so none is dropped.
-    let line = [b"x".repeat(1023), b"\n".to_vec()].concat();
-    for _ in 0..256 {
-        send(&mut s, &ClientMsg::Input { session, data: line.clone() });
-    }
+    flood_sleeper(&mut s);
 
     send(&mut s, &ClientMsg::Ping { nonce: 42 });
     loop {
@@ -101,5 +107,26 @@ fn input_to_a_program_that_doesnt_read_doesnt_block_the_connection() {
     while attached(&d) != 0 {
         assert!(Instant::now() < deadline, "the closed connection stayed attached");
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Closing the tab of a program that stopped reading must end it, even
+/// while an input write to it is stuck (#233).
+#[test]
+fn kill_ends_a_session_whose_input_is_stuck() {
+    let d = start_daemon();
+    let mut s = connect(&d);
+    let session = flood_sleeper(&mut s);
+    // Let the input thread get stuck in its write.
+    std::thread::sleep(Duration::from_millis(200));
+    send(&mut s, &ClientMsg::Kill { req: 2, session });
+    let (mut ok, mut exited) = (false, false);
+    while !(ok && exited) {
+        match read_msg::<_, ServerMsg>(&mut s) {
+            Ok(ServerMsg::Ok { req: 2 }) => ok = true,
+            Ok(ServerMsg::Exited { session: id, .. }) if id == session => exited = true,
+            Ok(_) => {}
+            Err(e) => panic!("Kill didn't end the session (ok: {ok}, exited: {exited}): {e}"),
+        }
     }
 }
