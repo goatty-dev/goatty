@@ -11,7 +11,10 @@
 //! signature covers `index.json` → the index pins every file of every
 //! plugin version by sha256 → the manifest pins every download by sha256.
 //! Files that aren't in the signed index are never used. `sequence` only
-//! goes up, so a client refuses an older (replayed) index.
+//! goes up, so a client refuses an older (replayed) index. `expires` limits
+//! how long a client can be held on an old index by someone who blocks the
+//! newer one (a freeze attack): past it, goatty warns (but keeps working),
+//! and `build` renews the index well before it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,6 +31,10 @@ pub const FORMAT: u32 = 1;
 pub const INDEX: &str = "index.json";
 pub const SIGNATURE: &str = "index.json.sig";
 pub const META: &str = "registry.toml";
+/// How long a built index is valid.
+pub const LIFETIME_SECS: u64 = 90 * 24 * 60 * 60;
+/// `build` renews an unchanged index with less than this left.
+pub const RENEW_BEFORE_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// `registry.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +59,10 @@ pub struct Index {
     pub sequence: u64,
     /// Unix seconds.
     pub generated: u64,
+    /// Unix seconds after which clients warn that the registry may be
+    /// holding them on an old index. Absent in indexes from before #100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
     pub plugins: BTreeMap<String, Entry>,
 }
 
@@ -94,6 +105,17 @@ impl Index {
             .filter_map(|(k, v)| semver::Version::parse(k).ok().map(|sv| (sv, k, v)))
             .max_by(|a, b| a.0.cmp(&b.0))
             .map(|(_, k, v)| (k.as_str(), v))
+    }
+
+    /// Whether the index is past its `expires` at `now` (Unix seconds).
+    pub fn expired(&self, now: u64) -> bool {
+        self.expires.is_some_and(|e| now >= e)
+    }
+
+    /// Whether `build` would renew this index at `now`: it never expires,
+    /// or less than [`RENEW_BEFORE_SECS`] are left.
+    pub fn renewal_due(&self, now: u64) -> bool {
+        self.expires.is_none_or(|e| e.saturating_sub(now) < RENEW_BEFORE_SECS)
     }
 
     pub fn version(&self, id: &str, version: &str) -> Option<&Version> {
@@ -149,9 +171,14 @@ pub fn version_entry(m: &Manifest, files: BTreeMap<String, String>, yanked: bool
 }
 
 /// Validate every plugin in the registry and build its index. The
-/// sequence continues from the committed `index.json` (+1 when the
-/// plugins changed, the same otherwise). Problems in any plugin fail the build.
+/// sequence continues from the committed `index.json`: the same when the
+/// plugins are unchanged and its expiry isn't due ([`Index::renewal_due`]),
+/// +1 otherwise with a fresh `expires`. Problems in any plugin fail the build.
 pub fn build(dir: &Path) -> Result<Index> {
+    build_at(dir, now())
+}
+
+fn build_at(dir: &Path, now: u64) -> Result<Index> {
     let meta = read_meta(dir)?;
     let mut plugins: BTreeMap<String, Entry> = BTreeMap::new();
     let mut problems = Vec::new();
@@ -201,19 +228,20 @@ pub fn build(dir: &Path) -> Result<Index> {
         bail!("the registry has problems:\n  {}", problems.join("\n  "));
     }
     let previous: Option<Index> = std::fs::read(dir.join(INDEX)).ok().and_then(|b| serde_json::from_slice(&b).ok());
-    let (sequence, generated) = match &previous {
-        Some(p) if p.plugins == plugins && p.registry == meta.name => (p.sequence, p.generated),
-        Some(p) => (p.sequence + 1, now()),
-        None => (1, now()),
+    let (sequence, generated, expires) = match &previous {
+        Some(p) if p.plugins == plugins && p.registry == meta.name && !p.renewal_due(now) => (p.sequence, p.generated, p.expires),
+        Some(p) => (p.sequence + 1, now, Some(now + LIFETIME_SECS)),
+        None => (1, now, Some(now + LIFETIME_SECS)),
     };
-    Ok(Index { format: FORMAT, registry: meta.name, sequence, generated, plugins })
+    Ok(Index { format: FORMAT, registry: meta.name, sequence, generated, expires, plugins })
 }
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Whether the committed index matches the plugin directories.
+/// Whether the committed index matches the plugin directories and isn't
+/// due for renewal.
 pub fn is_current(dir: &Path) -> Result<bool> {
     let built = build(dir)?;
     let committed: Index = serde_json::from_slice(&std::fs::read(dir.join(INDEX)).context("no index.json")?).context("parse index.json")?;
@@ -322,6 +350,35 @@ pub(crate) mod tests {
         sign_dir(dir, &key).unwrap();
         assert_eq!(verify_snapshot(dir, &trusted, 2).unwrap().plugins["eza"].summary, "A modern, evil ls");
         assert_eq!(build(dir).unwrap().sequence, 2, "unchanged plugins keep the sequence");
+    }
+
+    #[test]
+    fn expiry_is_renewed_before_it_runs_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (public, _) = make_registry(dir);
+        let index = verify_snapshot(dir, &[public], 0).unwrap();
+        let expires = index.expires.unwrap();
+        assert_eq!(expires, index.generated + LIFETIME_SECS);
+        assert!(!index.expired(expires - 1));
+        assert!(index.expired(expires));
+
+        // Unchanged and plenty of time left: the same index.
+        let early = build_at(dir, expires - RENEW_BEFORE_SECS).unwrap();
+        assert_eq!(early, index);
+        // Close to expiring: renewed, with a new sequence so the old one can't be replayed.
+        let late = build_at(dir, expires - RENEW_BEFORE_SECS + 1).unwrap();
+        assert_eq!(late.sequence, 2);
+        assert_eq!(late.expires, Some(expires - RENEW_BEFORE_SECS + 1 + LIFETIME_SECS));
+        assert_eq!(late.plugins, index.plugins);
+
+        // An index from before `expires` never expires, and is renewed by the next build.
+        let mut old = index.clone();
+        old.expires = None;
+        assert!(!String::from_utf8(old.to_bytes()).unwrap().contains("expires"));
+        assert!(!old.expired(u64::MAX));
+        std::fs::write(dir.join(INDEX), old.to_bytes()).unwrap();
+        assert_eq!(build(dir).unwrap().sequence, 2);
     }
 
     #[test]
