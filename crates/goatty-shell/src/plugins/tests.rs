@@ -230,6 +230,18 @@ fn a_package_id_belongs_to_one_plugin() {
     assert!(w.dirs.tools_dir().join("demo").is_dir(), "the package other lists stays");
     p.uninstall("other").unwrap();
     assert!(!w.dirs.tools_dir().join("demo").exists());
+
+    // A plugin on a system copy of the package doesn't keep the download.
+    let plan = p.plan(&demo, &settings).unwrap();
+    p.install(&demo, &plan.digest, &settings).unwrap();
+    let mut lock = Lock::load(&w.dirs).unwrap();
+    let mut other = lock.plugins["demo"].clone();
+    other.packages[0].system = Some("/usr/bin/demo".into());
+    lock.plugins.insert("other".into(), other);
+    lock.save(&w.dirs).unwrap();
+    p.uninstall("demo").unwrap();
+    assert!(!w.dirs.bin_dir().join("demo").exists());
+    assert!(!w.dirs.tools_dir().join("demo").exists());
 }
 
 /// Downloads that cancel their install once they started.

@@ -723,19 +723,22 @@ impl Plugins<'_> {
         Ok((entry, self.unneeded(&lock)))
     }
 
-    /// Remove plugin `owner`'s use of package `id` (its executables `bins`):
-    /// the whole package, or only the executables no other plugin lists
-    /// when another installed plugin still lists the package (#222).
+    /// Remove plugin `owner`'s use of goatty's download of package `id`
+    /// (its executables `bins`): the whole download, or only the
+    /// executables no other plugin lists when another installed plugin
+    /// still uses the download (#222). A plugin that uses a system copy
+    /// doesn't keep the download.
     fn drop_package(&self, lock: &Lock, owner: &str, id: &str, bins: &[String]) -> Result<bool> {
-        if lock.package_user(id, owner).is_none() {
-            return install::uninstall_package(id, bins, self.dirs);
-        }
-        let kept: BTreeSet<&str> = lock
+        let others: Vec<&lock::Package> = lock
             .plugins
             .iter()
             .filter(|(plugin, _)| plugin.as_str() != owner)
-            .flat_map(|(_, e)| e.packages.iter().filter(|p| p.id == id).flat_map(|p| p.bins.iter().map(|b| manifest::bin_name(b))))
+            .flat_map(|(_, e)| e.packages.iter().filter(|p| p.id == id && p.system.is_none()))
             .collect();
+        if others.is_empty() {
+            return install::uninstall_package(id, bins, self.dirs);
+        }
+        let kept: BTreeSet<&str> = others.iter().flat_map(|p| p.bins.iter().map(|b| manifest::bin_name(b))).collect();
         let gone: Vec<String> = bins.iter().filter(|b| !kept.contains(manifest::bin_name(b))).cloned().collect();
         install::remove_links(id, &gone, self.dirs)
     }
