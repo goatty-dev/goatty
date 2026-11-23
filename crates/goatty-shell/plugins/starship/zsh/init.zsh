@@ -1,7 +1,8 @@
 # goatty's built-in Starship plugin. goatty generates starship.toml from the
-# prompt settings; your own config wins when prefer_user_config is on.
+# prompt settings (starship-plain.toml, without Nerd Font icons, for other
+# terminals: the .zshrc picks); your own config wins when prefer_user_config is on.
 if [[ ${goatty_settings[prefer_user_config]:-} != true ]] || [[ -z ${STARSHIP_CONFIG:-} && ! -e $HOME/.config/starship.toml ]]; then
-  builtin export STARSHIP_CONFIG=$_goatty_dir/starship.toml
+  builtin export STARSHIP_CONFIG=$_goatty_dir/${_goatty_starship_toml:-starship.toml}
 fi
 # Starship logs a warning into the terminal whenever a module's command
 # outlives command_timeout (git or rustc right after login, under load).

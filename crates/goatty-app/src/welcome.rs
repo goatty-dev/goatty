@@ -7,7 +7,9 @@
 //!    when missing, installed with progress (no sudo, pinned checksums),
 //!    whether to import the PATH folders and variables the user's own
 //!    `.zshrc`/`.bashrc` sets up (on by default; shown when they have one,
-//!    with what it brings), and the prompt style.
+//!    with what it brings), whether to use goatty's shell in every terminal
+//!    (off by default; the exact line and file are shown, so the switch is
+//!    the consent), and the prompt style.
 //! 3. **Ready**: the few shortcuts worth knowing, links onward.
 //!
 //! It opens by itself once, on the very first start (no client settings
@@ -157,6 +159,10 @@ pub struct Welcome {
     /// The host runs the user's shell to see what it sets up.
     import_checking: bool,
     import_error: Option<String>,
+    /// goatty's shell in every terminal: the line in the host's `.zshenv`.
+    everywhere: Option<goatty_shell::everywhere::Status>,
+    everywhere_busy: bool,
+    everywhere_error: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -200,6 +206,9 @@ impl Welcome {
             import: None,
             import_checking: false,
             import_error: None,
+            everywhere: None,
+            everywhere_busy: false,
+            everywhere_error: None,
             _subs: subs,
         }
     }
@@ -250,6 +259,7 @@ impl Welcome {
                         v.host = host;
                         if managed {
                             v.load_import(cx);
+                            v.everywhere(goatty_shell::everywhere::Action::Status, cx);
                         }
                     }
                     Err(e) => v.error = Some(format!("{e:#}")),
@@ -291,6 +301,74 @@ impl Welcome {
             }
         })
         .detach();
+    }
+
+    /// Ask the host about the line in its `.zshenv`, or add or remove it.
+    fn everywhere(&mut self, action: goatty_shell::everywhere::Action, cx: &mut Context<'_, Self>) {
+        let Some(link) = self.link.clone() else { return };
+        if self.everywhere_busy {
+            return;
+        }
+        self.everywhere_busy = true;
+        self.everywhere_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { link.everywhere(action) }).await;
+            let _ = this.update(cx, |v, cx| {
+                v.everywhere_busy = false;
+                match result {
+                    Ok(s) => v.everywhere = Some(s),
+                    // An older goattyd: no question about it.
+                    Err(e) if action == goatty_shell::everywhere::Action::Status => log::info!("every terminal: {e:#}"),
+                    Err(e) => v.everywhere_error = Some(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Use goatty's shell in every terminal", with the exact lines and
+    /// file shown above the switch: turning it on is the consent.
+    fn everywhere_section(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<impl IntoElement> {
+        use goatty_shell::everywhere::{Action, State};
+        let s = self.everywhere.as_ref()?;
+        let on = s.state == State::On;
+        let (desc, can) = match (&s.state, &s.unavailable) {
+            (State::On, _) => (format!("On · {} starts goatty's shell in every new zsh", s.file), true),
+            (State::Changed, _) => (format!("{} has a goatty line goatty didn't write: edit it there", s.file), false),
+            (State::Off, Some(why)) => (why.clone(), false),
+            (State::Off, None) => ("VS Code and other editors, other terminals, tmux and SSH logins get this shell too".to_owned(), true),
+        };
+        let busy = self.everywhere_busy;
+        let mut sec = settings_section(ui, "Every terminal").child(
+            settings_row(ui, settings_window::everywhere::LABEL)
+                .desc(desc)
+                .disabled(!can || busy)
+                .control(
+                    toggle("everywhere", on, ui, self.act(cx, move |v, cx| v.everywhere(if on { Action::Off } else { Action::On }, cx)))
+                        .aria_label(settings_window::everywhere::LABEL),
+                )
+                .below(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(format!(
+                            "{} {}:",
+                            if on { "goatty added these lines to the end of" } else { "Turning it on adds these lines to the end of" },
+                            s.file
+                        ))))
+                        .child(settings_window::everywhere::code_lines(ui, crate_mono(cx), &s.lines)),
+                ),
+        );
+        let icons = self.host.as_ref().is_some_and(|h| h.prompt.plain_elsewhere());
+        sec = sec.footer(match &self.everywhere_error {
+            Some(e) => format!("Couldn't change it: {e}"),
+            None if icons => "Your ~/.zshrc stops running there, as in goatty's tabs; the PATH folders and variables it sets up still come along. Prompt icons show as text in other terminals. Off again under Settings → Shell: goatty removes exactly these lines.".to_owned(),
+            None => "Your ~/.zshrc stops running there, as in goatty's tabs; the PATH folders and variables it sets up still come along. Off again under Settings → Shell: goatty removes exactly these lines.".to_owned(),
+        });
+        Some(sec)
     }
 
     /// Turn the import on or off on the host.
@@ -717,6 +795,9 @@ impl Welcome {
             page = page.child(settings_window::progress_card(ui, p));
         }
         if let Some(sec) = self.import_section(ui, cx) {
+            page = page.child(sec);
+        }
+        if let Some(sec) = self.everywhere_section(ui, cx) {
             page = page.child(sec);
         }
         if let Some(h) = &self.host {

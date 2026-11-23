@@ -1,6 +1,6 @@
 # Managed zsh (Stage 3)
 
-goatty sessions run zsh with a configuration goatty generates: autosuggestions, syntax highlighting, completion in fzf (fzf-tab), Starship, fzf's history and file search, and shell integration (OSC 133/7). Nothing in the user's dotfiles changes. Code: `crates/goatty-shell`. Startup files: `crates/goatty-shell/zsh/`.
+goatty sessions run zsh with a configuration goatty generates: autosuggestions, syntax highlighting, completion in fzf (fzf-tab), Starship, fzf's history and file search, and shell integration (OSC 133/7). Nothing in the user's dotfiles changes, unless they turn on [goatty's shell in every terminal](#goattys-shell-in-every-terminal-283), which adds one line to `.zshenv`. Code: `crates/goatty-shell`. Startup files: `crates/goatty-shell/zsh/`.
 
 The tools (fzf, fzf-tab, autosuggestions, syntax highlighting, Starship) are **built-in plugins** since #98: ordinary plugin manifests in `crates/goatty-shell/plugins/<id>/`, compiled into goatty. They get the same install plans, settings UI and load-order slots as registry plugins ([`plugins.md`](plugins.md#built-in-plugins)).
 
@@ -31,6 +31,7 @@ zsh then reads the startup files from goatty's directory:
            plugins-last.zsh (syntax highlighting: it wraps every widget defined before it)
            goatty-status / goatty-setup / goatty-reload, reload-on-request trap, missing-tools hint
 .zlogin    the user's own, because ZDOTDIR is already theirs again
+           (goatty's .zlogin only runs when something pointed ZDOTDIR back at goatty's directory: it hands it back and runs theirs)
 ```
 
 Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_startup.rs`):
@@ -41,7 +42,7 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
 - `typeset name=(…)` must not be prefixed with `builtin`, because that disables typeset's array-assignment syntax.
 - If `settings.zsh` fails to load, `.zshenv` restores the user's `ZDOTDIR` and returns: the session degrades to plain zsh instead of breaking.
 - Non-interactive zsh started during startup (e.g. `zsh -c` from a user's `.zprofile`) gets the user's `ZDOTDIR` straight away and behaves like plain zsh.
-- After startup, `ZDOTDIR` is exactly what the user had (set or unset), so nested shells, `exec zsh` and `.zlogout` behave like plain zsh. `goatty-reload` restarts the current shell with goatty's config. `SIGURG` (sent by `goattyd shell reload` or the settings window after an apply) makes the shell reload at its next idle prompt; see `docs/profiles.md`.
+- After startup, `ZDOTDIR` is exactly what the user had (set or unset), so nested shells, `exec zsh` and `.zlogout` behave like plain zsh (with [goatty's shell in every terminal](#goattys-shell-in-every-terminal-283) on, they start goatty's shell again through the line in `.zshenv`). If something points `ZDOTDIR` at goatty's directory once `.zshrc` is done (VS Code's shell integration does), the first prompt hands it back. `goatty-reload` restarts the current shell with goatty's config. `SIGURG` (sent by `goattyd shell reload` or the settings window after an apply) makes the shell reload at its next idle prompt; see `docs/profiles.md`.
 - Debian/Ubuntu's `/etc/zsh/zshrc` runs `compinit` unless `skip_global_compinit` is set; `.zshenv` sets it so compinit runs once, with goatty's dump file in `~/.cache/goatty/`.
 - fzf's key bindings are only evaluated when zle has a terminal (`-o zle && -t 0`). Without one, fzf's option save/restore fails on `zle`.
 
@@ -52,12 +53,14 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
 ~/.local/share/goatty/generations/<n>/   one built configuration each (newest 10 kept):
   zsh/settings.zsh              paths, feature list, history options, what goatty-setup installs
   zsh/plugins-*.zsh             the plugins, one file per load slot (see plugins.md)
-  zsh/.zshenv .zprofile .zshrc  static, from crates/goatty-shell/zsh/
+  zsh/.zshenv .zprofile .zshrc .zlogin  static, from crates/goatty-shell/zsh/
+  zsh/entry.zsh                 what the line in .zshenv sources (goatty's shell in every terminal)
   zsh/integration.zsh           OSC 133 + OSC 7, goatty's command-line widgets (OSC 7337)
   zsh/rc-guard.zsh              what a guarded .zshrc sources goes through it
   zsh/expand.zsh                the expansion widget (Space, Enter, Backspace), static
   zsh/expansions.zsh            the expansion rules as data: yours, then the plugins' (empty with shell.expansions off)
   zsh/starship.toml             generated from the prompt settings; used unless you prefer your own starship.toml
+  zsh/starship-plain.toml       the same prompt without Nerd Font glyphs, for other terminals (prompt.icons_elsewhere off)
   host.json, info.json          the settings it was built from; when, by which goatty, on which generation, what changed, its name
 ~/.local/share/goatty/current → generations/<n>   the active one
 ~/.local/share/goatty/tools/<package>/<version>/   managed installs (built-in and registry plugins' packages)
@@ -69,6 +72,8 @@ Rules that came out of testing against real zsh (`crates/goatty-shell/tests/zsh_
 ~/.local/state/goatty/shell-hint-dismissed      set by `goatty-setup --dismiss` or the GUI's "Don't ask again"
 ~/.local/state/goatty/shell-setup-offered       set once goatty's window offered the install (the shell hint stays quiet)
 ~/.local/state/goatty/import/   what your own shell sets up: harvest.json (the last harvest and failure), import.zsh
+~/.local/state/goatty/shell-refreshed   when the configuration and the import were last brought up to date (hooked shells compare against it)
+~/.local/state/goatty/zshenv-backups/   your .zshenv before goatty added or removed its line (newest 10)
 ```
 
 XDG variables are respected. History stays in the file plain zsh would use (`${ZDOTDIR:-$HOME}/.zsh_history`), so existing history keeps working.
@@ -90,6 +95,7 @@ XDG variables are respected. History stays in the file plain zsh would use (`${Z
 | `shell.path`: folders added to the end of PATH (before goatty's `bin/`), `~/…` = home, missing ones skipped; edited on Settings → PATH and with the palette's "Shell: Add a folder to PATH…" | none | |
 | `prompt.style` (`rich`/`lean`/`classic`/`rainbow`), `prompt.symbols` (`nerd`/`emoji`/`text`/`none`), `prompt.show` (`all`/`essential`) | rich, nerd, all | |
 | `prompt.two_line`, `prompt.newline_before`, `prompt.transient`, `prompt.duration_threshold_ms` (0 = never) | on, off, off, 2000 | |
+| `prompt.icons_elsewhere`: keep Nerd Font icons (and Powerline shapes) in other terminals; off, they get `starship-plain.toml` | off | |
 | `prompt.separator`, `prompt.heads`, `prompt.tails` (Classic/Rainbow), `prompt.frame`, `prompt.connection` (two lines) | angled, sharp, flat, none, none | |
 | `prompt.directory.*`, `prompt.character.*`, `prompt.colors.*`, `prompt.modules.<module>.{enabled, side, symbol, color}` | see below | |
 | `history.size` (100 000), `history.ignore_duplicates`, `history.ignore_space`, `history.share_between_sessions` | 100 000, on, on, off | |
@@ -167,9 +173,56 @@ fzf is goatty's one fuzzy finder (#165), split over two built-in plugins:
 
 **Atuin** was a built-in plugin until #165. It's now a registry plugin (`goattyd plugin install atuin`) that loads after fzf and takes Ctrl+R, optionally Up. A download goatty made for the old built-in (`tools/atuin/`, `bin/atuin`) is reused by that plugin at the same version, or removed with `goattyd shell uninstall atuin` (or `--all`).
 
+## goatty's shell in every terminal (#283)
+
+Off by default. Settings → Shell → "Use goatty's shell in every terminal" (per host; also in the welcome window, and `goattyd shell everywhere on|off|status`) makes every interactive zsh on the host run goatty's shell, not only goatty's tabs: VS Code's and other IDEs' terminals, other terminal emulators, tmux and herdr panes, SSH logins. Code: `goatty_shell::everywhere`, `zsh/entry.zsh`.
+
+**The hook.** With the user's consent (the dialog, or the CLI's question, shows the file and these exact lines), goatty appends to the `.zshenv` a new zsh reads: `$ZDOTDIR/.zshenv` when the environment or `/etc/zshenv` sets `ZDOTDIR` (asked from `zsh -f`, which still reads `/etc/zshenv`), else `~/.zshenv`:
+
+```zsh
+# goatty: use goatty's managed zsh in every terminal (Settings → Shell). Delete these 2 lines to stop.
+[[ -r ~/.local/share/goatty/current/zsh/entry.zsh ]] && source ~/.local/share/goatty/current/zsh/entry.zsh
+```
+
+The path is `~/…` when it needs no quoting (a `.zshenv` synced between machines keeps working), else quoted. The line goes at the end, so a `ZDOTDIR` the file sets is the user's; status warns about a line after it that sets `ZDOTDIR`. A `.zshenv` that's a link (a dotfiles repository) is edited where it points, through a temporary file, with its permissions; when that fails (a read-only Nix store), goatty shows the lines to add there. Turning it off removes exactly goatty's comment and line, wherever they are, and leaves the rest byte for byte (the newline goatty may have added before them stays). Both keep a backup in `~/.local/state/goatty/zshenv-backups/`. A line that mentions goatty's `entry.zsh` but isn't goatty's line (edited, commented out, copied) is reported as changed, and goatty neither adds nor removes anything until the user sorts it out. The switch shows what the file has, so a line added or removed by hand shows too.
+
+Why not `chsh` to a wrapper: a missing or broken wrapper (uninstall, failed update) would lock the user out of login, `su` and SSH; it needs sudo for `/etc/shells`, on every remote too; and `$SHELL` would stop being zsh, which VS Code's shell detection, IDEs and scripts check. The hook fails safe: without `entry.zsh` (goatty uninstalled, a generation from before this) zsh stays plain without a word, and the login shell stays `/usr/bin/zsh`. starship, atuin, mise and direnv integrate the same way: one visible line.
+
+**`entry.zsh`** (rendered into every generation, so a rollback or turning the managed zsh off takes effect) does nothing for non-interactive shells (`zsh -c`, scripts), for shells that are goatty's already (`_goatty_dir` is set: goattyd started it, or goatty's `.zshenv` is sourcing the user's `.zshenv` right now, so nothing loops), for the import's harvest (`GOATTY_IMPORT`, below), with `GOATTY_SHELL_MANAGED=0` (or `false`, `no`, `off`: plain zsh for one shell, the escape hatch), and while `shell.managed` is off or goatty's shell isn't zsh. Otherwise it sets `GOATTY_ORIG_ZDOTDIR` to the user's `ZDOTDIR`, points `ZDOTDIR` at goatty's directory and sources goatty's `.zshenv` right there, in hook mode (`_goatty_hooked`: it doesn't source the user's `.zshenv` again, which is running). From then on it's the same startup as a goatty session:
+
+```
+/etc/zshenv
+~/.zshenv (the user's)        ... their lines ..., then goatty's line → entry.zsh → goatty's .zshenv (settings.zsh; ZDOTDIR = goatty's)
+/etc/zprofile                 (login shells)
+goatty's .zprofile            the user's .zprofile with their ZDOTDIR      (login shells)
+/etc/zshrc
+goatty's .zshrc               as in a goatty session; ZDOTDIR is the user's again at its end
+the user's .zlogin            (login shells)
+```
+
+Nested shells and `exec zsh` from a hooked shell are goatty's again (that's the point); `goatty-reload` works as in goatty. Running shells don't reload when settings change (only goattyd's sessions get `SIGURG`): new ones pick it up.
+
+**Inside goatty or not.** goattyd's PTYs set `GOATTY_TTY` to the pane's terminal (`goatty_term::pty::TTY_ENV`), next to `TERM_PROGRAM=goatty`. The `.zshrc` counts as inside goatty only when both match `$TTY` and goatty: programs started from a goatty tab (an IDE, tmux) inherit the variables, but their shells run on other terminals. Remote goattyd sessions set them on the remote. Outside goatty:
+
+- OSC 7337 and the command-line widgets (`^[[7337;N~`) stay out. OSC 133 and OSC 7 still go out, unless the terminal brought its own shell integration (VS Code's `VSCODE_SHELL_INTEGRATION`, kitty's `KITTY_SHELL_INTEGRATION`, Ghostty's `_ghostty_deferred_init`): then it marks the prompts and goatty's marks would double them.
+- The prompt uses `starship-plain.toml`: text symbols instead of Nerd Font icons, thin separators and flat ends instead of Powerline shapes, and the user's own symbols that are Nerd Font glyphs back to the defaults (`PromptSettings::plain`). goatty draws those glyphs with its bundled font; other terminals (VS Code's default font) would show boxes. `prompt.icons_elsewhere` (Settings → Prompt → "Icons in other terminals") keeps them.
+
+**Freshness.** goatty's sessions rebuild the generation and redo the harvest when they start; nobody does that for shells elsewhere. So `entry.zsh` compares the user's and the system's startup files (zsh's and bash's), `host.json` and the goattyd binary against `~/.local/state/goatty/shell-refreshed` (a few `-nt` tests, no process). When one is newer, it runs `goattyd shell refresh --wait 2`: the refresh runs in a process of its own (its own session, so closing the terminal doesn't stop it), and the shell waits for it at most 2 s, then goes on with the cached configuration (the next shell gets the new one). An installer that just appended to `.zshrc` (rustup, nvm, bun, conda) works in the next terminal, as long as one run of the user's startup files takes less than that. The refresh asks the running goattyd when there is one, so the harvest runs with goattyd's environment, which the import's fingerprint compares against; without goattyd it runs in that process, without `ZDOTDIR` (the asking shell is in the middle of `.zshenv`), and the next goatty session may harvest once more because its environment differs. goatty never starts goattyd from a shell's startup: it would inherit that terminal's environment. The stamp gets the time the check *started*, so a file changed while it ran counts as newer. `Launcher::launch` (every goatty session) and `goattyd shell refresh` both touch it.
+
+**The harvest bypass.** The import runs the user's login shell to see what their files set up; with the hook it would harvest goatty's own config. It sets `GOATTY_IMPORT=1`, so `entry.zsh` returns at once (`tests/zsh_startup.rs::harvest_with_the_hook_reads_the_users_own_files`).
+
+**What changes for the user** (the dialog says so): `~/.zshrc` no longer runs in those shells, as in goatty's tabs. PATH folders and variables still arrive through the import; functions, aliases and key bindings go in `~/.config/goatty/zshrc`, or `shell.zsh.user_rc` runs `.zshrc` guarded (the dialog has that switch). Prompt icons fall back to text (above).
+
+**Interop**, checked against the real scripts in `tests/zsh_startup.rs` when they're installed:
+
+- **VS Code** injects its integration by setting `ZDOTDIR` to a directory of its own and `USER_ZDOTDIR` to the user's (or `$HOME`); its `.zshenv` sources `$USER_ZDOTDIR/.zshenv` (ours runs, `ZDOTDIR` becomes goatty's), remembers that as `USER_ZDOTDIR` and reads goatty's `.zprofile` and `.zshrc` through it. Both load (OSC 633 command detection and decorations, goatty's plugins and prompt). Three things needed handling: VS Code sets `HISTFILE=$USER_ZDOTDIR/.zsh_history`, inside goatty's generation, so the `.zshrc` resets a `HISTFILE` in goatty's directory to the usual one; after startup VS Code sets `ZDOTDIR=$USER_ZDOTDIR` (goatty's), which the first prompt hands back; and its `.zlogin` sources `$USER_ZDOTDIR/.zlogin`, so goatty's directory has a `.zlogin` that runs the user's.
+- **kitty** (and **Ghostty**, which copied its approach) restores `ZDOTDIR`, sources the user's `.zshenv` at top level and loads its integration deferred to the first prompt. Both load; goatty's OSC 133 marks stay out.
+- **macOS Terminal**: `/etc/zshrc_Apple_Terminal` keeps session files in `${ZDOTDIR:-$HOME}/.zsh_sessions`, read while `ZDOTDIR` is goatty's; the `.zshrc` moves `SHELL_SESSION_DIR`/`SHELL_SESSION_FILE` back like `HISTFILE` (macOS's `/etc/zshrc` sets `HISTFILE` that way too, also in goatty's own sessions).
+- **JetBrains** terminals, **tmux** and **herdr** panes, `ssh` into the host, `su - user` and `sudo -i -u user` start ordinary interactive (often login) shells that read `.zshenv` (please verify JetBrains by hand: its injection wasn't available to test).
+
 ## Shell integration
 
-`integration.zsh` emits OSC 133 `A` (prompt start) and `B` (input start) inside `PS1`, re-added on every prompt if a theme rebuilt it. It emits `C` from `preexec`, then `D;<status>` and OSC 7 (`file://host/percent-encoded/path`) from `precmd`. zsh restores `$?` for every hook, so hook order doesn't affect the status. rio-vt parses OSC 7; goatty-term applies the OSC 133 marks itself: they mark prompt rows (so the output viewer finds each command's output and Ctrl+Shift+Up/Down jump between prompts), say whether a command runs, and finished commands show as tab activity.
+Outside goatty (above), only OSC 133 and OSC 7 go out, and OSC 133 only when the terminal has no shell integration of its own. `integration.zsh` emits OSC 133 `A` (prompt start) and `B` (input start) inside `PS1`, re-added on every prompt if a theme rebuilt it. It emits `C` from `preexec`, then `D;<status>` and OSC 7 (`file://host/percent-encoded/path`) from `precmd`. zsh restores `$?` for every hook, so hook order doesn't affect the status. rio-vt parses OSC 7; goatty-term applies the OSC 133 marks itself: they mark prompt rows (so the output viewer finds each command's output and Ctrl+Shift+Up/Down jump between prompts), say whether a command runs, and finished commands show as tab activity.
 
 The right-click menu (#186) reads and changes the line typed at the prompt through zle widgets bound to private key sequences (`goatty_term::input::LineEdit`, `ESC [ 7337 ; n ~`, which no keyboard sends; bound in the emacs, viins and vicmd keymaps): `1` reports `$BUFFER` as `OSC 7337;line=<percent-encoded bytes>` (`UiEvent::CommandLine`; goatty acts on it only while it asked), `2` puts `sudo ` in front or takes it away (an empty line gets the previous command first), `3` runs zsh's `edit-command-line` (`$VISUAL`/`$EDITOR`) between `zle=0` and `zle=1`, since the editor owns the terminal meanwhile, `4` is `kill-buffer`. `precmd` prints `OSC 7337;zle=1` so goatty knows the widgets are there; `C` clears that, and the app also holds back while the pane's foreground program isn't a shell, so another shell or a running program never gets the keys. Attach and resync snapshots carry the flag (`zle=0|1` after the shell state). The encoding deliberately runs without `LC_ALL=C`: zle would turn characters C can't spell into `?`. Tested against real zsh in `tests/zsh_startup.rs::command_line_widgets_report_and_change_the_line`.
 
@@ -205,7 +258,7 @@ When a built-in tool's upstream release is at least two weeks old:
 
 ## First run and the GUI
 
-On the very first start (no `settings.json`, no `~/.local/state/goatty/welcome-shown`), goatty opens a **welcome window** with three steps: a theme (or follow the desktop) and the text size; the built-in tools of the window's host, the missing or outdated managed ones preselected and installed one at a time with progress, plus the prompt style; then the shortcuts worth knowing. Everything else keeps its defaults. The command palette's "Welcome and setup" opens it again.
+On the very first start (no `settings.json`, no `~/.local/state/goatty/welcome-shown`), goatty opens a **welcome window** with three steps: a theme (or follow the desktop) and the text size; the built-in tools of the window's host, the missing or outdated managed ones preselected and installed one at a time with progress, the import, goatty's shell in every terminal (off; the file and the exact lines are shown above the switch, so turning it on is the consent), plus the prompt style; then the shortcuts worth knowing. Everything else keeps its defaults. The command palette's "Welcome and setup" opens it again.
 
 When a tab connects to another host, goatty offers to bring this computer's whole shell setup there, tools included ([`profiles.md`](profiles.md#the-same-shell-on-every-host-159)). When a tab connects to this computer, or to a host set to never sync, and its managed shell misses default tools or has outdated managed copies, a sticky toast offers to install/update them: Install / Update / Not now / Don't ask again. That happens once per host per run, never while the welcome window is open, and never after "Don't ask again" (the same marker as `goatty-setup --dismiss`). The in-shell hint stays quiet in sessions of a goatty window that offers the setup itself (goattyd sets `GOATTY_GUI_SETUP=1` for clients with protocol v9, `goatty --local` always; the shell unsets it after startup), and for missing tools on hosts where a window already offered the install (`shell-setup-offered`); outdated managed copies still show the in-shell hint unless dismissed (`goatty-setup --dismiss`). Installing or updating reloads the host's running shells, so an idle prompt has the new tools at once.
 
@@ -260,6 +313,8 @@ Measured 2026-11-18 on the same dev machine (CachyOS, zsh 5.9.2, Starship 1.27.0
 | Combined init cost (23 warm runs, PTY) | 14.24 ms | 2.10 ms | -12.14 ms (6.8×) |
 | Full `zsh -l -i -c exit` (all defaults, 41 runs, PTY) | 71.70 ms | 61.54 ms | -10.16 ms (-14.2%) |
 | Full `zsh -l -i -c exit` (all defaults, 2×21 runs, no TTY) | 66.3–68.5 ms | 55.4–59.9 ms | ~-9.7 ms |
+
+**goatty's shell in every terminal (#283).** Measured 2026-11-23 on the same machine (zsh 5.9.2, debug goattyd, sandboxed `$HOME` without the host's tools, `shell.import` off): `zsh -i -c exit` with no TTY, 81 runs interleaved, median. The hook's normal path (no refresh due) costs about 0.3 ms: 25.2 ms through the line in `.zshenv` against 24.9 ms for a shell started the way goattyd starts it (`ZDOTDIR` set). The 25 `-nt` checks of the startup files take 0.03 ms of that. A refresh, when a startup file changed, waits at most 2 s once.
 
 ## Expansions
 

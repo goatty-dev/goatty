@@ -216,6 +216,7 @@ impl SettingsWindow {
             || self.aliases_modal_open()
             || self.prompt_modal_open()
             || self.shortcuts_modal_open()
+            || self.everywhere_modal_open()
         {
             return false;
         }

@@ -66,17 +66,19 @@ impl SettingsWindow {
             let zsh = matches!(choice, "auto" | "zsh");
             let z = &h.shell.zsh;
             let managed = h.shell.managed;
-            let hero = group(ui).child(
-                row(ui, "goatty's managed zsh")
-                    .icon(Icon::Zap)
-                    .desc(if zsh {
-                        "Plugins, prompt, history and shell integration, without touching your dotfiles. Off: plain zsh with your own config"
-                    } else {
-                        "Only for zsh: pick zsh or Automatic below to use it"
-                    })
-                    .disabled(!zsh)
-                    .control(toggle("managed", managed && zsh, ui, self.host(cx, |h| h.shell.managed = !h.shell.managed))),
-            );
+            let hero = group(ui)
+                .child(
+                    row(ui, "goatty's managed zsh")
+                        .icon(Icon::Zap)
+                        .desc(if zsh {
+                            "Plugins, prompt, history and shell integration, without touching your dotfiles. Off: plain zsh with your own config"
+                        } else {
+                            "Only for zsh: pick zsh or Automatic below to use it"
+                        })
+                        .disabled(!zsh)
+                        .control(toggle("managed", managed && zsh, ui, self.host(cx, |h| h.shell.managed = !h.shell.managed))),
+                )
+                .child(self.everywhere_row(ui, managed && zsh, cx));
             let this = cx.entity().downgrade();
             let program_section = section(ui, "Program")
                 .child(row(ui, "Shell").control(self.select(

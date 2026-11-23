@@ -15,6 +15,11 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::TermSize;
 
+/// The terminal (`/dev/pts/N`) of a goatty pane, set in its shell's
+/// environment. goatty's managed zsh compares it with `$TTY` (and
+/// `TERM_PROGRAM`) to tell whether it runs in goatty or elsewhere.
+pub const TTY_ENV: &str = "GOATTY_TTY";
+
 #[derive(Debug, Clone)]
 pub struct ShellCommand {
     pub program: String,
@@ -103,6 +108,13 @@ impl Pty {
         b.env("COLORTERM", "truecolor");
         b.env("TERM_PROGRAM", "goatty");
         b.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        // The pane's own terminal: goatty's shell sends goatty-only escape
+        // codes only while `$TTY` is this one. Programs it starts inherit
+        // the variable, but their shells (an IDE's, tmux panes) run on
+        // other terminals.
+        if let Some(tty) = pair.master.tty_name() {
+            b.env(TTY_ENV, tty);
+        }
         for (k, v) in &cmd.env {
             b.env(k, v);
         }

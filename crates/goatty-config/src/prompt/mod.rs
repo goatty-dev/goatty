@@ -525,6 +525,10 @@ pub struct PromptSettings {
     pub colors: PromptColors,
     /// Per-module settings by Starship module name.
     pub modules: BTreeMap<String, ModuleConfig>,
+    /// Keep Nerd Font icons in other terminals too (goatty's shell in every
+    /// terminal, #283). goatty draws them with its own font; elsewhere they
+    /// need a Nerd Font, so by default other terminals get [`Self::plain`].
+    pub icons_elsewhere: bool,
 }
 
 impl Default for PromptSettings {
@@ -546,11 +550,74 @@ impl Default for PromptSettings {
             character: CharacterPrompt::default(),
             colors: PromptColors::default(),
             modules: BTreeMap::new(),
+            icons_elsewhere: false,
         }
     }
 }
 
+/// A glyph only Nerd Fonts (or Powerline fonts) draw: Unicode's private use areas.
+fn is_private_use(c: char) -> bool {
+    matches!(c, '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..)
+}
+
+fn has_private_use(s: &str) -> bool {
+    s.chars().any(is_private_use)
+}
+
 impl PromptSettings {
+    /// The prompt draws glyphs that need a Nerd Font: icons, Powerline
+    /// separators or segment ends, or a symbol of the user's from the
+    /// private use area.
+    pub fn needs_nerd_font(&self) -> bool {
+        self.symbols == Symbols::Nerd || self != &self.plain()
+    }
+
+    /// Other terminals (outside goatty) get [`Self::plain`] instead of this
+    /// prompt: it needs a Nerd Font and [`Self::icons_elsewhere`] is off.
+    pub fn plain_elsewhere(&self) -> bool {
+        !self.icons_elsewhere && self.needs_nerd_font()
+    }
+
+    /// The same prompt, drawable in any font: text symbols instead of Nerd
+    /// Font icons, thin lines instead of Powerline separators, flat segment
+    /// ends, and the user's own symbols that are Nerd Font glyphs back to
+    /// the defaults. Everything else (style, modules, colors) stays.
+    pub fn plain(&self) -> Self {
+        let mut p = self.clone();
+        if p.symbols == Symbols::Nerd {
+            p.symbols = Symbols::Text;
+        }
+        if has_private_use(p.separator.glyph(Side::Left)) || has_private_use(p.separator.glyph(Side::Right)) {
+            p.separator = Separator::Vertical;
+        }
+        for edge in [&mut p.heads, &mut p.tails] {
+            if has_private_use(edge.glyph(Side::Left)) || has_private_use(edge.glyph(Side::Right)) {
+                *edge = Edge::Flat;
+            }
+        }
+        let d = DirectoryPrompt::default();
+        if has_private_use(&p.directory.truncation_symbol) {
+            p.directory.truncation_symbol = d.truncation_symbol;
+        }
+        if has_private_use(&p.directory.home_symbol) {
+            p.directory.home_symbol = d.home_symbol;
+        }
+        for s in [&mut p.character.success, &mut p.character.error, &mut p.character.vicmd] {
+            if has_private_use(s) {
+                s.clear();
+            }
+        }
+        let ids: Vec<String> = p.modules.keys().cloned().collect();
+        for id in ids {
+            p.edit_module(&id, |c| {
+                if c.symbol.as_deref().is_some_and(has_private_use) {
+                    c.symbol = None;
+                }
+            });
+        }
+        p
+    }
+
     /// Whether module `m` shows (where it's relevant).
     pub fn module_on(&self, m: &Module) -> bool {
         match m.id {

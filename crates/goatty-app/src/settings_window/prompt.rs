@@ -569,7 +569,26 @@ impl SettingsWindow {
                             cx,
                             self.set_prompt(cx, |p, e| p.tails = e),
                         )),
-                );
+                )
+                .child({
+                    // goatty draws Nerd Font glyphs with its own font; other
+                    // terminals (goatty's shell in every terminal) need one.
+                    let nerd = p.needs_nerd_font();
+                    row(ui, "Icons in other terminals")
+                        .desc(match (starship, nerd) {
+                            (false, _) => "Needs Starship".to_owned(),
+                            (true, false) => "This prompt draws in any font".to_owned(),
+                            (true, true) if p.icons_elsewhere => "Other terminals need a Nerd Font for them".to_owned(),
+                            (true, true) => "Off: text instead of icons where goatty's shell runs outside goatty".to_owned(),
+                        })
+                        .disabled(!starship || !nerd)
+                        .control(toggle(
+                            "prompt-icons-elsewhere",
+                            p.icons_elsewhere,
+                            ui,
+                            self.host(cx, |h| h.prompt.icons_elsewhere = !h.prompt.icons_elsewhere),
+                        ))
+                });
 
             let mut durations: Vec<u32> = vec![0, 1000, 2000, 3000, 5000, 10_000, 30_000, 60_000];
             if !durations.contains(&p.duration_threshold_ms) {

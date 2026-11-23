@@ -140,7 +140,7 @@ impl Context {
         self.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
-    fn which(&self, bin: &str) -> Option<String> {
+    pub(crate) fn which(&self, bin: &str) -> Option<String> {
         let path = self.var("PATH")?;
         std::env::split_paths(path).map(|d| d.join(bin)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
     }

@@ -6,7 +6,12 @@
 # the user's ZDOTDIR back and sources their .zshenv. For interactive shells
 # it then points ZDOTDIR here again, so zsh reads goatty's .zprofile and
 # .zshrc next. The end of .zshrc restores the user's ZDOTDIR for good, so
-# .zlogin, .zlogout and any zsh started later behave like plain zsh.
+# .zlogin, .zlogout and any zsh started later behave like plain zsh (or,
+# with goatty's shell in every terminal, start goatty's again through the
+# line in the user's .zshenv).
+#
+# That line sources entry.zsh, which sources this file from inside the
+# user's .zshenv (`_goatty_hooked`): it must not source that file again.
 
 # PATH after each startup step (interactive shells), so goatty's PATH page
 # can tell where each folder came from: step<TAB>$PATH. Anything new here
@@ -55,7 +60,7 @@ _goatty_zdotdir_user
 
 # Sourced at top level, not from a function: `typeset` in the user's file
 # must create globals.
-if (( _goatty_user_env )) && _goatty_user_file .zshenv; then
+if (( _goatty_user_env && ! ${+_goatty_hooked} )) && _goatty_user_file .zshenv; then
   builtin source -- "$REPLY"
 fi
 [[ -o interactive ]] && _goatty_path_marks+=("zshenv"$'\t'"$PATH")

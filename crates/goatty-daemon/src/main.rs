@@ -326,6 +326,31 @@ enum ShellCmd {
         #[arg(long)]
         refresh: bool,
     },
+    /// goatty's shell in every terminal: one line in your .zshenv makes every
+    /// interactive zsh on this host (IDE terminals, other terminals, tmux, SSH
+    /// logins) run goatty's shell. Without an argument: whether it's on.
+    Everywhere {
+        #[arg(value_enum, default_value_t = Everywhere::Status)]
+        action: Everywhere,
+        /// Don't ask before adding the line.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Bring the shell configuration and what goatty imports from your own
+    /// shell up to date now, as a new goatty tab would. Shells outside goatty
+    /// run it when a startup file changed.
+    Refresh {
+        /// Return after this many seconds at most; the refresh finishes in the background.
+        #[arg(long, value_name = "SECS")]
+        wait: Option<f64>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Everywhere {
+    Status,
+    On,
+    Off,
 }
 
 const CLIENT: &str = concat!("goattyd-cli ", env!("CARGO_PKG_VERSION"));
@@ -497,9 +522,38 @@ fn main() -> Result<()> {
                     println!("asked {n} running shell(s) to reload");
                     Ok(())
                 }
+                ShellCmd::Everywhere { action, yes } => {
+                    use goatty_shell::everywhere::Action;
+                    let action = match action {
+                        Everywhere::Status => Action::Status,
+                        Everywhere::On => Action::On,
+                        Everywhere::Off => Action::Off,
+                    };
+                    cmd::everywhere(&goatty_shell::HostService::from_env(std::env::current_exe().ok()), action, yes)
+                }
+                ShellCmd::Refresh { wait: Some(secs) } => cmd::refresh_detached(std::time::Duration::from_secs_f64(secs.clamp(0., 60.))),
+                ShellCmd::Refresh { wait: None } => match refresh_via_daemon() {
+                    Some(r) => r,
+                    None => cmd::refresh(&goatty_shell::HostService::from_env(std::env::current_exe().ok())),
+                },
             }
         }
     }
+}
+
+/// `goattyd shell refresh` through the running goattyd, which harvests with
+/// its own environment (the one the import compares against). `None`: no
+/// goattyd here (or one too old to ask), so this process does it.
+fn refresh_via_daemon() -> Option<Result<()>> {
+    let request = serde_json::to_string(&goatty_shell::setup::Request::Refresh).ok()?;
+    let mut c = Control::connect_within(&goatty_proto::socket_path(), CLIENT, Some(std::time::Duration::from_secs(2))).ok()?;
+    if c.protocol_version() < goatty_proto::SHELL_SINCE {
+        return None;
+    }
+    Some(c.shell(request).and_then(|reply| match serde_json::from_str(&reply)? {
+        goatty_shell::setup::Reply::Done => Ok(()),
+        other => anyhow::bail!("unexpected reply from goattyd: {other:?}"),
+    }))
 }
 
 /// goattyd's completion script for `shell`.

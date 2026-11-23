@@ -68,6 +68,13 @@ pub enum Request {
         #[serde(default)]
         refresh: bool,
     },
+    /// goatty's shell in every terminal: the line in the user's `.zshenv`
+    /// (`status`, `on`, `off`). Reply: `Everywhere`.
+    Everywhere { action: crate::everywhere::Action },
+    /// Bring the configuration and the import up to date as a new session
+    /// would (shells outside goatty ask when a startup file changed).
+    /// Reply: `Done`.
+    Refresh,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +87,7 @@ pub enum Reply {
     Diff { files: Vec<generation::FileDiff> },
     Path(Box<crate::path_report::Report>),
     Import(Box<crate::import::Status>),
+    Everywhere(Box<crate::everywhere::Status>),
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -279,6 +287,11 @@ impl HostService {
             Request::GenerationDiff { number } => Ok(Reply::Diff { files: history::file_diff(dirs_of(self)?, number)? }),
             Request::Path => Ok(Reply::Path(Box::new(self.path_report()))),
             Request::Import { refresh } => Ok(Reply::Import(Box::new(self.import_status(refresh)?))),
+            Request::Everywhere { action } => Ok(Reply::Everywhere(Box::new(self.everywhere(action)?))),
+            Request::Refresh => {
+                self.launcher.refresh(&self.settings())?;
+                Ok(Reply::Done)
+            }
         }
     }
 }
@@ -537,6 +550,61 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), req);
         let reply = Reply::Installed(Installed { lines: vec!["x".into()], failed: 0 });
         assert_eq!(serde_json::from_str::<Reply>(&serde_json::to_string(&reply).unwrap()).unwrap(), reply);
+    }
+
+    #[test]
+    fn everywhere_requests_turn_the_line_on_and_off() {
+        use crate::everywhere::{Action, State};
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".zshenv"), "export A=1\n").unwrap();
+        let dirs = Dirs::under(&tmp.path().join("xdg"));
+        // zsh from the sandbox's PATH (when the host has it), never the real home.
+        let path = crate::launch::which("zsh").map(|z| std::path::Path::new(&z).parent().unwrap().to_string_lossy().into_owned());
+        let env = vec![("HOME".into(), home.to_string_lossy().into_owned()), ("PATH".into(), path.clone().unwrap_or_default())];
+        let ctx = crate::import::Context::new(home.clone(), Some("/bin/zsh".into()), env, &dirs.zsh_dir());
+        let svc = HostService::new(Launcher::new(Some(dirs.clone()), None).with_import_context(ctx), Some(dirs.host_file()));
+        let ask = |action| match svc.shell_request(Request::Everywhere { action }) {
+            Ok(Reply::Everywhere(s)) => Ok(*s),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        if path.is_none() {
+            assert!(ask(Action::On).unwrap_err().to_string().contains("zsh isn't installed"));
+            return;
+        }
+        let s = ask(Action::Status).unwrap();
+        assert_eq!((s.state, s.file.as_str(), s.active, s.unavailable.as_deref()), (State::Off, "~/.zshenv", true, None));
+        let s = ask(Action::On).unwrap();
+        assert_eq!(s.state, State::On);
+        assert!(dirs.zsh_dir().join("entry.zsh").is_file(), "entry.zsh comes with the generation");
+        let text = std::fs::read_to_string(home.join(".zshenv")).unwrap();
+        assert!(text.starts_with("export A=1\n") && text.ends_with(&format!("{}\n", s.lines[1])), "{text}");
+        assert_eq!(ask(Action::Off).unwrap().state, State::Off);
+        assert_eq!(std::fs::read_to_string(home.join(".zshenv")).unwrap(), "export A=1\n");
+
+        // goatty's zsh off: it can't be turned on (the line would do nothing), but off works.
+        svc.set(r#"{"shell": {"managed": false}}"#, true).unwrap();
+        let s = ask(Action::Status).unwrap();
+        assert!(!s.active && s.unavailable.is_some(), "{s:?}");
+        assert!(ask(Action::On).is_err());
+        let entry = std::fs::read_to_string(dirs.zsh_dir().join("entry.zsh")).unwrap();
+        assert!(entry.contains("(( 0 )) || builtin return 0"), "the hook does nothing then: {entry}");
+    }
+
+    #[test]
+    fn refresh_builds_and_notes_the_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let svc = HostService::new(Launcher::new(Some(dirs.clone()), None), Some(dirs.host_file()));
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        assert_eq!(svc.shell_request(Request::Refresh).unwrap(), Reply::Done);
+        assert!(dirs.zsh_dir().join("entry.zsh").is_file());
+        let stamp = std::fs::metadata(dirs.refresh_stamp()).unwrap().modified().unwrap();
+        assert!(stamp >= before && stamp <= std::time::SystemTime::now(), "{stamp:?}");
+        let json = serde_json::to_string(&Request::Everywhere { action: crate::everywhere::Action::On }).unwrap();
+        assert_eq!(json, r#"{"op":"everywhere","action":"on"}"#);
     }
 
     #[test]

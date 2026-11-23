@@ -133,6 +133,7 @@ pub const INDEX: &[Entry] = &[
     e(Page::Shortcuts, "Custom", "Custom commands", "custom command shortcut lazygit split tab send keys").keys(&["commands.custom"]),
     e(Page::Shortcuts, "Plugins", "Plugin command placement", "open in split tab current pane plugin command").keys(&["commands.open_in"]),
     e(Page::Shell, "", "goatty's managed zsh", "zsh managed dotfiles").keys(&["shell.managed"]),
+    e(Page::Shell, "", super::everywhere::LABEL, "every terminal everywhere vscode ide editor tmux ssh zshenv hook other terminals"),
     e(Page::Snippets, "Expansions", "Expand plain words while typing", "expansion abbreviation space first lines head rewrite")
         .keys(&["shell.expansions", "expansions"]),
     e(Page::Snippets, "My snippets", "My snippets", "snippet cheatsheet template blanks fill in").keys(&["snippets"]),
@@ -166,6 +167,8 @@ pub const INDEX: &[Entry] = &[
     e(Page::Prompt, "Style", "Separators", "powerline angled round slanted vertical").keys(&["prompt.separator"]),
     e(Page::Prompt, "Style", "Segment heads", "powerline round edges ends caps sharp blurred pill").keys(&["prompt.heads"]),
     e(Page::Prompt, "Style", "Segment tails", "powerline round edges ends caps sharp blurred pill").keys(&["prompt.tails"]),
+    e(Page::Prompt, "Style", "Icons in other terminals", "nerd font icons vscode ide everywhere glyphs boxes")
+        .keys(&["prompt.icons_elsewhere"]),
     e(Page::Prompt, "Layout", "Input on its own line", "two line newline").keys(&["prompt.two_line"]),
     e(Page::Prompt, "Layout", "Frame", "box border lines").keys(&["prompt.frame"]),
     e(Page::Prompt, "Layout", "Connection line", "fill dotted solid gap").keys(&["prompt.connection"]),

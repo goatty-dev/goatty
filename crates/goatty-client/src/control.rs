@@ -194,6 +194,19 @@ impl Control {
         }
     }
 
+    /// A shell setup operation (`goatty_shell::setup::Request` as JSON);
+    /// returns the reply JSON. Needs protocol v9.
+    pub fn shell(&mut self, request: String) -> Result<String> {
+        if self.version < goatty_proto::SHELL_SINCE {
+            bail!("goattyd (protocol v{}) is too old for shell operations; restart it with `goattyd restart`", self.version);
+        }
+        match self.request(|req| ClientMsg::Shell { req, request })? {
+            ServerMsg::Shell { reply, .. } => Ok(reply),
+            ServerMsg::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
     /// A tailnet operation (`goatty_net::api::Request` as JSON); returns
     /// the reply JSON. Needs protocol v12.
     pub fn net(&mut self, request: String) -> Result<String> {

@@ -205,3 +205,31 @@ fn validation_cleans_up() {
     assert_eq!(p.modules["rust"].symbol.as_ref().unwrap().len(), MAX_TEXT);
     assert_eq!(p.modules["rust"].color.as_deref(), Some("bright-blue"));
 }
+
+#[test]
+fn plain_prompt_needs_no_nerd_font() {
+    let mut p = PromptSettings { style: PromptStyle::Rainbow, heads: Edge::Round, tails: Edge::Blurred, ..Default::default() };
+    p.directory.home_symbol = "\u{f015}".into();
+    p.character.success = "\u{e0b0}".into();
+    p.edit_module("git_branch", |c| {
+        c.symbol = Some("\u{f418} ".into());
+        c.color = Some("red".into());
+    });
+    p.edit_module("rust", |c| c.symbol = Some("R ".into()));
+    assert!(p.needs_nerd_font() && p.plain_elsewhere());
+    let plain = p.plain();
+    assert_eq!(plain.symbols, Symbols::Text);
+    assert_eq!((plain.separator, plain.heads, plain.tails), (Separator::Vertical, Edge::Flat, Edge::Blurred));
+    assert_eq!(plain.directory.home_symbol, "~");
+    assert!(plain.character.success.is_empty());
+    assert_eq!(plain.modules["git_branch"].symbol, None, "a Nerd Font symbol goes back to the default");
+    assert_eq!(plain.modules["git_branch"].color.as_deref(), Some("red"), "the rest stays");
+    assert_eq!(plain.modules["rust"].symbol.as_deref(), Some("R "));
+    assert!(!plain.needs_nerd_font());
+    assert_eq!(plain.plain(), plain);
+
+    let emoji = PromptSettings { symbols: Symbols::Emoji, separator: Separator::Slanted, heads: Edge::Flat, ..Default::default() };
+    assert!(!emoji.needs_nerd_font(), "emoji and box drawing are in common fonts");
+    let kept = PromptSettings { icons_elsewhere: true, ..Default::default() };
+    assert!(kept.needs_nerd_font() && !kept.plain_elsewhere());
+}

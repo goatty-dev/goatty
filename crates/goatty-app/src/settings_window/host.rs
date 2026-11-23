@@ -215,6 +215,15 @@ impl HostLink {
         }
     }
 
+    /// goatty's shell in every terminal on the host: the line in its
+    /// `.zshenv`, after `action` (`on` writes the file there).
+    pub fn everywhere(&self, action: goatty_shell::everywhere::Action) -> Result<goatty_shell::everywhere::Status> {
+        match self.shell(setup::Request::Everywhere { action })? {
+            setup::Reply::Everywhere(s) => Ok(*s),
+            other => bail!("unexpected reply from the host: {other:?}"),
+        }
+    }
+
     /// A tailnet operation on the host (its availability, pairing, paired
     /// devices). Runs `tailscale` there: off the UI thread.
     pub fn net(&self, req: &goatty_net::api::Request) -> Result<goatty_net::api::NetStatus> {

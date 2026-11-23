@@ -7,7 +7,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use goatty_config::{Effective, HostSettings, ZshSettings};
 use goatty_shell::{Dirs, Launch, Launcher};
@@ -1998,4 +1998,308 @@ echo \"ro:$*\" >> \"$HOME/init-calls\"
     assert!(out_fzf_cold.contains("fzf=warn") && out_fzf_cold.contains("fzf-setup-warning"), "{out_fzf_cold}");
     let out_fzf_warm = pty_session(&sb, &launch, &["print -r -- \"fzf=$fzf_ok\""]);
     assert!(out_fzf_warm.contains("fzf=warn") && out_fzf_warm.contains("fzf-setup-warning"), "{out_fzf_warm}");
+}
+
+// ---- goatty's shell in every terminal (#283) ---------------------------------
+
+impl Sandbox {
+    /// Build the generation (import off) and add goatty's line to the
+    /// sandbox's `.zshenv` (after `zshenv`, the user's own content).
+    fn hook(&self, zshenv: &str) -> goatty_shell::everywhere::Hook<'_> {
+        self.launch_with(no_highlighting(), None);
+        self.file(".zshenv", zshenv);
+        let hook = goatty_shell::everywhere::Hook::new(&self.dirs, &self.home, self.home.join(".zshenv"));
+        hook.enable().unwrap();
+        self.refreshed_at(SystemTime::now() + Duration::from_secs(3600));
+        hook
+    }
+
+    /// Pretend the last refresh happened `at` (in the future: nothing is
+    /// newer, so hooked shells don't ask the sandbox's fake goattyd).
+    fn refreshed_at(&self, at: SystemTime) {
+        let stamp = self.dirs.refresh_stamp();
+        std::fs::create_dir_all(stamp.parent().unwrap()).unwrap();
+        std::fs::File::options().create(true).truncate(false).write(true).open(&stamp).unwrap().set_modified(at).unwrap();
+    }
+
+    /// A plain `zsh ARGS` as another terminal starts it: no ZDOTDIR, only
+    /// the sandbox's environment plus `env`.
+    fn plain(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        Command::new(&self.zsh)
+            .args(args)
+            .env_clear()
+            .envs(self.base_env())
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
+            .current_dir(&self.home)
+            .output()
+            .unwrap()
+    }
+}
+
+/// Prints whether goatty's shell loaded (its `goatty-reload`), then ZDOTDIR.
+const MANAGED: &str = "print -r -- managed=${+functions[goatty-reload]} zd=${ZDOTDIR-unset}";
+
+#[test]
+fn hooked_zshenv_makes_interactive_shells_goattys() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook(&traced("zshenv", ""));
+    sb.file(".zprofile", &traced("zprofile", "path=($HOME/userbin $path)\n"));
+    sb.file(".zshrc", &traced("zshrc", ""));
+
+    // An interactive login shell (an SSH login, a terminal): goatty's shell,
+    // the user's .zshenv and .zprofile once, ZDOTDIR theirs again afterwards.
+    let o = sb.plain(&["-l", "-i", "-c", MANAGED], &[]);
+    assert_eq!(stdout(&o).trim(), "managed=1 zd=unset", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(sb.trace(), ["zshenv:unset", "zprofile:unset"], ".zshrc stays out (shell.zsh.user_rc is off)");
+
+    // Interactive, not login (VS Code on Linux, tmux with a default-command).
+    let o = sb.plain(&["-i", "-c", MANAGED], &[]);
+    assert_eq!(stdout(&o).trim(), "managed=1 zd=unset", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+
+    // Scripts and `zsh -c` stay plain, and so does the escape hatch.
+    assert_eq!(stdout(&sb.plain(&["-c", MANAGED], &[])).trim(), "managed=0 zd=unset");
+    for off in ["0", "false", "OFF"] {
+        let o = sb.plain(&["-i", "-c", MANAGED], &[("GOATTY_SHELL_MANAGED", off)]);
+        assert_eq!(stdout(&o).trim(), "managed=0 zd=unset", "GOATTY_SHELL_MANAGED={off}");
+    }
+
+    // Nested shells (and `exec zsh`) from a hooked shell are goatty's too, and
+    // a shell goattyd started doesn't loop through the hook: the user's
+    // .zshenv runs once per shell.
+    std::fs::remove_file(sb.home.join("trace")).unwrap();
+    let o = sb.plain(&["-i", "-c", &format!("{MANAGED}; {} -i -c '{MANAGED}'", sb.zsh)], &[]);
+    assert_eq!(stdout(&o), "managed=1 zd=unset\nmanaged=1 zd=unset\n", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(sb.trace(), ["zshenv:unset", "zshenv:unset"]);
+    std::fs::remove_file(sb.home.join("trace")).unwrap();
+    let launch = sb.launch_with(no_highlighting(), None);
+    let o = sb.run(&launch, MANAGED);
+    assert_eq!(stdout(&o).trim(), "managed=1 zd=unset", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(sb.trace(), ["zshenv:unset", "zprofile:unset"]);
+}
+
+#[test]
+fn hooked_zshenv_keeps_the_users_zdotdir() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    // The common ~/.config/zsh pattern: ~/.zshenv sets ZDOTDIR, the rest lives there.
+    let zd = sb.home.join(".config/zsh");
+    sb.hook(&format!("{}export ZDOTDIR={}\n", traced("zshenv", ""), zd.display()));
+    sb.file(".config/zsh/.zprofile", &traced("zprofile", ""));
+    sb.file(".config/zsh/.zlogin", &traced("zlogin", ""));
+    let o = sb.plain(&["-l", "-i", "-c", MANAGED], &[]);
+    assert_eq!(stdout(&o).trim(), format!("managed=1 zd={}", zd.display()), "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    let zd = zd.display();
+    assert_eq!(sb.trace(), ["zshenv:unset".to_owned(), format!("zprofile:{zd}"), format!("zlogin:{zd}")]);
+}
+
+#[test]
+fn hook_fails_safe_without_goattys_files() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook("export MINE=1\n");
+    // goatty uninstalled, or its data gone: plain zsh, no errors.
+    std::fs::remove_dir_all(&sb.dirs.data).unwrap();
+    let o = sb.plain(&["-l", "-i", "-c", &format!("{MANAGED} mine=$MINE")], &[]);
+    assert_eq!(stdout(&o).trim(), "managed=0 zd=unset mine=1");
+    assert_eq!(String::from_utf8_lossy(&o.stderr), "", "no errors");
+
+    // goatty's managed zsh turned off: the line stays and does nothing.
+    let sb = Sandbox::new(sb.zsh.clone());
+    sb.hook("");
+    let mut off = no_highlighting();
+    off.shell.managed = false;
+    sb.launcher().apply(&Effective::plain(off)).unwrap();
+    let o = sb.plain(&["-i", "-c", MANAGED], &[]);
+    assert_eq!(stdout(&o).trim(), "managed=0 zd=unset", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn harvest_with_the_hook_reads_the_users_own_files() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook("");
+    sb.file(".zshrc", "export FROM_ZSHRC=yes\npath=($HOME/rcbin $path)\n");
+    std::fs::create_dir_all(sb.home.join("rcbin")).unwrap();
+    let ctx = goatty_shell::import::Context::new(sb.home.clone(), Some(sb.zsh.clone()), sb.base_env(), &sb.dirs.zsh_dir());
+    let deadline = goatty_shell::import::Deadline::Wait(Duration::from_secs(20));
+    let (ok, record) = goatty_shell::import::refresh(&sb.dirs, goatty_config::ImportFrom::Zsh, &ctx, deadline, true).unwrap().unwrap();
+    let h = record.harvest.expect("a harvest");
+    assert!(ok, "{:?}", record.failure);
+    // goatty's .zshrc doesn't run the user's (user_rc is off), so these prove
+    // the harvest bypassed the hook.
+    assert!(h.vars.iter().any(|v| v.name == "FROM_ZSHRC" && v.value == "yes"), "{:?}", h.vars);
+    assert!(h.added_path().iter().any(|d| d.ends_with("/rcbin")), "{:?}", h.added_path());
+    assert!(!h.vars.iter().any(|v| v.name == "STARSHIP_LOG" || v.name.starts_with("FZF_")), "nothing of goatty's: {:?}", h.vars);
+    assert_eq!(h.zdotdir, None);
+}
+
+/// A shell in a PTY with `env` on top of the sandbox's; returns what it
+/// printed until `marker` (the prompt's end) showed `prompts` times after
+/// typing each line, then `exit`.
+fn pty_raw(sb: &Sandbox, args: &[&str], env: &[(&str, &str)], marker: &[u8], input: &[&str]) -> String {
+    let mut all = sb.base_env();
+    all.extend(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let mut cmd = ShellCommand::new(sb.zsh.clone(), args.iter().map(|a| a.to_string()).collect(), all);
+    cmd.cwd = Some(sb.home.clone());
+    let (mut pty, mut reader) = Pty::spawn(&cmd, TermSize::new(120, 40)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out = Vec::new();
+    let wait_prompts = |n: usize, out: &mut Vec<u8>| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while out.windows(marker.len()).filter(|w| *w == marker).count() < n {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(chunk) => out.extend(chunk),
+                Err(_) => panic!("waiting for prompt {n} ({:?}):\n{:?}", String::from_utf8_lossy(marker), String::from_utf8_lossy(out)),
+            }
+        }
+    };
+    wait_prompts(1, &mut out);
+    for (i, line) in input.iter().enumerate() {
+        pty.write(format!("{line}\r").as_bytes()).unwrap();
+        wait_prompts(i + 2, &mut out);
+    }
+    pty.write(b"exit\r").unwrap();
+    while let Ok(chunk) = rx.recv_timeout(Duration::from_secs(3)) {
+        out.extend(chunk);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn outside_goatty_only_standard_escape_codes_go_out() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook("");
+    // Another terminal: TERM_PROGRAM and the pane's terminal aren't goatty's
+    // (a GOATTY_TTY inherited from a goatty tab doesn't count either).
+    let other = [("TERM_PROGRAM", "otherterm"), ("GOATTY_TTY", "/dev/pts/none")];
+    let out = pty_raw(&sb, &["-i"], &other, b"\x1b]133;B", &["false", "print -r -- cfg=${STARSHIP_CONFIG:t}"]);
+    assert!(!out.contains("7337"), "no goatty-only codes: {out:?}");
+    assert!(out.contains("\x1b]133;A") && out.contains("\x1b]133;D;1\x07"), "OSC 133 marks: {out:?}");
+    assert!(out.contains("\x1b]7;file://"), "OSC 7: {out:?}");
+    // The same hooked shell in a goatty pane (the PTY sets GOATTY_TTY).
+    let out = pty_raw(&sb, &["-i"], &[], b"\x1b]133;B", &[]);
+    assert!(out.contains("\x1b]7337;zle=1\x07"), "{out:?}");
+}
+
+#[test]
+fn other_terminals_get_the_prompt_without_nerd_font_icons() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook("");
+    sb.file(".zprofile", "path=($HOME/userbin $path)\n");
+    let plain = sb.dirs.zsh_dir().join("starship-plain.toml");
+    let text = std::fs::read_to_string(&plain).unwrap();
+    assert!(!text.chars().any(|c| ('\u{e000}'..='\u{f8ff}').contains(&c) || c >= '\u{f0000}'), "no Nerd Font glyphs:\n{text}");
+    let cfg = "print -r -- cfg=${STARSHIP_CONFIG:t}";
+    let o = sb.plain(&["-l", "-i", "-c", cfg], &[]);
+    assert_eq!(stdout(&o).trim(), "cfg=starship-plain.toml", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+    let out = pty_raw(&sb, &["-l", "-i"], &[], b"\x1b]133;B", &[cfg]);
+    assert!(out.contains("cfg=starship.toml"), "goatty's pane draws the icons itself: {out:?}");
+    // With prompt.icons_elsewhere, other terminals keep them.
+    let mut keep = no_highlighting();
+    keep.prompt.icons_elsewhere = true;
+    sb.launch_with(keep, None);
+    let o = sb.plain(&["-l", "-i", "-c", cfg], &[]);
+    assert_eq!(stdout(&o).trim(), "cfg=starship.toml");
+}
+
+/// VS Code's shell integration (from an installed VS Code) on top of the
+/// hook: both load, history stays in the user's file, ZDOTDIR comes back.
+#[test]
+fn hook_chains_with_vscode_shell_integration() {
+    let Some(zsh) = zsh() else { return };
+    let scripts = [
+        "/usr/share/code/resources/app/out/vs/workbench/contrib/terminal/common/scripts",
+        "/opt/visual-studio-code/resources/app/out/vs/workbench/contrib/terminal/common/scripts",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|d| d.join("shellIntegration-rc.zsh").is_file());
+    let Some(scripts) = scripts else {
+        eprintln!("VS Code not installed; skipping");
+        return;
+    };
+    let sb = Sandbox::new(zsh);
+    sb.hook(&traced("zshenv", ""));
+    sb.file(".zlogin", &traced("zlogin", ""));
+    // What VS Code does: its scripts as the startup files of a ZDOTDIR of its own.
+    let vsc = sb.home.join("vscode-zdotdir");
+    std::fs::create_dir_all(&vsc).unwrap();
+    for (from, to) in [("rc", ".zshrc"), ("profile", ".zprofile"), ("env", ".zshenv"), ("login", ".zlogin")] {
+        std::fs::copy(scripts.join(format!("shellIntegration-{from}.zsh")), vsc.join(to)).unwrap();
+    }
+    let home = sb.home.to_string_lossy().into_owned();
+    let vsc = vsc.to_string_lossy().into_owned();
+    let env = [
+        ("ZDOTDIR", vsc.as_str()),
+        ("USER_ZDOTDIR", home.as_str()),
+        ("VSCODE_INJECTION", "1"),
+        ("TERM_PROGRAM", "vscode"),
+        ("GOATTY_TTY", "/dev/pts/none"),
+    ];
+    let probe = "print -r -- goatty=${+functions[goatty-reload]} vscode=${+functions[__vsc_precmd]} hist=${HISTFILE:t}:${${HISTFILE:h}:A} zd=${ZDOTDIR-unset} marks=$_goatty_marks";
+    for args in [&["-i"][..], &["-l", "-i"][..]] {
+        std::fs::remove_file(sb.home.join("trace")).ok();
+        let out = pty_raw(&sb, args, &env, b"\x1b]633;B", &[probe]);
+        // VS Code sets ZDOTDIR to $HOME (its "unset"), and points it at
+        // goatty's directory after startup: the first prompt hands it back.
+        let want = format!("goatty=1 vscode=1 hist=.zsh_history:{home} zd={home} marks=0\r\n");
+        assert!(out.contains(&want), "{args:?}: want {want:?} in\n{out:?}");
+        assert!(!out.contains("7337") && !out.contains("\x1b]133;"), "VS Code marks prompts itself: {out:?}");
+        if args.contains(&"-l") {
+            assert_eq!(sb.trace(), [format!("zshenv:{home}"), format!("zlogin:{home}")], "the user's .zlogin runs too");
+        }
+    }
+}
+
+/// kitty's shell integration (from an installed kitty): both load, and
+/// goatty leaves the prompt marks to kitty.
+#[test]
+fn hook_chains_with_kitty_shell_integration() {
+    let Some(zsh) = zsh() else { return };
+    let kitty = Path::new("/usr/lib/kitty/shell-integration/zsh");
+    if !kitty.join(".zshenv").is_file() {
+        eprintln!("kitty not installed; skipping");
+        return;
+    }
+    let sb = Sandbox::new(zsh);
+    sb.hook("");
+    let kitty = kitty.to_string_lossy().into_owned();
+    let env =
+        [("ZDOTDIR", kitty.as_str()), ("KITTY_SHELL_INTEGRATION", "enabled"), ("TERM_PROGRAM", "kitty"), ("GOATTY_TTY", "/dev/pts/none")];
+    let o = sb.plain(
+        &["-i", "-c", "print -r -- goatty=${+functions[goatty-reload]} kitty=${+functions[_ksi_deferred_init]} marks=$_goatty_marks"],
+        &env,
+    );
+    assert_eq!(stdout(&o).trim(), "goatty=1 kitty=1 marks=0", "stderr: {}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn hooked_shells_ask_for_a_refresh_when_a_startup_file_changed() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.hook("");
+    let asked = |sb: &Sandbox| sb.trace().iter().filter(|l| l.as_str() == "goattyd shell refresh --wait 2").count();
+    sb.plain(&["-i", "-c", "true"], &[]);
+    assert_eq!(asked(&sb), 0, "nothing changed since the last refresh");
+    // An installer appended to .zshrc after the last refresh.
+    sb.refreshed_at(SystemTime::now() - Duration::from_secs(60));
+    sb.file(".zshrc", "export PATH=$HOME/.new/bin:$PATH\n");
+    let o = sb.plain(&["-i", "-c", MANAGED], &[]);
+    assert_eq!(stdout(&o).trim(), "managed=1 zd=unset", "a failing goattyd doesn't break the shell");
+    assert_eq!(asked(&sb), 1);
+    // Never for scripts, nor in goatty's own sessions (they refresh when they start).
+    sb.plain(&["-c", "true"], &[]);
+    sb.run(&sb.launch_with(no_highlighting(), None), "true");
+    assert_eq!(asked(&sb), 1);
 }
