@@ -182,13 +182,21 @@ pub struct ImportSettings {
     pub enabled: bool,
     /// Whose startup files: the login shell's, zsh's or bash's.
     pub from: ImportFrom,
-    /// Variables left out, by name (`PATH` too).
+    /// Variables left out, by name (`PATH` too). Starts with
+    /// [`ImportSettings::CONFLICTING`].
     pub skip_vars: Vec<String>,
+}
+
+impl ImportSettings {
+    /// Variables that override goatty's own setup (fzf's options set the
+    /// look of the fzf and fzf-tab plugins), so they start switched off.
+    /// Sorted, like `skip_vars` after validation.
+    pub const CONFLICTING: &[&str] = &["FZF_ALT_C_OPTS", "FZF_CTRL_T_OPTS", "FZF_DEFAULT_OPTS", "FZF_DEFAULT_OPTS_FILE"];
 }
 
 impl Default for ImportSettings {
     fn default() -> Self {
-        Self { enabled: true, from: ImportFrom::Auto, skip_vars: Vec::new() }
+        Self { enabled: true, from: ImportFrom::Auto, skip_vars: Self::CONFLICTING.iter().map(|&n| n.into()).collect() }
     }
 }
 
@@ -278,11 +286,11 @@ impl Default for HistorySettings {
 
 impl Document for HostSettings {
     const NAME: &'static str = "host";
-    const VERSION: u32 = 4;
+    const VERSION: u32 = 5;
     const OPEN_MAPS: &'static [&'static str] = &["aliases", "snippets", "expansions", "plugins", "prompt.modules"];
 
     fn migrations() -> &'static [Migration] {
-        &[(1, builtin_tools_became_plugins), (2, atuin_left_the_builtins), (3, minimal_prompt_became_lean)]
+        &[(1, builtin_tools_became_plugins), (2, atuin_left_the_builtins), (3, minimal_prompt_became_lean), (4, conflicting_vars_skipped)]
     }
 
     fn validate(&mut self) -> Vec<Issue> {
@@ -406,6 +414,17 @@ fn minimal_prompt_became_lean(doc: &mut Value) {
     let modules = prompt.entry("modules").or_insert_with(|| Value::Object(Default::default()));
     if let Some(m) = modules.as_object_mut() {
         m.entry("git_branch").or_insert_with(|| serde_json::json!({ "symbol": "" }));
+    }
+}
+
+/// Version 4 → 5: [`ImportSettings::CONFLICTING`] became skipped by
+/// default. A stored `skip_vars` replaces that default, so it gets them too.
+fn conflicting_vars_skipped(doc: &mut Value) {
+    let Some(skip) = doc.pointer_mut("/shell/import/skip_vars").and_then(Value::as_array_mut) else { return };
+    for &name in ImportSettings::CONFLICTING {
+        if !skip.iter().any(|v| v == name) {
+            skip.push(name.into());
+        }
     }
 }
 
@@ -667,6 +686,23 @@ mod tests {
         let v2 = crate::store::parse::<HostSettings>(r#"{"version": 2, "prompt": {"starship": false}}"#);
         assert!(v2.value.plugin_enabled("starship"));
         assert_eq!(v2.unknown.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_vars_start_skipped() {
+        use crate::store::{parse, to_json};
+        let fresh = HostSettings::default();
+        assert_eq!(fresh.shell.import.skip_vars, ImportSettings::CONFLICTING);
+        assert!(!to_json(&fresh, &[]).contains("skip_vars"), "the default isn't written");
+        let old = parse::<HostSettings>(r#"{"version": 4, "shell": {"import": {"skip_vars": ["PATH", "FZF_DEFAULT_OPTS"]}}}"#);
+        assert!(old.issues.is_empty(), "{:?}", old.issues);
+        let mut want: Vec<&str> = ImportSettings::CONFLICTING.to_vec();
+        want.push("PATH");
+        want.sort();
+        assert_eq!(old.value.shell.import.skip_vars, want, "a stored list gets them too");
+        let on = parse::<HostSettings>(r#"{"version": 5, "shell": {"import": {"skip_vars": ["PATH"]}}}"#);
+        assert_eq!(on.value.shell.import.skip_vars, ["PATH"], "switched back on stays on");
+        assert_eq!(parse::<HostSettings>(r#"{"version": 4}"#).value, fresh);
     }
 
     #[test]
