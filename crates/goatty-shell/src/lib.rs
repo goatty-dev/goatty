@@ -11,6 +11,8 @@
 //! * [`import`]: what the user's own shell sets up (PATH, variables,
 //!   aliases from `.zshrc`/`.bashrc`), harvested in a separate process,
 //! * [`launch`]: which shell a session runs, and its environment,
+//! * [`everywhere`]: goatty's shell in every terminal, the opt-in line in
+//!   the user's `.zshenv`,
 //! * [`zsh`]: the startup files, rendered from the host settings,
 //! * [`generation`]: build, validate, activate and roll back configurations,
 //! * [`history`]: what each generation changed, names for them,
@@ -27,8 +29,10 @@
 //! * [`sync`]: what bringing this computer's shell setup to another host takes,
 //! * [`cmd`]: the `goattyd shell ...` commands.
 //!
-//! goatty never writes outside its own directories ([`dirs`]): no edits to
-//! `~/.zshrc`, the global PATH or the login shell.
+//! goatty writes under its own directories ([`dirs`]): no edits to
+//! `~/.zshrc`, the global PATH or the login shell. The one exception is
+//! opt-in: with the user's consent, [`everywhere`] adds one guarded line to
+//! their `.zshenv` (and removes exactly that line when they turn it off).
 
 pub mod aliases;
 pub mod builtins;
@@ -36,6 +40,7 @@ pub mod cmd;
 pub mod completions;
 pub mod dirs;
 pub mod doctor;
+pub mod everywhere;
 pub mod generation;
 pub mod history;
 pub mod import;

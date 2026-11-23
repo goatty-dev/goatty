@@ -16,6 +16,14 @@
 # PATH after each startup step (started in .zshenv): the system's zshrc ran.
 _goatty_path_marks+=("etc-zshrc"$'\t'"$PATH")
 
+# In one of goatty's panes: goattyd set GOATTY_TTY to the pane's terminal.
+# Programs started there inherit it, so it only counts on that terminal.
+# Elsewhere (goatty's shell in every terminal: an IDE, another terminal,
+# tmux, an SSH login) goatty's own escape codes stay out, and the prompt
+# can do without a Nerd Font.
+typeset -gi _goatty_inside=0
+[[ ${TERM_PROGRAM-} == goatty && -n ${GOATTY_TTY-} && $GOATTY_TTY == ${TTY-} ]] && _goatty_inside=1
+
 # feature -> "ok<TAB>detail" | "missing" | "off"
 typeset -gA _goatty_state
 # package -> the zsh script found for it (system copy or goatty's)
@@ -319,8 +327,25 @@ setopt complete_in_word always_to_end
 _goatty_on highlight-paste || zle_highlight=(${zle_highlight:#paste:*} paste:none)
 
 # --- History (settings: history.*) -------------------------------------------
-# Same file plain zsh would use, so existing history keeps working.
+# Same file plain zsh would use, so existing history keeps working. VS
+# Code's shell integration points HISTFILE at "your" ZDOTDIR, which with
+# goatty's shell in every terminal is goatty's directory: history kept
+# there would be gone with the next generation.
+[[ -n ${HISTFILE-} && ${HISTFILE:h:A} == ${_goatty_dir:A} ]] && builtin unset HISTFILE
 : ${HISTFILE:=${_goatty_user_zdotdir:-$HOME}/.zsh_history}
+# The same for macOS Terminal's session files (/etc/zshrc_Apple_Terminal
+# keeps them in "${ZDOTDIR:-$HOME}/.zsh_sessions", read while ZDOTDIR is goatty's).
+# Its shared history file is the HISTFILE it saw (goatty's directory too).
+if [[ -n ${SHELL_SESSION_DIR-} && ${SHELL_SESSION_DIR:h:A} == ${_goatty_dir:A} ]]; then
+  () {
+    local old=$SHELL_SESSION_DIR v
+    SHELL_SESSION_DIR=${_goatty_user_zdotdir:-$HOME}/.zsh_sessions
+    for v in SHELL_SESSION_FILE SHELL_SESSION_HISTFILE SHELL_SESSION_HISTFILE_NEW; do
+      [[ ${(P)v-} == "$old"/* ]] && typeset -g $v=$SHELL_SESSION_DIR/${${(P)v}#"$old"/}
+    done
+  }
+fi
+[[ -n ${SHELL_SESSION_HISTFILE_SHARED-} && ${SHELL_SESSION_HISTFILE_SHARED:h:A} == ${_goatty_dir:A} ]] && SHELL_SESSION_HISTFILE_SHARED=$HISTFILE
 HISTSIZE=$_goatty_hist_size
 SAVEHIST=$_goatty_hist_size
 setopt $_goatty_hist_opts
@@ -520,7 +545,15 @@ builtin source -- "$_goatty_dir/plugins-line-editor.zsh"
 
 # --- Prompt -----------------------------------------------------------------
 # The Starship plugin (or another prompt plugin); goatty's config for it is
-# generated from the prompt settings.
+# generated from the prompt settings. goatty draws Nerd Font icons with its
+# own font; other terminals get the same prompt without them, unless
+# prompt.icons_elsewhere is on (starship-plain.toml).
+typeset -g _goatty_starship_toml=starship.toml
+if (( ! _goatty_inside && _goatty_prompt_plain )); then
+  _goatty_starship_toml=starship-plain.toml
+  _goatty_transient_ok=$_goatty_transient_ok_plain
+  _goatty_transient_err=$_goatty_transient_err_plain
+fi
 builtin source -- "$_goatty_dir/plugins-prompt.zsh"
 # Kept when your .zshrc set a prompt of its own.
 if (( ! ${+_goatty_prompt} )) && [[ $PS1 == "$_goatty_ps1_before" ]]; then
@@ -593,6 +626,31 @@ _goatty_path_marks+=("additions"$'\t'"$PATH")
 # --- Plugins that load last: syntax highlighting ---------------------------
 # It wraps every line editor widget defined before it, yours included.
 builtin source -- "$_goatty_dir/plugins-last.zsh"
+
+# --- ZDOTDIR after startup ---------------------------------------------------
+# Another terminal's shell integration can point ZDOTDIR at goatty's
+# directory again once this file is done: VS Code's remembers the ZDOTDIR
+# your .zshenv left, which with goatty's shell in every terminal is
+# goatty's. The first prompt hands it back (so nested shells and .zlogout
+# behave), and goatty's .zlogin runs your own .zlogin when zsh is sent there.
+if (( ${+_goatty_user_zdotdir} )); then
+  typeset -g _goatty_zdotdir_final=$_goatty_user_zdotdir
+else
+  builtin unset _goatty_zdotdir_final
+fi
+_goatty_zdotdir_restore() {
+  add-zsh-hook -d precmd _goatty_zdotdir_restore
+  if (( ${+ZDOTDIR} )) && [[ ${ZDOTDIR:A} == ${_goatty_dir:A} ]]; then
+    if (( ${+_goatty_zdotdir_final} )); then
+      builtin export ZDOTDIR=$_goatty_zdotdir_final
+    else
+      builtin unset ZDOTDIR
+    fi
+  fi
+  return 0
+}
+builtin autoload -Uz add-zsh-hook
+add-zsh-hook precmd _goatty_zdotdir_restore
 
 # --- Commands ---------------------------------------------------------------
 
@@ -738,5 +796,5 @@ add-zsh-hook precmd _goatty_reload_requested
 
 # --- Done --------------------------------------------------------------------
 builtin unfunction _goatty_zdotdir_user _goatty_zdotdir_capture _goatty_user_file _goatty_on _goatty_find _goatty_ok _goatty_cached_init
-builtin unset _goatty_user_zdotdir _goatty_src _goatty_prompt GOATTY_GUI_SETUP _goatty_ps1_before
+builtin unset _goatty_user_zdotdir _goatty_src _goatty_prompt GOATTY_GUI_SETUP _goatty_ps1_before _goatty_starship_toml
 builtin unset _goatty_imported_vars _goatty_imported_path _goatty_imported_from

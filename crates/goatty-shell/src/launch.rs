@@ -1,6 +1,7 @@
 //! Which shell a new session runs, and with what environment.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use goatty_config::{Effective, HostSettings, store};
@@ -128,10 +129,12 @@ impl Launcher {
             log::warn!("no $HOME: starting plain zsh");
             return launch;
         };
+        let started = SystemTime::now();
         if let Err(e) = self.apply(host) {
             log::warn!("couldn't build the shell configuration: {e:#}");
         }
         self.prepare_import(&host.value);
+        touch_stamp(dirs, started);
         if !dirs.zsh_dir().join(".zshrc").is_file() {
             log::warn!("no usable shell configuration generation: starting plain zsh");
             return launch;
@@ -145,6 +148,22 @@ impl Launcher {
         }
         launch.managed = true;
         launch
+    }
+
+    /// Bring the configuration and the import of the user's shell setup up
+    /// to date, as a new session would, and note when
+    /// ([`Dirs::refresh_stamp`]): `goattyd shell refresh`, which shells
+    /// outside goatty ask for when a startup file changed
+    /// ([`crate::everywhere`]). `started`: taken before `host` was read, so
+    /// a change to `host.json` after that still counts as newer. May run the
+    /// user's shell: off the UI thread.
+    pub fn refresh(&self, host: &Effective<HostSettings>, started: SystemTime) -> Result<()> {
+        let dirs = self.dirs.as_ref().context("$HOME is not set, so goatty has nowhere to keep its shell environment")?;
+        // Also with goatty's zsh off: entry.zsh then says so.
+        let built = self.apply(host).map(|_| ());
+        self.prepare_import(&host.value);
+        touch_stamp(dirs, started);
+        built
     }
 
     /// Launch a direct program (`argv`, no shell) using this host's managed
@@ -207,6 +226,20 @@ impl Launcher {
             .with_context(|| format!("{raw_program:?} isn't installed on this host (not found on PATH)"))?;
         let env = if has_dirs { env_map.into_iter().collect() } else { Vec::new() };
         Ok(Launch { program: resolved.to_string_lossy().into_owned(), args: argv, env, managed: false })
+    }
+}
+
+/// Note that the configuration and the import were current as of `at`
+/// (the check's start, so a file changed while it ran still counts as newer).
+pub(crate) fn touch_stamp(dirs: &Dirs, at: SystemTime) {
+    let path = dirs.refresh_stamp();
+    let touched = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::File::options().create(true).truncate(false).write(true).open(&path))
+        .and_then(|f| f.set_modified(at));
+    if let Err(e) = touched {
+        log::warn!("couldn't note the shell refresh in {}: {e}", path.display());
     }
 }
 

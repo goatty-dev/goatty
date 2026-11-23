@@ -118,6 +118,14 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
         println!("  {:<10}  {}: {what}", if i == 0 { "your files" } else { "" }, f.path);
     }
     println!("  additions   {}{}", s.additions, if s.additions_exist { "" } else { " (create it for your own aliases etc.)" });
+    if let Ok(e) = svc.everywhere(crate::everywhere::Action::Status, None) {
+        let state = match e.state {
+            crate::everywhere::State::On => format!("on ({})", e.files_text()),
+            crate::everywhere::State::Off => "off (`goattyd shell everywhere on` uses goatty's shell in every terminal)".into(),
+            crate::everywhere::State::Changed => "a goatty line in your .zshenv was edited by hand (`goattyd shell everywhere`)".into(),
+        };
+        println!("  everywhere  {state}");
+    }
 
     match &s.startup {
         Some(st) => {
@@ -436,7 +444,11 @@ fn confirm(prompt: &str, verb: &str) -> Result<bool> {
     print!("{prompt}");
     std::io::stdout().flush()?;
     let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
+    // End of input (Ctrl+D) is no; an empty line (Enter) is the default yes.
+    if stdin.lock().read_line(&mut line)? == 0 {
+        println!();
+        return Ok(false);
+    }
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
 }
 
@@ -634,6 +646,110 @@ pub fn settings_unset(svc: &crate::HostService, key: &str) -> Result<()> {
     let text = read_or_empty(host_path(svc)?)?;
     let loaded = store::unset_key::<HostSettings>(&text, key).map_err(anyhow::Error::msg)?;
     apply_edit(svc, key, loaded)
+}
+
+/// `goattyd shell everywhere [status|on|off]`: goatty's shell in every
+/// terminal on this host (the line in `.zshenv`). `on` shows the lines and
+/// asks first (`yes`: don't ask).
+pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, yes: bool) -> Result<()> {
+    use crate::everywhere::{Action, State};
+    let before = svc.everywhere(Action::Status, None)?;
+    // Asks whenever a file would change (also to fill in one that's missing the line).
+    if action == Action::On && (before.state != State::On || !before.todo.is_empty()) {
+        if let Some(why) = &before.unavailable {
+            bail!("{why}");
+        }
+        if before.state == State::Changed {
+            let at = before.changed.first().map_or_else(|| before.files_text(), ToString::to_string);
+            bail!("a goatty line was edited by hand ({at}). Edit or remove it there, then try again");
+        }
+        let todo = if before.todo.is_empty() { before.files_text() } else { before.todo.join(" and ") };
+        println!("goatty adds these lines to the end of {todo}:\n");
+        for l in &before.lines {
+            println!("    {l}");
+        }
+        println!();
+        println!("Every new interactive zsh on this host then runs goatty's shell: IDE terminals, other terminals,");
+        println!("tmux, SSH logins. Scripts and `zsh -c` stay plain, and your login shell doesn't change.");
+        println!("  - Your ~/.zshrc stops running there, as in goatty's tabs. The PATH folders and variables it sets up");
+        println!("    still come along; put functions, aliases and key bindings in ~/.config/goatty/zshrc.");
+        println!("  - Plain zsh for one shell: GOATTY_SHELL_MANAGED=0 zsh. Undo: goattyd shell everywhere off.");
+        if !yes && !confirm("\nAdd them? [Y/n] ", "add them")? {
+            println!("Nothing changed.");
+            return Ok(());
+        }
+    }
+    let s = if action == Action::Status { before.clone() } else { svc.everywhere(action, Some(&before.files))? };
+    let state = match (s.state, s.active) {
+        (State::On, true) => "on: new interactive zsh shells on this host run goatty's shell",
+        (State::On, false) => "on, but goatty's managed zsh is off here, so the line does nothing",
+        (State::Off, _) => "off: only goatty's own sessions run goatty's shell",
+        (State::Changed, _) => "changed: a goatty line was edited by hand",
+    };
+    println!("goatty's shell in every terminal");
+    println!("  state       {state}");
+    println!("  {:<10}  {}", if s.files.len() == 1 { "file" } else { "files" }, s.files_text());
+    for c in &s.changed {
+        println!("  changed     {c}");
+    }
+    for w in &s.warnings {
+        println!("  \u{26a0} warning   {w}");
+    }
+    if let Some(why) = s.unavailable.as_deref().filter(|_| s.state != State::On) {
+        println!("  unavailable {why}");
+    }
+    if action != Action::Status && before.state != s.state {
+        if let Some(b) = s.backup.as_ref().filter(|b| before.backup.as_ref() != Some(*b)) {
+            println!("  backup      {b}");
+        }
+        if s.state == State::Off {
+            println!("\nShells that are open keep goatty's shell until they exit.");
+        } else {
+            println!("\nNew shells use it; open ones don't change.");
+        }
+    }
+    Ok(())
+}
+
+/// `goattyd shell refresh` without a running goattyd: bring the shell
+/// configuration and the import of the user's own shell setup up to date
+/// in this process, as a new goatty session would. (With one, goattyd does
+/// it: the import compares against goattyd's environment.)
+pub fn refresh(svc: &crate::HostService) -> Result<()> {
+    svc.refresh()
+}
+
+/// `goattyd shell refresh --wait SECS`, which shells outside goatty run
+/// when a startup file changed (`entry.zsh`): the refresh runs in a process
+/// of its own, in its own session (closing the terminal doesn't stop it),
+/// and this one returns once it's done or after `wait`, whichever is first.
+/// That process starts without `ZDOTDIR`: the shell asking is in the middle
+/// of the user's `.zshenv`, which may have set it.
+pub fn refresh_detached(wait: Duration) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().context("where is goattyd")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["shell", "refresh"])
+        .env_remove("ZDOTDIR")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: setsid is async-signal-safe and only changes the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().context("start goattyd shell refresh")?;
+    let start = std::time::Instant::now();
+    while start.elapsed() < wait {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

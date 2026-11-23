@@ -7,7 +7,9 @@
 //!    when missing, installed with progress (no sudo, pinned checksums),
 //!    whether to import the PATH folders and variables the user's own
 //!    `.zshrc`/`.bashrc` sets up (on by default; shown when they have one,
-//!    with what it brings), and the prompt style.
+//!    with what it brings), whether to use goatty's shell in every terminal
+//!    (off by default; the exact line and file are shown, so the switch is
+//!    the consent), and the prompt style.
 //! 3. **Ready**: the few shortcuts worth knowing, links onward.
 //!
 //! It opens by itself once, on the very first start (no client settings
@@ -157,6 +159,12 @@ pub struct Welcome {
     /// The host runs the user's shell to see what it sets up.
     import_checking: bool,
     import_error: Option<String>,
+    /// goatty's shell in every terminal: the line in the host's `.zshenv`.
+    everywhere: Option<goatty_shell::everywhere::Status>,
+    everywhere_busy: bool,
+    everywhere_error: Option<String>,
+    /// The lines were copied (the Copy button shows a check).
+    everywhere_copied: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -200,6 +208,10 @@ impl Welcome {
             import: None,
             import_checking: false,
             import_error: None,
+            everywhere: None,
+            everywhere_busy: false,
+            everywhere_error: None,
+            everywhere_copied: false,
             _subs: subs,
         }
     }
@@ -250,6 +262,7 @@ impl Welcome {
                         v.host = host;
                         if managed {
                             v.load_import(cx);
+                            v.everywhere(goatty_shell::everywhere::Action::Status, cx);
                         }
                     }
                     Err(e) => v.error = Some(format!("{e:#}")),
@@ -291,6 +304,134 @@ impl Welcome {
             }
         })
         .detach();
+    }
+
+    /// Ask the host about the line in its `.zshenv`, or add or remove it.
+    fn everywhere(&mut self, action: goatty_shell::everywhere::Action, cx: &mut Context<'_, Self>) {
+        let Some(link) = self.link.clone() else { return };
+        if self.everywhere_busy {
+            return;
+        }
+        self.everywhere_busy = true;
+        // A status check after a failed change keeps its error on screen.
+        if action != goatty_shell::everywhere::Action::Status {
+            self.everywhere_error = None;
+        }
+        // The files shown with the switch: nothing is written when they're others now.
+        let shown = self.everywhere.as_ref().map(|s| s.files.clone()).filter(|_| action == goatty_shell::everywhere::Action::On);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { link.everywhere(action, shown) }).await;
+            let _ = this.update(cx, |v, cx| {
+                v.everywhere_busy = false;
+                match result {
+                    Ok(s) => v.everywhere = Some(s),
+                    // An older goattyd: no question about it.
+                    Err(e) if action == goatty_shell::everywhere::Action::Status => log::info!("every terminal: {e:#}"),
+                    Err(e) => {
+                        v.everywhere_error = Some(format!("{e:#}"));
+                        // Show what the host has now (the files may have changed).
+                        v.everywhere(goatty_shell::everywhere::Action::Status, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Use goatty's shell in every terminal", with the exact lines and
+    /// files shown with the switch: turning it on is the consent.
+    fn everywhere_section(&self, ui: Ui, cx: &Context<'_, Self>) -> Option<impl IntoElement> {
+        use goatty_shell::everywhere::{Action, State};
+        use settings_window::everywhere::{LABEL, code_lines, error_lines, starts, warning_line};
+        let s = self.everywhere.as_ref()?;
+        let on = s.state == State::On;
+        let busy = self.everywhere_busy;
+        let row = settings_row(ui, LABEL);
+        let mut notes: Vec<String> = s.warnings.clone();
+        let row = match (&s.state, &s.unavailable) {
+            (State::Changed, _) => {
+                let at = s.changed.first().map_or_else(|| s.files_text(), ToString::to_string);
+                notes.extend(s.changed.iter().skip(1).map(|c| format!("Also edited by hand: {c}")));
+                row.desc(format!("A goatty line was edited by hand ({at}). Remove or fix it in the file, then check again")).control(
+                    button_with(
+                        "everywhere-check",
+                        Some(Icon::Refresh),
+                        "Check again",
+                        ButtonKind::Ghost,
+                        ui,
+                        self.act(cx, |v, cx| v.everywhere(Action::Status, cx)),
+                    ),
+                )
+            }
+            (State::Off, Some(why)) => {
+                row.desc(why.clone()).disabled(true).control(toggle("everywhere", false, ui, |_, _| {}).aria_label(LABEL))
+            }
+            (state, _) => {
+                if on {
+                    notes.extend(s.changed.iter().map(|c| format!("Also a goatty line edited by hand: {c}")));
+                }
+                let desc = if *state == State::On {
+                    format!("{} {} goatty's shell in every new interactive zsh", s.files_text(), starts(s))
+                } else {
+                    "VS Code and other editors, other terminals, tmux and SSH logins get this shell too".to_owned()
+                };
+                let copied = self.everywhere_copied;
+                let lines = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child(SharedString::from(format!(
+                        "{} {}:",
+                        if on { "goatty added these lines to the end of" } else { "Turning it on adds these lines to the end of" },
+                        s.files_text()
+                    ))))
+                    .child(code_lines(
+                        ui,
+                        "everywhere-lines",
+                        crate_mono(cx),
+                        &s.lines,
+                        copied,
+                        self.act(cx, |v, cx| {
+                            v.everywhere_copied = true;
+                            cx.notify();
+                        }),
+                    ));
+                row.desc(desc)
+                    .disabled(busy)
+                    .control(
+                        toggle(
+                            "everywhere",
+                            on,
+                            ui,
+                            self.act(cx, move |v, cx| v.everywhere(if on { Action::Off } else { Action::On }, cx)),
+                        )
+                        .aria_label(LABEL),
+                    )
+                    .below(lines)
+            }
+        };
+        // Warnings and errors outside the row, so a disabled row doesn't fade them.
+        let mut extra =
+            div().flex().flex_col().gap(px(6.)).px(px(16.)).pb(px(12.)).children(notes.iter().map(|w| warning_line(ui, w.clone())));
+        if let Some(e) = &self.everywhere_error {
+            extra = extra.child(banner(ui, Tone::Danger, format!("Couldn't update {}", s.files_text()), error_lines(e, s)));
+        }
+        let mut sec = settings_section(ui, "Every terminal").child(row);
+        if !notes.is_empty() || self.everywhere_error.is_some() {
+            sec = sec.child(extra);
+        }
+        let user_rc = self.host.as_ref().is_some_and(|h| h.shell.zsh.user_rc);
+        let import = self.import.as_ref().map_or_else(|| self.host.as_ref().is_none_or(|h| h.shell.import.enabled), |i| i.enabled);
+        let rc = match (user_rc, import) {
+            (true, _) => "Your ~/.zshrc runs guarded there, as in goatty's tabs.",
+            (false, true) => "Your ~/.zshrc won't run there (its PATH folders and variables still come along).",
+            (false, false) => "Your ~/.zshrc won't run there, and with the import off its PATH folders and variables stay out too.",
+        };
+        let icons =
+            if self.host.as_ref().is_some_and(|h| h.prompt.plain_elsewhere()) { " Prompt icons fall back to text there." } else { "" };
+        Some(sec.footer(format!("{rc}{icons} Change it any time under Settings → Shell.")))
     }
 
     /// Turn the import on or off on the host.
@@ -630,7 +771,7 @@ impl Welcome {
         let mut page = div().flex().flex_col().gap(px(24.)).child(Self::title(
             ui,
             format!("Your shell{host}"),
-            "goatty runs zsh with suggestions as you type, syntax colors, a clear prompt and searchable history. Your own dotfiles stay as they are.",
+            "goatty runs zsh with suggestions as you type, syntax colors, a clear prompt and searchable history. It doesn't change your dotfiles unless you ask it to.",
         ));
         if self.link.is_none() {
             return page.child(loading_card(ui, "Waiting for the terminal window to connect…"));
@@ -717,6 +858,9 @@ impl Welcome {
             page = page.child(settings_window::progress_card(ui, p));
         }
         if let Some(sec) = self.import_section(ui, cx) {
+            page = page.child(sec);
+        }
+        if let Some(sec) = self.everywhere_section(ui, cx) {
             page = page.child(sec);
         }
         if let Some(h) = &self.host {

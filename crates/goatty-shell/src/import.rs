@@ -140,7 +140,7 @@ impl Context {
         self.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
-    fn which(&self, bin: &str) -> Option<String> {
+    pub(crate) fn which(&self, bin: &str) -> Option<String> {
         let path = self.var("PATH")?;
         std::env::split_paths(path).map(|d| d.join(bin)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
     }
@@ -825,17 +825,25 @@ pub fn harvest(
 fn run(source: &Source, ctx: &Context, out: &Path, err: &Path, timeout: Duration) -> Result<Duration> {
     let stderr = private_file(err)?;
     let start = Instant::now();
-    let mut child = Command::new(&source.program)
-        .args(["-l", "-i", "-c", &script(source.kind, out, ctx)])
+    let mut cmd = Command::new(&source.program);
+    cmd.args(["-l", "-i", "-c", &script(source.kind, out, ctx)])
         .env_clear()
         .envs(ctx.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&ctx.home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr)
-        .process_group(0)
-        .spawn()
-        .with_context(|| format!("start {}", source.program))?;
+        .stderr(stderr);
+    // A session of its own: its own process group (killed as one below),
+    // and no controlling terminal, so an interactive startup can't stop on
+    // SIGTTOU/SIGTTIN when goattyd (or `goattyd shell refresh`) runs in one.
+    // SAFETY: setsid is async-signal-safe and only changes the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().with_context(|| format!("start {}", source.program))?;
     let pgid = libc::pid_t::try_from(child.id()).ok();
     let kill_group = || {
         if let Some(pgid) = pgid {

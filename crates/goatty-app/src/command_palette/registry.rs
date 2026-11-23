@@ -349,6 +349,10 @@ pub fn builtins() -> Vec<Command> {
         ]),
         Command::action("shell.reload", "Shell", "Reload running shells", "reload_shells")
             .keywords(&["restart", "refresh", "zsh", "apply", "source"]),
+        Command::handler("shell.everywhere", "Shell", "Use goatty's shell in every terminal…", |_, cx| {
+            settings_window::open_everywhere(cx)
+        })
+        .keywords(&["vscode", "ide", "editor", "tmux", "ssh", "zshenv", "everywhere", "other terminals"]),
         Command::handler("shell.add_to_path", "Shell", "Add a folder to PATH…", crate::shell_path::ask_add).keywords(&[
             "path",
             "bin",

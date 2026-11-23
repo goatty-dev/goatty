@@ -32,7 +32,7 @@ The issue list is the backlog, so only file issues that are worth reading.
 
 - Tests that start a daemon or run the CLIs use their own `GOATTY_SOCKET` and a sandboxed `HOME`. Tests that run the managed zsh use sandboxed `$HOME`/XDG dirs (`Dirs::under`). **Never touch the user's running daemon** at `$XDG_RUNTIME_DIR/goatty/goattyd.sock`: it holds their live sessions.
 - After a protocol change, a running goattyd outside the new client's version range can't talk to it. Tell the user instead of killing it.
-- goatty writes only under its own XDG dirs. It never silently edits dotfiles, the global PATH or the login shell, and never uses sudo without asking. OSC 52 clipboard reads are denied. The daemon socket is 0600 in a 0700 dir and never exposed on the network.
+- goatty writes under its own XDG dirs. It never edits the contents of the user's dotfiles. The one exception is opt-in: with the user's consent it adds one guarded line to `.zshenv` (shown to them first, and removed when they turn the setting off) so every interactive zsh uses goatty's managed config (`goatty_shell::everywhere`). It never changes the login shell or `/etc/shells`, never touches the global PATH, and never uses sudo without asking. OSC 52 clipboard reads are denied. The daemon socket is 0600 in a 0700 dir and never exposed on the network.
 - Never put a registry signing key in a repo or CI.
 - Never change the user's Tailscale (Serve routes, operator, login) from tests or by hand while working: the tailnet tests use the fake `tailscale` in `crates/goatty-net/tests/`.
 

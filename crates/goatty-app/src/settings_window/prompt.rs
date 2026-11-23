@@ -443,6 +443,27 @@ impl SettingsWindow {
             })
     }
 
+    /// One line of the prompt other terminals get ([`PromptSettings::plain`]).
+    fn plain_prompt_preview(&self, ui: Ui, p: &PromptSettings, cx: &Context<'_, Self>) -> impl IntoElement {
+        let t = &cx.global::<AppSettings>().colors;
+        let mut sample = PromptSettings { two_line: false, frame: Frame::None, ..p.plain() };
+        sample.directory.repo_root = false;
+        let preview = Preview { p: &sample, theme: t, starship: true, line_height: 20. };
+        div().flex().flex_col().gap(px(6.)).child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("In other terminals")).child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(radius::CONTROL))
+                .overflow_hidden()
+                .border_1()
+                .border_color(ui.divider)
+                .bg(rgb(t.background.0))
+                .font(Self::mono_font(cx))
+                .text_size(px(12.))
+                .children(preview.prompt(Moment::Fresh, div())),
+        )
+    }
+
     /// The style cards, each showing a small prompt in that style.
     fn style_cards(&self, ui: Ui, p: &PromptSettings, cx: &Context<'_, Self>) -> impl IntoElement {
         let t = &cx.global::<AppSettings>().colors;
@@ -569,7 +590,29 @@ impl SettingsWindow {
                             cx,
                             self.set_prompt(cx, |p, e| p.tails = e),
                         )),
-                );
+                )
+                .child({
+                    // goatty draws Nerd Font glyphs with its own font; other
+                    // terminals (goatty's shell in every terminal) need one.
+                    let nerd = p.needs_nerd_font();
+                    let row = row(ui, "Icons in other terminals")
+                        .desc(match (starship, nerd) {
+                            (false, _) => "Needs Starship".to_owned(),
+                            (true, false) => "This prompt draws in any font".to_owned(),
+                            (true, true) if p.icons_elsewhere => {
+                                "Keeps Nerd Font icons and Powerline shapes outside goatty: those terminals need a Nerd Font".to_owned()
+                            }
+                            (true, true) => "Off: text and flat edges outside goatty, so no Nerd Font is needed there".to_owned(),
+                        })
+                        .disabled(!starship || !nerd)
+                        .control(toggle(
+                            "prompt-icons-elsewhere",
+                            p.icons_elsewhere,
+                            ui,
+                            self.host(cx, |h| h.prompt.icons_elsewhere = !h.prompt.icons_elsewhere),
+                        ));
+                    if starship && nerd && !p.icons_elsewhere { row.below(self.plain_prompt_preview(ui, &p, cx)) } else { row }
+                });
 
             let mut durations: Vec<u32> = vec![0, 1000, 2000, 3000, 5000, 10_000, 30_000, 60_000];
             if !durations.contains(&p.duration_threshold_ms) {

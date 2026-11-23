@@ -18,6 +18,7 @@ mod appearance;
 mod chrome;
 mod diagnostics;
 mod dotfiles;
+pub(crate) mod everywhere;
 mod host;
 mod hosts;
 pub(crate) mod kit;
@@ -116,6 +117,18 @@ pub fn open(cx: &mut App) {
 pub fn open_issue(cx: &mut App, is_host: bool, path: &str) {
     let entry = search::entry_for(is_host, path);
     open_at(cx, Some(entry.map_or(Page::Profile, |e| e.page)));
+    if let Some(e) = entry
+        && let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
+    {
+        let _ = handle.update(cx, |view, _, cx| view.open_hit(&search::Hit::Setting(e), cx));
+    }
+}
+
+/// Settings → Shell with "Use goatty's shell in every terminal" picked out
+/// (the command palette's way there).
+pub fn open_everywhere(cx: &mut App) {
+    open_at(cx, Some(Page::Shell));
+    let entry = search::INDEX.iter().find(|e| e.label == everywhere::LABEL);
     if let Some(e) = entry
         && let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
     {
@@ -466,6 +479,7 @@ pub struct SettingsWindow {
     diag: diagnostics::DiagPage,
     path: path::PathPage,
     dotfiles: dotfiles::DotfilesPage,
+    everywhere: everywhere::EverywhereState,
     aliases: aliases::AliasesPage,
     snippets: snippets::SnippetsPage,
     prompt: prompt::PromptPage,
@@ -654,6 +668,7 @@ impl SettingsWindow {
             diag: diagnostics::DiagPage::default(),
             path: path::PathPage::new(cx),
             dotfiles: dotfiles::DotfilesPage::new(cx),
+            everywhere: everywhere::EverywhereState::new(cx),
             aliases: aliases::AliasesPage::new(cx),
             snippets: snippets::SnippetsPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
@@ -715,6 +730,7 @@ impl SettingsWindow {
         self.net.reset();
         self.path.reset();
         self.dotfiles.reset();
+        self.everywhere.reset();
         self.load_host(cx);
         self.load_plugins(false, cx);
         match self.page {
@@ -722,6 +738,7 @@ impl SettingsWindow {
             Page::Network => self.load_net(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
+            Page::Shell => self.load_everywhere(cx),
             _ => {}
         }
         cx.notify();
@@ -735,6 +752,7 @@ impl SettingsWindow {
             self.plugins.clear_review();
             self.prompt.modules_open = false;
             self.prompt.dialog = None;
+            self.everywhere.dialog = false;
         }
         self.page = page;
         self.menu = None;
@@ -762,6 +780,8 @@ impl SettingsWindow {
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
+            // What the host's .zshenv has now (the user may have edited it).
+            Page::Shell => self.load_everywhere(cx),
             _ => {}
         }
         cx.notify();
@@ -1169,6 +1189,8 @@ impl SettingsWindow {
             Some(self.prompt.modal_focus.clone())
         } else if self.shortcuts_modal_open() {
             Some(self.shortcuts.modal_focus.clone())
+        } else if self.everywhere_modal_open() {
+            Some(self.everywhere.modal_focus.clone())
         } else if self.drawer && f32::from(window.viewport_size().width) < chrome::RAIL_BELOW {
             Some(self.drawer_trap.clone())
         } else {
@@ -1206,6 +1228,7 @@ impl SettingsWindow {
             || self.snippets_modal_open()
             || self.prompt_modal_open()
             || self.shortcuts_modal_open()
+            || self.everywhere_modal_open()
         {
             return;
         }
@@ -1262,6 +1285,7 @@ impl SettingsWindow {
                         view.sync_prompt_inputs(cx);
                         view.path_host_changed(cx);
                         view.dotfiles_host_changed(cx);
+                        view.everywhere_host_changed(cx);
                     }
                     Err(e) => view.host_error = Some(format!("{e:#}")),
                 }

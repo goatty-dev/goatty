@@ -63,24 +63,28 @@ impl SettingsWindow {
                 Some("fish") => "fish",
                 Some(_) => "custom",
             };
-            let zsh = matches!(choice, "auto" | "zsh");
+            // A path to zsh (/opt/homebrew/bin/zsh) is zsh too.
+            let zsh = program.as_deref().filter(|p| !p.trim().is_empty()).is_none_or(goatty_shell::launch::is_zsh);
             let z = &h.shell.zsh;
             let managed = h.shell.managed;
-            let hero = group(ui).child(
-                row(ui, "goatty's managed zsh")
-                    .icon(Icon::Zap)
-                    .desc(if zsh {
-                        "Plugins, prompt, history and shell integration, without touching your dotfiles. Off: plain zsh with your own config"
-                    } else {
-                        "Only for zsh: pick zsh or Automatic below to use it"
-                    })
-                    .disabled(!zsh)
-                    .control(toggle("managed", managed && zsh, ui, self.host(cx, |h| h.shell.managed = !h.shell.managed))),
-            );
+            let hero = group(ui)
+                .child(
+                    row(ui, "goatty's managed zsh")
+                        .icon(Icon::Zap)
+                        .desc(if zsh {
+                            "Plugins, prompt, history and shell integration in goatty's tabs. Off: plain zsh with your own config"
+                        } else {
+                            "Only for zsh: pick zsh or Automatic below to use it"
+                        })
+                        .disabled(!zsh)
+                        .control(toggle("managed", managed && zsh, ui, self.host(cx, |h| h.shell.managed = !h.shell.managed))),
+                )
+                .child(self.everywhere_row(ui, managed && zsh, cx));
             let this = cx.entity().downgrade();
             let program_section = section(ui, "Program")
                 .child(row(ui, "Shell").control(self.select(
-                    "program", "Shell",
+                    "program",
+                    "Shell",
                     vec![
                         opt("auto", "Automatic").desc("zsh if it's installed, else your login shell"),
                         opt("zsh", "zsh"),
@@ -108,7 +112,10 @@ impl SettingsWindow {
                     },
                 )))
                 .when_some_child((choice == "custom").then_some(()), |_| {
-                    row(ui, "Program to run").desc("A path or a name on PATH. Enter saves").below(self.shell_path.clone()).into_any_element()
+                    row(ui, "Program to run")
+                        .desc("A path or a name on PATH. Enter saves")
+                        .below(self.shell_path.clone())
+                        .into_any_element()
                 });
             let off = !(managed && zsh);
             let imp = &h.shell.import;
@@ -136,19 +143,35 @@ impl SettingsWindow {
             );
             let on = BUILTIN_TOOLS.iter().filter(|id| h.plugin_enabled(id)).count();
             let integration = section(ui, "Integration")
-                .child(row(ui, "Shell integration").desc("Marks prompts and commands (OSC 133) and reports the directory (OSC 7)").disabled(off).control(toggle(
-                    "integration",
-                    z.integration,
-                    ui,
-                    self.host(cx, |h| h.shell.zsh.integration = !h.shell.zsh.integration),
-                )))
-                .child(row(ui, "Highlight pasted text").desc("Shows a paste in reverse video until you press the next key").disabled(off).control(
-                    toggle("highlight-paste", z.highlight_paste, ui, self.host(cx, |h| h.shell.zsh.highlight_paste = !h.shell.zsh.highlight_paste)),
-                ))
+                .child(
+                    row(ui, "Shell integration")
+                        .desc("Marks prompts and commands (OSC 133) and reports the directory (OSC 7)")
+                        .disabled(off)
+                        .control(toggle(
+                            "integration",
+                            z.integration,
+                            ui,
+                            self.host(cx, |h| h.shell.zsh.integration = !h.shell.zsh.integration),
+                        )),
+                )
+                .child(
+                    row(ui, "Highlight pasted text")
+                        .desc("Shows a paste in reverse video until you press the next key")
+                        .disabled(off)
+                        .control(toggle(
+                            "highlight-paste",
+                            z.highlight_paste,
+                            ui,
+                            self.host(cx, |h| h.shell.zsh.highlight_paste = !h.shell.zsh.highlight_paste),
+                        )),
+                )
                 .child(
                     row(ui, "Built-in plugins")
                         .icon(Icon::Puzzle)
-                        .desc(format!("Autosuggestions, syntax highlighting, fzf, fzf-tab and Starship · {on} of {} on", BUILTIN_TOOLS.len()))
+                        .desc(format!(
+                            "Autosuggestions, syntax highlighting, fzf, fzf-tab and Starship · {on} of {} on",
+                            BUILTIN_TOOLS.len()
+                        ))
                         .on_click("shell-plugins", self.listener_go(cx, Page::Plugins)),
                 )
                 .child(
@@ -161,12 +184,7 @@ impl SettingsWindow {
                         })
                         .on_click("shell-path", self.listener_go(cx, Page::Path)),
                 );
-            vec![
-                hero.into_any_element(),
-                program_section.into_any_element(),
-                dotfiles.into_any_element(),
-                integration.into_any_element(),
-            ]
+            vec![hero.into_any_element(), program_section.into_any_element(), dotfiles.into_any_element(), integration.into_any_element()]
         })
     }
 

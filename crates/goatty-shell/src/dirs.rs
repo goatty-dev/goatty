@@ -18,6 +18,8 @@
 //! $XDG_CACHE_HOME/goatty/         completion dump, init/ (cached tool init scripts), downloads
 //! $XDG_STATE_HOME/goatty/         small flags (the dismissed setup hint, the GUI offered the setup)
 //!   import/                       what the user's own shell sets up (harvest.json, import.zsh)
+//!   shell-refreshed               when the configuration and the import were last brought up to date
+//!   zshenv-backups/               the user's .zshenv before goatty added or removed its line
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -96,6 +98,26 @@ impl Dirs {
     /// Registries the user added (the official one is built in).
     pub fn registries_file(&self) -> PathBuf {
         self.config.join("registries.json")
+    }
+    /// The host settings (`goatty_config::host_file()` for the real dirs).
+    pub fn host_file(&self) -> PathBuf {
+        self.config.join("host.json")
+    }
+    /// Touched (with the time the check started) whenever the
+    /// configuration and the import were brought up to date: hooked shells
+    /// outside goatty compare their startup files against it (`entry.zsh`).
+    pub fn refresh_stamp(&self) -> PathBuf {
+        self.state.join("shell-refreshed")
+    }
+    /// The files goatty added its line to (one path a line), so turning it
+    /// off finds them after `ZDOTDIR` moved ([`crate::everywhere`]).
+    pub fn zshenv_record(&self) -> PathBuf {
+        self.state.join("zshenv-hooked")
+    }
+    /// Copies of the user's `.zshenv` from before goatty added or removed
+    /// its line ([`crate::everywhere`]).
+    pub fn zshenv_backups(&self) -> PathBuf {
+        self.state.join("zshenv-backups")
     }
     /// The user's own zsh additions, sourced late by the managed `.zshrc`.
     pub fn user_zshrc(&self) -> PathBuf {

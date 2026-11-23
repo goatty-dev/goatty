@@ -9,9 +9,21 @@
 # OSC 7337 is goatty's own: zle=1 at each prompt says the command-line
 # widgets below are bound; line=… answers goatty asking for the typed line.
 #
+# Outside goatty (goatty's shell in every terminal: an IDE, another
+# terminal, tmux) only the standard codes go out: OSC 7337 and its widgets
+# need goatty's pane (_goatty_inside, from .zshrc). When that terminal
+# brought its own shell integration (VS Code, kitty, Ghostty), it marks the
+# prompts itself, so goatty's OSC 133 marks stay out instead of doubling.
+#
 # Reference: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/semantic-prompts.md
 
 typeset -gi _goatty_running=0
+typeset -gi _goatty_marks=1
+if (( ! ${_goatty_inside:-0} )) && { (( ${+VSCODE_SHELL_INTEGRATION} )) ||
+     { (( ${+functions[_ksi_deferred_init]} )) && [[ ${KITTY_SHELL_INTEGRATION-} != *no-prompt-mark* ]]; } ||
+     (( ${+functions[_ghostty_deferred_init]} )); }; then
+  _goatty_marks=0
+fi
 
 _goatty_report_cwd() {
   emulate -L zsh -o no_multibyte -o extended_glob
@@ -28,7 +40,8 @@ _goatty_precmd() {
   fi
   _goatty_report_cwd
   # goatty's menus may use the widgets below at this prompt.
-  builtin print -rn -- $'\e]7337;zle=1\a'
+  (( _goatty_inside )) && builtin print -rn -- $'\e]7337;zle=1\a'
+  (( _goatty_marks )) || return 0
   # Mark the prompt inside PS1 so a redraw (e.g. after a resize) re-marks
   # it. Prompt themes set PS1 before this hook runs; checking every time
   # keeps the marks when a theme rebuilds PS1.
@@ -37,6 +50,7 @@ _goatty_precmd() {
 }
 
 _goatty_preexec() {
+  (( _goatty_marks )) || return 0
   builtin print -rn -- $'\e]133;C\a'
   _goatty_running=1
 }
@@ -47,7 +61,9 @@ add-zsh-hook preexec _goatty_preexec
 
 # --- Command-line actions for goatty's right-click menu (#186) ---------------
 # goatty sends these private key sequences (no keyboard sends them), and
-# only while a prompt said the widgets are here (zle=1 above).
+# only while a prompt said the widgets are here (zle=1 above). Only in
+# goatty's own panes: no other terminal sends them.
+(( ${_goatty_inside:-0} )) || builtin return 0
 
 # Report the typed line, percent-encoded byte by byte, as OSC 7337;line=…
 # (no LC_ALL=C here: zle would turn what C can't spell into "?").

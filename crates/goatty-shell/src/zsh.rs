@@ -23,6 +23,9 @@ pub const ZSHRC: &str = include_str!("../zsh/zshrc.zsh");
 pub const INTEGRATION: &str = include_str!("../zsh/integration.zsh");
 pub const RC_GUARD: &str = include_str!("../zsh/rc-guard.zsh");
 pub const EXPAND: &str = include_str!("../zsh/expand.zsh");
+pub const ZLOGIN: &str = include_str!("../zsh/zlogin.zsh");
+/// `entry.zsh`, with `@NAME@` placeholders [`render_entry`] fills in.
+pub const ENTRY: &str = include_str!("../zsh/entry.zsh");
 
 /// Inputs for [`render`].
 pub struct ZshConfig<'a> {
@@ -56,15 +59,44 @@ pub fn render(cfg: &ZshConfig<'_>) -> Vec<GeneratedFile> {
         GeneratedFile::new(".zshenv", ZSHENV),
         GeneratedFile::new(".zprofile", ZPROFILE),
         GeneratedFile::new(".zshrc", ZSHRC),
+        GeneratedFile::new(".zlogin", ZLOGIN),
+        GeneratedFile::new("entry.zsh", render_entry(cfg)),
         GeneratedFile::new("integration.zsh", INTEGRATION),
         GeneratedFile::new("rc-guard.zsh", RC_GUARD),
         GeneratedFile::new("expand.zsh", EXPAND),
         GeneratedFile::new("expansions.zsh", crate::snippets::render_expansions(cfg.settings, cfg.plugins).0),
         GeneratedFile::new("starship.toml", crate::starship::render(cfg.settings)),
+        GeneratedFile::new("starship-plain.toml", crate::starship::render(&plain_prompt(cfg.settings))),
         GeneratedFile::new("aliases.zsh", crate::aliases::render(cfg.settings)),
     ];
     files.extend(render_plugins(cfg));
     files
+}
+
+/// `settings` with the prompt other terminals get ([`goatty_config::PromptSettings::plain`]).
+fn plain_prompt(settings: &HostSettings) -> HostSettings {
+    let mut s = settings.clone();
+    s.prompt = s.prompt.plain();
+    s
+}
+
+/// Whether the hook in the user's `.zshenv` turns zsh into goatty's
+/// (`crate::everywhere`): goatty's managed zsh is on, and goatty's shell is
+/// zsh (automatic picks zsh when it's installed, which it is when zsh runs
+/// this).
+pub fn hook_active(s: &HostSettings) -> bool {
+    s.shell.managed && s.shell.program.as_deref().filter(|p| !p.trim().is_empty()).is_none_or(crate::launch::is_zsh)
+}
+
+/// `entry.zsh`: what the line goatty adds to the user's `.zshenv` sources
+/// ([`crate::everywhere`]).
+fn render_entry(cfg: &ZshConfig<'_>) -> String {
+    let d = cfg.dirs;
+    ENTRY
+        .replace("@STAMP@", &quote(&d.refresh_stamp().to_string_lossy()))
+        .replace("@DAEMON@", &quote(&cfg.daemon_exe.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()))
+        .replace("@HOST_FILE@", &quote(&d.host_file().to_string_lossy()))
+        .replace("@DIR@", &quote(&d.zsh_dir().to_string_lossy()))
 }
 
 /// What each slot file says about itself.
@@ -162,6 +194,8 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_daemon", &cfg.daemon_exe.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
     scalar("_goatty_user_env", flag(s.shell.zsh.user_env));
     scalar("_goatty_user_rc", flag(s.shell.zsh.user_rc));
+    // Shells that come in through the line in .zshenv (crate::everywhere).
+    scalar("_goatty_hook_active", flag(hook_active(s)));
     let imp = &s.shell.import;
     scalar("_goatty_import", flag(imp.enabled));
     scalar("_goatty_import_file", &d.import_file().to_string_lossy());
@@ -170,6 +204,11 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_prompt_transient", flag(s.prompt.transient));
     scalar("_goatty_transient_ok", &crate::starship::transient_prompt(&s.prompt, false));
     scalar("_goatty_transient_err", &crate::starship::transient_prompt(&s.prompt, true));
+    // Other terminals: the prompt without Nerd Font icons (starship-plain.toml).
+    let plain = s.prompt.plain();
+    scalar("_goatty_prompt_plain", flag(s.prompt.plain_elsewhere()));
+    scalar("_goatty_transient_ok_plain", &crate::starship::transient_prompt(&plain, false));
+    scalar("_goatty_transient_err_plain", &crate::starship::transient_prompt(&plain, true));
 
     let h = &s.history;
     let mut hist = vec!["extended_history", "hist_expire_dups_first", "hist_reduce_blanks", "hist_verify"];
