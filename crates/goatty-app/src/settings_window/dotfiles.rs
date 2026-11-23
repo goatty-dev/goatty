@@ -7,7 +7,7 @@
 //! running `.zshenv`/`.zprofile` and (guarded) `.zshrc` in goatty's shell
 //! itself.
 
-use goatty_config::{HostSettings, ImportFrom};
+use goatty_config::{HostSettings, ImportFrom, ImportSettings};
 use goatty_shell::import::{Harvest, Status};
 use gpui::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*, px,
@@ -97,6 +97,9 @@ struct Item {
     value: Vec<String>,
     kind: &'static str,
     on: bool,
+    /// Overrides goatty's own setup (`ImportSettings::CONFLICTING`), so it
+    /// starts switched off: the note saying so.
+    conflict: Option<&'static str>,
 }
 
 fn items(h: &Harvest, s: &HostSettings) -> Vec<Item> {
@@ -110,6 +113,7 @@ fn items(h: &Harvest, s: &HostSettings) -> Vec<Item> {
             value: added.iter().map(|d| goatty_shell::setup::tilde(std::path::Path::new(d))).collect(),
             kind: "PATH",
             on: !imp.skip_vars.iter().any(|n| n == "PATH"),
+            conflict: None,
         });
     }
     out.extend(h.vars.iter().map(|v| Item {
@@ -118,6 +122,8 @@ fn items(h: &Harvest, s: &HostSettings) -> Vec<Item> {
         value: vec![v.value.clone()],
         kind: "Variable",
         on: !imp.skip_vars.contains(&v.name),
+        conflict:
+            ImportSettings::CONFLICTING.contains(&v.name.as_str()).then_some("Overrides goatty's fzf look and keys, so it starts off"),
     }));
     out
 }
@@ -449,14 +455,32 @@ impl SettingsWindow {
                     )
                     .child(div().flex().child(badge(item.kind, Tone::Neutral, ui))),
             )
-            .child(div().flex_1().min_w_0().flex().flex_col().gap(px(2.)).children(item.value.iter().map(|line| {
+            .child(
                 div()
-                    .font_family(mono.clone())
-                    .text_size(px(text::LABEL))
-                    .text_color(if on { ui.muted } else { ui.faint })
-                    .truncate()
-                    .child(SharedString::from(if line.is_empty() { "(empty)".to_owned() } else { line.clone() }))
-            })))
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(item.value.iter().map(|line| {
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(text::LABEL))
+                            .text_color(if on { ui.muted } else { ui.faint })
+                            .truncate()
+                            .child(SharedString::from(if line.is_empty() { "(empty)".to_owned() } else { line.clone() }))
+                    }))
+                    .when_some(item.conflict, |d, why| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(badge("Conflicts with goatty", Tone::Warning, ui))
+                                .child(div().text_size(px(text::LABEL)).text_color(ui.muted).child(why)),
+                        )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -536,6 +560,12 @@ mod tests {
         let list = items(&harvest(), &s);
         let names: Vec<_> = list.iter().map(|i| (i.name.as_str(), i.on)).collect();
         assert_eq!(names, [("PATH", false), ("EDITOR", true)], "aliases aren't imported live");
+        let mut h = harvest();
+        h.vars.push(Var { name: "FZF_DEFAULT_OPTS".into(), value: "--color=dark".into() });
+        let list = items(&h, &HostSettings::default());
+        let fzf = list.iter().find(|i| i.name == "FZF_DEFAULT_OPTS").unwrap();
+        assert!(!fzf.on && fzf.conflict.is_some(), "imported but off, with a note");
+        assert!(list.iter().find(|i| i.name == "EDITOR").unwrap().conflict.is_none());
         assert_eq!(list[0].value, ["/opt/a"], "only the folders the startup added");
         assert_eq!(ago(30), "just now");
         assert_eq!(ago(7200), "2 h ago");
