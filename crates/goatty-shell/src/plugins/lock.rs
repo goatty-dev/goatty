@@ -91,6 +91,15 @@ impl Lock {
         Ok(())
     }
 
+    /// An installed plugin other than `except` that lists package `id`
+    /// (goatty's download or a system copy).
+    pub fn package_user(&self, id: &str, except: &str) -> Option<&str> {
+        self.plugins
+            .iter()
+            .find(|(plugin, e)| plugin.as_str() != except && e.packages.iter().any(|p| p.id == id))
+            .map(|(plugin, _)| plugin.as_str())
+    }
+
     /// Executables on PATH from installed plugins: name → plugin id.
     pub fn executables(&self) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();

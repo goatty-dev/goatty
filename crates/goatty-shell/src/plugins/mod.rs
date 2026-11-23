@@ -270,10 +270,16 @@ impl Plugins<'_> {
         let deps = self.dependencies(c, &lock)?;
         // Plugins of one install can't clash with each other either.
         let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut package_owners: BTreeMap<&str, &str> = BTreeMap::new();
         for x in deps.iter().chain([c]) {
             for exe in x.manifest.executables() {
                 if let Some(other) = owners.insert(exe, &x.manifest.id).filter(|o| *o != x.manifest.id) {
                     bail!("{exe} would be provided by both the {other} and the {} plugin", x.manifest.id);
+                }
+            }
+            for p in &x.manifest.packages {
+                if let Some(other) = package_owners.insert(&p.id, &x.manifest.id).filter(|o| *o != x.manifest.id) {
+                    bail!("package {} would be declared by both the {other} and the {} plugin", p.id, x.manifest.id);
                 }
             }
         }
@@ -344,6 +350,13 @@ impl Plugins<'_> {
             }
             if install::link_owner(self.dirs, exe).as_deref() == Some("?") {
                 bail!("{} already exists and isn't goatty's; not replacing it", self.dirs.bin_dir().join(exe).display());
+            }
+        }
+        // Packages live in `tools/<id>/`, shared by id: a second plugin
+        // with the same package id would replace or remove the first's.
+        for p in &m.packages {
+            if let Some(owner) = lock.package_user(&p.id, &m.id) {
+                bail!("package {} is already declared by the {owner} plugin; give it another id", p.id);
             }
         }
 
@@ -632,7 +645,7 @@ impl Plugins<'_> {
             // Undo packages this attempt added that the old version didn't have.
             let keep: Vec<&str> = previous.iter().flat_map(|p| p.packages.iter().map(|x| x.id.as_str())).collect();
             for (id, bins) in fresh.iter().filter(|(id, _)| !keep.contains(&id.as_str())) {
-                let _ = install::uninstall_package(id, bins, self.dirs);
+                let _ = self.drop_package(&lock, &m.id, id, bins);
             }
             return Err(e);
         }
@@ -643,7 +656,7 @@ impl Plugins<'_> {
         // Packages the old version had and the new one doesn't.
         if let Some(old) = &previous {
             for p in old.packages.iter().filter(|p| p.system.is_none() && !packages.iter().any(|n| n.id == p.id)) {
-                let _ = install::uninstall_package(&p.id, &p.bins, self.dirs);
+                let _ = self.drop_package(&lock, &m.id, &p.id, &p.bins);
             }
         }
         lock.plugins.insert(
@@ -699,7 +712,7 @@ impl Plugins<'_> {
             }
         }
         for p in entry.packages.iter().filter(|p| p.system.is_none()) {
-            install::uninstall_package(&p.id, &p.bins, self.dirs)?;
+            self.drop_package(&lock, id, &p.id, &p.bins)?;
         }
         let dir = lock::bundle_dir(self.dirs, id);
         if dir.exists() {
@@ -708,6 +721,23 @@ impl Plugins<'_> {
         lock.save(self.dirs)?;
         log::info!("uninstalled plugin {id}");
         Ok((entry, self.unneeded(&lock)))
+    }
+
+    /// Remove plugin `owner`'s use of package `id` (its executables `bins`):
+    /// the whole package, or only the executables no other plugin lists
+    /// when another installed plugin still lists the package (#222).
+    fn drop_package(&self, lock: &Lock, owner: &str, id: &str, bins: &[String]) -> Result<bool> {
+        if lock.package_user(id, owner).is_none() {
+            return install::uninstall_package(id, bins, self.dirs);
+        }
+        let kept: BTreeSet<&str> = lock
+            .plugins
+            .iter()
+            .filter(|(plugin, _)| plugin.as_str() != owner)
+            .flat_map(|(_, e)| e.packages.iter().filter(|p| p.id == id).flat_map(|p| p.bins.iter().map(|b| manifest::bin_name(b))))
+            .collect();
+        let gone: Vec<String> = bins.iter().filter(|b| !kept.contains(manifest::bin_name(b))).cloned().collect();
+        install::remove_links(id, &gone, self.dirs)
     }
 
     /// The plugins that were installed only because another plugin needed

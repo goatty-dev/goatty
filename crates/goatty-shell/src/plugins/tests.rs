@@ -192,6 +192,46 @@ fn local_plugins_are_flagged_and_conflicts_refused() {
     assert!(p.plan(&demo, &settings).unwrap_err().to_string().contains("already provided by the mine plugin"));
 }
 
+/// Two plugins can't declare one package id: they'd share `tools/<id>/`
+/// and replace or remove each other's package (#222).
+#[test]
+fn a_package_id_belongs_to_one_plugin() {
+    let w = world();
+    let p = w.plugins();
+    let settings = HostSettings::default();
+    let demo = p.find("demo", None).unwrap();
+    let plan = p.plan(&demo, &settings).unwrap();
+    p.install(&demo, &plan.digest, &settings).unwrap();
+
+    // Another plugin with package `demo` (another executable) is refused.
+    let dir = w.tmp.path().join("mine");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = std::fs::read_to_string(w.tmp.path().join("registry/plugins/demo/1.0.0/plugin.toml")).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        text.replace("id = \"demo\"\nname", "id = \"mine\"\nname")
+            .replace("bin = [\"demo\"]", "bin = [\"mine\"]")
+            .replace("command = \"demo\"", "command = \"mine\""),
+    )
+    .unwrap();
+    let c = Candidate::local(&dir).unwrap();
+    let err = p.plan(&c, &settings).unwrap_err().to_string();
+    assert!(err.contains("package demo is already declared by the demo plugin"), "{err}");
+
+    // A lock entry that lists the package (from before the check) keeps it
+    // when demo goes.
+    let mut lock = Lock::load(&w.dirs).unwrap();
+    let mut other = lock.plugins["demo"].clone();
+    other.packages[0].bins.clear();
+    lock.plugins.insert("other".into(), other);
+    lock.save(&w.dirs).unwrap();
+    p.uninstall("demo").unwrap();
+    assert!(!w.dirs.bin_dir().join("demo").exists(), "demo's executable goes");
+    assert!(w.dirs.tools_dir().join("demo").is_dir(), "the package other lists stays");
+    p.uninstall("other").unwrap();
+    assert!(!w.dirs.tools_dir().join("demo").exists());
+}
+
 /// Downloads that cancel their install once they started.
 #[derive(Debug)]
 struct CancelOnFetch {
