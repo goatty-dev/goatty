@@ -253,12 +253,19 @@ fn harvest_from_polluted_process_env_still_imports_user_path_and_vars() {
     let Some(zsh) = find("zsh") else { return };
     let sb = Sandbox::new();
     let local_bin = sb.home.join(".local/bin");
+    let custom_xdg = sb.home.join("custom-xdg");
     std::fs::create_dir_all(&local_bin).unwrap();
-    sb.file(".zshrc", "export PATH=\"$HOME/.local/bin:$PATH\"\nexport EDITOR=nvim\nexport ANDROID_HOME=/opt/android-sdk\n");
+    std::fs::create_dir_all(custom_xdg.join("shell")).unwrap();
+    std::fs::write(custom_xdg.join("shell/env"), "export FROM_XDG_CONFIG=yes\n").unwrap();
+    sb.file(
+        ".zshrc",
+        "export PATH=\"$HOME/.local/bin:/usr/local/sbin:$PATH\"\nexport EDITOR=nvim\nexport ANDROID_HOME=/opt/android-sdk\nsource \"$XDG_CONFIG_HOME/shell/env\"\n",
+    );
     let polluted_env = vec![
         ("HOME".into(), sb.home.to_string_lossy().into_owned()),
         ("USER".into(), "tester".into()),
-        ("PATH".into(), format!("{}:/opt/some-ide/bin:/usr/bin:/bin", local_bin.display())),
+        ("XDG_CONFIG_HOME".into(), custom_xdg.to_string_lossy().into_owned()),
+        ("PATH".into(), format!("{}:/usr/local/sbin:/opt/some-ide/bin:/usr/bin:/bin", local_bin.display())),
         ("EDITOR".into(), "nvim".into()),
         ("ANDROID_HOME".into(), "/opt/android-sdk".into()),
         ("VIRTUAL_ENV".into(), "/tmp/fake-venv".into()),
@@ -268,8 +275,10 @@ fn harvest_from_polluted_process_env_still_imports_user_path_and_vars() {
     let h = import::harvest(&src, &ctx, &sb.dirs.import_dir(), Duration::from_secs(20), None).unwrap_or_else(|f| panic!("{f:?}"));
     let local_bin_str = local_bin.to_string_lossy().into_owned();
     assert!(h.added_path().contains(&local_bin_str.as_str()), "expected ~/.local/bin in added_path: {:?}", h.added_path());
+    assert!(h.added_path().contains(&"/usr/local/sbin"), "expected /usr/local/sbin in added_path: {:?}", h.added_path());
     assert!(!h.path.iter().any(|p| p == "/opt/some-ide/bin"), "caller PATH leaked: {:?}", h.path);
     assert_eq!(var(&h, "EDITOR"), Some("nvim"));
     assert_eq!(var(&h, "ANDROID_HOME"), Some("/opt/android-sdk"));
+    assert_eq!(var(&h, "FROM_XDG_CONFIG"), Some("yes"));
     assert_eq!(var(&h, "VIRTUAL_ENV"), None);
 }

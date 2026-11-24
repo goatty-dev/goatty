@@ -91,17 +91,37 @@ impl Kind {
     }
 }
 
-/// Standard system `PATH` for a clean login-shell harvest.
-const DEFAULT_SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Minimal POSIX system `PATH` for a clean login-shell harvest.
+///
+/// Kept deliberately minimal (`/usr/bin:/bin`, matching POSIX `_CS_PATH`) so
+/// directories like `/usr/local/sbin` or `/usr/local/bin` added by a user's
+/// startup files aren't dropped on hosts where the daemon's own `PATH` lacks
+/// them (e.g. Intel macOS Homebrew or minimal Linux services).
+const DEFAULT_SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 /// Variables from the calling process that belong in a clean login-shell
-/// baseline (identity, locale, runtime/temp dirs, and a custom `ZDOTDIR`).
-/// Everything else — especially `PATH` and user variables a caller may have
-/// inherited from an already-configured interactive shell, IDE, virtualenv,
-/// or `nix develop` — is dropped so the harvest diffs against a clean login
-/// baseline instead of subtracting out the user's own `.zshrc`/`.bashrc` setup.
+/// baseline (identity, locale, XDG base/runtime dirs, temp dir, and a custom
+/// `ZDOTDIR`). Everything else — especially `PATH` and user variables a caller
+/// may have inherited from an already-configured interactive shell, IDE,
+/// virtualenv, or `nix develop` — is dropped so the harvest diffs against a
+/// clean login baseline instead of subtracting out the user's own
+/// `.zshrc`/`.bashrc` setup.
 fn is_baseline_var(name: &str) -> bool {
-    matches!(name, "USER" | "LOGNAME" | "SHELL" | "LANG" | "TZ" | "TMPDIR" | "XDG_RUNTIME_DIR" | "ZDOTDIR") || name.starts_with("LC_")
+    matches!(
+        name,
+        "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "LANG"
+            | "TZ"
+            | "TMPDIR"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_CACHE_HOME"
+            | "XDG_STATE_HOME"
+            | "XDG_RUNTIME_DIR"
+            | "ZDOTDIR"
+    ) || name.starts_with("LC_")
 }
 
 /// Where a harvest's facts come from: the host's home, login shell and the
@@ -1242,6 +1262,10 @@ mod tests {
             ("USER".into(), "alice".into()),
             ("LANG".into(), "en_US.UTF-8".into()),
             ("LC_TIME".into(), "de_DE.UTF-8".into()),
+            ("XDG_CONFIG_HOME".into(), "/srv/u-config".into()),
+            ("XDG_DATA_HOME".into(), "/srv/u-data".into()),
+            ("XDG_CACHE_HOME".into(), "/srv/u-cache".into()),
+            ("XDG_STATE_HOME".into(), "/srv/u-state".into()),
             ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
             ("TMPDIR".into(), "/tmp".into()),
         ];
@@ -1256,6 +1280,10 @@ mod tests {
         assert_eq!(a.var("USER"), Some("alice"));
         assert_eq!(a.var("LANG"), Some("en_US.UTF-8"));
         assert_eq!(a.var("LC_TIME"), Some("de_DE.UTF-8"));
+        assert_eq!(a.var("XDG_CONFIG_HOME"), Some("/srv/u-config"));
+        assert_eq!(a.var("XDG_DATA_HOME"), Some("/srv/u-data"));
+        assert_eq!(a.var("XDG_CACHE_HOME"), Some("/srv/u-cache"));
+        assert_eq!(a.var("XDG_STATE_HOME"), Some("/srv/u-state"));
         assert_eq!(a.var("XDG_RUNTIME_DIR"), Some("/run/user/1000"));
         assert_eq!(a.var("TMPDIR"), Some("/tmp"));
         assert_eq!(a.var("SHELL"), Some("/usr/bin/fish"));
@@ -1274,6 +1302,10 @@ mod tests {
             ("USER".into(), "alice".into()),
             ("LANG".into(), "en_US.UTF-8".into()),
             ("LC_TIME".into(), "de_DE.UTF-8".into()),
+            ("XDG_CONFIG_HOME".into(), "/srv/u-config".into()),
+            ("XDG_DATA_HOME".into(), "/srv/u-data".into()),
+            ("XDG_CACHE_HOME".into(), "/srv/u-cache".into()),
+            ("XDG_STATE_HOME".into(), "/srv/u-state".into()),
             ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
             ("TMPDIR".into(), "/tmp".into()),
         ];
