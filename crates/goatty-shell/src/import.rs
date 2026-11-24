@@ -91,9 +91,42 @@ impl Kind {
     }
 }
 
+/// Minimal POSIX system `PATH` for a clean login-shell harvest.
+///
+/// Kept deliberately minimal (`/usr/bin:/bin`, matching POSIX `_CS_PATH`) so
+/// directories like `/usr/local/sbin` or `/usr/local/bin` added by a user's
+/// startup files aren't dropped on hosts where the daemon's own `PATH` lacks
+/// them (e.g. Intel macOS Homebrew or minimal Linux services).
+const DEFAULT_SYSTEM_PATH: &str = "/usr/bin:/bin";
+
+/// Variables from the calling process that belong in a clean login-shell
+/// baseline (identity, locale, XDG base/runtime dirs, temp dir, and a custom
+/// `ZDOTDIR`). Everything else — especially `PATH` and user variables a caller
+/// may have inherited from an already-configured interactive shell, IDE,
+/// virtualenv, or `nix develop` — is dropped so the harvest diffs against a
+/// clean login baseline instead of subtracting out the user's own
+/// `.zshrc`/`.bashrc` setup.
+fn is_baseline_var(name: &str) -> bool {
+    matches!(
+        name,
+        "USER"
+            | "LOGNAME"
+            | "SHELL"
+            | "LANG"
+            | "TZ"
+            | "TMPDIR"
+            | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
+            | "XDG_CACHE_HOME"
+            | "XDG_STATE_HOME"
+            | "XDG_RUNTIME_DIR"
+            | "ZDOTDIR"
+    ) || name.starts_with("LC_")
+}
+
 /// Where a harvest's facts come from: the host's home, login shell and the
-/// environment goattyd hands to new sessions. Injectable, so tests run in
-/// a sandboxed `$HOME`.
+/// clean baseline environment the harvested shell starts with. Injectable,
+/// so tests run in a sandboxed `$HOME`.
 #[derive(Debug, Clone)]
 pub struct Context {
     pub home: PathBuf,
@@ -102,16 +135,55 @@ pub struct Context {
     /// The environment the harvested shell starts with (and the baseline
     /// that tells which variables its startup files changed).
     pub env: Vec<(String, String)>,
+    /// Fallback `PATH` from the calling process, used only by [`Self::which`]
+    /// to locate `zsh`/`bash` on hosts where shells live outside standard
+    /// system directories (e.g. NixOS or Homebrew). Never passed to the
+    /// harvested shell or included in `base_path`.
+    search_path: Option<String>,
 }
 
 impl Context {
-    /// This process: its environment, `$HOME` and the passwd login shell.
-    /// `zsh_dir`: goatty's own ZDOTDIR, never handed on as the user's.
+    /// This process: a clean login-shell baseline built from its environment,
+    /// `$HOME` and the passwd login shell. `zsh_dir`: goatty's own ZDOTDIR,
+    /// never handed on as the user's.
     pub fn from_env(zsh_dir: &Path) -> Option<Self> {
         let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
-        let env: Vec<(String, String)> = std::env::vars().collect();
         let login_shell = passwd_shell().or_else(|| std::env::var("SHELL").ok()).filter(|s| !s.is_empty());
-        Some(Self::new(home, login_shell, env, zsh_dir))
+        Some(Self::from_process_env(home, login_shell, std::env::vars(), zsh_dir))
+    }
+
+    /// Build a harvest context from a caller's process environment, stripping
+    /// it down to a clean login-shell baseline so PATH entries and variables
+    /// inherited from an interactive shell (or IDE / venv / `nix develop`)
+    /// aren't treated as the baseline and subtracted out of the import.
+    pub fn from_process_env(
+        home: PathBuf,
+        login_shell: Option<String>,
+        vars: impl IntoIterator<Item = (String, String)>,
+        zsh_dir: &Path,
+    ) -> Self {
+        let mut search_path = None;
+        let mut base = Vec::new();
+        for (k, v) in vars {
+            if k == "PATH" {
+                if !v.is_empty() {
+                    search_path = Some(v);
+                }
+                continue;
+            }
+            if is_baseline_var(&k) {
+                base.push((k, v));
+            }
+        }
+        base.push(("PATH".to_owned(), DEFAULT_SYSTEM_PATH.to_owned()));
+        if !base.iter().any(|(k, _)| k == "SHELL")
+            && let Some(shell) = &login_shell
+        {
+            base.push(("SHELL".to_owned(), shell.clone()));
+        }
+        let mut ctx = Self::new(home, login_shell, base, zsh_dir);
+        ctx.search_path = search_path;
+        ctx
     }
 
     /// From parts; `env` is cleaned up for the harvest (goatty's variables
@@ -133,7 +205,7 @@ impl Context {
         // Some startup files return early for a dumb terminal.
         set("TERM", "xterm-256color", false);
         env.sort();
-        Self { home, login_shell, env }
+        Self { home, login_shell, env, search_path: None }
     }
 
     fn var(&self, name: &str) -> Option<&str> {
@@ -141,8 +213,9 @@ impl Context {
     }
 
     pub(crate) fn which(&self, bin: &str) -> Option<String> {
-        let path = self.var("PATH")?;
-        std::env::split_paths(path).map(|d| d.join(bin)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+        let find_in =
+            |path: &str| std::env::split_paths(path).map(|d| d.join(bin)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned());
+        self.var("PATH").and_then(find_in).or_else(|| self.search_path.as_deref().and_then(find_in))
     }
 
     /// The user's ZDOTDIR (unset: `$HOME`), `known` when an earlier harvest
@@ -1167,6 +1240,78 @@ mod tests {
         assert_eq!(c.var(MARKER_ENV), Some("1"));
         assert_eq!(c.var("HOME"), Some("/h"));
         assert_eq!(c.var("DISABLE_AUTO_UPDATE"), Some("true"));
+    }
+
+    #[test]
+    fn from_process_env_uses_clean_baseline_and_stable_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let custom_shells = tmp.path().join("nix-sw/bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&custom_shells).unwrap();
+        std::fs::write(custom_shells.join("zsh"), "").unwrap();
+
+        let polluted_a = vec![
+            ("PATH".into(), format!("{}/.local/bin:/opt/ide/bin:{}", home.display(), custom_shells.display())),
+            ("EDITOR".into(), "nvim".into()),
+            ("ANDROID_HOME".into(), "/opt/android-sdk".into()),
+            ("TERM".into(), "xterm-kitty".into()),
+            ("KITTY_WINDOW_ID".into(), "1".into()),
+            ("GOATTY_SOCKET".into(), "/s".into()),
+            ("ZDOTDIR".into(), "/goatty/current/zsh".into()),
+            ("USER".into(), "alice".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("LC_TIME".into(), "de_DE.UTF-8".into()),
+            ("XDG_CONFIG_HOME".into(), "/srv/u-config".into()),
+            ("XDG_DATA_HOME".into(), "/srv/u-data".into()),
+            ("XDG_CACHE_HOME".into(), "/srv/u-cache".into()),
+            ("XDG_STATE_HOME".into(), "/srv/u-state".into()),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+            ("TMPDIR".into(), "/tmp".into()),
+        ];
+        let a = Context::from_process_env(home.clone(), Some("/usr/bin/fish".into()), polluted_a, Path::new("/goatty/current/zsh"));
+        assert_eq!(a.var("PATH"), Some(DEFAULT_SYSTEM_PATH));
+        assert_eq!(a.var("EDITOR"), None);
+        assert_eq!(a.var("ANDROID_HOME"), None);
+        assert_eq!(a.var("KITTY_WINDOW_ID"), None);
+        assert_eq!(a.var("GOATTY_SOCKET"), None);
+        assert_eq!(a.var("ZDOTDIR"), None);
+        assert_eq!(a.var("TERM"), Some("xterm-256color"));
+        assert_eq!(a.var("USER"), Some("alice"));
+        assert_eq!(a.var("LANG"), Some("en_US.UTF-8"));
+        assert_eq!(a.var("LC_TIME"), Some("de_DE.UTF-8"));
+        assert_eq!(a.var("XDG_CONFIG_HOME"), Some("/srv/u-config"));
+        assert_eq!(a.var("XDG_DATA_HOME"), Some("/srv/u-data"));
+        assert_eq!(a.var("XDG_CACHE_HOME"), Some("/srv/u-cache"));
+        assert_eq!(a.var("XDG_STATE_HOME"), Some("/srv/u-state"));
+        assert_eq!(a.var("XDG_RUNTIME_DIR"), Some("/run/user/1000"));
+        assert_eq!(a.var("TMPDIR"), Some("/tmp"));
+        assert_eq!(a.var("SHELL"), Some("/usr/bin/fish"));
+        // Shells outside DEFAULT_SYSTEM_PATH are still found via search_path fallback.
+        std::fs::write(custom_shells.join("goatty-test-only-shell"), "").unwrap();
+        assert_eq!(
+            a.which("goatty-test-only-shell").as_deref(),
+            Some(custom_shells.join("goatty-test-only-shell").to_string_lossy().as_ref())
+        );
+
+        // A different caller (e.g. an IDE terminal with different PATH/TERM/vars) gets the exact same fingerprint.
+        let polluted_b = vec![
+            ("PATH".into(), format!("/opt/t3code-bin:{}/.cargo/bin:/usr/bin", home.display())),
+            ("VSCODE_IPC_HOOK".into(), "/tmp/vscode".into()),
+            ("TERM".into(), "dumb".into()),
+            ("USER".into(), "alice".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("LC_TIME".into(), "de_DE.UTF-8".into()),
+            ("XDG_CONFIG_HOME".into(), "/srv/u-config".into()),
+            ("XDG_DATA_HOME".into(), "/srv/u-data".into()),
+            ("XDG_CACHE_HOME".into(), "/srv/u-cache".into()),
+            ("XDG_STATE_HOME".into(), "/srv/u-state".into()),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+            ("TMPDIR".into(), "/tmp".into()),
+        ];
+        let b = Context::from_process_env(home, Some("/usr/bin/fish".into()), polluted_b, Path::new("/goatty/current/zsh"));
+        let src = Source { kind: Kind::Zsh, program: "/usr/bin/zsh".into(), why: String::new() };
+        assert_eq!(fingerprint(&src, &a, None), fingerprint(&src, &b, None));
     }
 
     #[test]
