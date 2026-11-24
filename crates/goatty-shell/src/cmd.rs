@@ -713,8 +713,7 @@ pub fn everywhere(svc: &crate::HostService, action: crate::everywhere::Action, y
 
 /// `goattyd shell refresh` without a running goattyd: bring the shell
 /// configuration and the import of the user's own shell setup up to date
-/// in this process, as a new goatty session would. (With one, goattyd does
-/// it: the import compares against goattyd's environment.)
+/// in this process, as a new goatty session would.
 pub fn refresh(svc: &crate::HostService) -> Result<()> {
     svc.refresh()
 }

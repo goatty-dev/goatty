@@ -243,3 +243,33 @@ fn prepare_caches_until_a_startup_file_changes() {
     assert!(status.enabled && status.failure.is_some() && status.harvest.is_some());
     assert_eq!(status.files.iter().filter(|f| f.exists).map(|f| f.path.as_str()).collect::<Vec<_>>(), ["~/.zshrc"]);
 }
+
+/// Harvesting from a process whose environment already contains the user's
+/// `.zshrc` PATH entries and variables (e.g. `goattyd` or `goattyd shell refresh`
+/// launched from an interactive shell or IDE) still imports them and does not
+/// leak caller-specific PATH entries.
+#[test]
+fn harvest_from_polluted_process_env_still_imports_user_path_and_vars() {
+    let Some(zsh) = find("zsh") else { return };
+    let sb = Sandbox::new();
+    let local_bin = sb.home.join(".local/bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    sb.file(".zshrc", "export PATH=\"$HOME/.local/bin:$PATH\"\nexport EDITOR=nvim\nexport ANDROID_HOME=/opt/android-sdk\n");
+    let polluted_env = vec![
+        ("HOME".into(), sb.home.to_string_lossy().into_owned()),
+        ("USER".into(), "tester".into()),
+        ("PATH".into(), format!("{}:/opt/some-ide/bin:/usr/bin:/bin", local_bin.display())),
+        ("EDITOR".into(), "nvim".into()),
+        ("ANDROID_HOME".into(), "/opt/android-sdk".into()),
+        ("VIRTUAL_ENV".into(), "/tmp/fake-venv".into()),
+    ];
+    let ctx = Context::from_process_env(sb.home.clone(), Some(zsh), polluted_env, &sb.dirs.zsh_dir());
+    let src = import::source(ImportFrom::Zsh, &ctx).unwrap();
+    let h = import::harvest(&src, &ctx, &sb.dirs.import_dir(), Duration::from_secs(20), None).unwrap_or_else(|f| panic!("{f:?}"));
+    let local_bin_str = local_bin.to_string_lossy().into_owned();
+    assert!(h.added_path().contains(&local_bin_str.as_str()), "expected ~/.local/bin in added_path: {:?}", h.added_path());
+    assert!(!h.path.iter().any(|p| p == "/opt/some-ide/bin"), "caller PATH leaked: {:?}", h.path);
+    assert_eq!(var(&h, "EDITOR"), Some("nvim"));
+    assert_eq!(var(&h, "ANDROID_HOME"), Some("/opt/android-sdk"));
+    assert_eq!(var(&h, "VIRTUAL_ENV"), None);
+}
