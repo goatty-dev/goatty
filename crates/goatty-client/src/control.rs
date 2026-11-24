@@ -78,6 +78,19 @@ impl Control {
     /// [`Self::connect`], giving up when the daemon hasn't greeted within
     /// `timeout` (a socket can accept connections before anything serves it).
     pub fn connect_within(path: &Path, client: &str, timeout: Option<std::time::Duration>) -> Result<Self> {
+        Self::connect_from(path, client, timeout, goatty_proto::MIN_PROTOCOL_VERSION)
+    }
+
+    /// [`Self::connect_within`] to a daemon that may be older than this
+    /// build speaks, down to `ADMIN_MIN_PROTOCOL_VERSION`: only for
+    /// [`Self::list_sessions`], [`Self::restart`] and [`Self::shutdown`],
+    /// which every version since speaks the same way. That's how a new
+    /// goatty replaces an old daemon without ending its sessions.
+    pub fn connect_admin(path: &Path, client: &str, timeout: Option<std::time::Duration>) -> Result<Self> {
+        Self::connect_from(path, client, timeout, goatty_proto::ADMIN_MIN_PROTOCOL_VERSION)
+    }
+
+    fn connect_from(path: &Path, client: &str, timeout: Option<std::time::Duration>, min: u32) -> Result<Self> {
         let mut announce = PROTOCOL_VERSION;
         loop {
             let mut stream =
@@ -85,7 +98,7 @@ impl Control {
             stream.set_read_timeout(timeout)?;
             stream.set_write_timeout(timeout)?;
             stream.write_all(&handshake::hello(client, announce)?)?;
-            match handshake::read_greeting(&mut stream, &path.display().to_string(), announce)? {
+            match handshake::read_greeting_from(&mut stream, &path.display().to_string(), announce, min)? {
                 Outcome::Ok(g) => {
                     stream.set_read_timeout(None)?;
                     stream.set_write_timeout(None)?;
@@ -242,6 +255,14 @@ impl Control {
                 }
                 Err(e) => return Err(e.into()),
             }
+        }
+    }
+
+    /// The daemon's workspaces (protocol v17).
+    pub fn list_workspaces(&mut self) -> Result<Vec<goatty_proto::WorkspaceInfo>> {
+        match self.request(|req| ClientMsg::ListWorkspaces { req })? {
+            ServerMsg::Workspaces { list, .. } => Ok(list),
+            other => bail!("unexpected reply {other:?}"),
         }
     }
 

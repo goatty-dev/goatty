@@ -26,19 +26,24 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
-/// The oldest protocol version this build still speaks.
-pub const MIN_PROTOCOL_VERSION: u32 = 7;
+/// The oldest protocol version this build still speaks. v17 replaced the
+/// exclusive window layouts with shared workspaces, which can't be appended.
+pub const MIN_PROTOCOL_VERSION: u32 = 17;
+
+/// The oldest daemon a client may still ask to restart or stop
+/// (`goatty_client::local`): `Hello`, `ListSessions`, `Restart`, `Shutdown`
+/// and their replies keep their variant index and fields in every version
+/// since, so a new client can still replace an older daemon without ending
+/// its sessions.
+pub const ADMIN_MIN_PROTOCOL_VERSION: u32 = RESTART_SINCE;
 
 /// v6: `ClientMsg::Run` (a session running a given command).
 pub const RUN_SINCE: u32 = 6;
 
 /// v7: `ServerMsg::Process` and `SessionInfo::process`.
 pub const PROCESS_SINCE: u32 = 7;
-
-/// v8: `SaveLayout` / `ClaimLayout` (saved window layouts).
-pub const LAYOUT_SINCE: u32 = 8;
 
 /// v9: `Shell` (setup and diagnostics of the managed shell).
 pub const SHELL_SINCE: u32 = 9;
@@ -70,11 +75,11 @@ pub const SIZE_CONTROL_SINCE: u32 = 14;
 /// `ServerMsg::FlowWindow`, #9).
 pub const FLOW_CONTROL_SINCE: u32 = 15;
 
-/// v16: listing the free window layouts (`ListLayouts` / `ServerMsg::Layouts`),
-/// claiming one by id (`ClaimLayoutId`), so a client restores the layout it
-/// saved (a window's tabs on that host, #252) rather than the newest, and
-/// releasing one without disconnecting (`ReleaseLayout`: detached tabs).
-pub const LAYOUT_LIST_SINCE: u32 = 16;
+/// v17: workspaces (#215): a daemon's tabs and splits, shared by every
+/// client window that shows them (`ListWorkspaces`, `JoinWorkspace`,
+/// `SaveWorkspace` with revisions, `ServerMsg::LayoutChanged`, …). They
+/// replaced v8's and v16's exclusive window layouts.
+pub const WORKSPACES_SINCE: u32 = 17;
 
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
 /// for postcard headers and path metadata).
@@ -90,9 +95,12 @@ pub fn negotiate(peer: u32) -> Option<u32> {
 pub type SessionId = u64;
 /// Client-chosen correlation id for request/response pairs.
 pub type ReqId = u32;
-/// Client-chosen id of a window layout (random, so windows on different
-/// machines don't collide).
-pub type LayoutId = u64;
+/// v17: a workspace's id (random, chosen by the daemon).
+pub type WorkspaceId = u64;
+/// v17: a client window, as a connection's workspace requests name it: the
+/// windows of one client process share one connection per host, and each
+/// shows its own workspace there.
+pub type ViewId = u64;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WinSize {
@@ -257,21 +265,13 @@ pub enum ClientMsg {
         argv: Vec<String>,
         opts: StreamOpts,
     },
-    /// v8: remember a window's layout (tabs and splits) so a later window
-    /// can restore it. `json` is the client's own format, opaque to the
-    /// daemon; `sessions` are the sessions it shows. Saving also claims the
-    /// layout for this connection. No `sessions`: forget it. No reply.
-    SaveLayout {
-        id: LayoutId,
-        sessions: Vec<SessionId>,
-        json: String,
-    },
-    /// v8: take over the most recently saved layout that no connection
-    /// holds and that still shows a running session. One window gets it;
-    /// the next one gets the next layout or none. Reply: `Layout`.
-    ClaimLayout {
-        req: ReqId,
-    },
+    /// v8–v16 `SaveLayout`, retired in v17 (workspaces). Kept so the
+    /// variants after it keep their index.
+    #[doc(hidden)]
+    RetiredSaveLayout,
+    /// v8–v16 `ClaimLayout`, retired in v17.
+    #[doc(hidden)]
+    RetiredClaimLayout,
     /// v9: a shell setup or diagnostics operation (`goatty_shell::setup::Request`
     /// as JSON: status, install the built-in tools, offered, dismiss).
     /// Answered off the connection's reader thread, since the status starts a
@@ -347,27 +347,77 @@ pub enum ClientMsg {
     Rtt {
         rtt_us: u64,
     },
-    /// v16: the layouts no connection holds that still show a running
-    /// session, newest first, with only those sessions listed. Nothing is
-    /// claimed. Reply: `Layouts`.
-    ListLayouts {
+    /// v16 `ListLayouts`, retired in v17.
+    #[doc(hidden)]
+    RetiredListLayouts,
+    /// v16 `ClaimLayoutId`, retired in v17.
+    #[doc(hidden)]
+    RetiredClaimLayoutId,
+    /// v16 `ReleaseLayout`, retired in v17.
+    #[doc(hidden)]
+    RetiredReleaseLayout,
+    /// v17: every workspace on the daemon, in the order they were made
+    /// (dropping the ones whose sessions all ended and that no window shows,
+    /// unless it's the only one). Reply: `Workspaces`.
+    ListWorkspaces {
         req: ReqId,
     },
-    /// v16: take over layout `id` if no connection holds it and it still
-    /// shows a running session (like `ClaimLayout`, for one layout). Reply:
-    /// `Layout` (`None` when it's gone or held).
-    ClaimLayoutId {
+    /// v17: window `view` shows workspace `id` from now on: the one it
+    /// showed before on this connection is left, and it hears
+    /// `LayoutChanged` for this one. `None`, or a workspace that's gone: the
+    /// most recently active one (a fresh daemon makes "Main"). Joining
+    /// makes it the most recently active. Reply: `Joined`.
+    JoinWorkspace {
         req: ReqId,
-        id: LayoutId,
+        view: ViewId,
+        id: Option<WorkspaceId>,
     },
-    /// v16: keep layout `id` with `sessions` and `json` as a free layout
-    /// (detached tabs), the newest one, for any window to claim, unless
-    /// another connection holds it. Safe to send again (a retry after a link
-    /// drop never takes it from a window that claimed it meanwhile). No reply.
-    ReleaseLayout {
-        id: LayoutId,
+    /// v17: window `view` doesn't show a workspace on this connection any
+    /// more (it closed, or detached from the host). No reply.
+    LeaveWorkspace {
+        view: ViewId,
+    },
+    /// v17: a new, empty workspace, joined by `view` (as `JoinWorkspace`).
+    /// `name`: else "Workspace N". Reply: `Joined`.
+    CreateWorkspace {
+        req: ReqId,
+        view: ViewId,
+        name: Option<String>,
+    },
+    /// v17: replace workspace `id`'s layout with `json` (the client's own
+    /// format, opaque to the daemon), edited from revision `base`.
+    /// `sessions`: every session it shows, `tabs`: how many tabs (for
+    /// lists). Accepted only when `base` is still the newest revision, else
+    /// the reply carries the newest layout to rebase on. No `sessions`: the
+    /// workspace ends (unless it's the daemon's only one). Every other window
+    /// showing it hears `LayoutChanged`. Reply: `WorkspaceSaved`.
+    SaveWorkspace {
+        req: ReqId,
+        view: ViewId,
+        id: WorkspaceId,
+        base: u64,
+        tabs: u32,
         sessions: Vec<SessionId>,
         json: String,
+    },
+    /// v17: Reply: `Ok`, or `Error` for an unknown workspace or a bad name.
+    RenameWorkspace {
+        req: ReqId,
+        id: WorkspaceId,
+        name: String,
+    },
+    /// v17: forget workspace `id` (its sessions keep running, detached; the
+    /// client moves or ends them first). Reply: `Ok`, or `Error` for the
+    /// daemon's only workspace or an unknown one.
+    CloseWorkspace {
+        req: ReqId,
+        id: WorkspaceId,
+    },
+    /// v17: workspace `id`'s layout without joining it (moving its tabs
+    /// elsewhere). Reply: `WorkspaceLayout`.
+    GetWorkspace {
+        req: ReqId,
+        id: WorkspaceId,
     },
 }
 
@@ -384,14 +434,44 @@ pub enum TopLineCause {
     Resize,
 }
 
-/// A saved window layout (see `ClientMsg::SaveLayout`).
+/// v17: a workspace as lists show it (without its layout).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LayoutInfo {
-    pub id: LayoutId,
-    pub json: String,
-    /// The layout's sessions that are still running.
+pub struct WorkspaceInfo {
+    pub id: WorkspaceId,
+    pub name: String,
+    /// Bumped by every accepted save.
+    pub revision: u64,
+    /// Tabs in its layout, as its last save counted them.
+    pub tabs: u32,
+    /// Its sessions that are still running.
     pub sessions: Vec<SessionId>,
-    pub saved_unix: u64,
+    /// How many client windows show it now.
+    pub views: u32,
+    /// Larger is more recently active (joined, created or saved).
+    pub active: u64,
+}
+
+/// v17: a workspace's layout (see `ClientMsg::SaveWorkspace`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceLayout {
+    pub id: WorkspaceId,
+    pub revision: u64,
+    /// The client's JSON; empty for a workspace never saved.
+    pub json: String,
+    /// The sessions it shows that are still running.
+    pub sessions: Vec<SessionId>,
+}
+
+/// v17: what became of a `SaveWorkspace`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// Stored as this revision.
+    Saved { revision: u64 },
+    /// Someone saved since `base`: this is the newest layout. Re-apply the
+    /// edit on it and save again.
+    Conflict(WorkspaceLayout),
+    /// The workspace doesn't exist (any more).
+    Gone,
 }
 
 /// One changed file of the generated shell configuration.
@@ -527,11 +607,9 @@ pub enum ServerMsg {
         session: SessionId,
         name: Option<String>,
     },
-    /// v8: reply to `ClaimLayout`.
-    Layout {
-        req: ReqId,
-        layout: Option<LayoutInfo>,
-    },
+    /// v8–v16 `Layout`, retired in v17.
+    #[doc(hidden)]
+    RetiredLayout,
     /// v9: `goatty_shell::setup::Reply` as JSON.
     Shell {
         req: ReqId,
@@ -612,10 +690,42 @@ pub enum ServerMsg {
     FlowWindow {
         window: u32,
     },
-    /// v16: reply to `ListLayouts`.
-    Layouts {
+    /// v16 `Layouts`, retired in v17.
+    #[doc(hidden)]
+    RetiredLayouts,
+    /// v17: reply to `ListWorkspaces`.
+    Workspaces {
         req: ReqId,
-        layouts: Vec<LayoutInfo>,
+        list: Vec<WorkspaceInfo>,
+    },
+    /// v17: reply to `JoinWorkspace` and `CreateWorkspace`: the workspace
+    /// the window shows now.
+    Joined {
+        req: ReqId,
+        info: WorkspaceInfo,
+        layout: WorkspaceLayout,
+    },
+    /// v17: reply to `SaveWorkspace`.
+    WorkspaceSaved {
+        req: ReqId,
+        outcome: SaveOutcome,
+    },
+    /// v17: reply to `GetWorkspace` (`None`: no such workspace).
+    WorkspaceLayout {
+        req: ReqId,
+        layout: Option<WorkspaceLayout>,
+    },
+    /// v17: window `by` saved a workspace that a window of this connection
+    /// shows (sent once per connection; not to `by` itself). Not a reply.
+    LayoutChanged {
+        by: ViewId,
+        layout: WorkspaceLayout,
+    },
+    /// v17: the daemon's workspaces changed (one was made, renamed, closed
+    /// or ended, or a window started or stopped showing one), to every
+    /// connection that listed or joined workspaces. Not a reply.
+    WorkspacesChanged {
+        list: Vec<WorkspaceInfo>,
     },
 }
 
@@ -631,8 +741,10 @@ impl ServerMsg {
             | ServerMsg::Generations { req, .. }
             | ServerMsg::ShellsReloaded { req, .. }
             | ServerMsg::Plugin { req, .. }
-            | ServerMsg::Layout { req, .. }
-            | ServerMsg::Layouts { req, .. }
+            | ServerMsg::Workspaces { req, .. }
+            | ServerMsg::Joined { req, .. }
+            | ServerMsg::WorkspaceSaved { req, .. }
+            | ServerMsg::WorkspaceLayout { req, .. }
             | ServerMsg::Shell { req, .. }
             | ServerMsg::Net { req, .. }
             | ServerMsg::History { req, .. }
@@ -673,6 +785,7 @@ mod tests {
         assert_eq!(negotiate(PROTOCOL_VERSION + 3), Some(PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION), Some(MIN_PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION - 1), None);
+        assert!(ADMIN_MIN_PROTOCOL_VERSION <= MIN_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -732,10 +845,23 @@ mod tests {
         // v15 additions come after v14's.
         assert_eq!(postcard::to_allocvec(&ClientMsg::Rtt { rtt_us: 1000 }).unwrap()[0], 30);
         assert_eq!(postcard::to_allocvec(&ServerMsg::FlowWindow { window: StreamOpts::REMOTE.window }).unwrap()[0], 25);
-        // v16 additions come after v15's.
-        assert_eq!(postcard::to_allocvec(&ClientMsg::ListLayouts { req: 1 }).unwrap()[0], 31);
-        assert_eq!(postcard::to_allocvec(&ClientMsg::ClaimLayoutId { req: 1, id: 2 }).unwrap()[0], 32);
-        assert_eq!(postcard::to_allocvec(&ClientMsg::ReleaseLayout { id: 2, sessions: vec![1], json: String::new() }).unwrap()[0], 33);
-        assert_eq!(postcard::to_allocvec(&ServerMsg::Layouts { req: 1, layouts: Vec::new() }).unwrap()[0], 26);
+        // v16's slots stay, retired; v17 additions come after them.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::RetiredReleaseLayout).unwrap()[0], 33);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ListWorkspaces { req: 1 }).unwrap()[0], 34);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::GetWorkspace { req: 1, id: 2 }).unwrap()[0], 41);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::RetiredLayouts).unwrap()[0], 26);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Workspaces { req: 1, list: Vec::new() }).unwrap()[0], 27);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::WorkspacesChanged { list: Vec::new() }).unwrap()[0], 32);
+    }
+
+    #[test]
+    fn admin_messages_keep_their_shape() {
+        // What a new client sends an older daemon to restart or stop it
+        // (`ADMIN_MIN_PROTOCOL_VERSION`), and what it reads back.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::ListSessions { req: 5 }).unwrap(), [1, 5]);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Shutdown { req: 5 }).unwrap(), [11, 5]);
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Restart { req: 5, exe: None }).unwrap(), [23, 5, 0]);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Ok { req: 5 }).unwrap(), [7, 5]);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Sessions { req: 5, list: Vec::new() }).unwrap(), [1, 5, 0]);
     }
 }

@@ -18,8 +18,8 @@ use goatty_term::pty::{Pty, ShellCommand};
 use goatty_term::{Palette, Terminal, TerminalChannels};
 use parking_lot::{Mutex, RwLock};
 
-use crate::layouts::Layouts;
 use crate::session::{CwdCoordinator, Pause, Session, pump_output, to_size};
+use crate::workspaces::{Changes, Workspaces};
 
 /// The session registry shared by every connection.
 pub(crate) struct Daemon {
@@ -30,8 +30,8 @@ pub(crate) struct Daemon {
     /// Removed on shutdown.
     pub(crate) socket: PathBuf,
     pub(crate) sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
-    /// The windows' tabs and splits.
-    pub(crate) layouts: Mutex<Layouts>,
+    /// The tabs and splits client windows share (#215).
+    pub(crate) workspaces: Mutex<Workspaces>,
     pub(crate) next_session: AtomicU64,
     pub(crate) next_conn: AtomicU64,
     /// The listening socket the accept loop serves (a restart passes it on).
@@ -83,7 +83,7 @@ impl Daemon {
             host: HostService::from_env(std::env::current_exe().ok()),
             socket,
             sessions: Mutex::default(),
-            layouts: Mutex::default(),
+            workspaces: Mutex::default(),
             next_session: AtomicU64::new(0),
             next_conn: AtomicU64::new(0),
             listener_fd: Mutex::new(None),
@@ -234,28 +234,51 @@ impl Daemon {
                     daemon.host.untrack_shell(pid);
                 }
                 s.finish(code);
+                daemon.session_ended();
             })?;
         }
         self.sessions.lock().insert(id, session.clone());
         Ok(session)
     }
 
-    /// Give connection `conn` the newest free window layout (see `Layouts`).
-    pub(crate) fn claim_layout(&self, conn: u64) -> Option<goatty_proto::LayoutInfo> {
-        let live: std::collections::HashSet<SessionId> = self.sessions.lock().keys().copied().collect();
-        self.layouts.lock().claim(conn, |s| live.contains(&s))
+    /// The running sessions' ids.
+    pub(crate) fn live(&self) -> std::collections::HashSet<SessionId> {
+        self.sessions.lock().keys().copied().collect()
     }
 
-    /// Give connection `conn` free layout `id` (see `Layouts::claim_id`).
-    pub(crate) fn claim_layout_id(&self, conn: u64, id: goatty_proto::LayoutId) -> Option<goatty_proto::LayoutInfo> {
-        let live: std::collections::HashSet<SessionId> = self.sessions.lock().keys().copied().collect();
-        self.layouts.lock().claim_id(conn, id, |s| live.contains(&s))
+    /// A session ended: a workspace no window shows may have ended with it.
+    fn session_ended(&self) {
+        let live = self.live();
+        if self.workspaces.lock().prune(|s| live.contains(&s)) {
+            self.announce(Changes { list: true, layout: None });
+        }
     }
 
-    /// The free layouts (see `Layouts::list_free`).
-    pub(crate) fn free_layouts(&self) -> Vec<goatty_proto::LayoutInfo> {
-        let live: std::collections::HashSet<SessionId> = self.sessions.lock().keys().copied().collect();
-        self.layouts.lock().list_free(|s| live.contains(&s))
+    /// Tell the connections what changed in the workspaces: a saved layout
+    /// to the ones that show it (not to the window that saved it), the list
+    /// to every one that watches workspaces. Each frame is encoded once.
+    pub(crate) fn announce(&self, changes: Changes) {
+        let send = |frame: &goatty_proto::Frame, to: &dyn Fn(u64, &crate::client::Liveness) -> bool| {
+            for (&conn, live) in self.conns.lock().iter() {
+                if to(conn, live)
+                    && let Some(tx) = live.writer.upgrade()
+                {
+                    let _ = tx.send(crate::client::Outbound::from(frame.clone()));
+                }
+            }
+        };
+        if let Some((by, layout, conns)) = changes.layout
+            && let Ok(frame) = goatty_proto::encode(&goatty_proto::ServerMsg::LayoutChanged { by, layout })
+        {
+            send(&frame, &|conn, _| conns.contains(&conn));
+        }
+        if changes.list {
+            let live = self.live();
+            let list = self.workspaces.lock().list(|s| live.contains(&s));
+            if let Ok(frame) = goatty_proto::encode(&goatty_proto::ServerMsg::WorkspacesChanged { list }) {
+                send(&frame, &|_, live| live.watches_workspaces());
+            }
+        }
     }
 
     pub(crate) fn list(&self) -> Vec<SessionInfo> {

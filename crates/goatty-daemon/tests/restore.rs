@@ -1,6 +1,6 @@
 //! Sessions outlive goattyd (#131):
 //! * `Restart` re-executes the daemon (here: an updated build at the same
-//!   path) and the session, its screen and the saved layout carry over,
+//!   path) and the session, its screen and the workspaces carry over,
 //! * a program that can't take over is refused and nothing changes,
 //! * PTYs systemd kept in the fd store come back as sessions (a fake
 //!   `LISTEN_FDS`, as after a crash), with the screen saved on SIGTERM.
@@ -129,7 +129,19 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
     // A full-screen program is on (the alternate screen) when it restarts.
     send(&mut s, &ClientMsg::Input { session: id, data: b"printf '\\033[?1049hIN-ALT-%s' $((3*3))\r".to_vec() });
     read_until(&mut s, "IN-ALT-9");
-    send(&mut s, &ClientMsg::SaveLayout { id: 77, sessions: vec![id], json: "{\"tabs\":1}".into() });
+    send(&mut s, &ClientMsg::JoinWorkspace { req: 2, view: 1, id: None });
+    let main = loop {
+        if let ServerMsg::Joined { info, .. } = next_msg(&mut s) {
+            break info.id;
+        }
+    };
+    send(&mut s, &ClientMsg::SaveWorkspace { req: 3, view: 1, id: main, base: 0, tabs: 1, sessions: vec![id], json: "{\"tabs\":1}".into() });
+    loop {
+        if let ServerMsg::WorkspaceSaved { outcome, .. } = next_msg(&mut s) {
+            assert_eq!(outcome, goatty_proto::SaveOutcome::Saved { revision: 1 });
+            break;
+        }
+    }
     let pid_before = Control::connect(&sock, "test").unwrap().list_sessions().unwrap()[0].pid;
 
     // An update replaces the file the daemon runs.
@@ -159,11 +171,14 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
     let list = c.list_sessions().unwrap();
     assert_eq!(list.iter().map(|s| (s.id, s.pid)).collect::<Vec<_>>(), [(id, pid_before)]);
 
-    // The screen and the layout carried over; the shell still answers.
+    // The screen and the workspace carried over; the shell still answers.
     let mut s = connect(&sock);
-    send(&mut s, &ClientMsg::ClaimLayout { req: 2 });
+    send(&mut s, &ClientMsg::JoinWorkspace { req: 2, view: 1, id: None });
     match read_msg::<_, ServerMsg>(&mut s).unwrap() {
-        ServerMsg::Layout { layout: Some(l), .. } => assert_eq!((l.id, l.sessions), (77, vec![id])),
+        ServerMsg::Joined { info, layout, .. } => {
+            assert_eq!((info.id, info.name.as_str(), info.views), (main, "Main", 1));
+            assert_eq!((layout.revision, layout.json.as_str(), layout.sessions), (1, "{\"tabs\":1}", vec![id]));
+        }
         other => panic!("{other:?}"),
     }
     send(&mut s, &ClientMsg::Attach { req: 3, session: id, size: SIZE, opts: StreamOpts::LOCAL });
@@ -232,7 +247,7 @@ fn ptys_from_the_systemd_fd_store_come_back() {
     std::fs::write(
         state.join("state.json"),
         format!(
-            r#"{{"version":1,"next_session":20,"listener_fd":null,"layouts":[],
+            r#"{{"version":1,"next_session":20,"listener_fd":null,"layouts":[{{"id":3,"json":"old","sessions":[7],"saved_unix":0,"seq":1}}],
                 "sessions":[{{"id":7,"fd":null,"pid":{shell},"created_unix":1700000000,"managed":false,"snapshot":"s7.vt"}}]}}"#
         ),
     )

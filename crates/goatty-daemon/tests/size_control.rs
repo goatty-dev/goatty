@@ -10,7 +10,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use goatty_client::Control;
-use goatty_proto::{ClientMsg, PROTOCOL_VERSION, SIZE_CONTROL_SINCE, ServerMsg, SessionId, StreamOpts, WinSize, encode, read_msg};
+use goatty_proto::{ClientMsg, PROTOCOL_VERSION, ServerMsg, SessionId, StreamOpts, WinSize, encode, read_msg};
 
 struct Daemon {
     child: Child,
@@ -169,16 +169,8 @@ fn one_client_controls_the_size_and_others_watch_until_they_take_over() {
     assert_eq!(next_size_control(&mut a, id), (72, 15, true));
     wait_size(&d.sock, id, (72, 15));
 
-    // A client from before v14 takes control as it always did.
-    let mut c = connect(&d.sock, SIZE_CONTROL_SINCE - 1);
-    send(&mut c, &ClientMsg::Attach { req: 3, session: id, size: ws(50, 10), opts: StreamOpts::LOCAL });
-    assert_eq!(next_size_control(&mut a, id), (50, 10, false));
-    wait_size(&d.sock, id, (50, 10));
+    // The controller's resizes apply.
     send(&mut a, &ClientMsg::Resize { session: id, size: ws(80, 24) });
-    round_trip(&mut a);
-    assert_eq!(size_of(&d.sock, id), (50, 10));
-    // Its connection ending hands control back.
-    drop(c);
     assert_eq!(next_size_control(&mut a, id), (80, 24, true));
     wait_size(&d.sock, id, (80, 24));
 

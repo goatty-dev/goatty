@@ -4,7 +4,7 @@
 //! What has to carry over is each session's PTY master (the shell keeps
 //! running as long as one is open) and what the daemon knows about it: the
 //! screens and scrollback (`Terminal::restore_snapshot`), size, ids, and the
-//! saved window layouts.
+//! workspaces.
 //!
 //! * **Restart** (protocol `Restart`, `goattyd restart`): every output pump
 //!   pauses between two reads, the state goes to `<socket>.restore/`, the
@@ -40,7 +40,7 @@ use goatty_term::pty::{self, Pty};
 use goatty_term::{Palette, TermSize, Terminal};
 use serde::{Deserialize, Serialize};
 
-use crate::layouts::{Layouts, SavedLayout};
+use crate::workspaces::{SavedWorkspace, Workspaces};
 use crate::server::{Daemon, NewSession};
 use crate::session::Session;
 use crate::systemd::StoredPty;
@@ -62,7 +62,13 @@ struct State {
     #[serde(default)]
     socket_activated: bool,
     sessions: Vec<SavedSession>,
-    layouts: Vec<SavedLayout>,
+    /// Always empty: builds before v17 read their window layouts here (a
+    /// state without it fails to load there), and a v17 build drops what an
+    /// older one wrote (#215: old layouts aren't migrated).
+    #[serde(default, skip_deserializing)]
+    layouts: [(); 0],
+    #[serde(default)]
+    workspaces: Vec<SavedWorkspace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +173,8 @@ fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: 
         listener_fd: if with_fds { *daemon.listener_fd.lock() } else { None },
         socket_activated: daemon.socket_activated.load(Ordering::SeqCst),
         sessions: saved,
-        layouts: daemon.layouts.lock().export(),
+        layouts: [],
+        workspaces: daemon.workspaces.lock().export(),
     };
     let file = dir.join("state.json");
     write_private(&file, &serde_json::to_vec(&state)?)?;
@@ -326,7 +333,8 @@ pub(crate) fn take_over(daemon: &Arc<Daemon>, file: &Path) -> Result<Option<Unix
     }
     bump_next_session(daemon, state.next_session);
     daemon.socket_activated.store(state.socket_activated, Ordering::SeqCst);
-    *daemon.layouts.lock() = Layouts::import(state.layouts);
+    let live = daemon.live();
+    *daemon.workspaces.lock() = Workspaces::import(state.workspaces, |s| live.contains(&s));
     let _ = std::fs::remove_dir_all(&dir);
     state.listener_fd.map(crate::server::listener_from_fd).transpose()
 }
@@ -366,7 +374,8 @@ pub(crate) fn adopt_stored(daemon: &Arc<Daemon>, ptys: Vec<(StoredPty, OwnedFd)>
     if let Some(state) = state {
         bump_next_session(daemon, state.next_session);
         if !adopted.is_empty() {
-            *daemon.layouts.lock() = Layouts::import(state.layouts);
+            let live = daemon.live();
+            *daemon.workspaces.lock() = Workspaces::import(state.workspaces, |s| live.contains(&s));
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

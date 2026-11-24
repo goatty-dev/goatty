@@ -67,14 +67,25 @@ pub(crate) enum Outcome {
 /// even an old daemon's greeting decodes far enough to tell. Anything else:
 /// not a (compatible) goattyd.
 pub(crate) fn read_greeting(reader: &mut impl Read, via: &str, announced: u32) -> Result<Outcome> {
-    let reply: ServerMsg = read_msg(reader).with_context(|| format!("no valid greeting from goattyd via {via}"))?;
-    check_greeting(reply, announced)
+    read_greeting_from(reader, via, announced, MIN_PROTOCOL_VERSION)
 }
 
+/// [`read_greeting`], accepting daemons down to protocol `min` (restarting
+/// or stopping an older daemon, `ADMIN_MIN_PROTOCOL_VERSION`).
+pub(crate) fn read_greeting_from(reader: &mut impl Read, via: &str, announced: u32, min: u32) -> Result<Outcome> {
+    let reply: ServerMsg = read_msg(reader).with_context(|| format!("no valid greeting from goattyd via {via}"))?;
+    check_greeting_from(reply, announced, min)
+}
+
+#[cfg(test)]
 fn check_greeting(reply: ServerMsg, announced: u32) -> Result<Outcome> {
+    check_greeting_from(reply, announced, MIN_PROTOCOL_VERSION)
+}
+
+fn check_greeting_from(reply: ServerMsg, announced: u32, min: u32) -> Result<Outcome> {
     match reply {
         ServerMsg::Hello { version, daemon_pid, host } => {
-            if (MIN_PROTOCOL_VERSION..=announced.min(PROTOCOL_VERSION)).contains(&version) {
+            if (min..=announced.min(PROTOCOL_VERSION)).contains(&version) {
                 Ok(Outcome::Ok(Greeting { host, pid: daemon_pid, version }))
             } else {
                 Err(VersionMismatch {
@@ -86,7 +97,7 @@ fn check_greeting(reply: ServerMsg, announced: u32) -> Result<Outcome> {
             }
         }
         ServerMsg::Error { message, .. } => match legacy_mismatch(&message) {
-            Some(v) if (MIN_PROTOCOL_VERSION..announced).contains(&v) => Ok(Outcome::RetryWith(v)),
+            Some(v) if (min..announced).contains(&v) => Ok(Outcome::RetryWith(v)),
             Some(v) => Err(VersionMismatch { daemon_protocol: Some(v), daemon_version: None, daemon_is_newer: v > announced }.into()),
             None => Err(anyhow::anyhow!("goattyd: {message}")),
         },
@@ -134,13 +145,25 @@ mod tests {
     }
 
     #[test]
+    fn older_daemons_can_still_be_restarted() {
+        let old = hello(MIN_PROTOCOL_VERSION - 1, "0.1.0");
+        assert!(check_greeting(old.clone(), PROTOCOL_VERSION).is_err());
+        let Outcome::Ok(g) = check_greeting_from(old, PROTOCOL_VERSION, goatty_proto::ADMIN_MIN_PROTOCOL_VERSION).unwrap() else { panic!() };
+        assert_eq!(g.version, MIN_PROTOCOL_VERSION - 1);
+    }
+
+    #[test]
     fn legacy_exact_match_daemons_get_a_retry() {
+        // Exact-match daemons (v5 and older) are older than any client
+        // speaks now; the retry logic itself, with a lower minimum:
         let err = |d: u32| ServerMsg::Error { req: None, message: format!("protocol mismatch: daemon v{d}, client v{PROTOCOL_VERSION}") };
-        assert!(matches!(check_greeting(err(MIN_PROTOCOL_VERSION), PROTOCOL_VERSION).unwrap(), Outcome::RetryWith(MIN_PROTOCOL_VERSION)));
+        let check = |reply, announced| check_greeting_from(reply, announced, 4);
+        assert!(matches!(check(err(5), PROTOCOL_VERSION).unwrap(), Outcome::RetryWith(5)));
         // Too old to speak to at all.
-        assert!(!mismatch(check_greeting(err(MIN_PROTOCOL_VERSION - 1), PROTOCOL_VERSION)).daemon_is_newer);
+        assert!(!mismatch(check(err(3), PROTOCOL_VERSION)).daemon_is_newer);
+        assert!(!mismatch(check_greeting(err(5), PROTOCOL_VERSION)).daemon_is_newer);
         // Retrying with that version and getting the same answer again doesn't loop.
-        assert!(check_greeting(err(MIN_PROTOCOL_VERSION), MIN_PROTOCOL_VERSION).is_err());
+        assert!(check(err(5), 5).is_err());
         let other = ServerMsg::Error { req: None, message: "nope".into() };
         assert_eq!(check_greeting(other, PROTOCOL_VERSION).unwrap_err().to_string(), "goattyd: nope");
     }
