@@ -451,8 +451,11 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientMsg::ListWorkspaces { req } => {
                     live.watching.store(true, Ordering::Relaxed);
                     let alive = daemon.live();
-                    let list = daemon.workspaces.lock().list(|s| alive.contains(&s));
-                    reply(ServerMsg::Workspaces { req, list });
+                    let (list, seq) = {
+                        let mut w = daemon.workspaces.lock();
+                        (w.list(|s| alive.contains(&s)), w.version())
+                    };
+                    reply(ServerMsg::Workspaces { req, seq, list });
                 }
                 ClientMsg::JoinWorkspace { req, view, id } => {
                     live.watching.store(true, Ordering::Relaxed);

@@ -265,7 +265,7 @@ pub struct Workspace {
     /// changes from other windows wait for it.
     divider_dragging: bool,
     /// The workspace switcher's popover.
-    switcher: Option<(Entity<switcher::Switcher>, Subscription)>,
+    switcher: Option<switcher::OpenSwitcher>,
     /// The window's size and state, recorded for reopening.
     window: SavedWindow,
     /// Recording the size waits for the window to stop resizing.
@@ -591,6 +591,8 @@ impl Workspace {
     fn focus_active(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         if let Some(menu) = self.menu_focus(cx) {
             menu.focus(window, cx);
+        } else if let Some(s) = &self.switcher {
+            s.view.focus_handle(cx).focus(window, cx);
         } else if let Some((view, _)) = &self.recent {
             view.focus_handle(cx).focus(window, cx);
         } else if let Some((picker, _)) = &self.snippets {
@@ -712,9 +714,13 @@ impl Workspace {
         };
         match mode {
             AttachMode::Join(Some(id)) | AttachMode::Restore(id) if id != current => self.switch_workspace(&conn, id, window, cx),
-            AttachMode::Undetach(id) if id != current => self.switch_workspace(&conn, id, window, cx),
+            // Another workspace's detached tabs: show it, with them back.
+            AttachMode::Undetach(id) if id != current => self.switch_workspace_with(&conn, AttachMode::Undetach(id), window, cx),
             AttachMode::Join(_) | AttachMode::Restore(_) => show_host(self, window, cx),
-            AttachMode::Undetach(_) => self.undetach_tabs(i, None, window, cx),
+            AttachMode::Undetach(_) => {
+                let all: Vec<u64> = self.shown[i].detached.iter().map(|t| t.id).collect();
+                self.undetach_tabs(i, Some(all), window, cx);
+            }
             AttachMode::New => {
                 if let Some(at) = self.tabs.iter().position(|t| sync::on_conn(t, &conn)) {
                     let key = self.host_key(&self.tabs[at]);
@@ -722,13 +728,19 @@ impl Workspace {
                 }
             }
             AttachMode::Id(session) => {
-                // Shown already: that tab; else a tab of its own.
+                // Shown already: that tab; one of this workspace's detached
+                // tabs: back; in another workspace: that one; else a tab of
+                // its own.
                 let at = self.tabs.iter().position(|t| {
                     sync::on_conn(t, &conn) && t.panes.iter().any(|p| p.view.read(cx).session().daemon_id() == Some(session))
                 });
-                match at {
-                    Some(at) => self.activate(at, window, cx),
-                    None => self.add_session_tabs(i, vec![session], window, cx),
+                let detached = self.shown[i].detached.iter().find(|t| t.tree.contains(session)).map(|t| t.id);
+                let elsewhere = self.shown[i].list.iter().find(|w| w.id != current && w.sessions.contains(&session)).map(|w| w.id);
+                match (at, detached, elsewhere) {
+                    (Some(at), _, _) => self.activate(at, window, cx),
+                    (None, Some(tab), _) => self.undetach_tabs(i, Some(vec![tab]), window, cx),
+                    (None, None, Some(_)) => self.switch_workspace_with(&conn, AttachMode::Id(session), window, cx),
+                    (None, None, None) => self.add_session_tabs(i, vec![session], window, cx),
                 }
             }
             AttachMode::AllDetached => {
@@ -1107,11 +1119,9 @@ impl Workspace {
 
     fn make_pane(&mut self, session: Arc<Session>, window: &mut Window, cx: &mut Context<'_, Self>) -> Pane {
         let id = self.next_id();
-        let view = cx.new(|cx| TerminalView::new(session.clone(), window, cx));
-        // Another window of this goatty may show it too: the last one to let
-        // go detaches it. (Counted after the view exists: the first view
-        // reads the UI events from before it, see `Session::ui_cursor`.)
-        session.add_view();
+        // The pane takes over the session's view claim (another window of
+        // this goatty may show it too: the last one to let go detaches it).
+        let view = cx.new(|cx| TerminalView::new(session, window, cx));
         let events =
             cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| this.on_terminal_event(id, ev, window, cx));
         let focus = view.focus_handle(cx);
@@ -1127,7 +1137,7 @@ impl Workspace {
             cx,
             Toast::info("New session not opened").body("The tab or host it was started for was closed or detached.").key("workspace.spawn"),
         );
-        if !session.detach() {
+        if !session.release_view() {
             cx.background_executor().spawn(async move { session.kill() }).detach();
         }
     }

@@ -50,6 +50,8 @@ pub(crate) struct Workspaces {
     map: HashMap<WorkspaceId, Record>,
     /// For `created` and `active`.
     seq: u64,
+    /// Grows with every change to what [`Self::list`] says (`ServerMsg::Workspaces::seq`).
+    version: u64,
 }
 
 /// A workspace as the next goattyd gets it (see `crate::restore`).
@@ -124,6 +126,15 @@ impl Workspaces {
         self.seq
     }
 
+    /// The list's version: larger is newer.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn changed(&mut self) {
+        self.version += 1;
+    }
+
     /// Make "Main" when there's no workspace at all. True when it did.
     fn ensure_one(&mut self) -> bool {
         if !self.map.is_empty() {
@@ -131,6 +142,7 @@ impl Workspaces {
         }
         let seq = self.tick();
         self.map.insert(new_id(), Record::new(MAIN.into(), seq));
+        self.changed();
         true
     }
 
@@ -157,7 +169,11 @@ impl Workspaces {
         for (_, id) in ids {
             self.map.remove(&id);
         }
-        self.map.len() != before
+        let pruned = self.map.len() != before;
+        if pruned {
+            self.changed();
+        }
+        pruned
     }
 
     /// Every workspace, in the order they were made (see [`Self::prune`]).
@@ -196,6 +212,7 @@ impl Workspaces {
 
     fn show(&mut self, conn: u64, view: ViewId, id: WorkspaceId, alive: impl Fn(SessionId) -> bool) -> (WorkspaceInfo, WorkspaceLayout) {
         let seq = self.tick();
+        self.changed();
         let r = self.map.get_mut(&id).expect("shown workspaces exist");
         r.views.insert((conn, view));
         r.active = seq;
@@ -226,7 +243,11 @@ impl Workspaces {
 
     /// Window `(conn, view)` shows no workspace any more. True when it showed one.
     pub(crate) fn leave(&mut self, conn: u64, view: ViewId) -> bool {
-        self.map.values_mut().any(|r| r.views.remove(&(conn, view)))
+        let left = self.map.values_mut().any(|r| r.views.remove(&(conn, view)));
+        if left {
+            self.changed();
+        }
+        left
     }
 
     /// Connection `conn` ended: its windows show nothing. True when one showed something.
@@ -236,6 +257,9 @@ impl Workspaces {
             let before = r.views.len();
             r.views.retain(|(c, _)| *c != conn);
             any |= r.views.len() != before;
+        }
+        if any {
+            self.changed();
         }
         any
     }
@@ -268,9 +292,11 @@ impl Workspaces {
         if ends {
             // Its last tab closed: the windows that show it hear it went.
             self.map.remove(&id);
+            self.changed();
             return Ok((SaveOutcome::Saved { revision }, Changes { list: true, layout: None }));
         }
-        let list = r.tabs != tabs;
+        // Lists show tab counts and sessions (how many shells closing it ends).
+        let list = r.tabs != tabs || r.sessions != sessions;
         (r.json, r.sessions, r.tabs, r.active) = (json, sessions, tabs, seq);
         let conns: Vec<u64> = {
             let mut c: Vec<u64> = r.views.iter().filter(|&&v| v != (conn, view)).map(|(c, _)| *c).collect();
@@ -279,6 +305,9 @@ impl Workspaces {
             c
         };
         let layout = r.layout(id, &alive);
+        if list {
+            self.changed();
+        }
         Ok((SaveOutcome::Saved { revision }, Changes { list, layout: Some((view, layout, conns)) }))
     }
 
@@ -286,6 +315,7 @@ impl Workspaces {
         let name = clean_name(name).ok_or("a workspace needs a name")?;
         let r = self.map.get_mut(&id).ok_or("that workspace is gone")?;
         r.name = name;
+        self.changed();
         Ok(())
     }
 
@@ -298,6 +328,7 @@ impl Workspaces {
             return Err("the host's only workspace can't be closed".into());
         }
         self.map.remove(&id);
+        self.changed();
         Ok(())
     }
 
@@ -345,7 +376,7 @@ impl Workspaces {
                 (w.id, r)
             })
             .collect();
-        let mut this = Self { map, seq };
+        let mut this = Self { map, seq, version: 0 };
         this.prune(alive);
         this
     }
@@ -459,6 +490,32 @@ mod tests {
         assert!(w.drop_conn(4));
         assert!(w.viewers(main.id).is_empty());
         assert!(!w.drop_conn(4));
+    }
+
+    #[test]
+    fn every_change_to_the_list_moves_its_version() {
+        let mut w = Workspaces::default();
+        let mut last = w.version();
+        let mut moved = |w: &Workspaces, what: &str| {
+            assert!(w.version() > last, "{what} didn't move the version");
+            last = w.version();
+        };
+        let (main, _) = w.join(1, 10, None, all);
+        moved(&w, "join");
+        save(&mut w, (1, 10), main.id, 0, &[1], "main");
+        moved(&w, "a save with new tabs");
+        let (ops, _) = w.create(1, 10, None, all);
+        moved(&w, "create");
+        w.rename(ops.id, "ops").unwrap();
+        moved(&w, "rename");
+        w.leave(1, 10);
+        moved(&w, "leave");
+        w.join(2, 20, Some(ops.id), all);
+        w.close(ops.id).unwrap();
+        moved(&w, "close (of the most recently active one)");
+        w.join(3, 30, Some(main.id), all);
+        w.drop_conn(3);
+        moved(&w, "a connection ending");
     }
 
     #[test]

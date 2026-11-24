@@ -80,14 +80,25 @@ const UI_LOG: usize = 512;
 
 /// The sessions panes show, by connection and session: a window that shows
 /// a session another window of this process shows already gets the same
-/// one (one connection carries one subscription per session).
+/// one (one connection carries one subscription per session). Claiming a
+/// view of one ([`shared`]) and letting go of the last ([`Session::release_view`])
+/// both happen under this lock, so a session is never detached while it's
+/// being handed to another window.
 static SHARED: Mutex<Vec<(usize, u64, std::sync::Weak<Session>)>> = Mutex::new(Vec::new());
 
+/// The session `id` on `conn` a window of this process shows, with a view
+/// claimed for the caller (a pane takes it over, or the caller lets go).
 fn shared(conn: &Connection, id: u64) -> Option<Arc<Session>> {
     let key = conn.key();
     let mut shared = SHARED.lock();
     shared.retain(|(_, _, w)| w.strong_count() > 0);
-    shared.iter().find(|(c, s, _)| *c == key && *s == id).and_then(|(_, _, w)| w.upgrade()).filter(|s| !s.exited.load(Ordering::Acquire))
+    let s = shared
+        .iter()
+        .find(|(c, s, _)| *c == key && *s == id)
+        .and_then(|(_, _, w)| w.upgrade())
+        .filter(|s| !s.exited.load(Ordering::Acquire) && s.views.load(Ordering::Acquire) > 0)?;
+    s.views.fetch_add(1, Ordering::AcqRel);
+    Some(s)
 }
 
 fn share(s: &Arc<Session>) {
@@ -96,13 +107,6 @@ fn share(s: &Arc<Session>) {
         let mut shared = SHARED.lock();
         shared.retain(|(c, i, w)| w.strong_count() > 0 && !(*c == key && *i == id));
         shared.push((key, id, Arc::downgrade(s)));
-    }
-}
-
-fn unshare(s: &Session) {
-    if let (Some(conn), Some(id)) = (s.connection(), s.daemon_id()) {
-        let key = conn.key();
-        SHARED.lock().retain(|(c, i, w)| w.strong_count() > 0 && !(*c == key && *i == id));
     }
 }
 
@@ -165,9 +169,12 @@ pub struct Session {
     backend: Backend,
     ui_events: flume::Receiver<UiEvent>,
     ui_log: Mutex<UiLog>,
-    /// Panes (in any window of this process) that show it; the last one
-    /// to let go detaches it ([`Self::release_view`]).
+    /// Views of it (panes in any window of this process, or ones being
+    /// handed to a pane): one from the start, for whoever made or attached
+    /// it; the last one to let go detaches it ([`Self::release_view`]).
     views: std::sync::atomic::AtomicUsize,
+    /// A view read its UI events already (a later one starts at the end).
+    ui_started: AtomicBool,
     /// The view whose pane size the session follows (0: whichever lays
     /// out first), so two views of different sizes don't take turns.
     size_owner: AtomicU64,
@@ -181,8 +188,9 @@ pub struct Session {
     pub ssh_host: Option<String>,
     /// Authoritative shell directory from `ServerMsg::Cwd` (daemon v13+).
     remote_cwd: Mutex<Option<String>>,
-    /// Set whenever `PaneEvent::Cwd` updates `remote_cwd`.
-    cwd_dirty: AtomicBool,
+    /// Bumped whenever `PaneEvent::Cwd` updates `remote_cwd` (each view
+    /// keeps the last one it saw).
+    cwd_gen: AtomicU64,
     /// The foreground program (`zsh`, `nvim`, …), when known.
     pub process: Mutex<Option<String>>,
     /// Local sessions watch their own PTY; daemon sessions hear it from goattyd.
@@ -379,7 +387,7 @@ impl PaneSink for Sink {
             PaneEvent::Process(name) => *s.process.lock() = name,
             PaneEvent::Cwd(cwd) => {
                 *s.remote_cwd.lock() = cwd;
-                s.cwd_dirty.store(true, Ordering::Release);
+                s.cwd_gen.fetch_add(1, Ordering::AcqRel);
             }
         }
         s.waker.wake();
@@ -426,7 +434,8 @@ impl Session {
             backend,
             ui_events: ui,
             ui_log: Mutex::default(),
-            views: std::sync::atomic::AtomicUsize::new(0),
+            views: std::sync::atomic::AtomicUsize::new(1),
+            ui_started: AtomicBool::new(false),
             size_owner: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             exit_code: Mutex::new(None),
@@ -435,7 +444,7 @@ impl Session {
             host_label,
             ssh_host,
             remote_cwd: Mutex::new(None),
-            cwd_dirty: AtomicBool::new(false),
+            cwd_gen: AtomicU64::new(0),
             process: Mutex::new(None),
             fg: std::sync::OnceLock::new(),
             waker: Waker::default(),
@@ -685,7 +694,7 @@ impl Session {
     pub fn ui_cursor(&self) -> (u64, Option<String>) {
         let mut log = self.ui_log.lock();
         self.drain_ui(&mut log);
-        let first = self.views.load(Ordering::Acquire) == 0;
+        let first = !self.ui_started.swap(true, Ordering::AcqRel);
         (if first { log.events.front().map_or(log.next, |(n, _)| *n) } else { log.next }, log.title.clone())
     }
 
@@ -698,17 +707,23 @@ impl Session {
         out
     }
 
-    /// A pane shows it now.
-    pub fn add_view(&self) {
-        self.views.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// A pane stopped showing it (detached, or its window closed): the last
-    /// one detaches it from goattyd, without ending its shell. True when it
-    /// did.
+    /// A view of it went away (a pane detached, its window closed, or it
+    /// was attached for a tab that's gone): the last one detaches it from
+    /// goattyd, without ending its shell. True when it did.
     pub fn release_view(&self) -> bool {
-        let before = self.views.try_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1))).unwrap_or(0);
-        before <= 1 && self.detach()
+        let Backend::Daemon { conn, id, sink } = &self.backend else { return false };
+        {
+            let mut shared = SHARED.lock();
+            let before = self.views.try_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1))).unwrap_or(0);
+            if before > 1 {
+                return false;
+            }
+            // Nobody can claim it from here on.
+            let (key, sid) = (conn.key(), id.load(Ordering::Relaxed));
+            shared.retain(|(c, i, w)| w.strong_count() > 0 && !(*c == key && *i == sid));
+        }
+        conn.detach_sink(id.load(Ordering::Relaxed), sink);
+        true
     }
 
     /// Whether view `token` may set the session's size: the one that last
@@ -936,20 +951,6 @@ impl Session {
         self.daemon_id().is_some()
     }
 
-    /// Unsubscribe from the session on `goattyd` without ending its shell,
-    /// whatever else shows it (see [`Self::release_view`]). Returns
-    /// `false` for a window-owned local PTY (`--local`).
-    pub fn detach(&self) -> bool {
-        match &self.backend {
-            Backend::Local { .. } => false,
-            Backend::Daemon { conn, id, sink } => {
-                unshare(self);
-                conn.detach_sink(id.load(Ordering::Relaxed), sink);
-                true
-            }
-        }
-    }
-
     /// The goattyd session id; `None` for local PTYs.
     pub fn daemon_id(&self) -> Option<u64> {
         match &self.backend {
@@ -986,9 +987,10 @@ impl Session {
         self.remote_cwd.lock().clone().or_else(|| self.terminal.current_directory().map(|p| p.to_string_lossy().into_owned()))
     }
 
-    /// Consume any pending CWD change pushed by `PaneEvent::Cwd`.
-    pub fn take_cwd_dirty(&self) -> bool {
-        self.cwd_dirty.swap(false, Ordering::AcqRel)
+    /// How many CWD changes `PaneEvent::Cwd` pushed so far (a view compares
+    /// it with the last one it saw).
+    pub fn cwd_generation(&self) -> u64 {
+        self.cwd_gen.load(Ordering::Acquire)
     }
 
     /// Window title: the app's title plus host and link state when remote.

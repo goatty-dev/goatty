@@ -48,6 +48,16 @@ pub enum SwitcherEvent {
     Dismiss,
 }
 
+/// The open switcher, for the host it was opened for.
+pub(super) struct OpenSwitcher {
+    pub view: Entity<Switcher>,
+    pub conn: std::sync::Arc<goatty_client::Connection>,
+    /// A second click this soon after the chip opened it renames (a
+    /// double-click on the chip lands on the backdrop).
+    opened: std::time::Instant,
+    _subscription: Subscription,
+}
+
 pub struct Switcher {
     focus: FocusHandle,
     rows: Vec<Row>,
@@ -210,11 +220,16 @@ impl Switcher {
             })
             .child(div().flex_none().text_size(px(text::CAPTION)).text_color(ui.muted).child(tabs))
             .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                let current = this.rows.get(at).is_some_and(|r| r.current);
                 if ev.click_count() == 2 {
                     this.start_rename(id, window, cx);
-                } else if this.renaming.as_ref().is_none_or(|(rid, _, _)| *rid != id) {
+                } else if !current && this.renaming.as_ref().is_none_or(|(rid, _, _)| *rid != id) {
+                    // The current one stays: a second click renames it.
                     this.selected = at;
                     this.pick(at, cx);
+                } else {
+                    this.selected = at;
+                    cx.notify();
                 }
             }))
             .on_mouse_down(
@@ -291,9 +306,9 @@ impl Render for Switcher {
 }
 
 impl Workspace {
-    /// The rows for the active tab's host's workspaces.
-    fn switcher_rows(&self) -> Option<(Vec<Row>, SharedString)> {
-        let i = self.active_shown()?;
+    /// The rows for host `conn`'s workspaces.
+    fn switcher_rows(&self, conn: &std::sync::Arc<goatty_client::Connection>) -> Option<(Vec<Row>, SharedString)> {
+        let i = self.shown_index(conn)?;
         let sh = &self.shown[i];
         let rows = sh
             .list
@@ -310,10 +325,7 @@ impl Workspace {
                 }
             })
             .collect();
-        let host = match self.active_tab().and_then(|t| t.host.as_ref()) {
-            Some(h) => super::groups::host_label(h),
-            None => "this host".into(),
-        };
+        let host = super::groups::host_label(&crate::session::Spawner::Daemon(conn.clone()));
         Some((rows, host.into()))
     }
 
@@ -325,15 +337,17 @@ impl Workspace {
 
     /// Open the switcher (`rename`: with that workspace's name being edited).
     pub(super) fn open_switcher(&mut self, rename: Option<WorkspaceId>, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some((rows, host)) = self.switcher_rows() else {
+        let conn = self.active_shown().map(|i| self.shown[i].conn.clone());
+        let Some((rows, host)) = conn.as_ref().and_then(|c| self.switcher_rows(c)) else {
             let toast = crate::toast::Toast::info("No workspaces here").body("This tab isn't kept by a goattyd (or is still connecting).");
             crate::toast::show_in(window, cx, toast.key("workspace.switch"));
             return;
         };
         self.close_palette(window, cx);
+        let Some(conn) = conn else { return };
         let view = cx.new(|cx| Switcher::new(rows, host, rename, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, _, ev: &SwitcherEvent, window, cx| this.on_switcher_event(ev, window, cx));
-        self.switcher = Some((view, sub));
+        self.switcher = Some(OpenSwitcher { view, conn, opened: std::time::Instant::now(), _subscription: sub });
         cx.notify();
     }
 
@@ -346,15 +360,15 @@ impl Workspace {
 
     /// The host's workspaces changed: an open switcher follows.
     pub(super) fn refresh_switcher(&mut self, cx: &mut Context<'_, Self>) {
-        let Some((view, _)) = &self.switcher else { return };
-        match self.switcher_rows() {
-            Some((rows, _)) => view.update(cx, |s, cx| s.set_rows(rows, cx)),
+        let Some(open) = &self.switcher else { return };
+        match self.switcher_rows(&open.conn) {
+            Some((rows, _)) => open.view.clone().update(cx, |s, cx| s.set_rows(rows, cx)),
             None => self.switcher = None,
         }
     }
 
     fn on_switcher_event(&mut self, ev: &SwitcherEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let Some(conn) = self.active_shown().map(|i| self.shown[i].conn.clone()) else { return };
+        let Some(conn) = self.switcher.as_ref().map(|s| s.conn.clone()) else { return };
         match ev {
             SwitcherEvent::Switch(id) => {
                 let id = *id;
@@ -461,10 +475,22 @@ impl Workspace {
 
     /// The open switcher, under the chip, over a backdrop that closes it.
     pub(super) fn render_switcher(&self, vertical: bool, cx: &mut Context<'_, Self>) -> Option<AnyElement> {
-        let (view, _) = self.switcher.as_ref()?;
+        let view = &self.switcher.as_ref()?.view;
         let top = if vertical { 48. } else { 42. };
-        let close =
-            |this: &mut Self, _: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>| this.close_switcher(window, cx);
+        let close = |this: &mut Self, ev: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<'_, Self>| {
+            // The chip's double-click: its second click lands here.
+            let double =
+                ev.click_count >= 2 && this.switcher.as_ref().is_some_and(|s| s.opened.elapsed() < std::time::Duration::from_millis(600));
+            match this.switcher.as_ref() {
+                Some(s) if double => {
+                    let id = this.shown_index(&s.conn).map(|i| this.shown[i].id);
+                    if let Some(id) = id {
+                        s.view.clone().update(cx, |v, cx| v.start_rename(id, window, cx));
+                    }
+                }
+                _ => this.close_switcher(window, cx),
+            }
+        };
         let backdrop = div()
             .id("workspace-switcher-backdrop")
             .absolute()

@@ -312,6 +312,8 @@ pub struct TerminalView {
     ui_cursor: u64,
     /// Identifies this view to the session's size ownership.
     token: u64,
+    /// The session's CWD change count this view has seen.
+    cwd_gen: u64,
     /// Last decorated title reported via [`TerminalEvent::TitleChanged`].
     title: String,
     /// Last foreground program reported the same way.
@@ -469,6 +471,7 @@ impl TerminalView {
             wake,
             ui_cursor,
             token,
+            cwd_gen: 0,
             title: String::new(),
             process: None,
             status: initial_status,
@@ -599,11 +602,19 @@ impl TerminalView {
         &self.session
     }
 
+    /// The pane went out of sight (its workspace was parked): another
+    /// window showing the session sets its size from now on.
+    pub fn disown_size(&self) {
+        self.session.disown_size(self.token);
+    }
+
     fn on_wake(&mut self, cx: &mut Context<'_, Self>) {
         self.wake.clear();
         self.poke_cursor();
         // Tabs fall back to the directory when there's no title.
-        let mut cwd_changed = self.session.take_cwd_dirty();
+        let cwd_gen = self.session.cwd_generation();
+        let mut cwd_changed = cwd_gen != self.cwd_gen;
+        self.cwd_gen = cwd_gen;
         let mut clear_stats = false;
         let mut status_changed = false;
         // Told after the drain: agents' news first, so a program's own

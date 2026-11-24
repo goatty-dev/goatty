@@ -263,7 +263,9 @@ fn open_local(restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
                 return Ok(conn);
             }
             log::info!("restarting the local goattyd, which is older than this goatty speaks: {e:#}");
-            let (conn, kept) = restart_local(None)?;
+            // Not forced: one that turns out unable to keep its sessions
+            // isn't stopped (the error asks instead).
+            let (conn, kept) = restart_local(None, false)?;
             *restarted.lock().unwrap_or_else(|p| p.into_inner()) = Some(if kept { Restart::Kept } else { Restart::Empty });
             Ok(conn)
         }
@@ -348,11 +350,11 @@ enum Restart {
 /// here with none, or after the user agreed). A connection to it that's in
 /// use (`conn`, else the pooled one) reconnects by itself; wait for that
 /// rather than racing it to start one. True when the sessions were kept.
-fn restart_local(conn: Option<Arc<Connection>>) -> Result<(Arc<Connection>, bool)> {
+fn restart_local(conn: Option<Arc<Connection>>, force: bool) -> Result<(Arc<Connection>, bool)> {
     let conn = conn.or_else(|| pool::live(&Endpoint::Local));
     let old = conn.as_ref().map(|c| c.daemon_pid());
     let installed = local::installed_daemon();
-    let kept = match local::restart_daemon(installed.as_deref(), true).context("couldn't restart the running goattyd")? {
+    let kept = match local::restart_daemon(installed.as_deref(), force).context("couldn't restart the running goattyd")? {
         Restarted::Kept { .. } => true,
         Restarted::NotRunning | Restarted::Stopped(_) => false,
     };
@@ -400,7 +402,9 @@ fn check_local(conn: Arc<Connection>, restarted: &Mutex<Option<Restart>>) -> Res
     }
     log::info!("restarting goattyd ({sessions} sessions, kept): {} replaces {}", outdated.installed.display(), outdated.running.display());
     let old = conn.clone();
-    let (conn, kept) = match restart_local(Some(conn)) {
+    // Forced only when nothing would end: with sessions, a daemon that
+    // can't keep them (or doesn't answer as one that can) isn't stopped.
+    let (conn, kept) = match restart_local(Some(conn), sessions == 0) {
         Ok(done) => done,
         // It refused (e.g. the installed build can't take over) and runs on:
         // keep using it rather than asking to retry the same thing.
@@ -536,9 +540,22 @@ impl ConnectView {
         self.step = Step::Working(label);
         cx.emit(ConnectEvent::Changed);
         cx.notify();
+        let view_id = self.plan.join.as_ref().map(|j| j.view);
         cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
             let result = cx.background_executor().spawn(async move { job() }).await;
-            let _ = this.update_in(cx, |view, window, cx| view.finish(result, window, cx));
+            let mut result = Some(result);
+            let delivered = this.update_in(cx, |view, window, cx| {
+                if let Some(result) = result.take() {
+                    view.finish(result, window, cx);
+                }
+            });
+            // The tab (or its window) went away meanwhile: let go of what
+            // it brought, so nothing stays subscribed or joined for it.
+            if delivered.is_err()
+                && let Some(Ok(ready)) = result
+            {
+                discard(ready, view_id);
+            }
         })
         .detach();
     }
@@ -647,7 +664,7 @@ impl ConnectView {
                     let current = pool::open(Endpoint::Local).ok().filter(|c| local::outdated(c.daemon_pid()).is_none());
                     let conn = match current {
                         Some(conn) => conn,
-                        None => restart_local(None)?.0,
+                        None => restart_local(None, true)?.0,
                     };
                     let startup = start(&conn, mode, join.as_ref())?;
                     Ok((startup, Spawner::Daemon(conn)))
@@ -694,6 +711,25 @@ impl ConnectView {
         if let Some(c) = choice {
             cx.stop_propagation();
             self.choose(c, window, cx);
+        }
+    }
+}
+
+/// What a connecting tab brought when nobody's there to take it: its
+/// sessions are let go (they keep running) and the window `view` leaves the
+/// workspace it joined.
+fn discard((startup, spawner): Ready, view: Option<goatty_proto::ViewId>) {
+    match startup {
+        Startup::Session(s) => {
+            s.release_view();
+        }
+        Startup::Joined(j) => {
+            for s in j.sessions.values().chain(j.extra.iter().map(|(s, _)| s)) {
+                s.release_view();
+            }
+            if let (Some(conn), Some(view)) = (spawner.connection(), view) {
+                conn.leave_workspace(view);
+            }
         }
     }
 }

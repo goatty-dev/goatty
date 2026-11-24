@@ -693,9 +693,11 @@ pub enum ServerMsg {
     /// v16 `Layouts`, retired in v17.
     #[doc(hidden)]
     RetiredLayouts,
-    /// v17: reply to `ListWorkspaces`.
+    /// v17: reply to `ListWorkspaces`. `seq` grows with every change to the
+    /// list, so a client can tell an older list from a newer one.
     Workspaces {
         req: ReqId,
+        seq: u64,
         list: Vec<WorkspaceInfo>,
     },
     /// v17: reply to `JoinWorkspace` and `CreateWorkspace`: the workspace
@@ -723,8 +725,10 @@ pub enum ServerMsg {
     },
     /// v17: the daemon's workspaces changed (one was made, renamed, closed
     /// or ended, or a window started or stopped showing one), to every
-    /// connection that listed or joined workspaces. Not a reply.
+    /// connection that listed or joined workspaces. Not a reply. `seq` as in
+    /// `Workspaces`.
     WorkspacesChanged {
+        seq: u64,
         list: Vec<WorkspaceInfo>,
     },
 }
@@ -850,8 +854,8 @@ mod tests {
         assert_eq!(postcard::to_allocvec(&ClientMsg::ListWorkspaces { req: 1 }).unwrap()[0], 34);
         assert_eq!(postcard::to_allocvec(&ClientMsg::GetWorkspace { req: 1, id: 2 }).unwrap()[0], 41);
         assert_eq!(postcard::to_allocvec(&ServerMsg::RetiredLayouts).unwrap()[0], 26);
-        assert_eq!(postcard::to_allocvec(&ServerMsg::Workspaces { req: 1, list: Vec::new() }).unwrap()[0], 27);
-        assert_eq!(postcard::to_allocvec(&ServerMsg::WorkspacesChanged { list: Vec::new() }).unwrap()[0], 32);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Workspaces { req: 1, seq: 0, list: Vec::new() }).unwrap()[0], 27);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::WorkspacesChanged { seq: 0, list: Vec::new() }).unwrap()[0], 32);
     }
 
     #[test]

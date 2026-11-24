@@ -109,11 +109,13 @@ enum Pending {
     /// `fetch_history`: the answer goes to the pane's sink.
     History(SessionId),
     /// `JoinWorkspace` / `CreateWorkspace`: the view is registered when the
-    /// reply is read, so no `LayoutChanged` after it is missed.
+    /// reply is read, so no `LayoutChanged` after it is missed; unless the
+    /// window left meanwhile (`left` moved past `left_gen`).
     Join {
         tx: flume::Sender<ServerMsg>,
         view: ViewId,
         sink: Arc<dyn WorkspaceSink>,
+        left_gen: u64,
     },
     /// A view joining its workspace again after a reconnect.
     Rejoin(ViewId),
@@ -126,8 +128,9 @@ pub enum WorkspaceEvent {
     /// Another window saved the workspace this one shows.
     Changed(WorkspaceLayout),
     /// The host's workspaces changed (made, renamed, closed, ended, or
-    /// shown by another window).
-    List(Vec<WorkspaceInfo>),
+    /// shown by another window). `seq`: larger is newer (events and list
+    /// replies can arrive in either order).
+    List { seq: u64, list: Vec<WorkspaceInfo> },
     /// The link came back and the window joined again: the workspace it
     /// showed, or the most recently active one when that's gone.
     Rejoined { info: WorkspaceInfo, layout: WorkspaceLayout },
@@ -163,6 +166,9 @@ struct Shared {
     /// The windows that show a workspace on this (pooled) connection: they
     /// join it again after a reconnect and hear its changes.
     views: Mutex<HashMap<ViewId, View>>,
+    /// How often each window left ([`Connection::leave_workspace`]): a join
+    /// answered after its window left doesn't register it.
+    left: Mutex<HashMap<ViewId, u64>>,
     pending: Mutex<HashMap<ReqId, Pending>>,
     /// `SizeControl` that came before the `Attached` of a session we don't
     /// have a pane for yet (v14 sends it first); delivered before its snapshot.
@@ -316,6 +322,7 @@ impl Connection {
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
+            left: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -895,8 +902,13 @@ impl Connection {
     /// this connection hears when they change (`WorkspaceEvent::List`, to
     /// the windows that show one).
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+        self.list_workspaces_seq().map(|(_, list)| list)
+    }
+
+    /// [`Self::list_workspaces`] with the list's version (`WorkspaceEvent::List`).
+    pub fn list_workspaces_seq(&self) -> Result<(u64, Vec<WorkspaceInfo>)> {
         match self.request(Pending::Reply, |req| ClientMsg::ListWorkspaces { req })? {
-            ServerMsg::Workspaces { list, .. } => Ok(list),
+            ServerMsg::Workspaces { seq, list, .. } => Ok((seq, list)),
             other => bail!("unexpected reply {other:?}"),
         }
     }
@@ -910,7 +922,8 @@ impl Connection {
         id: Option<WorkspaceId>,
         sink: Arc<dyn WorkspaceSink>,
     ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
-        match self.request(|tx| Pending::Join { tx, view, sink }, |req| ClientMsg::JoinWorkspace { req, view, id })? {
+        let left_gen = self.shared.left.lock().get(&view).copied().unwrap_or(0);
+        match self.request(|tx| Pending::Join { tx, view, sink, left_gen }, |req| ClientMsg::JoinWorkspace { req, view, id })? {
             ServerMsg::Joined { info, layout, .. } => Ok((info, layout)),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -924,7 +937,8 @@ impl Connection {
         name: Option<String>,
         sink: Arc<dyn WorkspaceSink>,
     ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
-        match self.request(|tx| Pending::Join { tx, view, sink }, |req| ClientMsg::CreateWorkspace { req, view, name })? {
+        let left_gen = self.shared.left.lock().get(&view).copied().unwrap_or(0);
+        match self.request(|tx| Pending::Join { tx, view, sink, left_gen }, |req| ClientMsg::CreateWorkspace { req, view, name })? {
             ServerMsg::Joined { info, layout, .. } => Ok((info, layout)),
             other => bail!("unexpected reply {other:?}"),
         }
@@ -933,7 +947,10 @@ impl Connection {
     /// Window `view` stops showing a workspace on this host (it closed or
     /// detached from the host). Doesn't block.
     pub fn leave_workspace(&self, view: ViewId) {
-        if self.shared.views.lock().remove(&view).is_some() && self.is_connected() {
+        // A join on its way when the window leaves doesn't register it.
+        *self.shared.left.lock().entry(view).or_insert(0) += 1;
+        self.shared.views.lock().remove(&view);
+        if self.is_connected() {
             self.shared.send(&ClientMsg::LeaveWorkspace { view });
         }
     }
@@ -1290,6 +1307,12 @@ fn read_loop(s: &Shared, reader: &mut Reader) -> anyhow::Error {
     }
 }
 
+/// The request `req`'s waiter, taken out of the map (not held across the
+/// handling: it locks the views and panes too).
+fn take_pending(s: &Shared, req: ReqId) -> Option<Pending> {
+    s.pending.lock().remove(&req)
+}
+
 /// Feed `bytes` to the pane's sink outside the lock, then count them.
 fn feed_pane(s: &Shared, session: SessionId, bytes: &[u8]) -> Option<Arc<dyn PaneSink>> {
     let sink = s.panes.lock().get(&session).map(|p| p.sink.clone())?;
@@ -1455,13 +1478,18 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::Shell { req, .. }
         | ServerMsg::Net { req, .. }
         | ServerMsg::PathStat { req, .. }
-        | ServerMsg::FileData { req, .. } => match s.pending.lock().remove(&req) {
+        | ServerMsg::FileData { req, .. } => match take_pending(s, req) {
             Some(Pending::Reply(tx)) => {
                 let _ = tx.send(msg);
             }
-            Some(Pending::Join { tx, view, sink }) => {
+            Some(Pending::Join { tx, view, sink, left_gen }) => {
                 if let ServerMsg::Joined { info, .. } = &msg {
-                    s.views.lock().insert(view, View { workspace: info.id, sink });
+                    if s.left.lock().get(&view).copied().unwrap_or(0) == left_gen {
+                        s.views.lock().insert(view, View { workspace: info.id, sink });
+                    } else {
+                        // The window left while it was joining.
+                        s.send(&ClientMsg::LeaveWorkspace { view });
+                    }
                 }
                 let _ = tx.send(msg);
             }
@@ -1561,7 +1589,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 sink.workspace(s as *const Shared as usize, WorkspaceEvent::Changed(layout.clone()));
             }
         }
-        ServerMsg::WorkspacesChanged { list } => {
+        ServerMsg::WorkspacesChanged { seq, list } => {
             let mut sinks: Vec<Arc<dyn WorkspaceSink>> = Vec::new();
             for v in s.views.lock().values() {
                 if !sinks.iter().any(|x| Arc::ptr_eq(x, &v.sink)) {
@@ -1569,7 +1597,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 }
             }
             for sink in sinks {
-                sink.workspace(s as *const Shared as usize, WorkspaceEvent::List(list.clone()));
+                sink.workspace(s as *const Shared as usize, WorkspaceEvent::List { seq, list: list.clone() });
             }
         }
         ServerMsg::RetiredLayout | ServerMsg::RetiredLayouts => log::warn!("goattyd sent a retired layout message"),
@@ -1655,6 +1683,7 @@ mod tests {
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
+            left: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -1751,6 +1780,7 @@ mod tests {
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
+            left: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -2029,7 +2059,7 @@ mod tests {
             fn workspace(&self, conn: usize, ev: WorkspaceEvent) {
                 let what = match ev {
                     WorkspaceEvent::Changed(l) => format!("changed {} r{}", l.json, l.revision),
-                    WorkspaceEvent::List(l) => format!("list {}", l.len()),
+                    WorkspaceEvent::List { list, .. } => format!("list {}", list.len()),
                     WorkspaceEvent::Rejoined { info, .. } => format!("rejoined {}", info.id),
                 };
                 self.0.lock().push((conn, what));
@@ -2056,7 +2086,7 @@ mod tests {
             send(ServerMsg::LayoutChanged { by: 1, layout: layout(7, "a") });
             // Another workspace's change: nobody here shows it.
             send(ServerMsg::LayoutChanged { by: 9, layout: layout(8, "b") });
-            send(ServerMsg::WorkspacesChanged { list: vec![info(7), info(8)] });
+            send(ServerMsg::WorkspacesChanged { seq: 3, list: vec![info(7), info(8)] });
             match read_msg::<_, ClientMsg>(&mut r).unwrap() {
                 ClientMsg::LeaveWorkspace { view: 2 } => {}
                 other => panic!("unexpected {other:?}"),
@@ -2078,6 +2108,53 @@ mod tests {
         conn.leave_workspace(2);
         assert_eq!(conn.shown_workspace(2), None);
         conn.leave_workspace(2);
+
+        let _ = tx_drop.send(());
+        reader_h.join().unwrap();
+        drop(conn);
+        server_h.join().unwrap();
+    }
+
+    #[test]
+    fn a_window_that_leaves_while_joining_isnt_registered() {
+        struct Quiet;
+        impl WorkspaceSink for Quiet {
+            fn workspace(&self, _: usize, _: WorkspaceEvent) {}
+        }
+        let (seen_tx, seen_rx) = flume::unbounded::<String>();
+        let (go_tx, go_rx) = flume::bounded::<()>(1);
+        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let req = match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::JoinWorkspace { req, .. } => req,
+                other => panic!("unexpected {other:?}"),
+            };
+            let _ = seen_tx.send("join".into());
+            // The window leaves before the answer comes.
+            assert!(matches!(read_msg::<_, ClientMsg>(&mut r).unwrap(), ClientMsg::LeaveWorkspace { view: 4 }));
+            let _ = go_rx.recv_timeout(Duration::from_secs(5));
+            let info = WorkspaceInfo { id: 7, name: "Main".into(), revision: 0, tabs: 0, sessions: vec![], views: 1, active: 1 };
+            let layout = WorkspaceLayout { id: 7, revision: 0, json: String::new(), sessions: vec![] };
+            w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
+            w.flush().unwrap();
+            // ... so the daemon hears it leave again, after the join.
+            if let Ok(ClientMsg::LeaveWorkspace { view: 4 }) = read_msg::<_, ClientMsg>(&mut r) {
+                let _ = seen_tx.send("left again".into());
+            }
+            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
+            drop(w);
+        });
+        let conn = Arc::new(conn);
+        let joining = {
+            let conn = conn.clone();
+            std::thread::spawn(move || conn.join_workspace(4, None, Arc::new(Quiet)))
+        };
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "join");
+        conn.leave_workspace(4);
+        let _ = go_tx.send(());
+        assert_eq!(joining.join().unwrap().unwrap().0.id, 7);
+        assert_eq!(conn.shown_workspace(4), None, "not registered: it left");
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "left again");
 
         let _ = tx_drop.send(());
         reader_h.join().unwrap();

@@ -274,8 +274,11 @@ impl Daemon {
         }
         if changes.list {
             let live = self.live();
-            let list = self.workspaces.lock().list(|s| live.contains(&s));
-            if let Ok(frame) = goatty_proto::encode(&goatty_proto::ServerMsg::WorkspacesChanged { list }) {
+            let (list, seq) = {
+                let mut w = self.workspaces.lock();
+                (w.list(|s| live.contains(&s)), w.version())
+            };
+            if let Ok(frame) = goatty_proto::encode(&goatty_proto::ServerMsg::WorkspacesChanged { seq, list }) {
                 send(&frame, &|_, live| live.watches_workspaces());
             }
         }

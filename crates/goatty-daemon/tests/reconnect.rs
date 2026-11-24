@@ -621,7 +621,7 @@ fn windows_share_a_workspace_and_hear_each_others_saves() {
     assert_eq!((ops.name.as_str(), empty.revision), ("Workspace 2", 0));
     b.rename_workspace(ops.id, "ops".into()).unwrap();
     eventually("window a hears the new name", || {
-        ha.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List(l) if l.iter().any(|w| w.name == "ops")))
+        ha.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List { list, .. } if list.iter().any(|w| w.name == "ops")))
     });
     let list = a.list_workspaces().unwrap();
     assert_eq!(list.iter().map(|w| (w.name.as_str(), w.views)).collect::<Vec<_>>(), [("Main", 1), ("ops", 1)]);
@@ -660,7 +660,7 @@ fn workspaces_end_with_their_sessions_and_closing_keeps_them() {
     // The window shows "logs" now; "ops" ends with its shell.
     a.kill(s1).unwrap();
     eventually("ops ends", || {
-        heard.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List(l) if !l.iter().any(|w| w.id == ops.id)))
+        heard.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List { list, .. } if !list.iter().any(|w| w.id == ops.id)))
     });
     // Closing "logs" forgets it, but its shell keeps running.
     a.leave_workspace(1);

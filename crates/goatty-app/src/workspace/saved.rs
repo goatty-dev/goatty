@@ -233,17 +233,18 @@ fn merge_tab(base: &SavedTab, mine: &SavedTab, theirs: &SavedTab) -> SavedTab {
         mine.tree.clone()
     } else {
         // Both changed the splits: mine, with theirs' new and closed panes.
+        // New ones first: removing a pane never empties the tree then.
         let (b, t) = (base.tree.leaves(), theirs.tree.leaves());
         let mut tree = mine.tree.clone();
-        for gone in b.iter().filter(|s| !t.contains(s)) {
-            if tree.leaves().len() > 1 {
-                tree.remove(*gone);
-            }
-        }
         for new in t.iter().filter(|s| !b.contains(s)) {
             if !tree.contains(*new) {
                 let last = *tree.leaves().last().expect("a tree has a leaf");
                 tree.split(last, *new, Direction::Right);
+            }
+        }
+        for gone in b.iter().filter(|s| !t.contains(s)) {
+            if tree.leaves().len() > 1 {
+                tree.remove(*gone);
             }
         }
         tree
@@ -346,7 +347,8 @@ pub struct Join {
 /// A workspace a window just joined, with its sessions attached.
 pub struct Joined {
     pub info: WorkspaceInfo,
-    /// Every workspace on the host.
+    /// Every workspace on the host (listed after joining), and the list's version.
+    pub seq: u64,
     pub list: Vec<WorkspaceInfo>,
     pub revision: u64,
     /// The layout as the daemon has it (with running sessions only).
@@ -398,9 +400,32 @@ pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Sessions attached for a window, let go again unless they're handed over
+/// (`take`): a startup that fails halfway leaves nothing subscribed.
+struct Held(Vec<Arc<Session>>);
+
+impl Held {
+    fn keep(&mut self, s: &Arc<Session>) {
+        self.0.push(s.clone());
+    }
+
+    fn take(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for s in self.0.drain(..) {
+            s.release_view();
+        }
+    }
+}
+
 /// Join a workspace on `conn` by `mode` as window `join` and attach its
 /// sessions; `plain`: a session made for a plain SSH tab, shown in it too.
-/// Blocks.
+/// When something fails after joining, the window leaves the workspace
+/// again and lets go of what it attached. Blocks.
 pub fn startup(
     conn: &Arc<Connection>,
     size: TermSize,
@@ -408,14 +433,38 @@ pub fn startup(
     join: &Join,
     plain: Option<(Arc<Session>, String)>,
 ) -> Result<Startup> {
-    let list = conn.list_workspaces()?;
+    let mut held = Held(plain.iter().map(|(s, _)| s.clone()).collect());
     let target = match mode {
         AttachMode::Join(id) => id,
         AttachMode::Restore(id) | AttachMode::Undetach(id) => Some(id),
-        AttachMode::Id(session) => list.iter().find(|w| w.sessions.contains(&session)).map(|w| w.id),
+        AttachMode::Id(session) => conn.list_workspaces()?.iter().find(|w| w.sessions.contains(&session)).map(|w| w.id),
         AttachMode::New | AttachMode::AllDetached => None,
     };
     let (info, wl) = conn.join_workspace(join.view, target, join.sink.clone())?;
+    match joined(conn, size, mode, info, wl, plain, &mut held) {
+        Ok(j) => {
+            held.take();
+            Ok(Startup::Joined(Box::new(j)))
+        }
+        Err(e) => {
+            conn.leave_workspace(join.view);
+            Err(e)
+        }
+    }
+}
+
+/// [`startup`] once joined: attach what the window shows.
+fn joined(
+    conn: &Arc<Connection>,
+    size: TermSize,
+    mode: AttachMode,
+    info: WorkspaceInfo,
+    wl: goatty_proto::WorkspaceLayout,
+    plain: Option<(Arc<Session>, String)>,
+    held: &mut Held,
+) -> Result<Joined> {
+    // Listed after joining: it counts this window.
+    let (seq, list) = conn.list_workspaces_seq()?;
     let alive: HashSet<SessionId> = wl.sessions.iter().copied().collect();
     let base = Layout::parse(&wl.json, &alive);
     let mut show = base.clone();
@@ -431,6 +480,7 @@ pub fn startup(
     }
     let ids: Vec<SessionId> = show.tabs.iter().flat_map(|t| t.tree.leaves()).collect();
     let sessions = attach_all(conn, size, &ids)?;
+    sessions.values().for_each(|s| held.keep(s));
     let attached: HashSet<SessionId> = sessions.keys().copied().collect();
     let detached: HashSet<SessionId> = show.detached.iter().flat_map(|t| t.tree.leaves()).collect();
     let mut kept = show.clone();
@@ -439,12 +489,15 @@ pub fn startup(
     let mut extra = Vec::new();
     match mode {
         AttachMode::Id(session) if !sessions.contains_key(&session) => {
-            extra.push((Session::daemon(conn.clone(), size, Some(session), None)?, None));
+            let s = Session::daemon(conn.clone(), size, Some(session), None)?;
+            held.keep(&s);
+            extra.push((s, None));
         }
         AttachMode::AllDetached => {
             let shown: HashSet<SessionId> = list.iter().flat_map(|w| w.sessions.iter().copied()).chain(base.sessions()).collect();
             let loose = loose_detached(&conn.list_sessions()?, &shown);
             for (_, s) in attach_all(conn, size, &loose)?.into_iter().collect::<std::collections::BTreeMap<_, _>>() {
+                held.keep(&s);
                 extra.push((s, None));
             }
         }
@@ -455,10 +508,12 @@ pub fn startup(
     }
     let fresh = matches!(mode, AttachMode::New) || (matches!(mode, AttachMode::Join(_)) && show.tabs.is_empty() && extra.is_empty());
     if fresh {
-        extra.push((Session::daemon(conn.clone(), size, None, None)?, None));
+        let s = Session::daemon(conn.clone(), size, None, None)?;
+        held.keep(&s);
+        extra.push((s, None));
     }
     log::info!("joined workspace {:?} on {} ({} tabs)", info.name, conn.endpoint().label(), show.tabs.len());
-    Ok(Startup::Joined(Box::new(Joined { revision: wl.revision, info, list, base, show, sessions, extra })))
+    Ok(Joined { revision: wl.revision, info, seq, list, base, show, sessions, extra })
 }
 
 /// Attach `ids` (sessions another window of this goatty shows are shared),
@@ -484,7 +539,6 @@ pub fn attach_all(conn: &Arc<Connection>, size: TermSize, ids: &[SessionId]) -> 
     }
     if let Some(err) = link_err {
         for s in sessions.values() {
-            s.add_view();
             s.release_view();
         }
         return Err(err);
@@ -629,6 +683,21 @@ mod tests {
         let mut leaves = merged.tabs[0].tree.leaves();
         leaves.sort_unstable();
         assert_eq!(leaves, [1, 5, 7]);
+    }
+
+    #[test]
+    fn a_pane_one_side_closed_and_the_other_moved_away_goes() {
+        // Mine closed pane 2; theirs detached pane 1 (a tab of its own,
+        // detached) and split in pane 3.
+        let base = Layout::new(vec![tab(1, split(1, 2))], Vec::new());
+        let mut mine = base.clone();
+        mine.tabs[0].tree = Node::Leaf(1);
+        let mut theirs = base.clone();
+        theirs.tabs[0].tree = split(2, 3);
+        theirs.detached.push(SavedTab { detached_at: Some(1), ..tab(9, Node::Leaf(1)) });
+        let merged = merge(&base, &mine, &theirs);
+        assert_eq!(merged.tabs[0].tree, Node::Leaf(3));
+        assert_eq!(merged.detached.iter().map(|t| t.tree.clone()).collect::<Vec<_>>(), [Node::Leaf(1)], "pane 1 stays detached");
     }
 
     #[test]
