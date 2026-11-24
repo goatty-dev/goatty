@@ -272,7 +272,6 @@ impl Workspaces {
         }
         let list = r.tabs != tabs;
         (r.json, r.sessions, r.tabs, r.active) = (json, sessions, tabs, seq);
-        r.views.insert((conn, view));
         let conns: Vec<u64> = {
             let mut c: Vec<u64> = r.views.iter().filter(|&&v| v != (conn, view)).map(|(c, _)| *c).collect();
             c.sort_unstable();

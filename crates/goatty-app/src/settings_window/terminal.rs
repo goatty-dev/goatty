@@ -307,15 +307,23 @@ impl SettingsWindow {
                 "on-launch",
                 "When goatty starts",
                 opts(&[
-                    (OnLaunch::Reattach, "Restore every window", "Their tabs and splits on every host, with their sessions"),
-                    (OnLaunch::ReattachLocal, "Restore this computer's tabs", "Other hosts' tabs stay detached until you connect"),
-                    (OnLaunch::New, "Start a new session", "An empty window with a fresh shell"),
+                    (OnLaunch::Reattach, "Restore every window", "Each window comes back with the workspaces it showed on every host"),
+                    (
+                        OnLaunch::ReattachLocal,
+                        "Restore this computer's tabs",
+                        "This computer's last workspace; other hosts' wait until you connect",
+                    ),
+                    (OnLaunch::New, "Start a new session", "A new window on the last workspace, with a fresh tab"),
                 ]),
                 &s.workspace.on_launch,
                 cx,
                 |v, _, cx| AppSettings::update(cx, |s| s.workspace.on_launch = v),
             )))
-            .footer("Reconnecting to other hosts may ask for SSH passwords. The --new, --attach and --ssh command-line flags still win.");
+            .footer(
+                "A workspace is a set of tabs a host keeps for every window that shows it; make more with \"New workspace\" in the \
+                 command palette or the + menu. Reconnecting to other hosts may ask for SSH passwords. The --new, --attach and --ssh \
+                 command-line flags still win.",
+            );
         let tabs = section(ui, "Tabs")
             .child(row(ui, "Style").below(self.tab_style_cards(ui, cx)))
             .child(row(ui, "Show the tab bar").control(segmented(

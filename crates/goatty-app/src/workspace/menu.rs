@@ -13,7 +13,10 @@
 //! * a divider's: even out that split, or every split,
 //! * the new-tab button's (#252): a new tab here or on another host of the
 //!   window, a new tab on any known host (submenu), reattaching what was
-//!   detached, the sessions picker, a new window,
+//!   detached, the sessions picker, a new window, and a "Workspace" submenu
+//!   (switch, new, rename, close; #215),
+//! * a workspace's (the switcher's chip and rows): switch, rename, open in
+//!   a new window, close,
 //! * a host group's label (`groups`): a new tab on that host, fold or
 //!   unfold, show only this host, every host, the host's settings, close
 //!   its tabs.
@@ -39,6 +42,8 @@ pub(super) enum MenuOwner {
     Pane(PaneId),
     /// The new-tab button (the strip's, the sidebar's).
     NewTabButton,
+    /// The workspace chip or a row of the switcher.
+    Workspace,
 }
 
 /// The open menu.
@@ -103,7 +108,7 @@ impl Workspace {
         let mine = match owner {
             MenuOwner::Tab(t) => t == tab,
             MenuOwner::Pane(p) => self.tab_index(tab).is_some_and(|i| self.tabs[i].pane(p).is_some()),
-            MenuOwner::NewTabButton => false,
+            MenuOwner::NewTabButton | MenuOwner::Workspace => false,
         };
         if mine {
             self.close_menu(window, cx);
@@ -574,7 +579,65 @@ impl Workspace {
         let connecting = self.active_tab().is_none_or(|t| t.host.is_none()).then_some("This tab is still connecting");
         entries.push(Item::action("Duplicate this tab", "duplicate_tab", cx).icon(Icon::Copy).disabled(connecting).into());
         entries.push(Item::action("New window", "new_window", cx).into());
+        // Workspaces (#215): found here even with one, where there's no chip.
+        let no_workspace = self.active_shown().is_none().then_some("This tab isn't kept by a goattyd");
+        let mut workspace: Vec<Entry> = vec![
+            Item::action("Switch workspace…", "switch_workspace", cx).icon(Icon::Rows2).disabled(no_workspace).into(),
+            Item::action("New workspace", "new_workspace", cx).icon(Icon::Plus).disabled(no_workspace).into(),
+        ];
+        if self.shows_workspaces() {
+            workspace.push(Entry::Separator);
+            workspace.push(Item::action("Rename the workspace…", "rename_workspace", cx).icon(Icon::Pencil).into());
+            workspace.push(Item::action("Close the workspace…", "close_workspace", cx).icon(Icon::Trash).into());
+        }
+        entries.push(Item::submenu("Workspace", workspace).icon(Icon::Rows2).into());
         self.open_menu(MenuOwner::NewTabButton, entries, at, false, window, cx);
+    }
+
+    // ---- a workspace's menu ---------------------------------------------------
+
+    /// The menu of workspace `id` on `conn` (the chip's, a switcher row's).
+    pub(super) fn open_workspace_menu(
+        &mut self,
+        conn: std::sync::Arc<goatty_client::Connection>,
+        id: goatty_proto::WorkspaceId,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let me = cx.entity().downgrade();
+        let current = self.shown_index(&conn).is_some_and(|i| self.shown[i].id == id);
+        let only = self.shown_index(&conn).is_some_and(|i| self.shown[i].list.len() < 2);
+        let on = |f: fn(
+            &mut Workspace,
+            &std::sync::Arc<goatty_client::Connection>,
+            goatty_proto::WorkspaceId,
+            &mut Window,
+            &mut Context<'_, Workspace>,
+        )| {
+            let (me, conn) = (me.clone(), conn.clone());
+            move |window: &mut Window, cx: &mut gpui::App| {
+                let _ = me.update(cx, |this, cx| f(this, &conn, id, window, cx));
+            }
+        };
+        let mut entries: Vec<Entry> = Vec::new();
+        if !current {
+            entries.push(Item::new("Switch to it", on(|this, c, id, w, cx| this.switch_workspace(c, id, w, cx))).icon(Icon::Check).into());
+        }
+        entries.push(Item::new("Rename…", on(|this, _, id, w, cx| this.open_switcher(Some(id), w, cx))).icon(Icon::Pencil).into());
+        entries.push(
+            Item::new("Open in new window", on(|this, c, id, _, cx| this.open_workspace_in_new_window(c, id, cx)))
+                .icon(Icon::SquareArrowOutUpRight)
+                .into(),
+        );
+        entries.push(Entry::Separator);
+        entries.push(
+            Item::new("Close…", on(|this, c, id, w, cx| this.close_workspace(c, id, w, cx)))
+                .icon(Icon::Trash)
+                .disabled(only.then_some("A host always keeps one workspace"))
+                .into(),
+        );
+        self.open_menu(MenuOwner::Workspace, entries, at, false, window, cx);
     }
 
     // ---- a divider's menu -------------------------------------------------------

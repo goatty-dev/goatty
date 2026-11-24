@@ -501,17 +501,17 @@ impl<'de> Deserialize<'de> for Padding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OnLaunch {
-    /// Reopen every window that was open when goatty quit, with its tabs
-    /// and splits on every host: this computer and the SSH and tailnet
-    /// hosts it had tabs on (#252). Without such a window, restore this
-    /// computer's last window (else reattach the newest detached session,
-    /// else start one).
+    /// Reopen every window that was open when goatty quit: each joins the
+    /// workspaces it showed on every host (this computer and the SSH and
+    /// tailnet hosts it had tabs on, #252, #215). Without such a window,
+    /// this computer's most recently active workspace.
     #[default]
     Reattach,
-    /// Restore only this computer's last window (as `reattach` did before
-    /// #252): other hosts' tabs stay detached until you connect there.
+    /// Only this computer's most recently active workspace: other hosts'
+    /// wait until you connect there.
     ReattachLocal,
-    /// Always start a new session.
+    /// A new window on this computer's most recently active workspace, with
+    /// a fresh tab added to it.
     New,
 }
 

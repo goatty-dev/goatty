@@ -107,7 +107,6 @@ impl Sink {
     }
 }
 
-
 #[test]
 fn cwd_stat_and_read_work_over_proxy() {
     let d = start_daemon();

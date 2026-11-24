@@ -318,9 +318,10 @@ pub fn current(cx: &App) -> Vec<HostEntry> {
 }
 
 /// The attach mode for a connection without an explicit session: the
-/// last window's layout, or a new session (`workspace.on_launch`).
+/// host's most recently active workspace, with a fresh tab when
+/// `workspace.on_launch` asks for a new session.
 pub fn default_attach(cx: &App) -> AttachMode {
-    if cx.global::<AppSettings>().client.workspace.on_launch == OnLaunch::New { AttachMode::New } else { AttachMode::Auto }
+    if cx.global::<AppSettings>().client.workspace.on_launch == OnLaunch::New { AttachMode::New } else { AttachMode::Join(None) }
 }
 
 /// Connect to `host` (an alias or `user@host`) the way the settings say:
@@ -338,13 +339,21 @@ pub fn connect(cx: &mut App, host: &str) {
 pub fn open(cx: &mut App, req: OpenRequest) {
     // Plain SSH only for a fresh session: restoring or reattaching means the
     // host's goattyd that listed them (even after the host was set to plain).
-    let fresh = matches!(req.attach, AttachMode::New | AttachMode::Auto);
+    let fresh = matches!(req.attach, AttachMode::New | AttachMode::Join(None));
     let plain = match &req.host {
         HostRef::Ssh(host) => fresh && cx.global::<AppSettings>().client.ssh.plain(host),
         HostRef::Local | HostRef::Tailnet { .. } => false,
     };
     log::info!("opening a session on {}{}", req.host.label(), if plain { " (plain SSH)" } else { "" });
-    let plan = ConnectPlan { endpoint: req.host.endpoint(), mode: req.attach, open_settings: None, plain, conn: req.conn };
+    let plan = ConnectPlan {
+        endpoint: req.host.endpoint(),
+        mode: req.attach,
+        open_settings: None,
+        plain,
+        conn: req.conn,
+        join: None,
+        active_tab: None,
+    };
     let window = cx.try_global::<LastWorkspace>().map(|w| w.0).filter(|_| req.place == OpenIn::Tab);
     cx.defer(move |cx| {
         if let Some(handle) = window {

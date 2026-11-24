@@ -148,7 +148,9 @@ mod tests {
     fn older_daemons_can_still_be_restarted() {
         let old = hello(MIN_PROTOCOL_VERSION - 1, "0.1.0");
         assert!(check_greeting(old.clone(), PROTOCOL_VERSION).is_err());
-        let Outcome::Ok(g) = check_greeting_from(old, PROTOCOL_VERSION, goatty_proto::ADMIN_MIN_PROTOCOL_VERSION).unwrap() else { panic!() };
+        let Outcome::Ok(g) = check_greeting_from(old, PROTOCOL_VERSION, goatty_proto::ADMIN_MIN_PROTOCOL_VERSION).unwrap() else {
+            panic!()
+        };
         assert_eq!(g.version, MIN_PROTOCOL_VERSION - 1);
     }
 

@@ -63,6 +63,21 @@ pub struct ConnectPlan {
     pub plain: bool,
     /// A connection to the endpoint made already (the session picker's).
     pub conn: Option<Arc<Connection>>,
+    /// How the window joins the host's workspace (#215); set by the window
+    /// (`Workspace::open_connect_tab`). `None`: no joining (a plain SSH tab
+    /// in a window that shows this computer's workspace already).
+    pub join: Option<saved::Join>,
+    /// The tab to show once there (a reopened window's, a new window's).
+    pub active_tab: Option<u64>,
+}
+
+/// Join the workspace `mode` asks for on `conn` (or, without `join`, just
+/// make a session there).
+fn start(conn: &Arc<Connection>, mode: AttachMode, join: Option<&saved::Join>) -> Result<Startup> {
+    match join {
+        Some(join) => saved::startup(conn, initial_size(), mode, join, None),
+        None => Ok(Startup::Session(Session::daemon(conn.clone(), initial_size(), None, None)?)),
+    }
 }
 
 /// The terminal window's first pane size; it resizes on first layout.
@@ -465,6 +480,11 @@ impl ConnectView {
         self.ready.take()
     }
 
+    /// The tab to show once connected.
+    pub fn active_tab(&self) -> Option<u64> {
+        self.plan.active_tab
+    }
+
     fn ssh_target(&self) -> Option<SshTarget> {
         match &self.plan.endpoint {
             Endpoint::Ssh(t) => Some(t.clone()),
@@ -538,11 +558,12 @@ impl ConnectView {
         if self.plan.plain
             && let Some(target) = self.ssh_target()
         {
-            self.work(format!("Opening ssh {}…", target.host), window, cx, move || plain_ssh(&target.host));
+            let join = self.plan.join.clone();
+            self.work(format!("Opening ssh {}…", target.host), window, cx, move || plain_ssh(&target.host, join.as_ref()));
             return;
         }
-        let (endpoint, mode, conn) = (self.plan.endpoint.clone(), self.plan.mode, self.plan.conn.take());
-        let restoring = matches!(mode, AttachMode::Layout(_) | AttachMode::AllDetached);
+        let (endpoint, mode, conn, join) = (self.plan.endpoint.clone(), self.plan.mode, self.plan.conn.take(), self.plan.join.clone());
+        let restoring = mode.restores();
         let label = match (endpoint.is_local(), restoring) {
             (true, false) => "Starting a shell…".to_string(),
             (true, true) => "Restoring your tabs…".to_string(),
@@ -559,7 +580,7 @@ impl ConnectView {
             if check {
                 conn = check_local(conn, &restarted)?;
             }
-            let startup = saved::startup(&conn, initial_size(), mode)?;
+            let startup = start(&conn, mode, join.as_ref())?;
             Ok((startup, Spawner::Daemon(conn)))
         });
     }
@@ -582,7 +603,7 @@ impl ConnectView {
             Choice::Restart if self.plan.endpoint.is_local() => {
                 self.check_local = false;
                 self.outdated = None;
-                let mode = self.plan.mode;
+                let (mode, join) = (self.plan.mode, self.plan.join.clone());
                 self.work("Restarting goattyd…".into(), window, cx, move || {
                     let _one = one_local_restart();
                     // Another window's answer may have replaced it meanwhile:
@@ -592,17 +613,18 @@ impl ConnectView {
                         Some(conn) => conn,
                         None => restart_local(None)?.0,
                     };
-                    let startup = saved::startup(&conn, initial_size(), mode)?;
+                    let startup = start(&conn, mode, join.as_ref())?;
                     Ok((startup, Spawner::Daemon(conn)))
                 });
             }
             Choice::Plain => {
                 let Some(target) = self.ssh_target() else { return };
-                self.work(format!("Opening ssh {}…", target.host), window, cx, move || plain_ssh(&target.host));
+                let join = self.plan.join.clone();
+                self.work(format!("Opening ssh {}…", target.host), window, cx, move || plain_ssh(&target.host, join.as_ref()));
             }
             Choice::Install | Choice::Restart => {
                 let Some(target) = self.ssh_target() else { return };
-                let (endpoint, mode) = (self.plan.endpoint.clone(), self.plan.mode);
+                let (endpoint, mode, join) = (self.plan.endpoint.clone(), self.plan.mode, self.plan.join.clone());
                 let restart = choice == Choice::Restart;
                 self.installing = choice == Choice::Install;
                 let label = if upload.is_some() {
@@ -619,7 +641,7 @@ impl ConnectView {
                     }
                     let conn = Connection::open(endpoint, crate::CLIENT)?;
                     pool::add(&conn);
-                    let startup = saved::startup(&conn, initial_size(), mode)?;
+                    let startup = start(&conn, mode, join.as_ref())?;
                     Ok((startup, Spawner::Daemon(conn)))
                 });
             }
@@ -641,15 +663,21 @@ impl ConnectView {
 }
 
 /// `ssh host` in a new session of the local goattyd (it survives closing the
-/// window). If the local daemon can't (too old, won't start), in a PTY of
-/// this window instead. New tabs from it run `ssh host` again.
-pub fn plain_ssh(host: &str) -> Result<Ready> {
+/// window), in this computer's workspace (`join`: the window shows none
+/// yet, so it joins one). If the local daemon can't (too old, won't
+/// start), in a PTY of this window instead. New tabs from it run `ssh host`
+/// again.
+pub fn plain_ssh(host: &str, join: Option<&saved::Join>) -> Result<Ready> {
     let argv = plain_ssh_argv(host);
     match pool::open(Endpoint::Local) {
         Ok(conn) => match Session::daemon_run(conn.clone(), initial_size(), argv.clone(), None) {
             Ok(session) => {
-                let spawner = Spawner::Plain { host: host.to_string(), base: Box::new(Spawner::Daemon(conn)) };
-                return Ok((Startup::Session(session), spawner));
+                let spawner = Spawner::Plain { host: host.to_string(), base: Box::new(Spawner::Daemon(conn.clone())) };
+                let startup = match join {
+                    Some(join) => saved::startup(&conn, initial_size(), AttachMode::Join(None), join, Some((session, host.to_string())))?,
+                    None => Startup::Session(session),
+                };
+                return Ok((startup, spawner));
             }
             Err(e) => log::warn!("the local goattyd can't run ssh ({e:#}); running it in this window"),
         },

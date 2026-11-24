@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
     ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, NET_SINCE, PROTOCOL_VERSION,
-    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, SaveOutcome, ServerMsg, SessionId,
-    SessionInfo, StreamOpts, ViewId, WinSize, WorkspaceId, WorkspaceInfo, WorkspaceLayout, encode, read_msg,
+    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, SaveOutcome, ServerMsg, SessionId, SessionInfo,
+    StreamOpts, ViewId, WinSize, WorkspaceId, WorkspaceInfo, WorkspaceLayout, encode, read_msg,
 };
 use parking_lot::Mutex;
 

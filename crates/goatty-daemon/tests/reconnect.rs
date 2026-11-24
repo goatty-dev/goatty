@@ -611,7 +611,9 @@ fn windows_share_a_workspace_and_hear_each_others_saves() {
     // A reconnect joins the same workspace again.
     a.force_disconnect();
     eventually("window a rejoins", || {
-        ha.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::Rejoined { info, layout } if info.id == main.id && layout.revision == 2))
+        ha.0.lock()
+            .iter()
+            .any(|e| matches!(e, goatty_client::WorkspaceEvent::Rejoined { info, layout } if info.id == main.id && layout.revision == 2))
     });
 
     // A second workspace: listed, renamed, the others hear it.

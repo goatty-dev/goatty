@@ -166,7 +166,7 @@ impl Cli {
             (true, _) => AttachMode::New,
             (false, Some(id)) => AttachMode::Id(id),
             (false, None) if prefer_new => AttachMode::New,
-            (false, None) => AttachMode::Auto,
+            (false, None) => AttachMode::Join(None),
         }
     }
 
@@ -213,7 +213,7 @@ mod tests {
         let cli = Cli::parse_from(["goatty", "--attach", "3"]);
         assert!(matches!(cli.attach_mode(true), AttachMode::Id(3)));
         assert!(matches!(Cli::parse_from(["goatty"]).attach_mode(true), AttachMode::New));
-        assert!(matches!(Cli::parse_from(["goatty"]).attach_mode(false), AttachMode::Auto));
+        assert!(matches!(Cli::parse_from(["goatty"]).attach_mode(false), AttachMode::Join(None)));
         assert!(matches!(cli.endpoint().unwrap(), Some(Endpoint::Local)));
         assert!(Cli::parse_from(["goatty", "--local"]).endpoint().unwrap().is_none());
         assert!(Cli::try_parse_from(["goatty", "--local", "--ssh", "h"]).is_err());

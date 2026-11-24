@@ -26,7 +26,8 @@ pub struct ActionInfo {
 }
 
 /// Action groups in display order.
-pub const GROUPS: &[&str] = &["Clipboard", "Command line", "Scrolling", "Output", "Text size", "goatty", "Notifications", "Tabs", "Panes"];
+pub const GROUPS: &[&str] =
+    &["Clipboard", "Command line", "Scrolling", "Output", "Text size", "goatty", "Notifications", "Workspaces", "Tabs", "Panes"];
 
 pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "copy", label: "Copy the selection", group: "Clipboard" },
@@ -58,6 +59,13 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "dismiss_notifications", label: "Dismiss all notifications", group: "Notifications" },
     ActionInfo { name: "press_notification_button", label: "Press the newest notification's main button", group: "Notifications" },
     ActionInfo { name: "show_recent_notifications", label: "Show recent notifications", group: "Notifications" },
+    // Workspaces (#215): several sets of tabs on one goattyd.
+    ActionInfo { name: "switch_workspace", label: "Switch workspace (the list of this host's workspaces)", group: "Workspaces" },
+    ActionInfo { name: "next_workspace", label: "Next workspace on this host", group: "Workspaces" },
+    ActionInfo { name: "previous_workspace", label: "Previous workspace on this host", group: "Workspaces" },
+    ActionInfo { name: "new_workspace", label: "New workspace", group: "Workspaces" },
+    ActionInfo { name: "rename_workspace", label: "Rename the workspace", group: "Workspaces" },
+    ActionInfo { name: "close_workspace", label: "Close the workspace", group: "Workspaces" },
     ActionInfo { name: "new_tab", label: "New tab", group: "Tabs" },
     ActionInfo { name: "close_pane", label: "Close the pane (the tab with its last pane)", group: "Panes" },
     ActionInfo { name: "detach_pane", label: "Detach the pane (keep its shell running in the background)", group: "Panes" },
@@ -82,7 +90,7 @@ pub static ACTIONS: &[ActionInfo] = &[
     ActionInfo { name: "detach_other_tabs", label: "Detach the other tabs (keep their shells running)", group: "Tabs" },
     ActionInfo { name: "detach_host", label: "Detach from this host (close its tabs and keep its shells running)", group: "Tabs" },
     ActionInfo { name: "reattach_detached", label: "Reattach what was detached last on this host (its tabs at once)", group: "Tabs" },
-    ActionInfo { name: "new_window", label: "New window", group: "Tabs" },
+    ActionInfo { name: "new_window", label: "New window (on the same workspace)", group: "Tabs" },
     ActionInfo { name: "merge_tab", label: "Bring another tab into this one (side by side)", group: "Tabs" },
     ActionInfo { name: "toggle_tab_sidebar", label: "Fold or unfold the tab sidebar", group: "Tabs" },
     ActionInfo { name: "toggle_vertical_tabs", label: "Switch between vertical and horizontal tabs", group: "Tabs" },
@@ -224,6 +232,10 @@ pub static DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl-pagedown", "next_tab"),
     ("ctrl-pageup", "previous_tab"),
     ("ctrl-shift-pageup", "move_tab_left"),
+    // Workspaces, next to the tabs' keys.
+    ("ctrl-alt-pagedown", "next_workspace"),
+    ("ctrl-alt-pageup", "previous_workspace"),
+    ("ctrl-alt-w", "switch_workspace"),
     ("ctrl-shift-pagedown", "move_tab_right"),
     ("alt-1", "select_tab_1"),
     ("alt-2", "select_tab_2"),

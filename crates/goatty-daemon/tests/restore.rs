@@ -135,7 +135,10 @@ fn a_restart_into_an_updated_build_keeps_the_session() {
             break info.id;
         }
     };
-    send(&mut s, &ClientMsg::SaveWorkspace { req: 3, view: 1, id: main, base: 0, tabs: 1, sessions: vec![id], json: "{\"tabs\":1}".into() });
+    send(
+        &mut s,
+        &ClientMsg::SaveWorkspace { req: 3, view: 1, id: main, base: 0, tabs: 1, sessions: vec![id], json: "{\"tabs\":1}".into() },
+    );
     loop {
         if let ServerMsg::WorkspaceSaved { outcome, .. } = next_msg(&mut s) {
             assert_eq!(outcome, goatty_proto::SaveOutcome::Saved { revision: 1 });

@@ -40,10 +40,10 @@ use goatty_term::pty::{self, Pty};
 use goatty_term::{Palette, TermSize, Terminal};
 use serde::{Deserialize, Serialize};
 
-use crate::workspaces::{SavedWorkspace, Workspaces};
 use crate::server::{Daemon, NewSession};
 use crate::session::Session;
 use crate::systemd::StoredPty;
+use crate::workspaces::{SavedWorkspace, Workspaces};
 
 /// The newest state format this build reads; `goattyd restore-version`
 /// prints it, and a restart only runs a goattyd that reads ours.

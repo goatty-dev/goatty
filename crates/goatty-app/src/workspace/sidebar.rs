@@ -248,8 +248,10 @@ impl Workspace {
                         .on_click(dispatch(ToggleTabSidebar)),
                 )
                 .child(sidebar_button("tab-sidebar-settings", Icon::Sliders, "Settings", c).size(px(30.)).on_click(dispatch(OpenSettings)));
+            let chip = self.workspace_chip(true, cx);
             frame
                 .p(px(PAD))
+                .children(chip.map(|chip| div().flex_none().pb(px(6.)).child(chip)))
                 .child(
                     div()
                         .id("tab-list")

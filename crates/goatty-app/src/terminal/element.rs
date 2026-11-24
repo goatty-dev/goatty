@@ -105,6 +105,9 @@ impl Geom {
 
 pub struct TerminalElement {
     pub session: Arc<Session>,
+    /// The view's token: only the view that owns the session's size sets
+    /// it (two windows can show the same session, #215).
+    pub token: u64,
     pub frame: Rc<RefCell<Frame>>,
     pub geom: Rc<StdCell<Geom>>,
     pub stats: Rc<RefCell<Stats>>,
@@ -265,7 +268,7 @@ impl Element for TerminalElement {
         let rows = ((inner_h / line_height).floor() as u16).max(1);
         let mut origin = bounds.origin + point(pad.left, pad.top);
 
-        if self.session.view_differs(cols, rows) {
+        if self.session.view_differs(cols, rows) && self.session.may_resize(self.token) {
             let scale = window.scale_factor();
             self.session.resize(TermSize {
                 cols,
