@@ -916,40 +916,63 @@ impl Connection {
         }
     }
 
+    /// Current membership generation for `view`, bumped by every explicit
+    /// `join_workspace`, `create_workspace`, and `leave_workspace`.
+    pub fn view_gen(&self, view: ViewId) -> u64 {
+        self.shared.left.lock().get(&view).copied().unwrap_or(0)
+    }
+
+    fn request_join_at(
+        &self,
+        view: ViewId,
+        sink: Arc<dyn WorkspaceSink>,
+        expected_gen: Option<u64>,
+        msg: impl FnOnce(ReqId) -> ClientMsg,
+    ) -> (u64, Result<Option<(WorkspaceInfo, WorkspaceLayout)>>) {
+        let req = self.shared.req_id();
+        let (tx, rx) = flume::bounded(1);
+        let left_gen = {
+            // Hold `left` across the generation check/bump, pending registration,
+            // and frame enqueue so explicit joins, leaves, and reconnect replays
+            // are strictly ordered on both `left` and the wire.
+            // Lock order: `left` > `views` > `pending`.
+            let mut left = self.shared.left.lock();
+            let current = left.get(&view).copied().unwrap_or(0);
+            if expected_gen.is_some_and(|g| current != g) {
+                return (current, Ok(None));
+            }
+            let left_gen = {
+                let mut map = self.shared.pending.lock();
+                if !self.is_connected() {
+                    return (current, Err(anyhow!("not connected to goattyd")));
+                }
+                let entry = left.entry(view).or_insert(0);
+                *entry += 1;
+                let left_gen = *entry;
+                map.insert(req, Pending::Join { tx, view, sink, left_gen });
+                left_gen
+            };
+            self.shared.send(&msg(req));
+            left_gen
+        };
+        let reply = rx.recv_timeout(REQUEST_TIMEOUT);
+        self.shared.pending.lock().remove(&req);
+        let result = match reply {
+            Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
+            Ok(ServerMsg::Joined { info, layout, .. }) => Ok(Some((info, layout))),
+            Ok(other) => Err(anyhow!("unexpected reply {other:?}")),
+            Err(_) => Err(ReplyLost.into()),
+        };
+        (left_gen, result)
+    }
+
     fn request_join(
         &self,
         view: ViewId,
         sink: Arc<dyn WorkspaceSink>,
         msg: impl FnOnce(ReqId) -> ClientMsg,
     ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
-        let req = self.shared.req_id();
-        let (tx, rx) = flume::bounded(1);
-        {
-            // Hold `left` across the generation bump, pending registration, and
-            // frame enqueue so explicit joins, leaves, and reconnect replays
-            // are strictly ordered on both `left` and the wire.
-            // Lock order: `left` > `views` > `pending`.
-            let mut left = self.shared.left.lock();
-            {
-                let mut map = self.shared.pending.lock();
-                if !self.is_connected() {
-                    bail!("not connected to goattyd");
-                }
-                let entry = left.entry(view).or_insert(0);
-                *entry += 1;
-                let left_gen = *entry;
-                map.insert(req, Pending::Join { tx, view, sink, left_gen });
-            }
-            self.shared.send(&msg(req));
-        }
-        let reply = rx.recv_timeout(REQUEST_TIMEOUT);
-        self.shared.pending.lock().remove(&req);
-        match reply {
-            Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
-            Ok(ServerMsg::Joined { info, layout, .. }) => Ok((info, layout)),
-            Ok(other) => bail!("unexpected reply {other:?}"),
-            Err(_) => Err(ReplyLost.into()),
-        }
+        self.request_join_at(view, sink, None, msg).1.map(|pair| pair.expect("unconditional join yields a reply"))
     }
 
     /// Window `view` shows workspace `id` on this host from now on (`None`
@@ -973,6 +996,64 @@ impl Connection {
         sink: Arc<dyn WorkspaceSink>,
     ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
         self.request_join(view, sink, |req| ClientMsg::CreateWorkspace { req, view, name })
+    }
+
+    /// Like [`Self::create_workspace`], but only proceeds if `view`'s
+    /// membership generation is still `expected_gen`. Returns the generation
+    /// after the attempt (`Ok(None)` if superseded before sending). Blocks.
+    pub fn create_workspace_if_unchanged(
+        &self,
+        view: ViewId,
+        expected_gen: u64,
+        name: Option<String>,
+        sink: Arc<dyn WorkspaceSink>,
+    ) -> (u64, Result<Option<(WorkspaceInfo, WorkspaceLayout)>>) {
+        self.request_join_at(view, sink, Some(expected_gen), |req| ClientMsg::CreateWorkspace { req, view, name })
+    }
+
+    /// Restore `view`'s membership to `id` (`None` leaves) only if no newer
+    /// join, create, or leave has changed `view`'s generation since
+    /// `expected_gen`. Returns `Ok(None)` when superseded or when leaving.
+    pub fn restore_workspace_if_unchanged(
+        &self,
+        view: ViewId,
+        expected_gen: u64,
+        id: Option<WorkspaceId>,
+        sink: Arc<dyn WorkspaceSink>,
+    ) -> Result<Option<(WorkspaceInfo, WorkspaceLayout)>> {
+        match id {
+            Some(ws) => {
+                let (_, res) = self.request_join_at(view, sink.clone(), Some(expected_gen), |req| ClientMsg::JoinWorkspace {
+                    req,
+                    view,
+                    id: Some(ws),
+                });
+                if res.is_err() && !self.is_connected() {
+                    // Link dropped before restore could be sent: keep the
+                    // target workspace recorded for reconnect replay unless a
+                    // newer join/leave already superseded `expected_gen`.
+                    let mut left = self.shared.left.lock();
+                    if left.get(&view).copied().unwrap_or(0) == expected_gen {
+                        *left.entry(view).or_insert(0) += 1;
+                        self.shared.views.lock().insert(view, View { workspace: ws, sink });
+                    }
+                }
+                res
+            }
+            None => {
+                // Lock order: `left`, then `views`.
+                let mut left = self.shared.left.lock();
+                if left.get(&view).copied().unwrap_or(0) != expected_gen {
+                    return Ok(None);
+                }
+                *left.entry(view).or_insert(0) += 1;
+                self.shared.views.lock().remove(&view);
+                if self.is_connected() {
+                    self.shared.send(&ClientMsg::LeaveWorkspace { view });
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Window `view` stops showing a workspace on this host (it closed or
@@ -2340,5 +2421,77 @@ mod tests {
         reader_h.join().unwrap();
         drop(conn);
         server_h.join().unwrap();
+    }
+
+    #[test]
+    fn restore_workspace_if_unchanged_respects_newer_join_and_leave() {
+        struct Quiet;
+        impl WorkspaceSink for Quiet {
+            fn workspace(&self, _: usize, _: WorkspaceEvent) {}
+        }
+
+        let (seen_tx, seen_rx) = flume::unbounded::<String>();
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                match msg {
+                    ClientMsg::JoinWorkspace { req, id, .. } => {
+                        let ws = id.unwrap_or(1);
+                        let _ = seen_tx.send(format!("join:{ws}"));
+                        let info =
+                            WorkspaceInfo { id: ws, name: format!("W{ws}"), revision: 0, tabs: 0, sessions: vec![], views: 1, active: 1 };
+                        let layout = WorkspaceLayout { id: ws, revision: 0, json: String::new(), sessions: vec![] };
+                        w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    ClientMsg::CreateWorkspace { req, .. } => {
+                        let _ = seen_tx.send("create".into());
+                        let info = WorkspaceInfo { id: 9, name: "New".into(), revision: 0, tabs: 0, sessions: vec![], views: 1, active: 1 };
+                        let layout = WorkspaceLayout { id: 9, revision: 0, json: String::new(), sessions: vec![] };
+                        w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    ClientMsg::LeaveWorkspace { view } => {
+                        let _ = seen_tx.send(format!("leave:{view}"));
+                    }
+                    _ => {}
+                }
+            }
+            drop(w);
+        });
+
+        let sink: Arc<dyn WorkspaceSink> = Arc::new(Quiet);
+        conn.join_workspace(4, Some(1), sink.clone()).unwrap();
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join:1");
+        let gen1 = conn.view_gen(4);
+
+        // Create succeeds and bumps generation to gen2.
+        let (gen2, created) = conn.create_workspace_if_unchanged(4, gen1, None, sink.clone());
+        assert_eq!(created.unwrap().unwrap().0.id, 9);
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "create");
+        assert!(gen2 > gen1);
+
+        // Stale create with old `gen1` is skipped without hitting the wire.
+        let (_, skipped) = conn.create_workspace_if_unchanged(4, gen1, None, sink.clone());
+        assert!(skipped.unwrap().is_none());
+        assert!(seen_rx.try_recv().is_err());
+
+        // Restore with matching `gen2` re-joins workspace 1.
+        let restored = conn.restore_workspace_if_unchanged(4, gen2, Some(1), sink.clone()).unwrap();
+        assert_eq!(restored.unwrap().0.id, 1);
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join:1");
+        assert_eq!(conn.shown_workspace(4), Some(1));
+
+        // A newer join to workspace 2 supersedes `gen2`; restoring with `gen2`
+        // (for either Some(1) or None) must be a no-op.
+        conn.join_workspace(4, Some(2), sink.clone()).unwrap();
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join:2");
+        assert!(conn.restore_workspace_if_unchanged(4, gen2, Some(1), sink.clone()).unwrap().is_none());
+        assert!(conn.restore_workspace_if_unchanged(4, gen2, None, sink.clone()).unwrap().is_none());
+        assert_eq!(conn.shown_workspace(4), Some(2));
+        assert!(seen_rx.try_recv().is_err());
+
+        drop(conn);
+        server_h.join().unwrap();
+        reader_h.join().unwrap();
     }
 }

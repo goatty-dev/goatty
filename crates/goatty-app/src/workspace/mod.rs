@@ -324,6 +324,9 @@ pub struct Workspace {
     early_events: Vec<(usize, goatty_client::WorkspaceEvent)>,
     /// Workspaces to close once the tabs moved out of them are saved elsewhere.
     move_closes: Vec<sync::MoveClose>,
+    /// Hosts with a `new_workspace` creation in flight (by connection key), so
+    /// overlapping requests from action, menu, or switcher don't race.
+    creating_workspace: std::collections::HashSet<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -420,6 +423,7 @@ impl Workspace {
             show_when_attached: None,
             early_events: Vec::new(),
             move_closes: Vec::new(),
+            creating_workspace: std::collections::HashSet::new(),
             _subscriptions: vec![appearance, button_layout, settings, activation, bounds],
         };
         reopen::window_opened(cx, this.window_id);

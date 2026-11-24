@@ -1325,6 +1325,10 @@ impl Workspace {
             toast::show_in(window, cx, toast.key("workspace.new"));
             return;
         };
+        let conn_key = conn.key();
+        if !self.creating_workspace.insert(conn_key) {
+            return;
+        }
         let (size, cwd) = match self.focused_view() {
             Some(v) => {
                 let v = v.read(cx);
@@ -1334,65 +1338,130 @@ impl Workspace {
             None => (TermSize::new(100, 30), None),
         };
         let join = self.join.clone();
-        let current = self.shown_index(&conn).map(|i| self.shown[i].id);
+        let before = self.shown_index(&conn).map(|i| (self.shown[i].id, self.shown[i].epoch));
+        let current = before.map(|(id, _)| id);
+        let before_gen = conn.view_gen(join.view);
         let task = cx.background_executor().spawn({
             let conn = conn.clone();
+            let join = join.clone();
             async move {
-                let (info, layout) = conn.create_workspace(join.view, None, join.sink.clone())?;
+                let (create_gen, created) = conn.create_workspace_if_unchanged(join.view, before_gen, None, join.sink.clone());
+                let (info, layout) = match created {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        // Ambiguous timeout while connected: the daemon may
+                        // have moved `join.view` to a newly created workspace.
+                        // Restore `current` only if no newer join/leave has
+                        // superseded this request.
+                        let restored = if e.downcast_ref::<ReplyLost>().is_some() && conn.is_connected() {
+                            conn.restore_workspace_if_unchanged(join.view, create_gen, current, join.sink.clone())
+                                .ok()
+                                .flatten()
+                                .map(|(_, layout)| layout)
+                        } else {
+                            None
+                        };
+                        return Err((e, restored));
+                    }
+                };
                 let session = match Session::daemon(conn.clone(), size, None, cwd) {
                     Ok(s) => s,
                     Err(e) => {
-                        // No shell, no workspace: back to the one the window shows.
+                        // No shell, no workspace: back to the one the window
+                        // shows unless a newer join/leave moved it elsewhere.
                         let _ = conn.close_workspace(info.id);
-                        match current {
-                            Some(id) => drop(conn.join_workspace(join.view, Some(id), join.sink.clone())),
-                            None => conn.leave_workspace(join.view),
-                        }
-                        return Err(e);
+                        let restored = conn
+                            .restore_workspace_if_unchanged(join.view, create_gen, current, join.sink.clone())
+                            .ok()
+                            .flatten()
+                            .map(|(_, layout)| layout);
+                        return Err((e, restored));
                     }
                 };
                 let (seq, list) = conn.list_workspaces_seq().unwrap_or_else(|_| (0, vec![info.clone()]));
-                anyhow::Ok(Box::new(Joined {
-                    info,
-                    seq,
-                    list,
-                    revision: layout.revision,
-                    base: Layout::new(Vec::new(), Vec::new()),
-                    show: Layout::new(Vec::new(), Vec::new()),
-                    sessions: HashMap::new(),
-                    extra: vec![(session, None)],
-                }))
+                Ok(Some((
+                    create_gen,
+                    Box::new(Joined {
+                        info,
+                        seq,
+                        list,
+                        revision: layout.revision,
+                        base: Layout::new(Vec::new(), Vec::new()),
+                        show: Layout::new(Vec::new(), Vec::new()),
+                        sessions: HashMap::new(),
+                        extra: vec![(session, None)],
+                    }),
+                )))
             }
         });
         let view_id = self.join.view;
+        let sink = join.sink;
         cx.spawn_in(window, async move |this, cx| {
             let mut result = Some(task.await);
-            let delivered = this.update_in(cx, |this, window, cx| match result.take().expect("new workspace result") {
-                Ok(j) => {
-                    let id = j.info.id;
-                    let pos = match this.shown_index(&conn) {
-                        Some(i) => this.park(i, cx),
-                        None => this.tabs.len(),
-                    };
-                    this.show_joined(pos, j, Spawner::Daemon(conn.clone()), None, true, window, cx);
-                    this.open_switcher(Some(id), window, cx);
-                }
-                Err(e) => {
-                    toast::show_in(window, cx, Toast::error("Couldn't make a workspace").body(format!("{e:#}")).key("workspace.new"));
+            let delivered = this.update_in(cx, |this, window, cx| {
+                this.creating_workspace.remove(&conn_key);
+                match result.take().expect("new workspace result") {
+                    Ok(Some((create_gen, j))) => {
+                        let shown_now = this.shown_index(&conn).map(|i| (this.shown[i].id, this.shown[i].epoch));
+                        if shown_now != before || conn.view_gen(view_id) != create_gen {
+                            // The window switched workspaces or detached while
+                            // creation was in flight: discard the superseded
+                            // workspace instead of replacing the displayed one.
+                            let id = j.info.id;
+                            let restore_to = shown_now.map(|(id, _)| id);
+                            let sessions: Vec<Arc<Session>> = j.extra.into_iter().map(|(s, _)| s).collect();
+                            for s in &sessions {
+                                s.release_view();
+                            }
+                            this.kill_sessions(sessions, cx).detach();
+                            let c = conn.clone();
+                            let sink = sink.clone();
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let _ = c.close_workspace(id);
+                                    let _ = c.restore_workspace_if_unchanged(view_id, create_gen, restore_to, sink);
+                                })
+                                .detach();
+                            return;
+                        }
+                        let id = j.info.id;
+                        let pos = match this.shown_index(&conn) {
+                            Some(i) => this.park(i, cx),
+                            None => this.tabs.len(),
+                        };
+                        this.show_joined(pos, j, Spawner::Daemon(conn.clone()), None, true, window, cx);
+                        this.open_switcher(Some(id), window, cx);
+                    }
+                    Ok(None) => {}
+                    Err((e, restored)) => {
+                        if let Some(layout) = restored
+                            && this.shown_index(&conn).map(|i| (this.shown[i].id, this.shown[i].epoch)) == before
+                        {
+                            this.apply_remote(conn_key, layout, window, cx);
+                        }
+                        toast::show_in(window, cx, Toast::error("Couldn't make a workspace").body(format!("{e:#}")).key("workspace.new"));
+                    }
                 }
             });
-            // The window closed before taking ownership: release the new
-            // shell's view claim, leave the join, and drop the empty workspace.
+            // The window closed before taking ownership: release and end the
+            // unused shell, leave the join, and drop the empty workspace.
             if delivered.is_err()
-                && let Some(Ok(j)) = result
+                && let Some(Ok(Some((_, j)))) = result
             {
                 let id = j.info.id;
-                for (s, _) in &j.extra {
+                let sessions: Vec<Arc<Session>> = j.extra.into_iter().map(|(s, _)| s).collect();
+                for s in &sessions {
                     s.release_view();
                 }
                 conn.leave_workspace(view_id);
                 cx.background_executor()
                     .spawn(async move {
+                        for s in sessions {
+                            if let Some(sid) = s.daemon_id() {
+                                let _ = conn.kill(sid);
+                            }
+                        }
                         let _ = conn.close_workspace(id);
                     })
                     .detach();
