@@ -9,7 +9,8 @@
 //!
 //! * goattyd missing → install it (`goatty_client::remote::install`),
 //! * goattyd too old → install this build's goattyd and restart the daemon
-//!   (that ends the host's sessions, so the button says so),
+//!   (a daemon from protocol v10 on keeps its sessions; an older one's end,
+//!   and the button says so),
 //! * either way, or when goattyd can't run there → **plain SSH**: `ssh host`
 //!   in a session of the *local* goattyd. Nothing is installed on the host,
 //!   and nothing of goatty runs there; the session survives closing the
@@ -203,7 +204,7 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     upload: None,
                 };
             }
-            let warning = Some(format!("Restarting goattyd ends the sessions running on {host}."));
+            let warning = (!keeps_sessions(mismatch)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
             if probe.as_ref().is_some_and(Probe::runs_ours) {
                 return Ask {
                     title: format!("Restart goattyd on {host}?"),
@@ -237,6 +238,36 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                 },
             }
         }
+    }
+}
+
+/// An older daemon that a restart replaces with its sessions kept
+/// (protocol v10 on; `Control::connect_admin` still speaks to it).
+fn keeps_sessions(mismatch: &goatty_client::VersionMismatch) -> bool {
+    !mismatch.daemon_is_newer && mismatch.daemon_protocol.is_some_and(local::can_keep_sessions)
+}
+
+/// The local daemon speaks no protocol this goatty does but is old enough
+/// to restart with its sessions: restart it with the installed build right
+/// away (no question: nothing is lost) and connect.
+fn open_local(restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
+    match pool::open(Endpoint::Local) {
+        Err(e) => {
+            let keeps = matches!(e.downcast_ref::<LocalProblem>(), Some(LocalProblem::Incompatible(m)) if keeps_sessions(m));
+            if !keeps {
+                return Err(e);
+            }
+            let _one = one_local_restart();
+            if let Ok(conn) = pool::open(Endpoint::Local) {
+                // Another window restarted it meanwhile.
+                return Ok(conn);
+            }
+            log::info!("restarting the local goattyd, which is older than this goatty speaks: {e:#}");
+            let (conn, kept) = restart_local(None)?;
+            *restarted.lock().unwrap_or_else(|p| p.into_inner()) = Some(if kept { Restart::Kept } else { Restart::Empty });
+            Ok(conn)
+        }
+        ok => ok,
     }
 }
 
@@ -288,10 +319,11 @@ pub fn describe_local(problem: &LocalProblem, installed: Option<&std::path::Path
             };
             let (min, max) = (goatty_proto::MIN_PROTOCOL_VERSION, goatty_proto::PROTOCOL_VERSION);
             let age = if mismatch.daemon_is_newer { "newer" } else { "older" };
+            let warning = (!keeps_sessions(mismatch)).then(|| "Restarting goattyd ends the sessions running in it.".to_string());
             Ask {
                 title: "Restart goattyd?".into(),
                 body: vec![format!("The running {daemon} is {age} than this goatty can talk to (protocol v{min}–v{max}). {starts}")],
-                warning: Some("Restarting goattyd ends the sessions running in it.".into()),
+                warning,
                 choices: vec![close, (Choice::Retry, "Retry".into()), restart],
                 upload: None,
             }
@@ -564,7 +596,10 @@ impl ConnectView {
         }
         let (endpoint, mode, conn, join) = (self.plan.endpoint.clone(), self.plan.mode, self.plan.conn.take(), self.plan.join.clone());
         let restoring = mode.restores();
+        // A workspace this window switches to: the host is there already.
+        let switching = conn.is_some() && matches!(mode, AttachMode::Join(Some(_)));
         let label = match (endpoint.is_local(), restoring) {
+            _ if switching => "Opening the workspace…".to_string(),
             (true, false) => "Starting a shell…".to_string(),
             (true, true) => "Restoring your tabs…".to_string(),
             (false, false) => format!("Connecting to {}…", endpoint.label()),
@@ -575,6 +610,7 @@ impl ConnectView {
         self.work(label, window, cx, move || {
             let mut conn = match conn {
                 Some(c) => c,
+                None if check => open_local(&restarted)?,
                 None => pool::open(endpoint)?,
             };
             if check {
@@ -803,6 +839,10 @@ mod tests {
         let newer = VersionMismatch { daemon_protocol: Some(99), daemon_version: None, daemon_is_newer: true };
         let p = RemoteProblem::Incompatible { host: "box".into(), mismatch: newer, probe: None };
         assert_eq!(choices(&describe(&p, bundle(false))), [Choice::Cancel, Choice::Plain]);
+        // A daemon from v10 on keeps its sessions over the restart: no warning.
+        let v16 = VersionMismatch { daemon_protocol: Some(16), daemon_version: Some("0.3.0".into()), daemon_is_newer: false };
+        let p = RemoteProblem::Incompatible { host: "box".into(), mismatch: v16, probe: probe("/usr/bin/goattyd") };
+        assert!(describe(&p, bundle(false)).warning.is_none());
     }
 
     #[test]
@@ -812,5 +852,7 @@ mod tests {
         assert_eq!(choices(&a), [Choice::Cancel, Choice::Retry, Choice::Restart]);
         assert!(a.body[0].contains("older") && a.body[0].contains("/x/goattyd"), "{:?}", a.body);
         assert!(a.warning.unwrap().contains("ends the sessions"));
+        let v16 = VersionMismatch { daemon_protocol: Some(16), daemon_version: Some("0.3.0".into()), daemon_is_newer: false };
+        assert!(describe_local(&LocalProblem::Incompatible(v16), None).warning.is_none());
     }
 }

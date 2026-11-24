@@ -54,9 +54,12 @@ impl Waker {
         });
     }
 
+    /// A new view's wake-ups. It's woken once right away, for what
+    /// happened before it existed (the session may even have ended).
     fn subscribe(&self) -> (Arc<WakeListener>, flume::Receiver<()>) {
         let (tx, rx) = flume::unbounded();
-        let l = Arc::new(WakeListener { pending: AtomicBool::new(false), tx });
+        let _ = tx.send(());
+        let l = Arc::new(WakeListener { pending: AtomicBool::new(true), tx });
         self.listeners.lock().push(Arc::downgrade(&l));
         (l, rx)
     }

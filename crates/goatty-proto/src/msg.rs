@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(negotiate(PROTOCOL_VERSION + 3), Some(PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION), Some(MIN_PROTOCOL_VERSION));
         assert_eq!(negotiate(MIN_PROTOCOL_VERSION - 1), None);
-        assert!(ADMIN_MIN_PROTOCOL_VERSION <= MIN_PROTOCOL_VERSION);
+        const { assert!(ADMIN_MIN_PROTOCOL_VERSION <= MIN_PROTOCOL_VERSION) };
     }
 
     #[test]

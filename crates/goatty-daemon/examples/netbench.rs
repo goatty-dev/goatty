@@ -1,8 +1,10 @@
 //! Headless end-to-end benchmark of the client ⇄ daemon path: keystroke echo
 //! latency (alone, and while another pane on the same connection floods),
-//! flood throughput, and multi-pane window restore (sequential vs.
-//! pipelined `attach_many`), with the client feeding a real mirror VT (same
-//! work the GUI does, minus rendering).
+//! flood throughput, multi-pane window restore (sequential vs. pipelined
+//! `attach_many`), workspace live sync (a save's round trip and how soon
+//! another window has it, #215) and what a background workspace's
+//! subscriptions cost the client, with the client feeding a real mirror VT
+//! (same work the GUI does, minus rendering).
 //!
 //!   cargo run --release -p goatty-daemon --example netbench            # private local daemon
 //!   cargo run --release -p goatty-daemon --example netbench -- proxy   # same, through `goattyd proxy` (remote code path)
@@ -16,6 +18,8 @@
 //!   RESTORE_PANES  (default 8; 0 skips the multi-pane restore phase)
 //!   RESTORE_LINES  (default 0; lines of scrollback seeded per restored pane)
 //!   CONTEND_PANES  (default 2; panes flooding during the second echo phase; 0 skips it)
+//!   SYNC_TABS      (default 20; tabs in the workspace two windows edit; 0 skips the sync phase)
+//!   BG_PANES       (default 8; a background workspace's panes printing a line every 100 ms; 0 skips it)
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -346,6 +350,105 @@ fn bench_contended(
     Ok(lat)
 }
 
+/// Workspace news for the sync phase: when each revision arrived.
+#[derive(Default)]
+struct Heard(Mutex<Vec<(u64, Instant)>>);
+
+impl goatty_client::WorkspaceSink for Heard {
+    fn workspace(&self, _conn: usize, event: goatty_client::WorkspaceEvent) {
+        if let goatty_client::WorkspaceEvent::Changed(l) = event {
+            self.0.lock().push((l.revision, Instant::now()));
+        }
+    }
+}
+
+struct SyncMetrics {
+    tabs: usize,
+    bytes: usize,
+    save: Vec<Duration>,
+    seen: Vec<Duration>,
+}
+
+/// Two windows (two connections) show one workspace; one saves a layout of
+/// `tabs` tabs (a rename each time, as a person would), the other hears it.
+fn bench_sync(endpoint: &Endpoint, tabs: usize) -> anyhow::Result<SyncMetrics> {
+    let a = Connection::open(endpoint.clone(), "netbench-sync-a")?;
+    let b = Connection::open(endpoint.clone(), "netbench-sync-b")?;
+    let (heard_a, heard_b) = (Arc::new(Heard::default()), Arc::new(Heard::default()));
+    let (ws, _) = a.create_workspace(1, Some("netbench-sync".into()), heard_a)?;
+    b.join_workspace(2, Some(ws.id), heard_b.clone())?;
+    let session = a.create(WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 }, None, Sink::new(TermSize::new(80, 24)))?;
+    let layout = |round: usize| {
+        let tabs: Vec<String> =
+            (0..tabs).map(|t| format!(r#"{{"id":{},"name":"tab {t} round {round}","tree":{{"leaf":{session}}}}}"#, 1000 + t)).collect();
+        format!(r#"{{"version":2,"tabs":[{}]}}"#, tabs.join(","))
+    };
+    let (mut save, mut seen) = (Vec::new(), Vec::new());
+    let mut revision = 0;
+    let bytes = layout(0).len();
+    for round in 0..50 {
+        let t = Instant::now();
+        match a.save_workspace(1, ws.id, revision, u32::try_from(tabs).unwrap_or(u32::MAX), vec![session], layout(round))? {
+            goatty_proto::SaveOutcome::Saved { revision: r } => revision = r,
+            other => anyhow::bail!("save {round}: {other:?}"),
+        }
+        save.push(t.elapsed());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(&(_, at)) = heard_b.0.lock().iter().find(|(r, _)| *r == revision) {
+                seen.push(at.saturating_duration_since(t));
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the other window never heard revision {revision}");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    let _ = a.kill(session);
+    let _ = a.close_workspace(ws.id);
+    save.sort();
+    seen.sort();
+    Ok(SyncMetrics { tabs, bytes, save, seen })
+}
+
+/// CPU time this process has used so far.
+fn cpu_time() -> Duration {
+    // SAFETY: `usage` is plain data that getrusage fills in.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: valid pointer to a rusage for the call.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) };
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
+    tv(usage.ru_utime) + tv(usage.ru_stime)
+}
+
+/// A background workspace's `panes` stay subscribed (the GUI keeps feeding
+/// their mirror terminals, without drawing): the client's CPU and the bytes
+/// they bring while each prints a line every 100 ms, for 5 s.
+fn bench_background(conn: &Connection, panes: usize) -> anyhow::Result<(f64, f64)> {
+    let size = TermSize::new(200, 50);
+    let ws = WinSize { cols: 200, rows: 50, cell_width: 8, cell_height: 16 };
+    let mut busy = KillOnDrop { conn, ids: Vec::new() };
+    let mut sinks = Vec::new();
+    for _ in 0..panes {
+        let sink = Sink::new(size);
+        let id = conn.create(ws, None, sink.clone())?;
+        busy.ids.push(id);
+        conn.input(id, b"echo READY-$((3+3))\r");
+        anyhow::ensure!(sink.wait_tail(b"READY-6", Duration::from_secs(10)), "background shell did not start");
+        sinks.push(sink);
+    }
+    for &id in &busy.ids {
+        conn.input(id, b"while :; do date '+%T.%N background pane log line with some text'; sleep 0.1; done\r");
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let bytes0: u64 = sinks.iter().map(|s| s.bytes.load(Ordering::Relaxed)).sum();
+    let (cpu0, t0) = (cpu_time(), Instant::now());
+    std::thread::sleep(Duration::from_secs(5));
+    let (cpu, wall) = (cpu_time() - cpu0, t0.elapsed());
+    let bytes: u64 = sinks.iter().map(|s| s.bytes.load(Ordering::Relaxed)).sum::<u64>() - bytes0;
+    drop(busy);
+    Ok((cpu.as_secs_f64() / wall.as_secs_f64() * 100.0, bytes as f64 / wall.as_secs_f64() / 1e3))
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("__delay-proxy") {
@@ -359,6 +462,8 @@ fn main() -> anyhow::Result<()> {
     let restore_panes: usize = std::env::var("RESTORE_PANES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let contend_panes: usize = std::env::var("CONTEND_PANES").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
     let restore_lines: usize = std::env::var("RESTORE_LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let sync_tabs: usize = std::env::var("SYNC_TABS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let bg_panes: usize = std::env::var("BG_PANES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
 
     // Removed when dropped at the end of main, after the daemon is killed.
     let dir = tempfile::Builder::new().prefix("goatty-netbench-").tempdir()?;
@@ -425,6 +530,8 @@ fn main() -> anyhow::Result<()> {
     let restore =
         if restore_panes > 0 { Some(bench_restore(&endpoint, &setup_endpoint, restore_panes, restore_lines, size, ws)?) } else { None };
 
+    let sync = if sync_tabs > 0 { Some(bench_sync(&endpoint, sync_tabs)?) } else { None };
+
     let t0 = Instant::now();
     let conn = Connection::open(endpoint, "netbench")?;
     let connect = t0.elapsed();
@@ -466,6 +573,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     let contended = if contend_panes > 0 { Some(bench_contended(&conn, id, &sink, ws, size, contend_panes)?) } else { None };
+
+    let background = if bg_panes > 0 { Some(bench_background(&conn, bg_panes)?) } else { None };
 
     let active_window = conn.flow_window();
     if active_window != opts.window {
@@ -514,6 +623,21 @@ fn main() -> anyhow::Result<()> {
             sink.resyncs.load(Ordering::Relaxed),
             sink.skipped.load(Ordering::Relaxed) as f64 / 1e6
         );
+    }
+    if let Some(m) = sync {
+        let p = |v: &[Duration], q: usize| v[(v.len() * q / 100).min(v.len() - 1)].as_secs_f64() * 1e3;
+        println!(
+            "workspace save      {} tabs ({:.1} KB): round trip p50 {:.3} ms p90 {:.3} ms; other window has it p50 {:.3} ms p90 {:.3} ms",
+            m.tabs,
+            m.bytes as f64 / 1e3,
+            p(&m.save, 50),
+            p(&m.save, 90),
+            p(&m.seen, 50),
+            p(&m.seen, 90)
+        );
+    }
+    if let Some((cpu, kbps)) = background {
+        println!("background {bg_panes} panes  {kbps:.1} KB/s fed to mirror terminals, client CPU {cpu:.1}% (of one core)");
     }
     if let Some(rtt) = conn.rtt() {
         println!("heartbeat rtt       {:>8.3} ms", rtt.as_secs_f64() * 1e3);

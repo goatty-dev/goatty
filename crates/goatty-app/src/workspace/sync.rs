@@ -739,7 +739,7 @@ impl Workspace {
                 this.finish_removing_tabs(window, cx);
             }
             // The gone workspace's parked panes, unless the new one took them.
-            this.release_parked(&conn, None, cx);
+            this.release_parked(&conn, cx);
         });
     }
 
@@ -774,23 +774,14 @@ impl Workspace {
         }
     }
 
-    /// Parked workspaces on `conn` (all but `keep`) let go of their sessions.
-    fn release_parked(&mut self, conn: &Arc<Connection>, keep: Option<WorkspaceId>, cx: &mut Context<'_, Self>) {
-        let (gone, stay): (Vec<Parked>, Vec<Parked>) = std::mem::take(&mut self.parked)
-            .into_iter()
-            .partition(|p| Arc::ptr_eq(&p.conn, conn) && Some(p.id) != keep && !p.tabs.iter().any(|t| !t.panes.is_empty()) || false);
-        self.parked = stay;
-        for p in gone {
-            self.release_tabs(p.tabs, cx);
-        }
-        // Parked workspaces that no longer exist on the host.
-        let known: HashSet<WorkspaceId> =
-            self.shown.iter().filter(|s| Arc::ptr_eq(&s.conn, conn)).flat_map(|s| s.list.iter().map(|w| w.id)).collect();
-        if known.is_empty() {
-            return;
-        }
-        let (gone, stay): (Vec<Parked>, Vec<Parked>) =
-            std::mem::take(&mut self.parked).into_iter().partition(|p| Arc::ptr_eq(&p.conn, conn) && !known.contains(&p.id));
+    /// Parked workspaces on `conn` that have nothing left (their panes were
+    /// taken back) or no longer exist on the host let go of their sessions.
+    fn release_parked(&mut self, conn: &Arc<Connection>, cx: &mut Context<'_, Self>) {
+        let known: Option<HashSet<WorkspaceId>> =
+            self.shown.iter().find(|s| Arc::ptr_eq(&s.conn, conn)).map(|s| s.list.iter().map(|w| w.id).collect());
+        let (gone, stay): (Vec<Parked>, Vec<Parked>) = std::mem::take(&mut self.parked).into_iter().partition(|p| {
+            Arc::ptr_eq(&p.conn, conn) && (p.tabs.iter().all(|t| t.panes.is_empty()) || known.as_ref().is_some_and(|k| !k.contains(&p.id)))
+        });
         self.parked = stay;
         for p in gone {
             self.release_tabs(p.tabs, cx);

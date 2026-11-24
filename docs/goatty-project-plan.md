@@ -452,6 +452,8 @@ Implement the desktop window, terminal rendering, PTY input/output, resize, sele
 
 Move PTY ownership into `goattyd`. Add reconnection after closing the GUI, persistent workspace layouts, tab/pane restoration, named workspaces and session management. Define how crashes and unexpected daemon termination are handled.
 
+> **Update (24 Nov 2026):** named workspaces are done (#215, [`workspaces.md`](workspaces.md)): a goattyd keeps workspaces (tabs and splits) that every client window showing one shares live, a window shows one workspace per host and switches between them from a chip in the tab bar, and windows, `--new` and reconnects join existing workspaces rather than making competing layouts.
+
 ### Stage 3 — Default Zsh environment
 
 Add the managed Zsh startup configuration, shell integration, completion, autosuggestions, syntax highlighting, Starship and Atuin. Make the initial setup one-click and provide a diagnostic screen for missing tools or failed integrations.

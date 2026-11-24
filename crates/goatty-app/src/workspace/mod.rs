@@ -1106,10 +1106,12 @@ impl Workspace {
     }
 
     fn make_pane(&mut self, session: Arc<Session>, window: &mut Window, cx: &mut Context<'_, Self>) -> Pane {
-        // Another window of this goatty may show it too: the last one to let go detaches it.
-        session.add_view();
         let id = self.next_id();
-        let view = cx.new(|cx| TerminalView::new(session, window, cx));
+        let view = cx.new(|cx| TerminalView::new(session.clone(), window, cx));
+        // Another window of this goatty may show it too: the last one to let
+        // go detaches it. (Counted after the view exists: the first view
+        // reads the UI events from before it, see `Session::ui_cursor`.)
+        session.add_view();
         let events =
             cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| this.on_terminal_event(id, ev, window, cx));
         let focus = view.focus_handle(cx);
