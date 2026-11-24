@@ -752,6 +752,7 @@ impl Workspace {
                 }
             }
             AttachMode::AllDetached => {
+                let epoch = self.shown[i].epoch;
                 let task = cx.background_executor().spawn({
                     let conn = conn.clone();
                     async move {
@@ -769,8 +770,11 @@ impl Workspace {
                             toast::show_in(window, cx, toast.key("reattach"));
                         }
                         Ok(ids) => {
-                            if let Some(i) = this.shown_index(&conn) {
+                            if let Some(i) = this.shown_index(&conn).filter(|&i| this.shown[i].epoch == epoch) {
                                 this.add_session_tabs(i, ids, window, cx);
+                            } else {
+                                let toast = Toast::info("Nothing was added").body("This window shows another workspace there now.");
+                                toast::show_in(window, cx, toast.key("reattach"));
                             }
                         }
                         Err(e) => {
@@ -932,13 +936,18 @@ impl Workspace {
             toast::show_in(window, cx, toast);
             // The connect screen stays until the shell is there.
             let placeholder = self.tabs[index].id;
+            let view_id = self.join.view;
             let task = cx.background_executor().spawn({
                 let spawner = spawner.clone();
                 async move { spawner.spawn(TermSize::new(100, 30), None) }
             });
             cx.spawn_in(window, async move |this, cx| {
-                let result = task.await;
-                let _ = this.update_in(cx, |this, window, cx| {
+                let mut result = Some(task.await);
+                let mut j = Some(j);
+                let spawner_cleanup = spawner.clone();
+                let delivered = this.update_in(cx, |this, window, cx| {
+                    let result = result.take().expect("spawn result");
+                    let j = j.take().expect("joined workspace");
                     // Nothing shows the joined workspace if this goes wrong.
                     let leave = |this: &Self| {
                         if let Some(conn) = spawner.connection()
@@ -968,6 +977,18 @@ impl Workspace {
                         }
                     }
                 });
+                // The window went away meanwhile: release the shell and leave
+                // the pending workspace join.
+                if delivered.is_err() {
+                    if let Some(Ok(session)) = result
+                        && !session.release_view()
+                    {
+                        cx.background_executor().spawn(async move { session.kill() }).detach();
+                    }
+                    if let Some(conn) = spawner_cleanup.connection() {
+                        conn.leave_workspace(view_id);
+                    }
+                }
             })
             .detach();
             cx.notify();
@@ -1670,32 +1691,59 @@ impl Workspace {
             toast::show_in(window, cx, toast.key("workspace.detach"));
             return;
         }
-        let n_tabs = detachable_ids.len();
-        let n_sessions = pane_ids.len();
         let mut undo: Detached = Vec::new();
+        let mut deferred_tabs: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let at = saved::now_ms();
-        for i in (0..self.shown.len()).rev() {
-            let conn = self.shown[i].conn.clone();
-            let leaving: Vec<&Tab> = self.tabs.iter().filter(|t| detachable_ids.contains(&t.id) && sync::on_conn(t, &conn)).collect();
+        let conns: Vec<Arc<goatty_client::Connection>> = self.shown.iter().map(|s| s.conn.clone()).collect();
+        for conn in conns.into_iter().rev() {
+            let Some(i) = self.shown_index(&conn) else { continue };
+            let leaving: Vec<u64> =
+                self.tabs.iter().filter(|t| detachable_ids.contains(&t.id) && sync::on_conn(t, &conn)).map(|t| t.id).collect();
             if leaving.is_empty() {
                 continue;
             }
             let all = self.tabs.iter().filter(|t| sync::on_conn(t, &conn)).all(|t| detachable_ids.contains(&t.id));
             if all {
-                // The whole host: the workspace stays on it as it is, with
-                // what this window changed and hadn't saved yet.
-                self.save_shown_now(i, cx);
+                // Keep the workspace until any unsaved edit or pending rebase
+                // finishes saving; on conflict it merges and retries, and on
+                // failure the edits remain in this window.
+                if self.shown_needs_save(i, cx) {
+                    deferred_tabs.extend(&leaving);
+                    self.save_then_detach(i, window, cx);
+                    continue;
+                }
                 let sh = self.shown.remove(i);
                 sh.conn.leave_workspace(self.join.view);
                 undo.push(Undo::Host { conn: conn.clone(), workspace: sh.id });
                 self.release_parked_of(&conn, cx);
             } else {
-                let tabs: Vec<SavedTab> =
-                    leaving.iter().filter_map(|t| saved_tab(t, cx)).map(|t| SavedTab { detached_at: Some(at), ..t }).collect();
+                let tabs: Vec<SavedTab> = self
+                    .tabs
+                    .iter()
+                    .filter(|t| leaving.contains(&t.id))
+                    .filter_map(|t| saved_tab(t, cx))
+                    .map(|t| SavedTab { detached_at: Some(at), ..t })
+                    .collect();
                 undo.push(Undo::Tabs { conn: conn.clone(), workspace: self.shown[i].id, ids: tabs.iter().map(|t| t.id).collect() });
                 self.shown[i].detached.extend(tabs);
             }
         }
+        if !deferred_tabs.is_empty() {
+            detachable_ids.retain(|id| !deferred_tabs.contains(id));
+            pane_ids.clear();
+            single_label = None;
+            for t in self.tabs.iter().filter(|t| detachable_ids.contains(&t.id)) {
+                if single_label.is_none() {
+                    single_label = Some(self.tab_label(t, cx));
+                }
+                pane_ids.extend(t.panes.iter().filter(|p| p.view.read(cx).session().can_detach()).map(|p| p.id));
+            }
+        }
+        if detachable_ids.is_empty() {
+            return;
+        }
+        let n_tabs = detachable_ids.len();
+        let n_sessions = pane_ids.len();
         self.note_detached(&undo);
         self.detach_panes_by_id(&pane_ids, cx);
         self.remove_tabs(&detachable_ids, window, cx);
@@ -1711,6 +1759,17 @@ impl Workspace {
                 format!("Their {n_sessions} sessions keep running in the background.")
             };
             toast::show_in(window, cx, with_undo(Toast::info(title).body(body).key("workspace.detach"), undo));
+        }
+    }
+
+    /// Complete a full-host detach that waited for its unsaved workspace edits
+    /// to save cleanly.
+    pub(super) fn finish_deferred_detach(&mut self, epoch: u64, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(i) = self.shown.iter().position(|s| s.epoch == epoch) else { return };
+        let conn = self.shown[i].conn.clone();
+        let ids: Vec<u64> = self.tabs.iter().filter(|t| sync::on_conn(t, &conn)).map(|t| t.id).collect();
+        if !ids.is_empty() {
+            self.detach_tabs(ids, window, cx);
         }
     }
 

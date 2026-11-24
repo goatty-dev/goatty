@@ -150,7 +150,7 @@ fn resume_all(sessions: &HashMap<SessionId, Arc<Session>>) {
 
 /// Write the state of `sessions` (paused) to the state dir; `with_fds`
 /// records the fds for an `execve`. Returns the state file.
-fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: bool) -> Result<PathBuf> {
+fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, workspaces: &Workspaces, with_fds: bool) -> Result<PathBuf> {
     let dir = state_dir(&daemon.socket);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -176,7 +176,7 @@ fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: 
         socket_activated: daemon.socket_activated.load(Ordering::SeqCst),
         sessions: saved,
         layouts: [],
-        workspaces: daemon.workspaces.lock().export(),
+        workspaces: workspaces.export(),
     };
     let file = dir.join("state.json");
     write_private(&file, &serde_json::to_vec(&state)?)?;
@@ -245,7 +245,9 @@ pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
     if !close_admission(daemon) {
         bail!("a restart is already under way");
     }
-    // Held until the exec: no session starts or ends meanwhile.
+    // Held until the exec: no session or workspace changes meanwhile.
+    // Lock order: `workspaces`, then `sessions` (same as `Daemon::with_workspaces`).
+    let workspaces = daemon.workspaces.lock();
     let sessions = daemon.sessions.lock();
     let result = (|| -> Result<std::io::Error> {
         // Whatever a pump read and didn't feed, or an answer not written
@@ -256,7 +258,7 @@ pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
         if !settle_replies(&sessions) {
             bail!("a session's program doesn't take its input; not restarting");
         }
-        let file = save(daemon, &sessions, true)?;
+        let file = save(daemon, &sessions, &workspaces, true)?;
         let listener = daemon.listener_fd.lock().context("no listening socket")?;
         let mut fds = vec![listener];
         fds.extend(sessions.values().map(|s| s.master_fd));
@@ -279,6 +281,7 @@ pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
     })();
     resume_all(&sessions);
     drop(sessions);
+    drop(workspaces);
     daemon.restarting.store(false, Ordering::SeqCst);
     match result {
         Ok(err) => Err(err).with_context(|| format!("couldn't run {}", exe.display())),
@@ -428,12 +431,14 @@ pub(crate) fn save_on_sigterm(daemon: Arc<Daemon>) -> Result<()> {
         // SAFETY: reading one byte into a valid buffer from our own pipe.
         while unsafe { libc::read(rx.as_raw_fd(), b.as_mut_ptr().cast(), 1) } != 1 {}
         close_admission(&daemon);
+        // Lock order: `workspaces`, then `sessions` (same as `Daemon::with_workspaces`).
+        let workspaces = daemon.workspaces.lock();
         let sessions = daemon.sessions.lock();
         // Best effort: the process ends either way.
         if !(pause_all(&sessions) && settle_replies(&sessions)) {
             log::warn!("SIGTERM: saving the screens anyway");
         }
-        match save(&daemon, &sessions, false) {
+        match save(&daemon, &sessions, &workspaces, false) {
             Ok(_) => log::info!("SIGTERM: saved {} sessions; systemd keeps their PTYs", sessions.len()),
             Err(e) => log::error!("SIGTERM: couldn't save the sessions' screens: {e:#}"),
         }

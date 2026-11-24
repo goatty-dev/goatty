@@ -948,8 +948,11 @@ impl Connection {
     /// detached from the host). Doesn't block.
     pub fn leave_workspace(&self, view: ViewId) {
         // A join on its way when the window leaves doesn't register it.
-        *self.shared.left.lock().entry(view).or_insert(0) += 1;
+        // Lock order: `left`, then `views` (same as `Pending::Join`).
+        let mut left = self.shared.left.lock();
+        *left.entry(view).or_insert(0) += 1;
         self.shared.views.lock().remove(&view);
+        drop(left);
         if self.is_connected() {
             self.shared.send(&ClientMsg::LeaveWorkspace { view });
         }
@@ -1487,10 +1490,12 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 // `LeaveWorkspace` went out after the join, and the daemon
                 // handles a connection's messages in order, so it left there
                 // too; a later join of the same window isn't touched.)
-                if let ServerMsg::Joined { info, .. } = &msg
-                    && s.left.lock().get(&view).copied().unwrap_or(0) == left_gen
-                {
-                    s.views.lock().insert(view, View { workspace: info.id, sink });
+                // Lock order: `left`, then `views` (same as `leave_workspace`).
+                if let ServerMsg::Joined { info, .. } = &msg {
+                    let left = s.left.lock();
+                    if left.get(&view).copied().unwrap_or(0) == left_gen {
+                        s.views.lock().insert(view, View { workspace: info.id, sink });
+                    }
                 }
                 let _ = tx.send(msg);
             }

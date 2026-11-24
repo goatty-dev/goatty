@@ -268,14 +268,11 @@ impl Element for TerminalElement {
         let rows = ((inner_h / line_height).floor() as u16).max(1);
         let mut origin = bounds.origin + point(pad.left, pad.top);
 
-        if self.session.view_differs(cols, rows) && self.session.may_resize(self.token) {
-            let scale = window.scale_factor();
-            self.session.resize(TermSize {
-                cols,
-                rows,
-                cell_width: (f32::from(cell_w) * scale) as u16,
-                cell_height: (f32::from(line_height) * scale) as u16,
-            });
+        let scale = window.scale_factor();
+        let pane_size =
+            TermSize { cols, rows, cell_width: (f32::from(cell_w) * scale) as u16, cell_height: (f32::from(line_height) * scale) as u16 };
+        if self.session.view_differs(pane_size) && self.session.may_resize(self.token) {
+            self.session.resize(pane_size);
         }
 
         let mut frame = self.frame.borrow_mut();

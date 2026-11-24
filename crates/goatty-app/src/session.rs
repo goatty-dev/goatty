@@ -885,11 +885,10 @@ impl Session {
         }
     }
 
-    /// The pane is `cols`×`rows` cells, unlike what [`Self::resize`] was
-    /// last told.
-    pub fn view_differs(&self, cols: u16, rows: u16) -> bool {
-        let v = self.view.lock();
-        (v.cols, v.rows) != (cols, rows)
+    /// The pane's size (cells and cell pixels) differs from what [`Self::resize`]
+    /// was last told.
+    pub fn view_differs(&self, size: TermSize) -> bool {
+        *self.view.lock() != size
     }
 
     /// Another client controls the session's size: the terminal has the

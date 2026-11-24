@@ -129,7 +129,7 @@ impl Layout {
             tabs.retain_mut(|t| {
                 let leaves = t.tree.leaves();
                 let unique = leaves.iter().collect::<HashSet<_>>().len() == leaves.len();
-                if unique && leaves.iter().all(|s| alive.contains(s) && !seen.contains(s)) {
+                if !leaves.is_empty() && unique && leaves.iter().all(|s| alive.contains(s) && !seen.contains(s)) {
                     seen.extend(leaves);
                 } else {
                     match t.tree.map_leaves(&mut |s| (alive.contains(&s) && seen.insert(s)).then_some(s)) {
@@ -211,7 +211,13 @@ fn merge_tabs(
     // Mine reordered the tabs both know: mine's order, else theirs.
     let reordered = common(mine, base) != common(base, mine);
     let (primary, secondary) = if reordered { (mine, theirs) } else { (theirs, mine) };
+    let (eb, em, et) = every;
     let keep = |id: u64| {
+        // Close wins across both lists: a tab in `base` removed from the
+        // whole workspace by either side isn't restored via the other list.
+        if find(eb, id).is_some() && (find(em, id).is_none() || find(et, id).is_none()) {
+            return false;
+        }
         let (b, m, t) = (find(base, id).is_some(), find(mine, id).is_some(), find(theirs, id).is_some());
         if b { m && t } else { m || t }
     };
@@ -224,15 +230,15 @@ fn merge_tabs(
         let at = secondary[..i].iter().rev().find_map(|p| out.iter().position(|&o| o == p.id)).map_or(0, |p| p + 1);
         out.insert(at, t.id);
     }
-    let (eb, em, et) = every;
     out.into_iter()
         .filter_map(|id| {
             let (b, m, t) = (find(eb, id).map(|i| &eb[i]), find(em, id).map(|i| &em[i]), find(et, id).map(|i| &et[i]));
             match (b, m, t) {
                 (Some(b), Some(m), Some(t)) => merge_tab(b, m, t),
-                (_, Some(m), _) => Some(m.clone()),
-                (_, None, Some(t)) => Some(t.clone()),
-                _ => None,
+                (Some(_), None, _) | (Some(_), _, None) => None,
+                (None, Some(m), _) => Some(m.clone()),
+                (None, None, Some(t)) => Some(t.clone()),
+                (None, None, None) => None,
             }
         })
         .collect()
@@ -754,6 +760,29 @@ mod tests {
         let mut l = Layout::new(vec![tab(1, split(4, 4))], Vec::new());
         l.prune(&[4].into());
         assert_eq!(l.tabs[0].tree, Node::Leaf(4));
+    }
+
+    #[test]
+    fn pruning_drops_empty_split_trees() {
+        let empty = Node::Split { axis: super::super::layout::Axis::Horizontal, children: Vec::new(), sizes: Vec::new() };
+        let mut l = Layout::new(vec![tab(1, empty.clone()), tab(2, Node::Leaf(1))], vec![tab(3, empty)]);
+        l.prune(&[1].into());
+        assert_eq!(ids(&l), [2]);
+        assert!(l.detached.is_empty());
+    }
+
+    #[test]
+    fn closing_a_tab_wins_over_concurrent_detach() {
+        let base = Layout::new(vec![tab(1, Node::Leaf(1)), tab(2, Node::Leaf(2))], Vec::new());
+        let mut closed = base.clone();
+        closed.tabs.remove(0);
+        let mut detached = base.clone();
+        let t = detached.tabs.remove(0);
+        detached.detached.push(SavedTab { detached_at: Some(5), ..t });
+        for merged in [merge(&base, &closed, &detached), merge(&base, &detached, &closed)] {
+            assert_eq!(ids(&merged), [2]);
+            assert!(merged.detached.is_empty(), "a closed tab must not return as detached");
+        }
     }
 
     #[test]

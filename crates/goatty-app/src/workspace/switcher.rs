@@ -87,13 +87,23 @@ impl Switcher {
         let mut this = Self { focus: cx.focus_handle(), rows, host, selected, renaming: None, scroll: gpui::ScrollHandle::new() };
         match rename {
             Some(id) => this.start_rename(id, window, cx),
-            None => this.focus.focus(window, cx),
+            None => {
+                this.scroll_selected();
+                this.focus.focus(window, cx);
+            }
         }
         this
     }
 
+    fn scroll_selected(&self) {
+        if self.selected < self.rows.len() {
+            self.scroll.scroll_to_item(self.selected);
+        }
+    }
+
     /// The host's workspaces changed while it's open.
     pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<'_, Self>) {
+        let before = self.selected;
         let selected = self.rows.get(self.selected).map(|r| r.id);
         let on_new = self.selected >= self.rows.len();
         self.rows = rows;
@@ -105,12 +115,16 @@ impl Switcher {
         if self.renaming.as_ref().is_some_and(|(id, _, _)| !self.rows.iter().any(|r| r.id == *id)) {
             self.renaming = None;
         }
+        if self.selected != before {
+            self.scroll_selected();
+        }
         cx.notify();
     }
 
     pub fn start_rename(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(at) = self.rows.iter().position(|r| r.id == id) else { return };
         self.selected = at;
+        self.scroll_selected();
         let name = self.rows[at].name.clone();
         let input = cx.new(|cx| {
             let mut input = TextInput::new("Workspace name", name, cx);
@@ -170,9 +184,7 @@ impl Switcher {
             }
             _ => return,
         }
-        if self.selected < self.rows.len() {
-            self.scroll.scroll_to_item(self.selected);
-        }
+        self.scroll_selected();
         cx.stop_propagation();
         cx.notify();
     }
