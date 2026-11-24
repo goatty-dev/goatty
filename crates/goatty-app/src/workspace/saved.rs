@@ -87,6 +87,18 @@ pub fn same_tree(a: &Node, b: &Node) -> bool {
     }
 }
 
+fn tree_valid(n: &Node) -> bool {
+    match n {
+        Node::Leaf(_) => true,
+        Node::Split { children, sizes, .. } => {
+            children.len() >= 2
+                && sizes.len() == children.len()
+                && sizes.iter().all(|s| s.is_finite() && *s > 0.0)
+                && children.iter().all(tree_valid)
+        }
+    }
+}
+
 fn same_tabs(a: &[SavedTab], b: &[SavedTab]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.same(y))
 }
@@ -129,7 +141,7 @@ impl Layout {
             tabs.retain_mut(|t| {
                 let leaves = t.tree.leaves();
                 let unique = leaves.iter().collect::<HashSet<_>>().len() == leaves.len();
-                if !leaves.is_empty() && unique && leaves.iter().all(|s| alive.contains(s) && !seen.contains(s)) {
+                if !leaves.is_empty() && tree_valid(&t.tree) && unique && leaves.iter().all(|s| alive.contains(s) && !seen.contains(s)) {
                     seen.extend(leaves);
                 } else {
                     match t.tree.map_leaves(&mut |s| (alive.contains(&s) && seen.insert(s)).then_some(s)) {
@@ -769,6 +781,17 @@ mod tests {
         l.prune(&[1].into());
         assert_eq!(ids(&l), [2]);
         assert!(l.detached.is_empty());
+    }
+
+    #[test]
+    fn pruning_repairs_malformed_split_sizes() {
+        let bad =
+            Node::Split { axis: super::super::layout::Axis::Horizontal, children: vec![Node::Leaf(1), Node::Leaf(2)], sizes: Vec::new() };
+        let mut l = Layout::new(vec![tab(1, bad)], Vec::new());
+        l.prune(&[1, 2].into());
+        let Node::Split { sizes, .. } = &l.tabs[0].tree else { panic!("expected split") };
+        assert_eq!(sizes, &[0.5, 0.5]);
+        assert!(l.tabs[0].tree.split(1, 3, Direction::Right));
     }
 
     #[test]

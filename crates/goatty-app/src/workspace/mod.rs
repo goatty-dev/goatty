@@ -752,7 +752,7 @@ impl Workspace {
                 }
             }
             AttachMode::AllDetached => {
-                let epoch = self.shown[i].epoch;
+                let (epoch, workspace_id) = (self.shown[i].epoch, self.shown[i].id);
                 let task = cx.background_executor().spawn({
                     let conn = conn.clone();
                     async move {
@@ -770,7 +770,9 @@ impl Workspace {
                             toast::show_in(window, cx, toast.key("reattach"));
                         }
                         Ok(ids) => {
-                            if let Some(i) = this.shown_index(&conn).filter(|&i| this.shown[i].epoch == epoch) {
+                            if let Some(i) =
+                                this.shown_index(&conn).filter(|&i| this.shown[i].epoch == epoch && this.shown[i].id == workspace_id)
+                            {
                                 this.add_session_tabs(i, ids, window, cx);
                             } else {
                                 let toast = Toast::info("Nothing was added").body("This window shows another workspace there now.");
@@ -790,7 +792,7 @@ impl Workspace {
     /// Show sessions `ids` on host `i` as a new tab each (attached off the
     /// UI thread), after its other tabs.
     fn add_session_tabs(&mut self, i: usize, ids: Vec<goatty_proto::SessionId>, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let mut target = self.mine(i, cx);
+        let mut target = self.local_target(i, cx);
         let first = ids.first().copied();
         target.tabs.extend(ids.into_iter().map(|s| SavedTab {
             id: saved::new_id(),
@@ -808,7 +810,7 @@ impl Workspace {
 
     /// Bring host `i`'s detached tabs back (`ids`; `None`: the ones detached last).
     fn undetach_tabs(&mut self, i: usize, ids: Option<Vec<u64>>, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let mut target = self.mine(i, cx);
+        let mut target = self.local_target(i, cx);
         let ids = ids.unwrap_or_else(|| target.last_detached());
         if ids.is_empty() {
             toast::show_in(window, cx, Toast::info("Nothing detached in this workspace").key("reattach"));

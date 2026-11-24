@@ -913,6 +913,41 @@ impl Connection {
         }
     }
 
+    fn request_join(
+        &self,
+        view: ViewId,
+        sink: Arc<dyn WorkspaceSink>,
+        msg: impl FnOnce(ReqId) -> ClientMsg,
+    ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
+        let req = self.shared.req_id();
+        let (tx, rx) = flume::bounded(1);
+        {
+            // Hold `left` across the generation read, pending registration, and
+            // frame enqueue so `leave_workspace` (which also holds `left` while
+            // incrementing the generation and queueing `LeaveWorkspace`) is
+            // strictly ordered with every join on both `left` and the wire.
+            // Lock order: `left`, then `pending` (never acquired in reverse).
+            let left = self.shared.left.lock();
+            let left_gen = left.get(&view).copied().unwrap_or(0);
+            {
+                let mut map = self.shared.pending.lock();
+                if !self.is_connected() {
+                    bail!("not connected to goattyd");
+                }
+                map.insert(req, Pending::Join { tx, view, sink, left_gen });
+            }
+            self.shared.send(&msg(req));
+        }
+        let reply = rx.recv_timeout(REQUEST_TIMEOUT);
+        self.shared.pending.lock().remove(&req);
+        match reply {
+            Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
+            Ok(ServerMsg::Joined { info, layout, .. }) => Ok((info, layout)),
+            Ok(other) => bail!("unexpected reply {other:?}"),
+            Err(_) => Err(ReplyLost.into()),
+        }
+    }
+
     /// Window `view` shows workspace `id` on this host from now on (`None`
     /// or gone: the most recently active one); `sink` hears about it, and
     /// the window joins it again after a reconnect. Blocks.
@@ -922,11 +957,7 @@ impl Connection {
         id: Option<WorkspaceId>,
         sink: Arc<dyn WorkspaceSink>,
     ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
-        let left_gen = self.shared.left.lock().get(&view).copied().unwrap_or(0);
-        match self.request(|tx| Pending::Join { tx, view, sink, left_gen }, |req| ClientMsg::JoinWorkspace { req, view, id })? {
-            ServerMsg::Joined { info, layout, .. } => Ok((info, layout)),
-            other => bail!("unexpected reply {other:?}"),
-        }
+        self.request_join(view, sink, |req| ClientMsg::JoinWorkspace { req, view, id })
     }
 
     /// A new workspace (`name`, else "Workspace N"), which window `view`
@@ -937,22 +968,19 @@ impl Connection {
         name: Option<String>,
         sink: Arc<dyn WorkspaceSink>,
     ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
-        let left_gen = self.shared.left.lock().get(&view).copied().unwrap_or(0);
-        match self.request(|tx| Pending::Join { tx, view, sink, left_gen }, |req| ClientMsg::CreateWorkspace { req, view, name })? {
-            ServerMsg::Joined { info, layout, .. } => Ok((info, layout)),
-            other => bail!("unexpected reply {other:?}"),
-        }
+        self.request_join(view, sink, |req| ClientMsg::CreateWorkspace { req, view, name })
     }
 
     /// Window `view` stops showing a workspace on this host (it closed or
     /// detached from the host). Doesn't block.
     pub fn leave_workspace(&self, view: ViewId) {
-        // A join on its way when the window leaves doesn't register it.
+        // A join on its way when the window leaves doesn't register it, and
+        // `LeaveWorkspace` is queued before any later join can read the new
+        // generation and send its request.
         // Lock order: `left`, then `views` (same as `Pending::Join`).
         let mut left = self.shared.left.lock();
         *left.entry(view).or_insert(0) += 1;
         self.shared.views.lock().remove(&view);
-        drop(left);
         if self.is_connected() {
             self.shared.send(&ClientMsg::LeaveWorkspace { view });
         }
