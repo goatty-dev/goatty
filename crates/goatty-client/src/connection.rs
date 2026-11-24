@@ -118,7 +118,10 @@ enum Pending {
         left_gen: u64,
     },
     /// A view joining its workspace again after a reconnect.
-    Rejoin(ViewId),
+    Rejoin {
+        view: ViewId,
+        left_gen: u64,
+    },
 }
 
 /// What a connection tells a window about the workspace it shows there
@@ -922,18 +925,19 @@ impl Connection {
         let req = self.shared.req_id();
         let (tx, rx) = flume::bounded(1);
         {
-            // Hold `left` across the generation read, pending registration, and
-            // frame enqueue so `leave_workspace` (which also holds `left` while
-            // incrementing the generation and queueing `LeaveWorkspace`) is
-            // strictly ordered with every join on both `left` and the wire.
-            // Lock order: `left`, then `pending` (never acquired in reverse).
-            let left = self.shared.left.lock();
-            let left_gen = left.get(&view).copied().unwrap_or(0);
+            // Hold `left` across the generation bump, pending registration, and
+            // frame enqueue so explicit joins, leaves, and reconnect replays
+            // are strictly ordered on both `left` and the wire.
+            // Lock order: `left` > `views` > `pending`.
+            let mut left = self.shared.left.lock();
             {
                 let mut map = self.shared.pending.lock();
                 if !self.is_connected() {
                     bail!("not connected to goattyd");
                 }
+                let entry = left.entry(view).or_insert(0);
+                *entry += 1;
+                let left_gen = *entry;
                 map.insert(req, Pending::Join { tx, view, sink, left_gen });
             }
             self.shared.send(&msg(req));
@@ -1267,13 +1271,23 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                     drop(panes);
                     // Every window joins its workspace again (the daemon
                     // forgot this connection's windows when the link dropped).
+                    // Hold `left` > `views` > `pending` so an explicit join or
+                    // leave after reconnect supersedes any replayed rejoin.
+                    let left = s.left.lock();
                     let views = s.views.lock();
+                    let mut pending = s.pending.lock();
                     for (&view, v) in views.iter() {
+                        if pending.values().any(|p| matches!(p, Pending::Join { view: pv, .. } if *pv == view)) {
+                            continue;
+                        }
                         let req = s.req_id();
-                        s.pending.lock().insert(req, Pending::Rejoin(view));
+                        let left_gen = left.get(&view).copied().unwrap_or(0);
+                        pending.insert(req, Pending::Rejoin { view, left_gen });
                         s.send(&ClientMsg::JoinWorkspace { req, view, id: Some(v.workspace) });
                     }
+                    drop(pending);
                     drop(views);
+                    drop(left);
                     break;
                 }
                 Err(e) => {
@@ -1527,14 +1541,19 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 }
                 let _ = tx.send(msg);
             }
-            Some(Pending::Rejoin(view)) => {
+            Some(Pending::Rejoin { view, left_gen }) => {
                 if let ServerMsg::Joined { info, layout, .. } = msg {
                     let sink = {
-                        let mut views = s.views.lock();
-                        views.get_mut(&view).map(|v| {
-                            v.workspace = info.id;
-                            v.sink.clone()
-                        })
+                        let left = s.left.lock();
+                        if left.get(&view).copied().unwrap_or(0) != left_gen {
+                            None
+                        } else {
+                            let mut views = s.views.lock();
+                            views.get_mut(&view).map(|v| {
+                                v.workspace = info.id;
+                                v.sink.clone()
+                            })
+                        }
                     };
                     if let Some(sink) = sink {
                         sink.workspace(s as *const Shared as usize, WorkspaceEvent::Rejoined { info, layout });
@@ -1600,7 +1619,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 Some(Pending::Reply(tx) | Pending::Join { tx, .. }) => {
                     let _ = tx.send(msg);
                 }
-                Some(Pending::Rejoin(view)) => log::warn!("window {view:x} couldn't join its workspace again: {message}"),
+                Some(Pending::Rejoin { view, .. }) => log::warn!("window {view:x} couldn't join its workspace again: {message}"),
                 Some(Pending::Reattach(session)) => {
                     if let Some(p) = s.panes.lock().remove(&session) {
                         p.sink.event(PaneEvent::Lost(message.clone()));

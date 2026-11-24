@@ -151,9 +151,10 @@ pub(super) struct Parked {
     /// Tabs of a closed workspace on their way into the next one this
     /// window shows on that host (whichever it turns out to be).
     pub moving: bool,
-    /// Full layout being moved when `moving` is true, including tabs whose
-    /// sessions were still attaching in the source workspace.
-    pub moving_layout: Option<Layout>,
+    /// When this parked workspace had tabs whose sessions were still attaching
+    /// at park/move time: `(instantiated_at_park, full_target)` so returning
+    /// preserves those pending tabs while honoring panes that exit while parked.
+    pub pending_layout: Option<(Layout, Layout)>,
     /// The [`Shown::epoch`] it had (a late save answer still updates `base`).
     pub epoch: u64,
     /// The tab that was active there (shown again on coming back).
@@ -459,8 +460,8 @@ impl Workspace {
             for p in self.parked.iter().filter(|p| p.conn.key() == key && p.id == into) {
                 ids.extend(p.tabs.iter().map(|t| t.id));
                 ids.extend(p.detached.iter().map(|t| t.id));
-                if let Some(l) = &p.moving_layout {
-                    ids.extend(l.tabs.iter().chain(&l.detached).map(|t| t.id));
+                if let Some((_, full)) = &p.pending_layout {
+                    ids.extend(full.tabs.iter().chain(&full.detached).map(|t| t.id));
                 }
             }
             ids
@@ -1026,9 +1027,11 @@ impl Workspace {
             } else {
                 active = active.or(parked.active);
             }
-            let mine = parked.moving_layout.unwrap_or_else(|| {
-                Layout::new(parked.tabs.iter().filter_map(|t| super::saved_tab(t, cx)).collect(), parked.detached.clone())
-            });
+            let current = Layout::new(parked.tabs.iter().filter_map(|t| super::saved_tab(t, cx)).collect(), parked.detached.clone());
+            let mine = match parked.pending_layout {
+                Some((at_park, full)) => saved::merge(&at_park, &current, &full),
+                None => current,
+            };
             target = saved::merge(&parked.base, &mine, &target);
             let at = index.min(self.tabs.len());
             for (k, t) in parked.tabs.into_iter().enumerate() {
@@ -1117,6 +1120,10 @@ impl Workspace {
             // Its last edit first (a parked workspace saves nothing more).
             self.save_shown(i, cx);
         }
+        // Preserve tabs whose sessions are still attaching so returning to
+        // this workspace doesn't treat them as locally closed.
+        let pending_layout =
+            (!self.shown[i].target.same(&self.shown[i].target_shown)).then(|| (self.mine(i, cx), self.local_target(i, cx)));
         let sh = self.shown.remove(i);
         let pos = self.tabs.iter().position(|t| on_conn(t, &sh.conn)).unwrap_or(self.tabs.len());
         let active_id = self.active_tab().map(|t| t.id);
@@ -1143,7 +1150,7 @@ impl Workspace {
             detached: sh.detached,
             tabs,
             moving: false,
-            moving_layout: None,
+            pending_layout,
             epoch: sh.epoch,
             active: shown_active,
         });
@@ -1219,7 +1226,7 @@ impl Workspace {
             detached: Vec::new(),
             tabs,
             moving: false,
-            moving_layout: None,
+            pending_layout: None,
             epoch: sh.epoch,
             active: None,
         });
@@ -1598,6 +1605,7 @@ impl Workspace {
                 // They (including detached and still-attaching tabs) join the
                 // next workspace this window shows there as tabs it added
                 // (`show_joined`); this one is closed once they're saved there.
+                let at_park = Layout::new(leaving.tabs.iter().filter_map(|t| super::saved_tab(t, cx)).collect(), full.detached.clone());
                 self.parked.push(Parked {
                     conn: conn.clone(),
                     id: next,
@@ -1605,7 +1613,7 @@ impl Workspace {
                     detached: full.detached.clone(),
                     tabs: leaving.tabs,
                     moving: true,
-                    moving_layout: Some(full),
+                    pending_layout: Some((at_park, full)),
                     epoch: 0,
                     active: None,
                 });
