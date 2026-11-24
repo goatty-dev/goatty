@@ -166,16 +166,14 @@ pub struct HostWorkspace {
 /// The host's workspaces with their detached tabs (blocks).
 fn host_workspaces(conn: &Connection) -> anyhow::Result<Vec<HostWorkspace>> {
     let list = conn.list_workspaces()?;
-    Ok(list
-        .into_iter()
-        .map(|info| {
-            let detached = match conn.get_workspace(info.id) {
-                Ok(Some(l)) => crate::workspace::saved::Layout::parse(&l.json, &l.sessions.iter().copied().collect()).detached,
-                _ => Vec::new(),
-            };
-            HostWorkspace { info, detached }
-        })
-        .collect())
+    let mut out = Vec::with_capacity(list.len());
+    for info in list {
+        // `None`: it ended while the list was read.
+        let Some(l) = conn.get_workspace(info.id)? else { continue };
+        let detached = crate::workspace::saved::Layout::parse(&l.json, &l.sessions.iter().copied().collect()).detached;
+        out.push(HostWorkspace { info, detached });
+    }
+    Ok(out)
 }
 
 /// The entries for workspace `w`: show it (another window may show it

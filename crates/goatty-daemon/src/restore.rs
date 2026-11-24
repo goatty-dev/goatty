@@ -47,7 +47,9 @@ use crate::workspaces::{SavedWorkspace, Workspaces};
 
 /// The newest state format this build reads; `goattyd restore-version`
 /// prints it, and a restart only runs a goattyd that reads ours.
-pub const STATE_VERSION: u32 = 2;
+/// 3: workspaces (#215) instead of window layouts. A build that reads 2
+/// would take the sessions and drop the workspaces, so a restart refuses it.
+pub const STATE_VERSION: u32 = 3;
 
 /// How long a restart waits for a session's output pump to pause.
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(1);

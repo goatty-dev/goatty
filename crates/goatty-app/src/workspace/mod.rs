@@ -317,7 +317,13 @@ pub struct Workspace {
     recently_detached: Vec<(HostRef, Option<String>)>,
     /// Activate the tab of this session once its pane exists (a tab being
     /// attached off the UI thread).
-    show_when_attached: Option<goatty_proto::SessionId>,
+    /// (connection key, session).
+    show_when_attached: Option<(usize, goatty_proto::SessionId)>,
+    /// What hosts said about their workspaces before this window showed
+    /// one there (it was still attaching): applied by `show_joined`.
+    early_events: Vec<(usize, goatty_client::WorkspaceEvent)>,
+    /// Workspaces to close once the tabs moved out of them are saved elsewhere.
+    move_closes: Vec<sync::MoveClose>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -412,6 +418,8 @@ impl Workspace {
             restoring: Vec::new(),
             recently_detached: Vec::new(),
             show_when_attached: None,
+            early_events: Vec::new(),
+            move_closes: Vec::new(),
             _subscriptions: vec![appearance, button_layout, settings, activation, bounds],
         };
         reopen::window_opened(cx, this.window_id);
@@ -787,11 +795,11 @@ impl Workspace {
             plain: None,
             detached_at: None,
         }));
-        self.reconcile(i, target, std::collections::HashMap::new(), None, window, cx);
-        // The first one is shown once it's attached.
+        // The first one is shown once it's there (maybe right away).
         if let Some(s) = first {
-            self.focus_session_when_shown(s);
+            self.focus_session_when_shown(i, s);
         }
+        self.reconcile(i, target, std::collections::HashMap::new(), None, window, cx);
     }
 
     /// Bring host `i`'s detached tabs back (`ids`; `None`: the ones detached last).
@@ -804,17 +812,17 @@ impl Workspace {
         }
         let first = target.detached.iter().find(|t| ids.contains(&t.id)).and_then(|t| t.tree.leaves().first().copied());
         target.undetach(&ids);
-        self.reconcile(i, target, std::collections::HashMap::new(), None, window, cx);
         if let Some(s) = first {
-            self.focus_session_when_shown(s);
+            self.focus_session_when_shown(i, s);
         }
+        self.reconcile(i, target, std::collections::HashMap::new(), None, window, cx);
         self.save_layout(cx);
     }
 
-    /// Show the tab with session `s` once its pane exists (attaching is
-    /// off the UI thread).
-    fn focus_session_when_shown(&mut self, s: goatty_proto::SessionId) {
-        self.show_when_attached = Some(s);
+    /// Show the tab with session `s` of host `i` once its pane exists
+    /// (attaching is off the UI thread).
+    fn focus_session_when_shown(&mut self, i: usize, s: goatty_proto::SessionId) {
+        self.show_when_attached = Some((self.shown[i].conn.key(), s));
     }
 
     fn on_connect_event(&mut self, tab: u64, ev: &ConnectEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -931,10 +939,19 @@ impl Workspace {
             cx.spawn_in(window, async move |this, cx| {
                 let result = task.await;
                 let _ = this.update_in(cx, |this, window, cx| {
+                    // Nothing shows the joined workspace if this goes wrong.
+                    let leave = |this: &Self| {
+                        if let Some(conn) = spawner.connection()
+                            && this.shown_index(conn).is_none()
+                        {
+                            conn.leave_workspace(this.join.view);
+                        }
+                    };
                     let Some(index) = this.tab_index(placeholder) else {
                         if let Ok(session) = result {
                             this.discard_spawned_session(session, cx);
                         }
+                        leave(this);
                         return;
                     };
                     match result {
@@ -946,6 +963,7 @@ impl Workspace {
                         Err(e) => {
                             let toast = Toast::error("Couldn't start a shell").body(format!("{e:#}")).key("workspace.spawn");
                             toast::show_in(window, cx, toast);
+                            leave(this);
                             this.remove_tab(index, window, cx);
                         }
                     }
@@ -1309,8 +1327,10 @@ impl Workspace {
         // A host whose workspace lost its last tab here: the workspace ends
         // (unless it's the host's only one) and the window shows the host's
         // most recently active other workspace, else it's done with the host.
-        let emptied: Vec<usize> =
-            (0..self.shown.len()).filter(|&i| !self.tabs.iter().any(|t| sync::on_conn(t, &self.shown[i].conn))).collect();
+        // (One still attaching its tabs isn't empty.)
+        let emptied: Vec<usize> = (0..self.shown.len())
+            .filter(|&i| self.shown[i].attaching.is_empty() && !self.tabs.iter().any(|t| sync::on_conn(t, &self.shown[i].conn)))
+            .collect();
         let mut next = Vec::new();
         for &i in emptied.iter().rev() {
             self.save_shown_now(i, cx);
@@ -1662,7 +1682,9 @@ impl Workspace {
             }
             let all = self.tabs.iter().filter(|t| sync::on_conn(t, &conn)).all(|t| detachable_ids.contains(&t.id));
             if all {
-                // The whole host: the workspace stays on it as it is.
+                // The whole host: the workspace stays on it as it is, with
+                // what this window changed and hadn't saved yet.
+                self.save_shown_now(i, cx);
                 let sh = self.shown.remove(i);
                 sh.conn.leave_workspace(self.join.view);
                 undo.push(Undo::Host { conn: conn.clone(), workspace: sh.id });
@@ -2100,6 +2122,10 @@ impl Workspace {
                         && let Some(w) = list.iter().filter(|w| w.views == 0 && !w.sessions.is_empty()).max_by_key(|w| w.active)
                     {
                         return Ok(Some(AttachMode::Join(Some(w.id))));
+                    }
+                    // A plain SSH host's tabs only: a loose local shell isn't one.
+                    if wanted.is_some() {
+                        return Ok(None);
                     }
                     let in_workspace: std::collections::HashSet<goatty_proto::SessionId> =
                         list.iter().flat_map(|w| w.sessions.iter().copied()).collect();

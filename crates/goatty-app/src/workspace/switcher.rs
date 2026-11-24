@@ -65,6 +65,8 @@ pub struct Switcher {
     /// The selected row; `rows.len()` is "New workspace".
     selected: usize,
     renaming: Option<(WorkspaceId, Entity<TextInput>, [Subscription; 2])>,
+    /// The rows scroll when there are many; the selected one stays in view.
+    scroll: gpui::ScrollHandle,
 }
 
 impl EventEmitter<SwitcherEvent> for Switcher {}
@@ -82,7 +84,7 @@ impl Switcher {
     /// `rename`: start with that workspace's name being edited (a new one).
     pub fn new(rows: Vec<Row>, host: SharedString, rename: Option<WorkspaceId>, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let selected = rows.iter().position(|r| r.current).unwrap_or(0);
-        let mut this = Self { focus: cx.focus_handle(), rows, host, selected, renaming: None };
+        let mut this = Self { focus: cx.focus_handle(), rows, host, selected, renaming: None, scroll: gpui::ScrollHandle::new() };
         match rename {
             Some(id) => this.start_rename(id, window, cx),
             None => this.focus.focus(window, cx),
@@ -93,8 +95,13 @@ impl Switcher {
     /// The host's workspaces changed while it's open.
     pub fn set_rows(&mut self, rows: Vec<Row>, cx: &mut Context<'_, Self>) {
         let selected = self.rows.get(self.selected).map(|r| r.id);
+        let on_new = self.selected >= self.rows.len();
         self.rows = rows;
-        self.selected = selected.and_then(|id| self.rows.iter().position(|r| r.id == id)).unwrap_or(self.selected.min(self.rows.len()));
+        self.selected = match selected {
+            _ if on_new => self.rows.len(),
+            Some(id) => self.rows.iter().position(|r| r.id == id).unwrap_or(self.selected.min(self.rows.len())),
+            None => self.selected.min(self.rows.len()),
+        };
         if self.renaming.as_ref().is_some_and(|(id, _, _)| !self.rows.iter().any(|r| r.id == *id)) {
             self.renaming = None;
         }
@@ -162,6 +169,9 @@ impl Switcher {
                 }
             }
             _ => return,
+        }
+        if self.selected < self.rows.len() {
+            self.scroll.scroll_to_item(self.selected);
         }
         cx.stop_propagation();
         cx.notify();
@@ -290,7 +300,7 @@ impl Render for Switcher {
                     .text_color(ui.muted)
                     .child(format!("Workspaces on {}", self.host)),
             )
-            .children(rows)
+            .child(div().id("ws-rows").flex().flex_col().max_h(px(360.)).overflow_y_scroll().track_scroll(&self.scroll).children(rows))
             .child(div().h(px(1.)).mx(px(6.)).my(px(4.)).bg(ui.divider))
             .child(new)
             .child(
@@ -471,6 +481,17 @@ impl Workspace {
             }
             .into_any_element(),
         )
+    }
+
+    /// About how wide the chip is in the tab bar (0 without one), for
+    /// sharing the strip between the tabs.
+    pub(super) fn chip_width(&self) -> f32 {
+        if !self.shows_workspaces() {
+            return 0.0;
+        }
+        let name = self.active_shown().map(|i| self.shown[i].name()).unwrap_or_default();
+        // Icon, gaps, padding and the chevron around the (cut) name.
+        (name.chars().count().min(24) as f32 * 7.5).min(160.0) + 64.0
     }
 
     /// The open switcher, under the chip, over a backdrop that closes it.

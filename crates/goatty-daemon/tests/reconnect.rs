@@ -552,7 +552,8 @@ fn clients_older_than_workspaces_are_refused() {
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     send(&mut s, &ClientMsg::Hello { version: goatty_proto::MIN_PROTOCOL_VERSION - 1, client: "old".into() });
     assert!(matches!(read_msg::<_, ServerMsg>(&mut s).unwrap(), ServerMsg::Hello { version: PROTOCOL_VERSION, .. }));
-    assert!(read_msg::<_, ServerMsg>(&mut s).is_err(), "closed");
+    // Closed: end of file, not a timeout.
+    assert_eq!(s.read(&mut [0u8; 1]).unwrap(), 0, "closed");
 }
 
 /// What a window hears about its workspace.

@@ -101,6 +101,20 @@ fn shared(conn: &Connection, id: u64) -> Option<Arc<Session>> {
     Some(s)
 }
 
+/// [`Session::daemon_attach_many`]'s lock for connection `conn`.
+fn attach_lock(conn: &Connection) -> Arc<Mutex<()>> {
+    static LOCKS: Mutex<Vec<(usize, std::sync::Weak<Mutex<()>>)>> = Mutex::new(Vec::new());
+    let key = conn.key();
+    let mut locks = LOCKS.lock();
+    locks.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(l) = locks.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade()) {
+        return l;
+    }
+    let l = Arc::new(Mutex::new(()));
+    locks.push((key, Arc::downgrade(&l)));
+    l
+}
+
 fn share(s: &Arc<Session>) {
     if let (Some(conn), Some(id)) = (s.connection(), s.daemon_id()) {
         let key = conn.key();
@@ -623,6 +637,11 @@ impl Session {
         }
         let (host_label, ssh_host) = Self::daemon_host_meta(conn);
         let ws = win(size);
+        // One attach at a time per connection: two windows restoring the
+        // same session at once share it rather than both subscribing (a
+        // connection keeps one subscription per session).
+        let lock = attach_lock(conn);
+        let _attaching = lock.lock();
         // Ones a window of this process shows already are shared.
         let mut out: Vec<(u64, Option<Result<Arc<Self>>>)> = ids.iter().map(|&id| (id, shared(conn, id).map(Ok))).collect();
         let mut sessions = Vec::with_capacity(ids.len());
@@ -698,11 +717,19 @@ impl Session {
         (if first { log.events.front().map_or(log.next, |(n, _)| *n) } else { log.next }, log.title.clone())
     }
 
-    /// The UI events after `cursor` (moved past them).
+    /// The UI events after `cursor` (moved past them). A view that fell
+    /// further behind than the log reaches gets the current title first.
     pub fn ui_events(&self, cursor: &mut u64) -> Vec<UiEvent> {
         let mut log = self.ui_log.lock();
         self.drain_ui(&mut log);
-        let out = log.events.iter().filter(|(n, _)| *n >= *cursor).map(|(_, e)| e.clone()).collect();
+        let mut out = Vec::new();
+        if log.events.front().is_some_and(|(n, _)| *n > *cursor) {
+            out.push(match &log.title {
+                Some(t) => UiEvent::Title(t.clone()),
+                None => UiEvent::ResetTitle,
+            });
+        }
+        out.extend(log.events.iter().filter(|(n, _)| *n >= *cursor).map(|(_, e)| e.clone()));
         *cursor = log.next;
         out
     }

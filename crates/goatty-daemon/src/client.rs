@@ -450,24 +450,18 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientMsg::ListWorkspaces { req } => {
                     live.watching.store(true, Ordering::Relaxed);
-                    let alive = daemon.live();
-                    let (list, seq) = {
-                        let mut w = daemon.workspaces.lock();
-                        (w.list(|s| alive.contains(&s)), w.version())
-                    };
+                    let (list, seq) = daemon.with_workspaces(|w, alive| (w.list(alive), w.version()));
                     reply(ServerMsg::Workspaces { req, seq, list });
                 }
                 ClientMsg::JoinWorkspace { req, view, id } => {
                     live.watching.store(true, Ordering::Relaxed);
-                    let alive = daemon.live();
-                    let (info, layout) = daemon.workspaces.lock().join(conn, view, id, |s| alive.contains(&s));
+                    let (info, layout) = daemon.with_workspaces(|w, alive| w.join(conn, view, id, alive));
                     reply(ServerMsg::Joined { req, info, layout });
                     daemon.announce(Changes { list: true, layout: None });
                 }
                 ClientMsg::CreateWorkspace { req, view, name } => {
                     live.watching.store(true, Ordering::Relaxed);
-                    let alive = daemon.live();
-                    let (info, layout) = daemon.workspaces.lock().create(conn, view, name.as_deref(), |s| alive.contains(&s));
+                    let (info, layout) = daemon.with_workspaces(|w, alive| w.create(conn, view, name.as_deref(), alive));
                     log::info!("connection {conn}: made workspace {:?}", info.name);
                     reply(ServerMsg::Joined { req, info, layout });
                     daemon.announce(Changes { list: true, layout: None });
@@ -478,8 +472,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     }
                 }
                 ClientMsg::SaveWorkspace { req, view, id, base, tabs, sessions, json } => {
-                    let alive = daemon.live();
-                    let saved = daemon.workspaces.lock().save((conn, view), id, base, tabs, sessions, json, |s| alive.contains(&s));
+                    let saved = daemon.with_workspaces(|w, alive| w.save((conn, view), id, base, tabs, sessions, json, alive));
                     match saved {
                         Ok((outcome, changes)) => {
                             reply(ServerMsg::WorkspaceSaved { req, outcome });
@@ -511,8 +504,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     }
                 }
                 ClientMsg::GetWorkspace { req, id } => {
-                    let alive = daemon.live();
-                    let layout = daemon.workspaces.lock().get(id, |s| alive.contains(&s));
+                    let layout = daemon.with_workspaces(|w, alive| w.get(id, alive));
                     reply(ServerMsg::WorkspaceLayout { req, layout });
                 }
                 ClientMsg::FetchHistory { req, session, before, count } => match daemon.get(session) {

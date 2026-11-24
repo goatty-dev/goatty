@@ -33,7 +33,7 @@ impl RemoteArgs {
 #[derive(Debug, Parser)]
 #[command(name = "goatty", version, about = "A fast, batteries-included terminal")]
 pub struct Cli {
-    /// Always create a new session (default: restore the last closed window, else reattach the newest detached session).
+    /// Always create a new session: a fresh tab in the most recently active workspace (default: restore the windows of the last run, else join that workspace, with a fresh shell when it has no tabs).
     #[arg(long, conflicts_with_all = ["attach", "local"])]
     pub new: bool,
 

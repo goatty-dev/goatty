@@ -1483,13 +1483,14 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 let _ = tx.send(msg);
             }
             Some(Pending::Join { tx, view, sink, left_gen }) => {
-                if let ServerMsg::Joined { info, .. } = &msg {
-                    if s.left.lock().get(&view).copied().unwrap_or(0) == left_gen {
-                        s.views.lock().insert(view, View { workspace: info.id, sink });
-                    } else {
-                        // The window left while it was joining.
-                        s.send(&ClientMsg::LeaveWorkspace { view });
-                    }
+                // The window left while it was joining: not registered. (Its
+                // `LeaveWorkspace` went out after the join, and the daemon
+                // handles a connection's messages in order, so it left there
+                // too; a later join of the same window isn't touched.)
+                if let ServerMsg::Joined { info, .. } = &msg
+                    && s.left.lock().get(&view).copied().unwrap_or(0) == left_gen
+                {
+                    s.views.lock().insert(view, View { workspace: info.id, sink });
                 }
                 let _ = tx.send(msg);
             }
@@ -2098,8 +2099,10 @@ mod tests {
         assert_eq!(conn.join_workspace(1, None, one.clone()).unwrap().0.id, 7);
         assert_eq!(conn.join_workspace(2, Some(7), two.clone()).unwrap().1.revision, 2);
         assert_eq!(conn.shown_workspace(2), Some(7));
+        // Both windows have the list (the last event each one gets).
+        let has_list = |h: &Heard| h.0.lock().iter().any(|(_, e)| e.starts_with("list"));
         let deadline = Instant::now() + Duration::from_secs(2);
-        while one.0.lock().is_empty() && Instant::now() < deadline {
+        while !(has_list(&one) && has_list(&two)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         let key = conn.key();
@@ -2137,9 +2140,10 @@ mod tests {
             let layout = WorkspaceLayout { id: 7, revision: 0, json: String::new(), sessions: vec![] };
             w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
             w.flush().unwrap();
-            // ... so the daemon hears it leave again, after the join.
-            if let Ok(ClientMsg::LeaveWorkspace { view: 4 }) = read_msg::<_, ClientMsg>(&mut r) {
-                let _ = seen_tx.send("left again".into());
+            // Nothing more: the leave came after the join already.
+            r.get_ref().set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            if read_msg::<_, ClientMsg>(&mut r).is_err() {
+                let _ = seen_tx.send("nothing more".into());
             }
             let _ = rx_drop.recv_timeout(Duration::from_secs(5));
             drop(w);
@@ -2154,7 +2158,7 @@ mod tests {
         let _ = go_tx.send(());
         assert_eq!(joining.join().unwrap().unwrap().0.id, 7);
         assert_eq!(conn.shown_workspace(4), None, "not registered: it left");
-        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "left again");
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "nothing more");
 
         let _ = tx_drop.send(());
         reader_h.join().unwrap();

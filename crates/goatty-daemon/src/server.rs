@@ -234,7 +234,7 @@ impl Daemon {
                     daemon.host.untrack_shell(pid);
                 }
                 s.finish(code);
-                daemon.session_ended();
+                daemon.session_ended(s.id);
             })?;
         }
         self.sessions.lock().insert(id, session.clone());
@@ -246,10 +246,20 @@ impl Daemon {
         self.sessions.lock().keys().copied().collect()
     }
 
-    /// A session ended: a workspace no window shows may have ended with it.
-    fn session_ended(&self) {
+    /// Run `f` on the workspaces with what's running now. The running
+    /// sessions are read under the workspaces' lock (always in that order),
+    /// so a session made and saved into a workspace meanwhile can't look
+    /// ended to a decision taken with an older snapshot.
+    pub(crate) fn with_workspaces<T>(&self, f: impl FnOnce(&mut Workspaces, &dyn Fn(SessionId) -> bool) -> T) -> T {
+        let mut w = self.workspaces.lock();
         let live = self.live();
-        if self.workspaces.lock().prune(|s| live.contains(&s)) {
+        f(&mut w, &|s| live.contains(&s))
+    }
+
+    /// Session `id` ended: the workspaces that listed it changed (and one no
+    /// window shows may have ended with it).
+    fn session_ended(&self, id: SessionId) {
+        if self.with_workspaces(|w, alive| w.session_ended(id, alive)) {
             self.announce(Changes { list: true, layout: None });
         }
     }
@@ -273,11 +283,7 @@ impl Daemon {
             send(&frame, &|conn, _| conns.contains(&conn));
         }
         if changes.list {
-            let live = self.live();
-            let (list, seq) = {
-                let mut w = self.workspaces.lock();
-                (w.list(|s| live.contains(&s)), w.version())
-            };
+            let (list, seq) = self.with_workspaces(|w, alive| (w.list(alive), w.version()));
             if let Ok(frame) = goatty_proto::encode(&goatty_proto::ServerMsg::WorkspacesChanged { seq, list }) {
                 send(&frame, &|_, live| live.watches_workspaces());
             }

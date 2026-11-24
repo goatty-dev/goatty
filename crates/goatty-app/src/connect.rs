@@ -746,7 +746,21 @@ pub fn plain_ssh(host: &str, join: Option<&saved::Join>) -> Result<Ready> {
             Ok(session) => {
                 let spawner = Spawner::Plain { host: host.to_string(), base: Box::new(Spawner::Daemon(conn.clone())) };
                 let startup = match join {
-                    Some(join) => saved::startup(&conn, initial_size(), AttachMode::Join(None), join, Some((session, host.to_string())))?,
+                    Some(join) => {
+                        let id = session.daemon_id();
+                        match saved::startup(&conn, initial_size(), AttachMode::Join(None), join, Some((session, host.to_string()))) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                // Nothing would show that ssh: a retry starts another.
+                                if let Some(id) = id
+                                    && let Err(k) = conn.kill(id)
+                                {
+                                    log::info!("ending the unused ssh session: {k:#}");
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
                     None => Startup::Session(session),
                 };
                 return Ok((startup, spawner));

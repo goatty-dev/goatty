@@ -59,6 +59,29 @@ pub(super) struct Shown {
     /// The version of `list`: a list older than it (sent before this window
     /// joined a workspace made just now) is stale.
     pub seq: u64,
+    /// This showing of the workspace (switching away and back makes a new
+    /// one): a save's answer counts only for the one that sent it.
+    pub epoch: u64,
+    /// The window's tabs as `reconcile` last left them: what attaching the
+    /// rest of `target` adds to, merged with edits made meanwhile.
+    pub target_shown: Layout,
+    /// A layout the daemon refused (not a lost link): not sent again as is.
+    pub rejected: Option<Layout>,
+}
+
+/// Tabs this window moved out of `workspace` into another one on `conn`:
+/// `workspace` is closed once a save holds them all (not before, so a
+/// failed move loses nothing).
+pub(super) struct MoveClose {
+    pub conn: Arc<Connection>,
+    pub workspace: WorkspaceId,
+    pub tabs: Vec<u64>,
+}
+
+/// A new [`Shown::epoch`].
+fn next_epoch() -> u64 {
+    static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Shown {
@@ -69,6 +92,9 @@ impl Shown {
             revision,
             detached: base.detached.clone(),
             target: base.clone(),
+            target_shown: base.clone(),
+            epoch: next_epoch(),
+            rejected: None,
             base,
             attaching: HashSet::new(),
             saving: false,
@@ -105,6 +131,10 @@ pub(super) struct Parked {
     /// Tabs of a closed workspace on their way into the next one this
     /// window shows on that host (whichever it turns out to be).
     pub moving: bool,
+    /// The [`Shown::epoch`] it had (a late save answer still updates `base`).
+    pub epoch: u64,
+    /// The tab that was active there (shown again on coming back).
+    pub active: Option<u64>,
 }
 
 impl Parked {
@@ -194,17 +224,16 @@ impl Workspace {
         }
         let mine = self.mine(i, cx);
         let sh = &mut self.shown[i];
-        if mine.same(&sh.base) {
+        if mine.same(&sh.base) || sh.rejected.as_ref().is_some_and(|r| mine.same(r)) {
             return;
         }
         sh.saving = true;
-        let (conn, id, base, view) = (sh.conn.clone(), sh.id, sh.revision, self.join.view);
+        let (conn, id, base, view, epoch) = (sh.conn.clone(), sh.id, sh.revision, self.join.view, sh.epoch);
         let (json, sessions, tabs) = (mine.to_json(), mine.sessions(), u32::try_from(mine.tabs.len()).unwrap_or(u32::MAX));
-        let key = conn.key();
         let task = cx.background_executor().spawn(async move { conn.save_workspace(view, id, base, tabs, sessions, json) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| this.saved(key, id, mine, result, cx));
+            let _ = this.update(cx, |this, cx| this.saved(epoch, mine, result, cx));
         })
         .detach();
     }
@@ -242,14 +271,14 @@ impl Workspace {
         super::reopen::update(cx, self.window_id, self.reopen_key, None);
     }
 
-    /// A save of workspace `id` on connection `key` was answered.
-    fn saved(&mut self, key: usize, id: WorkspaceId, sent: Layout, result: anyhow::Result<SaveOutcome>, cx: &mut Context<'_, Self>) {
-        let Some(i) = self.shown_by_key(key).filter(|&i| self.shown[i].id == id) else {
+    /// A save made by the showing `epoch` was answered (`sent`: what it sent).
+    fn saved(&mut self, epoch: u64, sent: Layout, result: anyhow::Result<SaveOutcome>, cx: &mut Context<'_, Self>) {
+        let Some(i) = self.shown.iter().position(|s| s.epoch == epoch) else {
             // Parked meanwhile: that's what the daemon has now (so coming
             // back doesn't count this edit as new again). A conflict is
             // merged when it's shown again.
             if let Ok(SaveOutcome::Saved { .. }) = result
-                && let Some(p) = self.parked.iter_mut().find(|p| p.conn.key() == key && p.id == id)
+                && let Some(p) = self.parked.iter_mut().find(|p| p.epoch == epoch)
             {
                 p.base = sent;
             }
@@ -260,32 +289,67 @@ impl Workspace {
             Ok(SaveOutcome::Saved { revision }) => {
                 let sh = &mut self.shown[i];
                 sh.revision = revision;
+                sh.rejected = None;
                 let ended = sent.tabs.is_empty() && sent.detached.is_empty();
+                let key = sh.conn.key();
                 sh.base = sent;
+                self.close_moved_from(key, cx);
                 if ended {
                     self.ended_here(i, cx);
                     return;
                 }
             }
-            // Someone saved first: re-apply this window's edit on theirs.
-            Ok(SaveOutcome::Conflict(layout)) => self.shown[i].pending = Some(layout),
+            // Someone saved first: re-apply this window's edit on theirs
+            // (unless a newer layout is waiting already).
+            Ok(SaveOutcome::Conflict(layout)) => {
+                let sh = &mut self.shown[i];
+                if sh.pending.as_ref().is_none_or(|p| p.revision < layout.revision) {
+                    sh.pending = Some(layout);
+                }
+            }
             Ok(SaveOutcome::Gone) => {
                 self.workspace_gone(i, cx);
                 return;
             }
-            // The link dropped: the window saves again when it joins again.
-            Err(e) if e.downcast_ref::<ReplyLost>().is_some() || !self.shown[i].conn.is_connected() => {}
+            // The link dropped: the window saves again when it joins again
+            // (not now: that would fail at once, over and over).
+            Err(e) if e.downcast_ref::<ReplyLost>().is_some() || !self.shown[i].conn.is_connected() => return,
             Err(e) => {
                 log::warn!("saving the workspace: {e:#}");
                 toast::show(cx, Toast::error("Couldn't save the workspace").body(format!("{e:#}")).key("workspace.save"));
-                // Don't try the same again and again.
-                self.shown[i].base = sent;
+                // Not this layout again; the next edit tries again.
+                self.shown[i].rejected = Some(sent);
             }
         }
         if let Some(layout) = self.shown[i].pending.take() {
             self.defer_remote(i, layout, cx);
         }
         self.save_layout(cx);
+    }
+
+    /// Workspaces whose tabs this window moved into another one on host
+    /// `key` are closed once a save holds every one of those tabs.
+    fn close_moved_from(&mut self, key: usize, cx: &mut Context<'_, Self>) {
+        let saved: HashSet<u64> = self
+            .shown
+            .iter()
+            .filter(|s| s.conn.key() == key)
+            .flat_map(|s| s.base.tabs.iter().chain(&s.base.detached).map(|t| t.id))
+            .collect();
+        // Moved tabs that closed meanwhile don't count.
+        let here: HashSet<u64> = self
+            .tabs
+            .iter()
+            .map(|t| t.id)
+            .chain(self.shown.iter().filter(|s| s.conn.key() == key).flat_map(|s| s.detached.iter().map(|t| t.id)))
+            .collect();
+        let (done, waiting): (Vec<MoveClose>, Vec<MoveClose>) = std::mem::take(&mut self.move_closes)
+            .into_iter()
+            .partition(|m| m.conn.key() == key && m.tabs.iter().filter(|t| here.contains(t)).all(|t| saved.contains(t)));
+        self.move_closes = waiting;
+        for m in done {
+            self.forget_workspace_on_daemon(m.conn, m.workspace, cx);
+        }
     }
 
     /// Apply a layout from elsewhere on the next update (it needs the window).
@@ -305,6 +369,20 @@ impl Workspace {
     // ---- changes from elsewhere ---------------------------------------------
 
     pub(super) fn on_workspace_event(&mut self, key: usize, event: WorkspaceEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Before this window shows the host's workspace (it's still
+        // attaching its sessions): kept for when it does (`show_joined`).
+        if self.shown_by_key(key).is_none() {
+            let newer = |a: &WorkspaceEvent, b: &WorkspaceEvent| match (a, b) {
+                (WorkspaceEvent::Changed(x), WorkspaceEvent::Changed(y)) => x.id == y.id,
+                (WorkspaceEvent::List { .. }, WorkspaceEvent::List { .. }) => true,
+                _ => false,
+            };
+            if !matches!(event, WorkspaceEvent::Rejoined { .. }) {
+                self.early_events.retain(|(k, e)| !(*k == key && newer(e, &event)));
+                self.early_events.push((key, event));
+            }
+            return;
+        }
         match event {
             WorkspaceEvent::Changed(layout) => self.apply_remote(key, layout, window, cx),
             WorkspaceEvent::List { seq, list } => {
@@ -333,6 +411,8 @@ impl Workspace {
             WorkspaceEvent::Rejoined { info, layout } => {
                 let Some(i) = self.shown_by_key(key) else { return };
                 self.shown[i].saving = false;
+                // A restarted daemon counts its lists from the start again.
+                self.shown[i].seq = 0;
                 if self.shown[i].id != info.id {
                     // Its workspace ended while the link was down: what the
                     // daemon joined it to instead replaces it (its revisions
@@ -360,7 +440,9 @@ impl Workspace {
             return;
         }
         if sh.saving || self.divider_dragging {
-            sh.pending = Some(layout);
+            if sh.pending.as_ref().is_none_or(|p| p.revision < layout.revision) {
+                sh.pending = Some(layout);
+            }
             return;
         }
         let alive: HashSet<SessionId> = layout.sessions.iter().copied().collect();
@@ -484,13 +566,16 @@ impl Workspace {
         }
         // A tab the user asked for (reattached, attached by id) is shown once it's there.
         let mut active_id = active_id;
-        if let Some(s) = self.show_when_attached
-            && let Some(t) = self.tabs.iter().find(|t| t.panes.iter().any(|p| p.view.read(cx).session().daemon_id() == Some(s)))
+        if let Some((k, s)) = self.show_when_attached
+            && k == conn.key()
+            && let Some(t) =
+                self.tabs.iter().find(|t| on_conn(t, &conn) && t.panes.iter().any(|p| p.view.read(cx).session().daemon_id() == Some(s)))
         {
             active_id = Some(t.id);
             self.show_when_attached = None;
         }
         self.after_tabs_replaced(active_id, pos, n, window, cx);
+        self.shown[i].target_shown = self.mine(i, cx);
         let attaching = &mut self.shown[i].attaching;
         missing.retain(|s| attaching.insert(*s));
         if !missing.is_empty() {
@@ -545,7 +630,10 @@ impl Workspace {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
+            // Let go of them if the window is gone before it takes them.
+            let mut held = saved::Held(result.as_ref().map(|s| s.values().cloned().collect()).unwrap_or_default());
             let _ = this.update_in(cx, |this, window, cx| {
+                held.take();
                 let Some(i) = this.shown_index(&conn) else {
                     if let Ok(sessions) = result {
                         for s in sessions.values() {
@@ -584,7 +672,9 @@ impl Workspace {
                     this.shown[i].attaching.remove(id);
                 }
                 // Sessions that couldn't be attached ended: their panes go.
-                let mut target = this.shown[i].target.clone();
+                // What's still to come, with what this window did meanwhile.
+                let mine = this.mine(i, cx);
+                let mut target = saved::merge(&this.shown[i].target_shown, &mine, &this.shown[i].target);
                 let alive: HashSet<SessionId> =
                     target.sessions().into_iter().filter(|s| !ids.contains(s) || fresh.contains_key(s)).collect();
                 target.prune(&alive);
@@ -620,9 +710,12 @@ impl Workspace {
         let i = match self.shown_index(&conn) {
             Some(i) if self.shown[i].id == info.id => {
                 let mine = self.mine(i, cx);
-                target = saved::merge(&self.shown[i].base, &mine, &target);
                 if revision >= self.shown[i].revision {
+                    target = saved::merge(&self.shown[i].base, &mine, &target);
                     (self.shown[i].base, self.shown[i].revision) = (base, revision);
+                } else {
+                    // Older than what the window shows: it removes nothing.
+                    target = mine;
                 }
                 i
             }
@@ -640,8 +733,12 @@ impl Workspace {
         }
         // Its tabs from when this window showed it before, and tabs this
         // window moved into it (closing another workspace).
+        let mut active = active;
         while let Some(p) = self.parked.iter().position(|p| Arc::ptr_eq(&p.conn, &conn) && (p.id == info.id || p.moving)) {
             let parked = self.parked.remove(p);
+            if !parked.moving {
+                active = active.or(parked.active);
+            }
             let mine = Layout::new(parked.tabs.iter().filter_map(|t| super::saved_tab(t, cx)).collect(), parked.detached.clone());
             target = saved::merge(&parked.base, &mine, &target);
             let at = index.min(self.tabs.len());
@@ -652,6 +749,21 @@ impl Workspace {
         self.reconcile(i, target, sessions, Some(index), window, cx);
         // Parked workspaces this one took every pane from, or that are gone.
         self.release_parked(&conn, cx);
+        // What the host said while the sessions were being attached.
+        let key = conn.key();
+        let (early, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.early_events).into_iter().partition(|(k, _)| *k == key);
+        self.early_events = rest;
+        for (_, event) in early {
+            match event {
+                WorkspaceEvent::List { seq, list } => {
+                    self.shown[i].take_list(seq, list);
+                }
+                WorkspaceEvent::Changed(layout) if layout.id == info.id && layout.revision > self.shown[i].revision => {
+                    self.later(cx, move |this, window, cx| this.apply_remote(key, layout, window, cx));
+                }
+                _ => {}
+            }
+        }
         // New tabs it was asked for, after its others.
         let mut show_tab = active.filter(|id| self.tab_index(*id).is_some());
         for (session, plain) in extra {
@@ -705,6 +817,9 @@ impl Workspace {
         let pos = self.tabs.iter().position(|t| on_conn(t, &sh.conn)).unwrap_or(self.tabs.len());
         let active_id = self.active_tab().map(|t| t.id);
         let (tabs, rest): (Vec<Tab>, Vec<Tab>) = std::mem::take(&mut self.tabs).into_iter().partition(|t| on_conn(t, &sh.conn));
+        // The tab to show when coming back: the active one, else the host's last.
+        let last = tabs.iter().find(|t| self.group_focus.iter().any(|(_, id)| *id == t.id)).map(|t| t.id);
+        let shown_active = active_id.filter(|id| tabs.iter().any(|t| t.id == *id)).or(last);
         self.tabs = rest;
         if let Some(id) = active_id {
             self.active = self.tab_index(id).unwrap_or(pos.min(self.tabs.len().saturating_sub(1)));
@@ -717,7 +832,16 @@ impl Workspace {
             let old = self.parked.remove(old);
             self.release_tabs(old.tabs, cx);
         }
-        self.parked.push(Parked { conn: sh.conn, id: sh.id, base: sh.base, detached: sh.detached, tabs, moving: false });
+        self.parked.push(Parked {
+            conn: sh.conn,
+            id: sh.id,
+            base: sh.base,
+            detached: sh.detached,
+            tabs,
+            moving: false,
+            epoch: sh.epoch,
+            active: shown_active,
+        });
         pos
     }
 
@@ -783,7 +907,16 @@ impl Workspace {
         self.tabs = rest;
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
         // Its panes are kept a moment: the workspace that takes its place may show them.
-        self.parked.push(Parked { conn: sh.conn.clone(), id: sh.id, base: sh.base, detached: Vec::new(), tabs, moving: false });
+        self.parked.push(Parked {
+            conn: sh.conn.clone(),
+            id: sh.id,
+            base: sh.base,
+            detached: Vec::new(),
+            tabs,
+            moving: false,
+            epoch: sh.epoch,
+            active: None,
+        });
         let conn = sh.conn.clone();
         let rejoin = !others.is_empty();
         self.later(cx, move |this, window, cx| {
@@ -951,11 +1084,22 @@ impl Workspace {
         }
         cx.notify();
         let conn = conn.clone();
-        let task = cx.background_executor().spawn(async move { conn.rename_workspace(id, name) });
-        cx.spawn(async move |_, cx| {
-            if let Err(e) = task.await {
-                cx.update(|cx| {
-                    toast::show(cx, Toast::error("Couldn't rename the workspace").body(format!("{e:#}")).key("workspace.rename"))
+        let task = cx.background_executor().spawn({
+            let conn = conn.clone();
+            async move {
+                // Failed: what the daemon calls it, to show again.
+                conn.rename_workspace(id, name).map_err(|e| (e, conn.list_workspaces_seq().ok()))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err((e, list)) = task.await {
+                let _ = this.update(cx, |this, cx| {
+                    toast::show(cx, Toast::error("Couldn't rename the workspace").body(format!("{e:#}")).key("workspace.rename"));
+                    if let (Some((seq, list)), Some(i)) = (list, this.shown_index(&conn)) {
+                        this.shown[i].take_list(seq, list);
+                        this.refresh_switcher(cx);
+                        cx.notify();
+                    }
                 });
             }
         })
@@ -985,16 +1129,19 @@ impl Workspace {
         .cloned() else {
             return;
         };
-        let tabs = if here { self.tabs.iter().filter(|t| on_conn(t, conn)).count() } else { info.tabs as usize };
+        let (tabs, shells) = if here {
+            (self.tabs.iter().filter(|t| on_conn(t, conn)).count(), self.shells_here(i, cx))
+        } else {
+            (info.tabs as usize, info.sessions.clone())
+        };
         self.close_switcher(window, cx);
-        if tabs == 0 || info.sessions.is_empty() {
-            self.finish_close(conn, id, None, false, window, cx);
+        if tabs == 0 || shells.is_empty() {
+            self.finish_close(conn, id, Some(into.id), false, Vec::new(), window, cx);
             return;
         }
-        let shells = info.sessions.len();
         let me = cx.entity().downgrade();
         let tabs_text = if tabs == 1 { "1 tab".to_string() } else { format!("{tabs} tabs") };
-        let shells_text = if shells == 1 { "1 shell".to_string() } else { format!("{shells} shells") };
+        let shells_text = if shells.len() == 1 { "1 shell".to_string() } else { format!("{} shells", shells.len()) };
         let choices = vec![
             ("move".to_string(), format!("Move {tabs_text} to {}", into.name), "Nothing ends; they show up there".to_string()),
             ("close".to_string(), format!("Close them (ends {shells_text})"), "Whatever runs in them stops".to_string()),
@@ -1004,19 +1151,39 @@ impl Workspace {
         let conn = conn.clone();
         let ask = crate::command_palette::Ask::new("Close workspace", vec![field], move |answers, window, cx| {
             let kill = answers.get("what").is_some_and(|a| a == "close");
-            let _ = me.update(cx, |this, cx| this.finish_close(&conn, id, Some(into.id), kill, window, cx));
+            let shells = shells.clone();
+            let _ = me.update(cx, |this, cx| this.finish_close(&conn, id, Some(into.id), kill, shells, window, cx));
         });
         self.open_ask(ask, window, cx);
     }
 
-    /// Close workspace `id`: its tabs move into workspace `into` (or end,
-    /// with `kill`), then the daemon forgets it.
+    /// The shells host `i`'s workspace has in this window: its panes' and
+    /// its detached tabs'.
+    fn shells_here(&self, i: usize, cx: &gpui::App) -> Vec<SessionId> {
+        let sh = &self.shown[i];
+        let panes = self.tabs.iter().filter(|t| on_conn(t, &sh.conn)).flat_map(|t| t.panes.iter());
+        panes.filter_map(|p| p.view.read(cx).session().daemon_id()).chain(sh.detached.iter().flat_map(|t| t.tree.leaves())).collect()
+    }
+
+    /// The workspace changed while its close was asked about: ask again.
+    fn ask_close_again(&mut self, conn: &Arc<Connection>, id: WorkspaceId, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let toast = Toast::info("The workspace changed meanwhile").body("Nothing ended; here's the question again.");
+        toast::show_in(window, cx, toast.key("workspace.close"));
+        self.close_workspace(conn, id, window, cx);
+    }
+
+    /// Close workspace `id`: its tabs move into workspace `into` (closing
+    /// it once they're saved there), or with `kill` the shells the user
+    /// was asked about (`confirmed`) end. When there are others by now,
+    /// the question comes again.
+    #[allow(clippy::too_many_arguments)]
     fn finish_close(
         &mut self,
         conn: &Arc<Connection>,
         id: WorkspaceId,
         into: Option<WorkspaceId>,
         kill: bool,
+        confirmed: Vec<SessionId>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1024,32 +1191,40 @@ impl Workspace {
         let here = self.shown[i].id == id;
         let conn = conn.clone();
         if here {
+            if kill && self.shells_here(i, cx).iter().any(|s| !confirmed.contains(s)) {
+                self.ask_close_again(&conn, id, window, cx);
+                return;
+            }
             // Show the other one; this one's tabs go with it (or end).
             let next = into.or_else(|| self.shown[i].list.iter().filter(|w| w.id != id).max_by_key(|w| w.active).map(|w| w.id));
             let Some(next) = next else { return };
             let pos = self.park(i, cx);
             let Some(p) = self.parked.iter().position(|p| Arc::ptr_eq(&p.conn, &conn) && p.id == id) else { return };
             let leaving = self.parked.remove(p);
-            if kill {
-                // Its detached tabs' shells too: the question counted them.
+            let moved: Vec<u64> = leaving.tabs.iter().map(|t| t.id).chain(leaving.detached.iter().map(|t| t.id)).collect();
+            if kill || moved.is_empty() {
                 let detached: Vec<SessionId> = leaving.detached.iter().flat_map(|t| t.tree.leaves()).collect();
                 let sessions: Vec<Arc<Session>> =
                     leaving.tabs.iter().flat_map(|t| t.panes.iter()).map(|p| p.view.read(cx).session().clone()).collect();
                 self.release_tabs(leaving.tabs, cx);
-                self.kill_sessions(sessions, cx).detach();
-                let c = conn.clone();
-                cx.background_executor()
-                    .spawn(async move {
-                        for s in detached {
-                            if let Err(e) = c.kill(s) {
-                                log::info!("ending session {s}: {e:#}");
+                if kill {
+                    self.kill_sessions(sessions, cx).detach();
+                    let c = conn.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            for s in detached {
+                                if let Err(e) = c.kill(s) {
+                                    log::info!("ending session {s}: {e:#}");
+                                }
                             }
-                        }
-                    })
-                    .detach();
+                        })
+                        .detach();
+                }
+                self.forget_workspace_on_daemon(conn.clone(), id, cx);
             } else {
                 // They (and its detached tabs) join the next workspace this
-                // window shows there as tabs it added (`show_joined`).
+                // window shows there as tabs it added (`show_joined`); this
+                // one is closed once they're saved there.
                 self.parked.push(Parked {
                     conn: conn.clone(),
                     id: next,
@@ -1057,7 +1232,10 @@ impl Workspace {
                     detached: leaving.detached,
                     tabs: leaving.tabs,
                     moving: true,
+                    epoch: 0,
+                    active: None,
                 });
+                self.move_closes.push(MoveClose { conn: conn.clone(), workspace: id, tabs: moved });
             }
             let plan = ConnectPlan {
                 endpoint: conn.endpoint().clone(),
@@ -1069,62 +1247,88 @@ impl Workspace {
                 active_tab: None,
             };
             self.open_connect_tab_at(plan, pos, window, cx);
-            self.forget_workspace_on_daemon(conn, id, cx);
             return;
         }
         // Not shown here: its tabs come from its layout.
+        enum Done {
+            Changed,
+            Ended,
+            Move(Layout, HashMap<SessionId, Arc<Session>>),
+        }
         let size = self.pane_size(cx);
         let task = cx.background_executor().spawn({
             let conn = conn.clone();
             async move {
                 let layout = conn.get_workspace(id)?;
                 let layout = layout.map(|l| Layout::parse(&l.json, &l.sessions.iter().copied().collect())).unwrap_or_default();
-                let ids: Vec<SessionId> = layout.tabs.iter().flat_map(|t| t.tree.leaves()).collect();
-                let sessions = if kill {
-                    // Its detached tabs' shells too: the question counted them.
-                    for &s in ids.iter().chain(&layout.detached.iter().flat_map(|t| t.tree.leaves()).collect::<Vec<_>>()) {
+                if kill {
+                    let all = layout.sessions();
+                    if all.iter().any(|s| !confirmed.contains(s)) {
+                        return anyhow::Ok(Done::Changed);
+                    }
+                    for s in all {
                         if let Err(e) = conn.kill(s) {
                             log::warn!("ending session {s}: {e:#}");
                         }
                     }
-                    HashMap::new()
-                } else {
-                    saved::attach_all(&conn, size, &ids)?
-                };
-                conn.close_workspace(id)?;
-                anyhow::Ok((layout, sessions))
+                    conn.close_workspace(id)?;
+                    return Ok(Done::Ended);
+                }
+                let ids: Vec<SessionId> = layout.tabs.iter().flat_map(|t| t.tree.leaves()).collect();
+                let sessions = saved::attach_all(&conn, size, &ids)?;
+                Ok(Done::Move(layout, sessions))
             }
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok((layout, sessions)) => {
-                    if let Some(p) = this.parked.iter().position(|p| Arc::ptr_eq(&p.conn, &conn) && p.id == id) {
-                        let parked = this.parked.remove(p);
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(p) = this.parked.iter().position(|p| Arc::ptr_eq(&p.conn, &conn) && p.id == id) {
+                    let parked = this.parked.remove(p);
+                    if !matches!(result, Ok(Done::Changed)) {
                         this.release_tabs(parked.tabs, cx);
+                    } else {
+                        this.parked.push(parked);
                     }
-                    let Some(i) = this.shown_index(&conn) else {
-                        for s in sessions.values() {
-                            s.release_view();
-                        }
-                        return;
-                    };
-                    if !kill {
+                }
+                match result {
+                    Ok(Done::Changed) => this.ask_close_again(&conn, id, window, cx),
+                    Ok(Done::Ended) => {}
+                    Ok(Done::Move(layout, sessions)) => {
+                        // Into the workspace the question named, or not at all.
+                        let Some(i) = this.shown_index(&conn).filter(|&i| into.is_none_or(|w| this.shown[i].id == w)) else {
+                            for s in sessions.values() {
+                                s.release_view();
+                            }
+                            let toast = Toast::info("Nothing was moved").body("This window shows another workspace there now.");
+                            toast::show_in(window, cx, toast.key("workspace.close"));
+                            return;
+                        };
                         // Panes whose shell ended meanwhile drop out of their tab.
                         let mut moved = Layout::new(layout.tabs, layout.detached);
                         let alive: HashSet<SessionId> =
                             moved.tabs.iter().flat_map(|t| t.tree.leaves()).filter(|s| sessions.contains_key(s)).collect();
                         let detached: HashSet<SessionId> = moved.detached.iter().flat_map(|t| t.tree.leaves()).collect();
                         moved.prune(&alive.union(&detached).copied().collect());
+                        let ids: Vec<u64> = moved.tabs.iter().chain(&moved.detached).map(|t| t.id).collect();
+                        if ids.is_empty() {
+                            this.forget_workspace_on_daemon(conn.clone(), id, cx);
+                            return;
+                        }
                         let mut target = this.mine(i, cx);
                         target.tabs.extend(moved.tabs);
                         target.detached.extend(moved.detached);
+                        // Closed once they're saved here.
+                        this.move_closes.push(MoveClose { conn: conn.clone(), workspace: id, tabs: ids });
                         this.reconcile(i, target, sessions, None, window, cx);
                         this.save_layout(cx);
                     }
-                }
-                Err(e) => {
-                    toast::show_in(window, cx, Toast::error("Couldn't close the workspace").body(format!("{e:#}")).key("workspace.close"));
+                    Err(e) => {
+                        toast::show_in(
+                            window,
+                            cx,
+                            Toast::error("Couldn't close the workspace").body(format!("{e:#}")).key("workspace.close"),
+                        );
+                    }
                 }
             });
         })

@@ -176,6 +176,16 @@ impl Workspaces {
         pruned
     }
 
+    /// Session `id` ended: true when a workspace listed it (its list entry
+    /// changed) or one ended with it.
+    pub(crate) fn session_ended(&mut self, id: SessionId, alive: impl Fn(SessionId) -> bool) -> bool {
+        let listed = self.map.values().any(|r| r.sessions.contains(&id));
+        if listed {
+            self.changed();
+        }
+        self.prune(alive) || listed
+    }
+
     /// Every workspace, in the order they were made (see [`Self::prune`]).
     pub(crate) fn list(&mut self, alive: impl Fn(SessionId) -> bool) -> Vec<WorkspaceInfo> {
         self.prune(&alive);
@@ -516,6 +526,19 @@ mod tests {
         w.join(3, 30, Some(main.id), all);
         w.drop_conn(3);
         moved(&w, "a connection ending");
+    }
+
+    #[test]
+    fn a_listed_session_ending_changes_the_list() {
+        let mut w = Workspaces::default();
+        let (main, _) = w.join(1, 10, None, all);
+        save(&mut w, (1, 10), main.id, 0, &[1, 2], "main");
+        let before = w.version();
+        assert!(w.session_ended(2, |s| s == 1), "Main listed it");
+        assert!(w.version() > before);
+        let before = w.version();
+        assert!(!w.session_ended(9, |s| s == 1), "nobody listed it");
+        assert_eq!(w.version(), before);
     }
 
     #[test]

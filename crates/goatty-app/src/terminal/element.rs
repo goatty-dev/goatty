@@ -289,7 +289,11 @@ impl Element for TerminalElement {
         }
         let caret = frame.caret.unwrap_or(self.geom.get().caret);
         let caret = (caret.0.min(frame.cols.saturating_sub(1)), caret.1.min(frame.rows.saturating_sub(1)));
-        let letterbox = self.session.watching().then(|| {
+        // Another client sizes the session, or another window of this goatty
+        // does (`may_resize`): the grid keeps its size here.
+        let fixed =
+            self.session.watching() || (!self.session.may_resize(self.token) && (frame.cols, frame.rows) != (cols as usize, rows as usize));
+        let letterbox = fixed.then(|| {
             // A grid larger than the pane pans so the cursor's cell shows.
             let pan = |cells: usize, fits: u16, at: usize| (at + 1).saturating_sub(fits as usize).min(cells.saturating_sub(fits as usize));
             origin.x -= cell_w * pan(frame.cols, cols, caret.0) as f32;

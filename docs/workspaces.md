@@ -56,13 +56,15 @@ The layout is opaque to the daemon: client JSON (`workspace/saved.rs`, format ve
 - **Background workspaces stay subscribed.** Switching away parks the left workspace's tabs (`sync::Parked`): their sessions stay attached and keep feeding their mirror terminals, without rendering, so bells, finished commands and output still mark the switcher. Coming back is a join round trip, with no re-attach. A parked workspace never takes a session's size, because its panes aren't laid out. Size control is taken as usual once its tabs are visible again.
 - **Two windows of one goatty process on one workspace** share each session's client-side `Session` (one subscription per session and connection): each view has its own wake-up, UI-event cursor and CWD-change count, and the view that last had focus sets the size (`Session::may_resize`; a parked view gives it up). A session comes with one view claimed for whoever attached or looked it up (under the lock that guards detaching), a pane takes that claim over, and the session is detached when its last view lets go (`Session::release_view`).
 
+Two limits remain when two windows of the same process show the same tab at once, because they share one mirror terminal. They scroll together. If both ask the managed zsh for the command line at the same moment, both get whichever answer comes first.
+
 ## Compatibility
 
 Workspaces replaced the exclusive window layouts of protocol v8/v16. This was a breaking change on purpose (nobody had installed goatty yet):
 
 - `MIN_PROTOCOL_VERSION` is 17. The v8/v16 layout messages are retired in place (`Retired…` variants keep their slots), so `Hello`, `ListSessions`, `Restart` and `Shutdown` keep their index. A new client can therefore still restart or stop a daemon down to v10 (`ADMIN_MIN_PROTOCOL_VERSION`, `Control::connect_admin`). The connect screen restarts an older local daemon right away, because its sessions carry over, and offers "Update and restart" for a remote one, without the "ends the sessions" warning.
 - `windows.json` is version 2. A version-1 file is dropped.
-- The restore state (`<socket>.restore/state.json`) carries workspaces in a new `workspaces` field. It writes an empty `layouts` array so that older builds can still read it, and it drops what an older build wrote there.
+- The restore state (`<socket>.restore/state.json`, format 3) carries workspaces in a new `workspaces` field and drops what an older build wrote in `layouts`. A restart refuses to hand the sessions to a build that reads format 2, since that build would drop the workspaces.
 
 ## Cost (`netbench`, i7-14700HX)
 

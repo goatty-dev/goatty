@@ -229,7 +229,7 @@ impl Workspace {
         let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
         // The settings button, the new-tab menu's chevron, and the window
         // buttons when goatty draws them.
-        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx);
+        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx) + self.chip_width();
         let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };

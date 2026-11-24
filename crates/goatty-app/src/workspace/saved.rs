@@ -128,7 +128,8 @@ impl Layout {
         let mut keep = |tabs: &mut Vec<SavedTab>| {
             tabs.retain_mut(|t| {
                 let leaves = t.tree.leaves();
-                if leaves.iter().all(|s| alive.contains(s) && !seen.contains(s)) {
+                let unique = leaves.iter().collect::<HashSet<_>>().len() == leaves.len();
+                if unique && leaves.iter().all(|s| alive.contains(s) && !seen.contains(s)) {
                     seen.extend(leaves);
                 } else {
                     match t.tree.map_leaves(&mut |s| (alive.contains(&s) && seen.insert(s)).then_some(s)) {
@@ -183,8 +184,12 @@ impl Layout {
 /// changed a tab's splits, mine wins and the panes theirs added or removed
 /// are added or removed in it too. Each session ends up in one tab.
 pub fn merge(base: &Layout, mine: &Layout, theirs: &Layout) -> Layout {
-    let tabs = merge_tabs(&base.tabs, &mine.tabs, &theirs.tabs);
-    let detached = merge_tabs(&base.detached, &mine.detached, &theirs.detached);
+    // A tab's fields merge by id across both lists: one side detaching a
+    // tab the other renamed keeps the new name.
+    let all = |l: &Layout| -> Vec<SavedTab> { l.tabs.iter().chain(&l.detached).cloned().collect() };
+    let every = (all(base), all(mine), all(theirs));
+    let tabs = merge_tabs(&base.tabs, &mine.tabs, &theirs.tabs, &every);
+    let detached = merge_tabs(&base.detached, &mine.detached, &theirs.detached, &every);
     // A tab moved between the two lists by one side is in both now.
     let moved: HashSet<u64> = tabs.iter().map(|t| t.id).collect();
     let mut out = Layout::new(tabs, detached.into_iter().filter(|t| !moved.contains(&t.id)).collect());
@@ -193,7 +198,14 @@ pub fn merge(base: &Layout, mine: &Layout, theirs: &Layout) -> Layout {
     out
 }
 
-fn merge_tabs(base: &[SavedTab], mine: &[SavedTab], theirs: &[SavedTab]) -> Vec<SavedTab> {
+/// Which tabs one list (tabs, or detached tabs) keeps and in what order;
+/// their fields come from `every` side's tabs in both lists.
+fn merge_tabs(
+    base: &[SavedTab],
+    mine: &[SavedTab],
+    theirs: &[SavedTab],
+    every: &(Vec<SavedTab>, Vec<SavedTab>, Vec<SavedTab>),
+) -> Vec<SavedTab> {
     let find = |list: &[SavedTab], id: u64| list.iter().position(|t| t.id == id);
     let common = |a: &[SavedTab], b: &[SavedTab]| -> Vec<u64> { a.iter().filter(|t| find(b, t.id).is_some()).map(|t| t.id).collect() };
     // Mine reordered the tabs both know: mine's order, else theirs.
@@ -212,11 +224,12 @@ fn merge_tabs(base: &[SavedTab], mine: &[SavedTab], theirs: &[SavedTab]) -> Vec<
         let at = secondary[..i].iter().rev().find_map(|p| out.iter().position(|&o| o == p.id)).map_or(0, |p| p + 1);
         out.insert(at, t.id);
     }
+    let (eb, em, et) = every;
     out.into_iter()
         .filter_map(|id| {
-            let (b, m, t) = (find(base, id).map(|i| &base[i]), find(mine, id).map(|i| &mine[i]), find(theirs, id).map(|i| &theirs[i]));
+            let (b, m, t) = (find(eb, id).map(|i| &eb[i]), find(em, id).map(|i| &em[i]), find(et, id).map(|i| &et[i]));
             match (b, m, t) {
-                (Some(b), Some(m), Some(t)) => Some(merge_tab(b, m, t)),
+                (Some(b), Some(m), Some(t)) => merge_tab(b, m, t),
                 (_, Some(m), _) => Some(m.clone()),
                 (_, None, Some(t)) => Some(t.clone()),
                 _ => None,
@@ -225,7 +238,8 @@ fn merge_tabs(base: &[SavedTab], mine: &[SavedTab], theirs: &[SavedTab]) -> Vec<
         .collect()
 }
 
-fn merge_tab(base: &SavedTab, mine: &SavedTab, theirs: &SavedTab) -> SavedTab {
+/// `None`: every pane left the tab (each side moved some elsewhere).
+fn merge_tab(base: &SavedTab, mine: &SavedTab, theirs: &SavedTab) -> Option<SavedTab> {
     let pick = |m: &Option<String>, b: &Option<String>, t: &Option<String>| if m != b { m.clone() } else { t.clone() };
     let tree = if same_tree(&mine.tree, &base.tree) {
         theirs.tree.clone()
@@ -243,19 +257,20 @@ fn merge_tab(base: &SavedTab, mine: &SavedTab, theirs: &SavedTab) -> SavedTab {
             }
         }
         for gone in b.iter().filter(|s| !t.contains(s)) {
-            if tree.leaves().len() > 1 {
-                tree.remove(*gone);
+            if tree.leaves() == [*gone] {
+                return None;
             }
+            tree.remove(*gone);
         }
         tree
     };
-    SavedTab {
+    Some(SavedTab {
         id: mine.id,
         name: pick(&mine.name, &base.name, &theirs.name),
         tree,
         plain: pick(&mine.plain, &base.plain, &theirs.plain),
         detached_at: if mine.detached_at != base.detached_at { mine.detached_at } else { theirs.detached_at },
-    }
+    })
 }
 
 /// The window's size (the restore size while maximized or fullscreen) in
@@ -402,14 +417,15 @@ pub fn now_ms() -> u64 {
 
 /// Sessions attached for a window, let go again unless they're handed over
 /// (`take`): a startup that fails halfway leaves nothing subscribed.
-struct Held(Vec<Arc<Session>>);
+pub(super) struct Held(pub Vec<Arc<Session>>);
 
 impl Held {
     fn keep(&mut self, s: &Arc<Session>) {
         self.0.push(s.clone());
     }
 
-    fn take(&mut self) {
+    /// Hand them over: nothing is let go.
+    pub fn take(&mut self) {
         self.0.clear();
     }
 }
@@ -698,6 +714,46 @@ mod tests {
         let merged = merge(&base, &mine, &theirs);
         assert_eq!(merged.tabs[0].tree, Node::Leaf(3));
         assert_eq!(merged.detached.iter().map(|t| t.tree.clone()).collect::<Vec<_>>(), [Node::Leaf(1)], "pane 1 stays detached");
+    }
+
+    #[test]
+    fn a_tab_detached_on_one_side_keeps_the_other_sides_rename() {
+        let base = Layout::new(vec![tab(1, Node::Leaf(1)), tab(2, Node::Leaf(2))], Vec::new());
+        let mut renamed = base.clone();
+        renamed.tabs[0].name = Some("renamed".into());
+        let mut detached = base.clone();
+        let t = detached.tabs.remove(0);
+        detached.detached.push(SavedTab { detached_at: Some(5), ..t });
+        // Both orders: whoever saved first.
+        for merged in [merge(&base, &renamed, &detached), merge(&base, &detached, &renamed)] {
+            assert_eq!(ids(&merged), [2]);
+            assert_eq!(merged.detached.len(), 1);
+            assert_eq!((merged.detached[0].name.as_deref(), merged.detached[0].detached_at), (Some("renamed"), Some(5)));
+        }
+    }
+
+    #[test]
+    fn both_panes_moving_out_of_a_tab_keeps_both_moves() {
+        // Tab 1 holds panes 1 and 2; mine moves 2 to a new tab 2, theirs
+        // moves 1 to a new tab 3.
+        let base = Layout::new(vec![tab(1, split(1, 2))], Vec::new());
+        let mut mine = base.clone();
+        mine.tabs[0].tree = Node::Leaf(1);
+        mine.tabs.push(tab(2, Node::Leaf(2)));
+        let mut theirs = base.clone();
+        theirs.tabs[0].tree = Node::Leaf(2);
+        theirs.tabs.push(tab(3, Node::Leaf(1)));
+        let merged = merge(&base, &mine, &theirs);
+        let mut got: Vec<(u64, Vec<SessionId>)> = merged.tabs.iter().map(|t| (t.id, t.tree.leaves())).collect();
+        got.sort();
+        assert_eq!(got, [(2, vec![2]), (3, vec![1])]);
+    }
+
+    #[test]
+    fn a_session_twice_in_one_split_shows_once() {
+        let mut l = Layout::new(vec![tab(1, split(4, 4))], Vec::new());
+        l.prune(&[4].into());
+        assert_eq!(l.tabs[0].tree, Node::Leaf(4));
     }
 
     #[test]

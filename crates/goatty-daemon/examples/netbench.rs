@@ -376,8 +376,20 @@ fn bench_sync(endpoint: &Endpoint, tabs: usize) -> anyhow::Result<SyncMetrics> {
     let b = Connection::open(endpoint.clone(), "netbench-sync-b")?;
     let (heard_a, heard_b) = (Arc::new(Heard::default()), Arc::new(Heard::default()));
     let (ws, _) = a.create_workspace(1, Some("netbench-sync".into()), heard_a)?;
+    // Gone again however this ends (on ssh and tailnet hosts it would stay).
+    struct Cleanup<'a>(&'a Connection, goatty_proto::WorkspaceId, Option<SessionId>);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(s) = self.2 {
+                let _ = self.0.kill(s);
+            }
+            let _ = self.0.close_workspace(self.1);
+        }
+    }
+    let mut cleanup = Cleanup(&a, ws.id, None);
     b.join_workspace(2, Some(ws.id), heard_b.clone())?;
     let session = a.create(WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 }, None, Sink::new(TermSize::new(80, 24)))?;
+    cleanup.2 = Some(session);
     let layout = |round: usize| {
         let tabs: Vec<String> =
             (0..tabs).map(|t| format!(r#"{{"id":{},"name":"tab {t} round {round}","tree":{{"leaf":{session}}}}}"#, 1000 + t)).collect();
@@ -403,8 +415,7 @@ fn bench_sync(endpoint: &Endpoint, tabs: usize) -> anyhow::Result<SyncMetrics> {
             std::thread::sleep(Duration::from_micros(100));
         }
     }
-    let _ = a.kill(session);
-    let _ = a.close_workspace(ws.id);
+    drop(cleanup);
     save.sort();
     seen.sort();
     Ok(SyncMetrics { tabs, bytes, save, seen })
