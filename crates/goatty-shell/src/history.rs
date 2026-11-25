@@ -467,7 +467,8 @@ mod tests {
 
         let d = file_diff(&dirs, 3).unwrap();
         assert_eq!(d.len(), 1, "against 1, its base, not 2");
-        assert!(d[0].unified.contains("-a") && d[0].unified.contains("+b"), "{}", d[0].unified);
+        let (old_line, new_line) = if cfg!(windows) { ("-# a", "+# b") } else { ("-a", "+b") };
+        assert!(d[0].unified.contains(old_line) && d[0].unified.contains(new_line), "{}", d[0].unified);
         let expected_plugin = if cfg!(windows) { "plugins/demo/init.ps1" } else { "plugins/demo/init.zsh" };
         assert_eq!(file_diff(&dirs, 2).unwrap().iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), [expected_plugin]);
         assert_eq!(file_diff(&dirs, 1).unwrap().len(), 1, "everything is new in the first");

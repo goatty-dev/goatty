@@ -104,7 +104,7 @@ pub fn which(exe: &str, path_var: Option<&str>, managed_bin: &Path) -> Option<Pa
                 .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
                 .split(';')
                 .filter(|e| !e.is_empty())
-                .map(str::to_string)
+                .map(|e| e.to_ascii_lowercase())
                 .collect()
         };
         std::env::split_paths(path_var?).filter(|d| d != managed_bin).find_map(|d| {

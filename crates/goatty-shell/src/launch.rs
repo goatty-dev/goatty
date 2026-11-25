@@ -388,7 +388,7 @@ pub fn which(bin: &str) -> Option<String> {
                 .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
                 .split(';')
                 .filter(|e| !e.is_empty())
-                .map(str::to_owned)
+                .map(|e| e.to_ascii_lowercase())
                 .collect()
         };
         for dir in std::env::split_paths(&path) {
