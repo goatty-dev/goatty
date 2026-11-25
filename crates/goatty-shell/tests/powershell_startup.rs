@@ -240,10 +240,10 @@ fn native_embedded_quotes_and_snippets_survive_pwsh_and_ps51() {
     }
 
     // Embedded snippet placeholders must arrive as single complete arguments.
+    let ps_toml = shells[0].replace('\\', "\\\\").replace('\'', "''");
+    let dump_toml = dump_str.replace('\\', "\\\\").replace('\'', "''");
     let sn: goatty_plugin::snippets::Snippet = toml::from_str(&format!(
-        "id = \"emb\"\ntitle = \"Emb\"\nline = \"& '{}' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{}' --out={{dir}}/file.txt --tag=pre-{{x}}-post {{dir}}\"\n[[input]]\nid = \"dir\"\nlabel = \"Dir\"\ntype = \"folder\"\n[[input]]\nid = \"x\"\nlabel = \"X\"\n",
-        shells[0].replace('\'', "''"),
-        dump_str.replace('\'', "''"),
+        "id = \"emb\"\ntitle = \"Emb\"\nline = \"& '{ps_toml}' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{dump_toml}' --out={{dir}}/file.txt --tag=pre-{{x}}-post {{dir}}\"\n[[input]]\nid = \"dir\"\nlabel = \"Dir\"\ntype = \"folder\"\n[[input]]\nid = \"x\"\nlabel = \"X\"\n",
     ))
     .unwrap();
     let mut sn_vals = BTreeMap::new();
