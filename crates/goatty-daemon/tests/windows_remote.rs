@@ -50,6 +50,7 @@ impl Host {
              set \"GOATTY_SHELL=cmd.exe\"\r\n\
              set \"RUST_LOG=warn,rio_vt=error\"\r\n\
              set \"USERPROFILE={home}\"\r\n\
+             set \"HOME={home}\"\r\n\
              set \"LOCALAPPDATA={home}\\AppData\\Local\"\r\n\
              set \"APPDATA={home}\\AppData\\Roaming\"\r\n\
              set \"PATH=%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\"\r\n\

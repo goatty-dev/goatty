@@ -209,7 +209,9 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     upload: None,
                 };
             }
-            let warning = (!keeps_sessions(mismatch)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
+            let platform = probe.as_ref().map(|p| &p.platform);
+            let warning =
+                (!remote_keeps_sessions(mismatch, platform)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
             if probe.as_ref().is_some_and(Probe::runs_ours) {
                 return Ask {
                     title: format!("Restart goattyd on {host}?"),
@@ -249,6 +251,16 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
 
 /// An older daemon that a restart replaces with its sessions kept
 /// (protocol v10 on; `Control::connect_admin` still speaks to it).
+/// Whether restarting a remote host's goattyd keeps its sessions. That
+/// depends on the host, not this computer: Windows daemons can't hand their
+/// sessions to a new build. A host of unknown platform gets the warning.
+fn remote_keeps_sessions(mismatch: &goatty_client::VersionMismatch, platform: Option<&Platform>) -> bool {
+    !mismatch.daemon_is_newer
+        && platform.is_some_and(|p| !p.is_windows())
+        && mismatch.daemon_protocol.is_some_and(|v| v >= goatty_proto::RESTART_SINCE)
+}
+
+/// [`remote_keeps_sessions`] for this computer's own daemon.
 fn keeps_sessions(mismatch: &goatty_client::VersionMismatch) -> bool {
     !mismatch.daemon_is_newer && mismatch.daemon_protocol.is_some_and(local::can_keep_sessions)
 }
@@ -897,8 +909,15 @@ mod tests {
         assert_eq!(choices(&describe(&p, bundle(false))), [Choice::Cancel, Choice::Plain]);
         // A daemon from v10 on keeps its sessions over the restart: no warning.
         let v16 = VersionMismatch { daemon_protocol: Some(16), daemon_version: Some("0.3.0".into()), daemon_is_newer: false };
-        let p = RemoteProblem::Incompatible { host: "box".into(), mismatch: v16, probe: probe("/usr/bin/goattyd") };
+        let p = RemoteProblem::Incompatible { host: "box".into(), mismatch: v16.clone(), probe: probe("/usr/bin/goattyd") };
         assert!(describe(&p, bundle(false)).warning.is_none());
+        // Not on a Windows host, whatever this computer runs: its daemon can't hand sessions over.
+        let windows = Some(Probe {
+            platform: Platform { os: "Windows".into(), arch: String::new() },
+            daemon: Some(format!(r"C:\Users\u\{}\{}", remote::WINDOWS_BIN_DIR, remote::windows_binary_name())),
+        });
+        let p = RemoteProblem::Incompatible { host: "win".into(), mismatch: v16, probe: windows };
+        assert!(describe(&p, bundle(false)).warning.is_some());
     }
 
     #[test]

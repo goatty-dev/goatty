@@ -1354,7 +1354,8 @@ impl TerminalView {
     /// Fallback for right-click context menus when the user didn't hover first
     /// to warm `remote_stats` (or `StatPath` is still in flight).
     fn fallback_remote_menu_target(&self, link: &Link) -> Option<Target> {
-        if !self.session.is_remote() || link.kind != LinkKind::Path || links::is_windows_drive_path(&link.target) {
+        let windows_host = self.session.connection().is_some_and(|c| c.host().os == "windows");
+        if !self.session.is_remote() || link.kind != LinkKind::Path || (links::is_windows_drive_path(&link.target) && !windows_host) {
             return None;
         }
         let supports_remote = self.session.connection().is_some_and(|c| c.supports_remote_files());

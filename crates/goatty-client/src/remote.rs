@@ -456,9 +456,6 @@ pub(crate) fn diagnose(target: &SshTarget, err: anyhow::Error, stderr: &[String]
     if target.is_windows() {
         return diagnose_windows(target, err, stderr, exit, interactive);
     }
-    if let Some(mismatch) = err.downcast_ref::<VersionMismatch>() {
-        return RemoteProblem::Incompatible { host: host.into(), mismatch: mismatch.clone(), probe }.into();
-    }
     // sh is Git Bash's, or no sh at all: ask the Windows way. A host that
     // doesn't answer that either keeps the original error.
     let sure = probe.as_ref().is_some_and(|p| p.platform.is_windows());
@@ -475,6 +472,11 @@ pub(crate) fn diagnose(target: &SshTarget, err: anyhow::Error, stderr: &[String]
             Err(e) if sure => return with_stderr(err, stderr).context(format!("{e:#}")),
             Err(e) => log::debug!("{host} isn't a Windows host either: {e:#}"),
         }
+    }
+    // After the Windows check: an old goattyd found by Git Bash's sh must be
+    // replaced the Windows way.
+    if let Some(mismatch) = err.downcast_ref::<VersionMismatch>() {
+        return RemoteProblem::Incompatible { host: host.into(), mismatch: mismatch.clone(), probe }.into();
     }
     if let Some(Probe { platform, daemon: None }) = probe {
         return RemoteProblem::NotInstalled { host: host.into(), platform }.into();
