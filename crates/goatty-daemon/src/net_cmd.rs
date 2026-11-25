@@ -54,10 +54,11 @@ pub fn run(cmd: NetCmd, client: &str) -> Result<()> {
             Err(e) => {
                 let s = request(&mut c, &Request::Status)?;
                 if let RouteStatus::Permission(p) = &s.route {
-                    println!("Tailscale doesn't let goatty add its Serve route yet. Run once:");
-                    println!("    {}", p.operator);
-                    println!("then `goattyd net enable` again (needs sudo rights: Tailscale checks them before it serves a Unix socket).");
-                    println!("Or add the route yourself:");
+                    println!("Tailscale doesn't let goatty add its Serve route yet. {}", p.advice());
+                    if !p.operator.is_empty() {
+                        println!("    {}", p.operator);
+                        println!("Or add the route yourself:");
+                    }
                     println!("    {}", p.direct);
                     std::process::exit(1);
                 }

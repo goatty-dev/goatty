@@ -251,21 +251,19 @@ impl SettingsWindow {
                             toast::show(cx, Toast::success("Copied").key("settings.net.copy"));
                         }))
                 };
-                Some(
-                    card(ui)
-                        .p(px(16.))
-                        .gap(px(10.))
-                        .child(banner(
-                            ui,
-                            Tone::Warning,
-                            "Tailscale doesn't let goatty add its route yet",
-                            vec!["Run this once in a terminal (it needs sudo rights), then turn availability on again:".into()],
-                        ))
+                // The advice comes from the host: it may run another OS than this window.
+                let mut body = card(ui).p(px(16.)).gap(px(10.)).child(banner(
+                    ui,
+                    Tone::Warning,
+                    "Tailscale doesn't let goatty add its route yet",
+                    vec![p.advice().to_string()],
+                ));
+                if !p.operator.is_empty() {
+                    body = body
                         .child(copy("net-copy-operator", p.operator.clone()))
-                        .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("Or add the route yourself:"))
-                        .child(copy("net-copy-direct", p.direct.clone()))
-                        .into_any_element(),
-                )
+                        .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("Or add the route yourself:"));
+                }
+                Some(body.child(copy("net-copy-direct", p.direct.clone())).into_any_element())
             }
             RouteStatus::PortTaken { .. } | RouteStatus::Failed { .. } => {
                 Some(banner(ui, Tone::Danger, s.route.describe(s.port), Vec::new()).into_any_element())

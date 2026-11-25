@@ -129,7 +129,9 @@ impl Parser<'_> {
 
     /// The files an `Include` argument names, sorted like ssh's glob.
     fn include_paths(&self, pattern: &str) -> Vec<PathBuf> {
-        let path = if let Some(rest) = pattern.strip_prefix("~/") {
+        // Win32-OpenSSH also takes `~\`.
+        let home_relative = pattern.strip_prefix("~/").or_else(|| pattern.strip_prefix("~\\").filter(|_| cfg!(windows)));
+        let path = if let Some(rest) = home_relative {
             match self.ssh_dir.parent() {
                 Some(home) => home.join(rest),
                 None => return Vec::new(),
@@ -310,6 +312,19 @@ mod tests {
         // Includes come first (they're on the first line); the loop stops at the depth limit.
         assert_eq!(aliases, ["a", "b", "other", "main"]);
         assert!(load(&dir.path().join("missing"), &ssh).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn follows_windows_style_includes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(ssh.join("config.d")).unwrap();
+        std::fs::write(ssh.join("config"), "Include config.d\\*.conf ~\\other\n").unwrap();
+        std::fs::write(ssh.join("config.d").join("a.conf"), "Host a\n").unwrap();
+        std::fs::write(dir.path().join("other"), "Host other\n").unwrap();
+        let aliases: Vec<String> = load(&ssh.join("config"), &ssh).into_iter().map(|h| h.alias).collect();
+        assert_eq!(aliases, ["a", "other"]);
     }
 
     #[test]

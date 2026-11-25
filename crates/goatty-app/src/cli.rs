@@ -19,7 +19,8 @@ pub struct RemoteArgs {
     pub remote_daemon: Option<String>,
 
     /// Use goattyd behind any stdio command, e.g. 'docker exec -i box goattyd proxy'.
-    /// It runs under `sh -c`, so quote arguments as in a shell.
+    /// It runs under `sh -c`, so quote arguments as in a shell (on Windows it is split
+    /// into words and run directly, e.g. 'wsl.exe -d Ubuntu -- goattyd proxy').
     #[arg(long, value_name = "CMD", conflicts_with = "ssh")]
     pub via: Option<String>,
 }

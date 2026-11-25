@@ -21,6 +21,9 @@ use crate::{History, PaneEvent, PaneSink, handshake, remote};
 
 /// How long to wait for a failed transport command's last words on stderr.
 const STDERR_GRACE: Duration = Duration::from_secs(2);
+/// How long a transport command that failed the handshake gets to exit by
+/// itself, so its exit code is its own.
+const EXIT_GRACE: Duration = Duration::from_millis(300);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Plugin operations download releases and registries.
@@ -226,20 +229,25 @@ impl Shared {
     /// Open a transport and shake hands, announcing a lower version once if
     /// an old daemon asks for it.
     /// `interactive: false` for automatic reconnects (ssh must not prompt).
+    /// A host that turns out to run Windows is asked again, the Windows way
+    /// (`remote::RetryAsWindows`).
     fn connect(&self, interactive: bool) -> Result<(Reader, HostInfo, u32)> {
-        for _ in 0..2 {
+        for _ in 0..3 {
             if self.closed.load(Ordering::Acquire) {
                 bail!("connection closed");
             }
-            if let Some(ok) = self.handshake(self.endpoint.connect(interactive)?)? {
-                return Ok(ok);
+            match self.handshake(self.endpoint.connect(interactive)?, interactive) {
+                Ok(Some(ok)) => return Ok(ok),
+                Ok(None) => {}
+                Err(e) if e.downcast_ref::<remote::RetryAsWindows>().is_some() => log::info!("{e}"),
+                Err(e) => return Err(e),
             }
         }
         bail!("goattyd via {} keeps rejecting the handshake", self.endpoint.label())
     }
 
     /// `None`: try again with the (now lowered) announced version.
-    fn handshake(&self, mut t: Transport) -> Result<Option<(Reader, HostInfo, u32)>> {
+    fn handshake(&self, mut t: Transport, interactive: bool) -> Result<Option<(Reader, HostInfo, u32)>> {
         let announced = self.announce.load(Ordering::Relaxed);
         let stderr = t.stderr.clone();
         // A transport that never answers (hung ssh) is torn down by the caller
@@ -282,10 +290,15 @@ impl Shared {
                 Ok(None)
             }
             Err(e) => {
-                self.close_transport();
+                // Let the command exit on its own first: its exit code tells
+                // a Windows shell apart (`remote::diagnose`).
+                let closer = self.closer.lock().take();
+                if let Some(c) = closer {
+                    c.reap(EXIT_GRACE);
+                }
                 let lines = stderr.wait(STDERR_GRACE);
                 Err(match &self.endpoint {
-                    Endpoint::Ssh(target) => remote::diagnose(&target.host, e, &lines),
+                    Endpoint::Ssh(target) => remote::diagnose(target, e, &lines, stderr.exit(), interactive),
                     Endpoint::Local => crate::local::diagnose(e),
                     _ => remote::with_stderr(e, &lines),
                 })

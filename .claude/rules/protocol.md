@@ -25,12 +25,12 @@ paths:
 - Don't use `std::io::copy` between pipes and Unix sockets. On Linux it uses `splice()`, which stalled the proxy. Use plain read/write loops, and write binary data to stdout through the raw fd.
 - Remote hosts:
   - goattyd is the default and plain SSH the only fallback. Don't add a third mode.
-  - Change nothing on a host outside `~/.local/share/goatty`, and install only after the user agreed.
+  - Change nothing on a host outside `~/.local/share/goatty` (on a Windows host `AppData\Local\goatty` in the user's profile), and install only after the user agreed.
   - Never restart a daemon in a way that ends its sessions (`stop`, or a daemon older than protocol v10) without telling the user. A `Restart` keeps them.
 - The tailnet (`goatty-net`, `docs/tailnet.md`):
   - Use only Tailscale's public CLI, never the LocalAPI. Never install, log in to, or run Tailscale for the user, and never run sudo: show the command instead.
   - In the Serve config, add one route on one port and remove only routes that forward to goatty's gateway socket. Never overwrite another route, and never run `serve reset`.
-  - goattyd binds no network socket, not even loopback: tailscaled forwards into the gateway Unix socket. Every gateway connection passes the device-key handshake before the protocol.
+  - goattyd binds no network socket, not even loopback: tailscaled forwards into the gateway Unix socket. The one exception is Windows, where Serve can't forward into a socket or pipe: the gateway listens on `127.0.0.1` only (`tailscale::Target::Loopback`). Every gateway connection passes the device-key handshake before the protocol.
   - Tests use `crates/goatty-net/tests/fake-tailscale.sh`, never the real `tailscale`.
 - The e2e tests in `crates/goatty-daemon/tests/` each use their own `GOATTY_SOCKET` and a sandboxed `HOME`.
 - The restore state (`goatty-daemon/src/restore.rs`) is a format between two goattyd builds, like the wire. New fields get `#[serde(default)]`. A change that older builds can't read bumps `STATE_VERSION`, and a restart refuses to hand sessions to a build that reads an older format.

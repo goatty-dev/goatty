@@ -26,6 +26,7 @@
 mod codec;
 mod msg;
 mod paths;
+pub mod process;
 
 pub use codec::{Frame, MAX_FRAME, ZSTD_LEVEL, encode, encode_server, read_msg, write_msg};
 pub use msg::*;
