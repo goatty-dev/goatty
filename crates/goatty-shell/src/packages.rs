@@ -185,6 +185,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
+    use crate::builtins;
 
     #[test]
     fn locates_managed_and_system_windows_executables() {
