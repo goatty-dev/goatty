@@ -391,7 +391,8 @@ try {{
   $d=Join-Path (Get-Location).Path '{WINDOWS_BIN_DIR}'
   $n='{name}'
   $null=New-Item -ItemType Directory -Force -Path $d
-  $t=Join-Path $d ".$n.$PID.tmp"
+  # Ends in .exe: PowerShell runs nothing else as a program.
+  $t=Join-Path $d ".$PID.$n"
   try {{
     $i=[Console]::OpenStandardInput()
     $f=[IO.File]::Create($t)
