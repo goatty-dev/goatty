@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use goatty_client::{Connection, Endpoint, PaneEvent, PaneSink};
-use goatty_proto::{ClientMsg, FLOW_CONTROL_SINCE, PROTOCOL_VERSION, ServerMsg, SessionId, StreamOpts, WinSize, encode, read_msg};
+use goatty_proto::{ClientMsg, PROTOCOL_VERSION, ServerMsg, SessionId, StreamOpts, WinSize, encode, read_msg};
 use goatty_term::{Frame, Palette, TermSize, Terminal};
 use parking_lot::Mutex;
 
@@ -358,104 +358,6 @@ fn local_connection_keeps_fixed_local_window() {
         match c.read_msg() {
             ServerMsg::FlowWindow { window } => panic!("LOCAL subscription must not emit FlowWindow({window})"),
             ServerMsg::Pong { nonce: 77 } => break,
-            _ => {}
-        }
-    }
-}
-
-#[test]
-fn pre_v15_client_never_receives_flow_window_or_sub_256k_floor() {
-    let d = start_daemon();
-    let mut c = connect_version(&d.sock, FLOW_CONTROL_SINCE - 1);
-    // Even if a pre-v15 peer requests a smaller 128 KiB starting window, the
-    // daemon enforces at least `StreamOpts::REMOTE.window` (256 KiB) and never
-    // sends `FlowWindow` (including during Create).
-    let (id, mut consumed) = create_raw(&mut c, StreamOpts { window: 128 << 10, history: 0 }, false);
-    c.send(&ClientMsg::Ack { session: id, consumed });
-
-    // A 192 KiB unacked burst exceeds 128 KiB but stays below the 256 KiB
-    // legacy floor, so it must arrive losslessly without triggering `Resync`.
-    c.send(&ClientMsg::Input {
-        session: id,
-        data: b"dd if=/dev/zero bs=4096 count=48 2>/dev/null | tr '\\0' F; echo; echo FLOOR-$((40+2))\r".to_vec(),
-    });
-    let t = term();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !screen_text(&t).contains("FLOOR-42") {
-        assert!(Instant::now() < deadline, "timed out waiting for FLOOR-42");
-        let msg = c.read_msg();
-        consumed += msg.stream_len() as u64;
-        match msg {
-            ServerMsg::FlowWindow { .. } => panic!("daemon must not send FlowWindow to pre-v15 client"),
-            ServerMsg::Resync { .. } => panic!("192 KiB burst must stay lossless under pre-v15 256 KiB floor"),
-            ServerMsg::Output { data, .. } => {
-                t.feed(&data);
-            }
-            ServerMsg::Process { .. }
-            | ServerMsg::Cwd { .. }
-            | ServerMsg::TopLine { .. }
-            | ServerMsg::SizeControl { .. }
-            | ServerMsg::Pong { .. } => {}
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-    c.send(&ClientMsg::Ack { session: id, consumed });
-
-    // Now drive a slow 10 MB flood and verify `FlowWindow` is still never sent.
-    c.send(&ClientMsg::Input {
-        session: id,
-        data: b"dd if=/dev/zero bs=65536 count=160 2>/dev/null | tr '\\0' O; echo; echo OLD-$((40+2))\r".to_vec(),
-    });
-
-    let mut unacked = 0u64;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    c.set_read_timeout(Some(Duration::from_millis(100)));
-    while !screen_text(&t).contains("OLD-42") {
-        assert!(Instant::now() < deadline, "timed out waiting for OLD-42");
-        let Some(msg) = c.try_read_msg().unwrap() else {
-            if unacked > 0 {
-                std::thread::sleep(Duration::from_millis(80));
-                c.send(&ClientMsg::Ack { session: id, consumed });
-                unacked = 0;
-            }
-            continue;
-        };
-        let slen = msg.stream_len() as u64;
-        consumed += slen;
-        unacked += slen;
-        match msg {
-            ServerMsg::FlowWindow { .. } => panic!("daemon must not send FlowWindow to pre-v15 client"),
-            ServerMsg::Output { data, .. } => {
-                t.feed(&data);
-            }
-            ServerMsg::Resync { snapshot, .. } => {
-                t.feed(&snapshot);
-                c.send(&ClientMsg::Ack { session: id, consumed });
-                unacked = 0;
-            }
-            ServerMsg::Process { .. }
-            | ServerMsg::Cwd { .. }
-            | ServerMsg::TopLine { .. }
-            | ServerMsg::SizeControl { .. }
-            | ServerMsg::Pong { .. } => {}
-            other => panic!("unexpected {other:?}"),
-        }
-        if unacked >= 64 << 10 {
-            std::thread::sleep(Duration::from_millis(120));
-            c.send(&ClientMsg::Ack { session: id, consumed });
-            unacked = 0;
-        }
-    }
-
-    // Protocol barrier: send final Ack + Ping and wait for Pong so any pending
-    // notification produced by the flood is observed before the test exits.
-    c.set_read_timeout(Some(Duration::from_secs(5)));
-    c.send(&ClientMsg::Ack { session: id, consumed });
-    c.send(&ClientMsg::Ping { nonce: 99 });
-    loop {
-        match c.read_msg() {
-            ServerMsg::FlowWindow { .. } => panic!("daemon must not send FlowWindow to pre-v15 client"),
-            ServerMsg::Pong { nonce: 99 } => break,
             _ => {}
         }
     }

@@ -112,7 +112,7 @@ fn main() -> Result<()> {
     let endpoint = cli.endpoint()?;
     // Plain `goatty`: every window of the last run, with its tabs on every
     // host (#252). `--ssh`, `--new` and `--attach` ask for something else.
-    let mut reopen = if on_launch == OnLaunch::Reattach && mode == AttachMode::Auto && matches!(endpoint, Some(Endpoint::Local)) {
+    let mut reopen = if on_launch == OnLaunch::Reattach && mode == AttachMode::Join(None) && matches!(endpoint, Some(Endpoint::Local)) {
         workspace::reopen::take_for_launch()
     } else {
         if on_launch != OnLaunch::Reattach {
@@ -148,7 +148,7 @@ fn main() -> Result<()> {
                 _ => false,
             };
             log::info!("backend: goattyd via {}", endpoint.label());
-            Initial::Connect(ConnectPlan { endpoint, mode, open_settings: None, plain, conn: None })
+            Initial::Connect(ConnectPlan { endpoint, mode, open_settings: None, plain, conn: None, join: None, active_tab: None })
         }
     };
     app::run(initial, Vec::new(), open_settings);

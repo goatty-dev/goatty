@@ -35,7 +35,7 @@ pub mod ssh_config;
 pub mod tailnet;
 pub mod transport;
 
-pub use connection::{AttachRequest, Connection, HostSettingsApplied, HostSettingsReply, ReplyLost};
+pub use connection::{AttachRequest, Connection, HostSettingsApplied, HostSettingsReply, ReplyLost, WorkspaceEvent, WorkspaceSink};
 pub use control::Control;
 pub use goatty_proto::{RemotePathInfo, TopLineCause};
 

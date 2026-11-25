@@ -290,7 +290,10 @@ pub fn can_keep_sessions(protocol: u32) -> bool {
 pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     let primary = goatty_proto::socket_path();
     let mut sock = primary.clone();
-    let mut control = match Control::connect(&primary, "goatty-restart") {
+    // Any daemon a restart keeps the sessions of, also one older than this
+    // build speaks (`ADMIN_MIN_PROTOCOL_VERSION`): the new one takes them over.
+    let admin = |p: &Path| Control::connect_admin(p, "goatty-restart", None);
+    let mut control = match admin(&primary) {
         Ok(c) => c,
         Err(e) => {
             if UnixStream::connect(&primary).is_err()
@@ -298,7 +301,7 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
                 && UnixStream::connect(&legacy).is_ok()
             {
                 sock = legacy;
-                match Control::connect(&sock, "goatty-restart") {
+                match admin(&sock) {
                     Ok(c) => c,
                     Err(le) => {
                         if UnixStream::connect(&sock).is_err() {
@@ -438,7 +441,7 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
             }
         }
     }
-    let connect_and_shutdown = |p: &Path| Control::connect(p, "goatty-stop").and_then(|mut c| c.shutdown().map(|()| c.pid()));
+    let connect_and_shutdown = |p: &Path| Control::connect_admin(p, "goatty-stop", None).and_then(|mut c| c.shutdown().map(|()| c.pid()));
     let err = match connect_and_shutdown(&path) {
         Ok(pid) => {
             if !wait_gone(pid, Duration::from_secs(5)) {

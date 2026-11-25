@@ -6,7 +6,7 @@
 //!   of buffering without bound,
 //! * the remote path (`goattyd proxy` over stdio, exactly what ssh runs)
 //!   works, including transparent reconnect + reattach,
-//! * a window's saved layout goes to exactly one later window,
+//! * windows share a workspace and hear each other's saves (#215),
 //! * a client fills its scrollback from the daemon on demand (compressed
 //!   over the remote path).
 
@@ -542,87 +542,134 @@ fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// v17 raised the oldest protocol (#215): an older client hears the
+/// daemon's newest version, so it can say which side to update, and the
+/// connection closes.
 #[test]
-fn window_layouts_go_to_one_later_window() {
+fn clients_older_than_workspaces_are_refused() {
     let d = start_daemon();
-    let a = Connection::open(proxy_endpoint(&d), "window a").unwrap();
-    let sink = Arc::new(TestSink::default());
-    let (s1, s2, s3) = (
-        a.create(SIZE, None, sink.clone()).unwrap(),
-        a.create(SIZE, None, Arc::new(TestSink::default())).unwrap(),
-        a.create(SIZE, None, Arc::new(TestSink::default())).unwrap(),
-    );
-    a.save_layout(7, vec![s1, s2, s3], "{\"tabs\":3}".into());
-    // Window A still holds it, also across a reconnect (saved again).
-    let b = Connection::open(proxy_endpoint(&d), "window b").unwrap();
-    assert_eq!(b.claim_layout().unwrap(), None);
-    a.force_disconnect();
-    eventually("window a reconnects", || sink.events.lock().iter().any(|e| e == "Reconnected"));
-    // The layout is saved right after the reattach requests.
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(b.claim_layout().unwrap(), None, "the reconnected window saved its layout again");
-
-    // One session ends, then window A closes: the layout is free.
-    a.kill(s2).unwrap();
-    eventually("session ends", || !Control::connect(&d.sock, "t").unwrap().list_sessions().unwrap().iter().any(|s| s.id == s2));
-    drop(a);
-    let mut got = None;
-    eventually("window b gets the layout", || {
-        got = b.claim_layout().unwrap();
-        got.is_some()
-    });
-    let got = got.unwrap();
-    assert_eq!((got.id, got.json.as_str(), got.sessions), (7, "{\"tabs\":3}", vec![s1, s3]));
-    // A third window doesn't get it too.
-    let c = Connection::open(proxy_endpoint(&d), "window c").unwrap();
-    assert_eq!(c.claim_layout().unwrap(), None);
-
-    // Saving without sessions forgets it.
-    b.save_layout(7, Vec::new(), String::new());
-    // Requests are handled in order: once this is answered, the save was too.
-    assert_eq!(b.claim_layout().unwrap(), None);
-    drop(b);
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(c.claim_layout().unwrap(), None);
+    let mut s = UnixStream::connect(&d.sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send(&mut s, &ClientMsg::Hello { version: goatty_proto::MIN_PROTOCOL_VERSION - 1, client: "old".into() });
+    assert!(matches!(read_msg::<_, ServerMsg>(&mut s).unwrap(), ServerMsg::Hello { version: PROTOCOL_VERSION, .. }));
+    // Closed: end of file, not a timeout.
+    assert_eq!(s.read(&mut [0u8; 1]).unwrap(), 0, "closed");
 }
 
-/// #252: a window with tabs on several hosts saves one layout per host;
-/// the next goatty lists the free ones and takes back exactly its own.
+/// What a window hears about its workspace.
+#[derive(Default)]
+struct Heard(Mutex<Vec<goatty_client::WorkspaceEvent>>);
+
+impl goatty_client::WorkspaceSink for Heard {
+    fn workspace(&self, _conn: usize, event: goatty_client::WorkspaceEvent) {
+        self.0.lock().push(event);
+    }
+}
+
+impl Heard {
+    fn changed(&self) -> Vec<(u64, String)> {
+        self.0
+            .lock()
+            .iter()
+            .filter_map(|e| match e {
+                goatty_client::WorkspaceEvent::Changed(l) => Some((l.revision, l.json.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// #215: two windows (two connections, as two computers would) join the
+/// same workspace, see each other's saves live, and a stale save gets the
+/// newest layout to rebase on.
 #[test]
-fn free_layouts_are_listed_and_claimed_by_id() {
+fn windows_share_a_workspace_and_hear_each_others_saves() {
+    use goatty_proto::SaveOutcome;
     let d = start_daemon();
     let a = Connection::open(proxy_endpoint(&d), "window a").unwrap();
     let b = Connection::open(proxy_endpoint(&d), "window b").unwrap();
-    let s1 = a.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
-    let s2 = b.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
-    a.save_layout(1, vec![s1], "a".into());
-    // Requests are handled in order: once this is answered, a's save was too.
-    a.list_layouts().unwrap();
-    b.save_layout(2, vec![s2], "b".into());
-    b.list_layouts().unwrap();
-    let c = Connection::open(proxy_endpoint(&d), "next goatty").unwrap();
-    assert!(c.supports_layout_list());
-    assert_eq!(c.list_layouts().unwrap(), [], "both are held");
-    drop(a);
-    drop(b);
-    eventually("both layouts are free", || c.list_layouts().unwrap().len() == 2);
-    // Newest first; listing claims nothing.
-    assert_eq!(c.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [2, 1]);
-    let got = c.claim_layout_id(1).unwrap().unwrap();
-    assert_eq!((got.id, got.json.as_str(), got.sessions), (1, "a", vec![s1]));
-    assert_eq!(c.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [2]);
-    assert_eq!(c.claim_layout_id(1).unwrap(), None, "held now");
-    assert_eq!(c.claim_layout_id(99).unwrap(), None);
-    assert_eq!(c.claim_layout().unwrap().map(|l| l.id), Some(2));
+    let (ha, hb) = (Arc::new(Heard::default()), Arc::new(Heard::default()));
+    let (main, layout) = a.join_workspace(1, None, ha.clone()).unwrap();
+    assert_eq!((main.name.as_str(), layout.revision, layout.json.as_str()), ("Main", 0, ""));
+    let (also, _) = b.join_workspace(2, None, hb.clone()).unwrap();
+    assert_eq!((also.id, also.views), (main.id, 2), "a second window joins the same workspace");
 
-    // Tabs detached in one goatty are free for another right away (v16
-    // `ReleaseLayout`), while the first stays connected.
-    let s3 = c.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
-    c.save_layout(3, vec![s3], "detached".into());
-    c.detach_layout(3, vec![s3], "detached".into());
-    let other = Connection::open(proxy_endpoint(&d), "another goatty").unwrap();
-    eventually("the detached layout is listed elsewhere", || other.list_layouts().unwrap().iter().any(|l| l.id == 3));
-    assert_eq!(other.claim_layout_id(3).unwrap().map(|l| l.sessions), Some(vec![s3]));
+    let pane = Arc::new(TestSink::default());
+    let s1 = a.create(SIZE, None, pane.clone()).unwrap();
+    assert_eq!(a.save_workspace(1, main.id, 0, 1, vec![s1], "a1".into()).unwrap(), SaveOutcome::Saved { revision: 1 });
+    eventually("window b hears window a's save", || hb.changed() == [(1, "a1".to_string())]);
+    assert!(ha.changed().is_empty(), "the saving window doesn't hear its own save");
+
+    // Window b saves on the old revision: a conflict with the newest layout.
+    let s2 = b.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    match b.save_workspace(2, main.id, 0, 1, vec![s2], "b1".into()).unwrap() {
+        SaveOutcome::Conflict(l) => assert_eq!((l.revision, l.json.as_str(), l.sessions), (1, "a1", vec![s1])),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(b.save_workspace(2, main.id, 1, 2, vec![s1, s2], "a1+b1".into()).unwrap(), SaveOutcome::Saved { revision: 2 });
+    eventually("window a hears it", || ha.changed() == [(2, "a1+b1".to_string())]);
+
+    // A reconnect joins the same workspace again.
+    a.force_disconnect();
+    eventually("window a rejoins", || {
+        ha.0.lock()
+            .iter()
+            .any(|e| matches!(e, goatty_client::WorkspaceEvent::Rejoined { info, layout } if info.id == main.id && layout.revision == 2))
+    });
+
+    // A second workspace: listed, renamed, the others hear it.
+    let (ops, empty) = b.create_workspace(2, None, hb.clone()).unwrap();
+    assert_eq!((ops.name.as_str(), empty.revision), ("Workspace 2", 0));
+    b.rename_workspace(ops.id, "ops".into()).unwrap();
+    eventually("window a hears the new name", || {
+        ha.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List { list, .. } if list.iter().any(|w| w.name == "ops")))
+    });
+    let list = a.list_workspaces().unwrap();
+    assert_eq!(list.iter().map(|w| (w.name.as_str(), w.views)).collect::<Vec<_>>(), [("Main", 1), ("ops", 1)]);
+
+    // Ended sessions drop out of the listed layout.
+    a.kill(s1).unwrap();
+    eventually("its session is pruned", || a.get_workspace(main.id).unwrap().unwrap().sessions == [s2]);
+
+    // A workspace ends with its last tab (not the host's only one) ...
+    let s3 = b.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    assert_eq!(b.save_workspace(2, ops.id, 0, 1, vec![s3], "ops".into()).unwrap(), SaveOutcome::Saved { revision: 1 });
+    assert_eq!(b.save_workspace(2, ops.id, 1, 0, Vec::new(), String::new()).unwrap(), SaveOutcome::Saved { revision: 2 });
+    assert_eq!(a.list_workspaces().unwrap().len(), 1);
+    assert_eq!(b.save_workspace(2, ops.id, 2, 0, Vec::new(), String::new()).unwrap(), SaveOutcome::Gone);
+    // ... and the only one can't be closed.
+    assert!(a.close_workspace(main.id).is_err());
+    assert_eq!(b.list_workspaces().unwrap().iter().map(|w| w.id).collect::<Vec<_>>(), [main.id]);
+}
+
+/// #215: a workspace nobody shows ends when its last session does, and a
+/// closed one keeps its sessions running.
+#[test]
+fn workspaces_end_with_their_sessions_and_closing_keeps_them() {
+    let d = start_daemon();
+    let a = Connection::open(proxy_endpoint(&d), "window a").unwrap();
+    let heard = Arc::new(Heard::default());
+    let (main, _) = a.join_workspace(1, None, heard.clone()).unwrap();
+    let s0 = a.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    a.save_workspace(1, main.id, 0, 1, vec![s0], "main".into()).unwrap();
+    let (ops, _) = a.create_workspace(1, Some("ops".into()), heard.clone()).unwrap();
+    let s1 = a.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    a.save_workspace(1, ops.id, 0, 1, vec![s1], "ops".into()).unwrap();
+    let (logs, _) = a.create_workspace(1, Some("logs".into()), heard.clone()).unwrap();
+    let s2 = a.create(SIZE, None, Arc::new(TestSink::default())).unwrap();
+    a.save_workspace(1, logs.id, 0, 1, vec![s2], "logs".into()).unwrap();
+    // The window shows "logs" now; "ops" ends with its shell.
+    a.kill(s1).unwrap();
+    eventually("ops ends", || {
+        heard.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List { list, .. } if !list.iter().any(|w| w.id == ops.id)))
+    });
+    // Closing "logs" forgets it, but its shell keeps running.
+    a.leave_workspace(1);
+    a.close_workspace(logs.id).unwrap();
+    assert!(a.list_sessions().unwrap().iter().any(|s| s.id == s2));
+    assert_eq!(a.list_workspaces().unwrap().iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["Main"]);
+    let mut c = Control::connect(&d.sock, "t").unwrap();
+    assert_eq!(c.list_workspaces().unwrap().len(), 1);
 }
 
 #[test]
@@ -678,22 +725,15 @@ fn attach_many_restores_multiple_panes_over_proxy() {
         let marker = format!("PANE-{i}-READY-2");
         eventually(&format!("pane {i} ready"), || sink.screen().contains(&marker));
     }
-    a.save_layout(42, ids.clone(), r#"{"version":1,"tabs":[],"active":0}"#.into());
-    // `save_layout` is asynchronous: round-trip once so it reaches goattyd
-    // before `drop(a)` closes the proxy.
-    a.list_sessions().unwrap();
+    let (main, _) = a.join_workspace(1, None, Arc::new(Heard::default())).unwrap();
+    a.save_workspace(1, main.id, 0, 8, ids.clone(), r#"{"version":2,"tabs":[]}"#.into()).unwrap();
     drop(a);
 
-    // A fresh window over the remote proxy path claims the layout and attaches
-    // all 8 live sessions (plus a missing id) in one pipelined batch.
+    // A fresh window over the remote proxy path joins the workspace and
+    // attaches all 8 live sessions (plus a missing id) in one pipelined batch.
     let b = Connection::open(proxy_endpoint(&d), "window b").unwrap();
-    let mut claimed = None;
-    eventually("window b claims layout", || {
-        claimed = b.claim_layout().unwrap();
-        claimed.is_some()
-    });
-    let claimed = claimed.unwrap();
-    assert_eq!(claimed.sessions, ids);
+    let (_, joined) = b.join_workspace(2, None, Arc::new(Heard::default())).unwrap();
+    assert_eq!(joined.sessions, ids);
 
     let mut restored_sinks = Vec::new();
     let mut requests = Vec::new();

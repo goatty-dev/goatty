@@ -479,7 +479,28 @@ pub fn builtins() -> Vec<Command> {
             "sessions",
             "background",
         ]),
-        Command::action("window.new", "Window", "New window", "new_window").keywords(&["open", "another window"]),
+        Command::action("window.new", "Window", "New window", "new_window").keywords(&["open", "another window", "same workspace"]),
+        Command::action("workspace.switch", "Workspace", "Switch workspace…", "switch_workspace").keywords(&[
+            "workspaces",
+            "session",
+            "tmux",
+            "context",
+            "project",
+            "list",
+        ]),
+        Command::action("workspace.new", "Workspace", "New workspace", "new_workspace")
+            .keywords(&["create", "add", "session", "tmux", "context", "project"]),
+        Command::action("workspace.next", "Workspace", "Next workspace", "next_workspace").keywords(&["switch", "cycle"]),
+        Command::action("workspace.previous", "Workspace", "Previous workspace", "previous_workspace").keywords(&["switch", "back"]),
+        Command::action("workspace.rename", "Workspace", "Rename the workspace", "rename_workspace").keywords(&["name", "title", "label"]),
+        Command::action("workspace.close", "Workspace", "Close the workspace", "close_workspace").keywords(&[
+            "delete",
+            "remove",
+            "end",
+            "kill",
+            "merge",
+            "move tabs",
+        ]),
         Command::handler("tab.detach_host_pick", "Tabs", "Detach from a host…", |window, cx| {
             window.defer(cx, |window, cx| {
                 if let Some(Some(ws)) = window.root::<crate::workspace::Workspace>() {

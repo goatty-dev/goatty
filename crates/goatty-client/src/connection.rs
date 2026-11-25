@@ -1,6 +1,6 @@
 //! [`Connection`]: a reconnecting, multiplexed link to one goattyd.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
-    ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, LAYOUT_LIST_SINCE, LayoutId, LayoutInfo,
-    NET_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, ServerMsg,
-    SessionId, SessionInfo, StreamOpts, WinSize, encode, read_msg,
+    ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, NET_SINCE, PROTOCOL_VERSION,
+    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, SaveOutcome, ServerMsg, SessionId, SessionInfo,
+    StreamOpts, ViewId, WinSize, WorkspaceId, WorkspaceInfo, WorkspaceLayout, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -108,44 +108,50 @@ enum Pending {
     Reattach(SessionId),
     /// `fetch_history`: the answer goes to the pane's sink.
     History(SessionId),
+    /// `JoinWorkspace` / `CreateWorkspace`: the view is registered when the
+    /// reply is read, so no `LayoutChanged` after it is missed; unless the
+    /// window left meanwhile (`left` moved past `left_gen`).
+    Join {
+        tx: flume::Sender<ServerMsg>,
+        view: ViewId,
+        sink: Arc<dyn WorkspaceSink>,
+        left_gen: u64,
+    },
+    /// A view joining its workspace again after a reconnect.
+    Rejoin {
+        view: ViewId,
+        left_gen: u64,
+    },
+}
+
+/// What a connection tells a window about the workspace it shows there
+/// (`WorkspaceSink`).
+#[derive(Debug, Clone)]
+pub enum WorkspaceEvent {
+    /// Another window saved the workspace this one shows.
+    Changed(WorkspaceLayout),
+    /// The host's workspaces changed (made, renamed, closed, ended, or
+    /// shown by another window). `seq`: larger is newer (events and list
+    /// replies can arrive in either order).
+    List { seq: u64, list: Vec<WorkspaceInfo> },
+    /// The link came back and the window joined again: the workspace it
+    /// showed, or the most recently active one when that's gone.
+    Rejoined { info: WorkspaceInfo, layout: WorkspaceLayout },
+}
+
+/// Where a window hears about its workspaces. Called on the connection's
+/// reader thread: queue it, don't block. `conn` is [`Connection::key`].
+pub trait WorkspaceSink: Send + Sync {
+    fn workspace(&self, conn: usize, event: WorkspaceEvent);
+}
+
+/// A window showing a workspace on this connection.
+struct View {
+    workspace: WorkspaceId,
+    sink: Arc<dyn WorkspaceSink>,
 }
 
 type Reader = std::io::BufReader<Box<dyn Read + Send>>;
-
-/// Layouts claimed on the current live link and any returned by a failed
-/// restore or detached workspace so a retry on the same pooled connection can
-/// reclaim them.
-#[derive(Default)]
-struct ClaimedLayouts {
-    gens: HashMap<LayoutId, u64>,
-    unclaimed: VecDeque<(u64, LayoutInfo)>,
-}
-
-impl ClaimedLayouts {
-    fn clear(&mut self) {
-        self.gens.clear();
-        self.unclaimed.clear();
-    }
-}
-
-/// A saved layout remembered on the connection for reconnect recovery.
-struct SavedLayoutState {
-    id: LayoutId,
-    sessions: Vec<SessionId>,
-    json: String,
-    /// `Some(link_gen)` when this exact `SaveLayout` was already queued on
-    /// `link_gen`; `None` when saved while offline and still waiting to be
-    /// sent on the next reconnect.
-    sent_gen: Option<u64>,
-    /// True once the workspace detached this layout: an unsent offline save is
-    /// still sent on reconnect and then moved into `claimed_layouts.unclaimed`
-    /// instead of remaining owned by the connection.
-    detached: bool,
-    /// v16: the `ReleaseLayout` went out on `sent_gen` before request id
-    /// `.0`: a reply to that request or a later one proves the daemon has it,
-    /// and the record goes. Until then a reconnect sends it again.
-    released_before: Option<ReqId>,
-}
 
 struct Shared {
     endpoint: Endpoint,
@@ -160,12 +166,12 @@ struct Shared {
     /// Number of in-flight `ClientMsg::Attach` requests per `(link_gen, session)`,
     /// used to serialize `detach_sink` against replacement attaches on a pooled link.
     attaching: Mutex<HashMap<(u64, SessionId), usize>>,
-    /// Each window's last saved layout on this (pooled) connection, saved
-    /// again after a reconnect (the daemon frees a layout when its
-    /// connection drops). A forget (no sessions) made offline stays until
-    /// it was sent.
-    layout: Mutex<HashMap<LayoutId, SavedLayoutState>>,
-    claimed_layouts: Mutex<ClaimedLayouts>,
+    /// The windows that show a workspace on this (pooled) connection: they
+    /// join it again after a reconnect and hear its changes.
+    views: Mutex<HashMap<ViewId, View>>,
+    /// How often each window left ([`Connection::leave_workspace`]): a join
+    /// answered after its window left doesn't register it.
+    left: Mutex<HashMap<ViewId, u64>>,
     pending: Mutex<HashMap<ReqId, Pending>>,
     /// `SizeControl` that came before the `Attached` of a session we don't
     /// have a pane for yet (v14 sends it first); delivered before its snapshot.
@@ -180,7 +186,7 @@ struct Shared {
     /// The daemon's pid on the current link.
     daemon_pid: AtomicU32,
     /// Incremented on every disconnect so state bound to one daemon connection
-    /// (such as layout claims) cannot bleed across a reconnect.
+    /// (such as in-flight attaches) cannot bleed across a reconnect.
     link_gen: AtomicU64,
     connected: AtomicBool,
     closed: AtomicBool,
@@ -318,8 +324,8 @@ impl Connection {
             out,
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
-            layout: Mutex::new(HashMap::new()),
-            claimed_layouts: Mutex::new(ClaimedLayouts::default()),
+            views: Mutex::new(HashMap::new()),
+            left: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -459,14 +465,6 @@ impl Connection {
         self.shared.send(&msg(req));
         let reply = rx.recv_timeout(timeout);
         self.shared.pending.lock().remove(&req);
-        if reply.is_ok() {
-            // The daemon handles a connection's messages in order: any
-            // release sent before this request has arrived.
-            self.shared
-                .layout
-                .lock()
-                .retain(|_, s| !(s.sent_gen == Some(link_gen) && s.released_before.is_some_and(|before| before <= req)));
-        }
         match reply {
             Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
             Ok(m) => Ok((link_gen, m)),
@@ -898,204 +896,224 @@ impl Connection {
         }
     }
 
-    /// Remember the window's layout (tabs and splits; `json` is the
-    /// client's format) on the host, so a later window can restore it. No
-    /// `sessions`: forget it. Never blocks; saved again after a reconnect.
-    pub fn save_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
-        let mut layout = self.shared.layout.lock();
-        {
-            let mut claimed = self.shared.claimed_layouts.lock();
-            claimed.gens.remove(&id);
-            claimed.unclaimed.retain(|(_, info)| info.id != id);
-        }
-        let connected = self.is_connected();
-        let sent_gen = connected.then(|| self.shared.link_gen.load(Ordering::Acquire));
-        if connected {
-            self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
-        }
-        if sessions.is_empty() && connected {
-            // Forgotten on the daemon; nothing to replay.
-            layout.remove(&id);
-        } else {
-            layout.insert(id, SavedLayoutState { id, sessions, json, sent_gen, detached: false, released_before: None });
-        }
+    /// This connection's identity, as [`WorkspaceSink`]s hear it.
+    pub fn key(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
-    /// Take over the newest layout no window holds (see
-    /// `ClientMsg::ClaimLayout`). Blocks: call off the UI thread.
-    pub fn claim_layout(&self) -> Result<Option<LayoutInfo>> {
-        {
-            let mut layout = self.shared.layout.lock();
-            let mut claimed = self.shared.claimed_layouts.lock();
-            let cur = self.shared.link_gen.load(Ordering::Acquire);
-            while let Some((g, info)) = claimed.unclaimed.pop_front() {
-                if g == cur && self.is_connected() {
-                    claimed.gens.insert(info.id, cur);
-                    if layout.get(&info.id).is_some_and(|s| s.detached) {
-                        layout.remove(&info.id);
-                    }
-                    return Ok(Some(info));
-                }
-            }
-        }
-        let (link_gen, reply) = self.request_with_gen(REQUEST_TIMEOUT, Pending::Reply, |req| ClientMsg::ClaimLayout { req })?;
-        self.claimed_reply(link_gen, reply)
+    /// The host's workspaces, in the order they were made. From then on,
+    /// this connection hears when they change (`WorkspaceEvent::List`, to
+    /// the windows that show one).
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>> {
+        self.list_workspaces_seq().map(|(_, list)| list)
     }
 
-    /// Note a `Layout` reply's claim on link `link_gen`.
-    fn claimed_reply(&self, link_gen: u64, reply: ServerMsg) -> Result<Option<LayoutInfo>> {
-        match reply {
-            ServerMsg::Layout { layout, .. } => {
-                if let Some(info) = &layout {
-                    let mut saved = self.shared.layout.lock();
-                    let mut claimed = self.shared.claimed_layouts.lock();
-                    if self.shared.link_gen.load(Ordering::Acquire) == link_gen && self.is_connected() {
-                        claimed.gens.insert(info.id, link_gen);
-                        if saved.get(&info.id).is_some_and(|s| s.detached) {
-                            saved.remove(&info.id);
-                        }
-                    }
-                }
-                Ok(layout)
-            }
+    /// [`Self::list_workspaces`] with the list's version (`WorkspaceEvent::List`).
+    pub fn list_workspaces_seq(&self) -> Result<(u64, Vec<WorkspaceInfo>)> {
+        match self.request(Pending::Reply, |req| ClientMsg::ListWorkspaces { req })? {
+            ServerMsg::Workspaces { seq, list, .. } => Ok((seq, list)),
             other => bail!("unexpected reply {other:?}"),
         }
     }
 
-    /// Whether a pane on this connection shows `session` (attaching it
-    /// again would take that pane's place).
-    pub fn shows(&self, session: SessionId) -> bool {
-        self.shared.panes.lock().contains_key(&session)
+    /// Current membership generation for `view`, bumped by every explicit
+    /// `join_workspace`, `create_workspace`, and `leave_workspace`.
+    pub fn view_gen(&self, view: ViewId) -> u64 {
+        self.shared.left.lock().get(&view).copied().unwrap_or(0)
     }
 
-    /// Whether the daemon lists free layouts and claims them by id (v16).
-    pub fn supports_layout_list(&self) -> bool {
-        self.protocol_version() >= LAYOUT_LIST_SINCE
-    }
-
-    /// Take over layout `id` (see `ClientMsg::ClaimLayoutId`): one this
-    /// connection detached, else the daemon's when it's free. `None` when
-    /// it's gone or another window holds it. A daemon older than v16 can't
-    /// claim by id: this takes the newest free layout when that's `id` (so
-    /// a single window still comes back), and never another window's.
-    /// Blocks: call off the UI thread.
-    pub fn claim_layout_id(&self, id: LayoutId) -> Result<Option<LayoutInfo>> {
-        {
-            let mut layout = self.shared.layout.lock();
-            let mut claimed = self.shared.claimed_layouts.lock();
-            let cur = self.shared.link_gen.load(Ordering::Acquire);
-            claimed.unclaimed.retain(|(g, _)| *g == cur);
-            if self.is_connected()
-                && let Some(pos) = claimed.unclaimed.iter().position(|(_, info)| info.id == id)
-                && let Some((_, info)) = claimed.unclaimed.remove(pos)
-            {
-                claimed.gens.insert(info.id, cur);
-                if layout.get(&info.id).is_some_and(|s| s.detached) {
-                    layout.remove(&info.id);
-                }
-                return Ok(Some(info));
+    fn request_join_at(
+        &self,
+        view: ViewId,
+        sink: Arc<dyn WorkspaceSink>,
+        expected_gen: Option<u64>,
+        msg: impl FnOnce(ReqId) -> ClientMsg,
+    ) -> (u64, Result<Option<(WorkspaceInfo, WorkspaceLayout)>>) {
+        let req = self.shared.req_id();
+        let (tx, rx) = flume::bounded(1);
+        let left_gen = {
+            // Hold `left` across the generation check/bump, pending registration,
+            // and frame enqueue so explicit joins, leaves, and reconnect replays
+            // are strictly ordered on both `left` and the wire.
+            // Lock order: `left` > `views` > `pending`.
+            let mut left = self.shared.left.lock();
+            let current = left.get(&view).copied().unwrap_or(0);
+            if expected_gen.is_some_and(|g| current != g) {
+                return (current, Ok(None));
             }
-        }
-        if !self.supports_layout_list() {
-            return Ok(match self.claim_layout()? {
-                Some(info) if info.id == id => Some(info),
-                Some(other) => {
-                    self.release_claimed_layout(other);
-                    None
+            let left_gen = {
+                let mut map = self.shared.pending.lock();
+                if !self.is_connected() {
+                    return (current, Err(anyhow!("not connected to goattyd")));
                 }
-                None => None,
-            });
-        }
-        let (link_gen, reply) = self.request_with_gen(REQUEST_TIMEOUT, Pending::Reply, |req| ClientMsg::ClaimLayoutId { req, id })?;
-        self.claimed_reply(link_gen, reply)
+                let entry = left.entry(view).or_insert(0);
+                *entry += 1;
+                let left_gen = *entry;
+                map.insert(req, Pending::Join { tx, view, sink, left_gen });
+                left_gen
+            };
+            self.shared.send(&msg(req));
+            left_gen
+        };
+        let reply = rx.recv_timeout(REQUEST_TIMEOUT);
+        self.shared.pending.lock().remove(&req);
+        let result = match reply {
+            Ok(ServerMsg::Error { message, .. }) => Err(anyhow!("goattyd: {message}")),
+            Ok(ServerMsg::Joined { info, layout, .. }) => Ok(Some((info, layout))),
+            Ok(other) => Err(anyhow!("unexpected reply {other:?}")),
+            Err(_) => Err(ReplyLost.into()),
+        };
+        (left_gen, result)
     }
 
-    /// The layouts a window could restore here, newest first: the ones this
-    /// connection detached (`detach_layout`), then the daemon's free ones
-    /// (v16; older daemons list none). Claims nothing. Blocks: call off the
-    /// UI thread.
-    pub fn list_layouts(&self) -> Result<Vec<LayoutInfo>> {
-        let mut list: Vec<LayoutInfo> = {
-            let claimed = self.shared.claimed_layouts.lock();
-            let cur = self.shared.link_gen.load(Ordering::Acquire);
-            claimed.unclaimed.iter().filter(|(g, _)| *g == cur).map(|(_, info)| info.clone()).collect()
-        };
-        if self.supports_layout_list() {
-            match self.request(Pending::Reply, |req| ClientMsg::ListLayouts { req })? {
-                ServerMsg::Layouts { layouts, .. } => {
-                    for l in layouts {
-                        if !list.iter().any(|x| x.id == l.id) {
-                            list.push(l);
-                        }
+    fn request_join(
+        &self,
+        view: ViewId,
+        sink: Arc<dyn WorkspaceSink>,
+        msg: impl FnOnce(ReqId) -> ClientMsg,
+    ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
+        self.request_join_at(view, sink, None, msg).1.map(|pair| pair.expect("unconditional join yields a reply"))
+    }
+
+    /// Window `view` shows workspace `id` on this host from now on (`None`
+    /// or gone: the most recently active one); `sink` hears about it, and
+    /// the window joins it again after a reconnect. Blocks.
+    pub fn join_workspace(
+        &self,
+        view: ViewId,
+        id: Option<WorkspaceId>,
+        sink: Arc<dyn WorkspaceSink>,
+    ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
+        self.request_join(view, sink, |req| ClientMsg::JoinWorkspace { req, view, id })
+    }
+
+    /// A new workspace (`name`, else "Workspace N"), which window `view`
+    /// shows from now on (as [`Self::join_workspace`]). Blocks.
+    pub fn create_workspace(
+        &self,
+        view: ViewId,
+        name: Option<String>,
+        sink: Arc<dyn WorkspaceSink>,
+    ) -> Result<(WorkspaceInfo, WorkspaceLayout)> {
+        self.request_join(view, sink, |req| ClientMsg::CreateWorkspace { req, view, name })
+    }
+
+    /// Like [`Self::create_workspace`], but only proceeds if `view`'s
+    /// membership generation is still `expected_gen`. Returns the generation
+    /// after the attempt (`Ok(None)` if superseded before sending). Blocks.
+    pub fn create_workspace_if_unchanged(
+        &self,
+        view: ViewId,
+        expected_gen: u64,
+        name: Option<String>,
+        sink: Arc<dyn WorkspaceSink>,
+    ) -> (u64, Result<Option<(WorkspaceInfo, WorkspaceLayout)>>) {
+        self.request_join_at(view, sink, Some(expected_gen), |req| ClientMsg::CreateWorkspace { req, view, name })
+    }
+
+    /// Restore `view`'s membership to `id` (`None` leaves) only if no newer
+    /// join, create, or leave has changed `view`'s generation since
+    /// `expected_gen`. Returns `Ok(None)` when superseded or when leaving.
+    pub fn restore_workspace_if_unchanged(
+        &self,
+        view: ViewId,
+        expected_gen: u64,
+        id: Option<WorkspaceId>,
+        sink: Arc<dyn WorkspaceSink>,
+    ) -> Result<Option<(WorkspaceInfo, WorkspaceLayout)>> {
+        match id {
+            Some(ws) => {
+                let (_, res) = self.request_join_at(view, sink.clone(), Some(expected_gen), |req| ClientMsg::JoinWorkspace {
+                    req,
+                    view,
+                    id: Some(ws),
+                });
+                if res.is_err() && !self.is_connected() {
+                    // Link dropped before restore could be sent: keep the
+                    // target workspace recorded for reconnect replay unless a
+                    // newer join/leave already superseded `expected_gen`.
+                    let mut left = self.shared.left.lock();
+                    if left.get(&view).copied().unwrap_or(0) == expected_gen {
+                        *left.entry(view).or_insert(0) += 1;
+                        self.shared.views.lock().insert(view, View { workspace: ws, sink });
                     }
                 }
-                other => bail!("unexpected reply {other:?}"),
+                res
+            }
+            None => {
+                // Lock order: `left`, then `views`.
+                let mut left = self.shared.left.lock();
+                if left.get(&view).copied().unwrap_or(0) != expected_gen {
+                    return Ok(None);
+                }
+                *left.entry(view).or_insert(0) += 1;
+                self.shared.views.lock().remove(&view);
+                if self.is_connected() {
+                    self.shared.send(&ClientMsg::LeaveWorkspace { view });
+                }
+                Ok(None)
             }
         }
-        Ok(list)
     }
 
-    /// Return a layout previously obtained from [`Self::claim_layout`] when
-    /// restoring it fails on a still-live link (for example, after an attach
-    /// timeout on a pooled connection). The next [`Self::claim_layout`] on
-    /// this connection can reclaim it; if the link drops, the daemon releases
-    /// the claim automatically and the stashed entry is discarded.
-    pub fn release_claimed_layout(&self, info: LayoutInfo) {
-        let mut claimed = self.shared.claimed_layouts.lock();
-        let cur = self.shared.link_gen.load(Ordering::Acquire);
-        if claimed.gens.get(&info.id) == Some(&cur) && self.is_connected() && self.supports_layout_list() {
-            // Free on the daemon for any window again.
-            claimed.gens.remove(&info.id);
-            self.shared.send(&ClientMsg::ReleaseLayout { id: info.id, sessions: info.sessions, json: info.json });
-            return;
-        }
-        if claimed.gens.remove(&info.id) == Some(cur) && self.is_connected() {
-            claimed.unclaimed.push_back((cur, info));
+    /// Window `view` stops showing a workspace on this host (it closed or
+    /// detached from the host). Doesn't block.
+    pub fn leave_workspace(&self, view: ViewId) {
+        // A join on its way when the window leaves doesn't register it, and
+        // `LeaveWorkspace` is queued before any later join can read the new
+        // generation and send its request.
+        // Lock order: `left`, then `views` (same as `Pending::Join`).
+        let mut left = self.shared.left.lock();
+        *left.entry(view).or_insert(0) += 1;
+        self.shared.views.lock().remove(&view);
+        if self.is_connected() {
+            self.shared.send(&ClientMsg::LeaveWorkspace { view });
         }
     }
 
-    /// Release a saved layout (`id`, `sessions`, `json`) without deleting it
-    /// on `goattyd`, so the next claim (by any window: v16 `ReleaseLayout`
-    /// frees it on the daemon; older daemons keep it held by this connection,
-    /// so only this connection reclaims it until it closes) can restore it.
-    /// If the latest layout changes have not been sent to `goattyd` yet (for
-    /// example, while the link is offline), they stay queued for reconnect
-    /// recovery as well as in the local reclaim queue.
-    pub fn detach_layout(&self, id: LayoutId, sessions: Vec<SessionId>, json: String) {
-        let mut saved = self.shared.layout.lock();
-        if sessions.is_empty() || json.is_empty() {
-            saved.remove(&id);
-            return;
+    /// The workspace window `view` shows here, if any.
+    pub fn shown_workspace(&self, view: ViewId) -> Option<WorkspaceId> {
+        self.shared.views.lock().get(&view).map(|v| v.workspace)
+    }
+
+    /// Save workspace `id`'s layout as window `view` edited it from
+    /// revision `base` (see `ClientMsg::SaveWorkspace`). Blocks.
+    pub fn save_workspace(
+        &self,
+        view: ViewId,
+        id: WorkspaceId,
+        base: u64,
+        tabs: u32,
+        sessions: Vec<SessionId>,
+        json: String,
+    ) -> Result<SaveOutcome> {
+        match self.request(Pending::Reply, |req| ClientMsg::SaveWorkspace { req, view, id, base, tabs, sessions, json })? {
+            ServerMsg::WorkspaceSaved { outcome, .. } => Ok(outcome),
+            other => bail!("unexpected reply {other:?}"),
         }
-        let connected = self.is_connected();
-        let cur = self.shared.link_gen.load(Ordering::Acquire);
-        if connected && self.supports_layout_list() {
-            // Free on the daemon: listed and claimed from there. Kept here
-            // until a reply shows it arrived (sent again after a link drop).
-            let released_before = Some(self.shared.next_req.load(Ordering::Relaxed));
-            self.shared.send(&ClientMsg::ReleaseLayout { id, sessions: sessions.clone(), json: json.clone() });
-            saved.insert(id, SavedLayoutState { id, sessions, json, sent_gen: Some(cur), detached: true, released_before });
-            let mut claimed = self.shared.claimed_layouts.lock();
-            claimed.gens.remove(&id);
-            claimed.unclaimed.retain(|(_, info)| info.id != id);
-            return;
+    }
+
+    /// Workspace `id`'s layout without showing it. Blocks.
+    pub fn get_workspace(&self, id: WorkspaceId) -> Result<Option<WorkspaceLayout>> {
+        match self.request(Pending::Reply, |req| ClientMsg::GetWorkspace { req, id })? {
+            ServerMsg::WorkspaceLayout { layout, .. } => Ok(layout),
+            other => bail!("unexpected reply {other:?}"),
         }
-        let already_queued =
-            saved.get(&id).is_some_and(|s| connected && s.sent_gen == Some(cur) && s.json == json && s.sessions == sessions);
-        let sent_gen = connected.then_some(cur);
-        if connected && !already_queued {
-            self.shared.send(&ClientMsg::SaveLayout { id, sessions: sessions.clone(), json: json.clone() });
-        }
-        // Keep the detached record replayable across a link drop until a claim
-        // (or a newer save) takes ownership of it.
-        saved.insert(
-            id,
-            SavedLayoutState { id, sessions: sessions.clone(), json: json.clone(), sent_gen, detached: true, released_before: None },
-        );
-        let mut claimed = self.shared.claimed_layouts.lock();
-        claimed.gens.remove(&id);
-        claimed.unclaimed.retain(|(_, info)| info.id != id);
-        claimed.unclaimed.push_front((cur, LayoutInfo { id, json, sessions, saved_unix: 0 }));
+    }
+
+    pub fn rename_workspace(&self, id: WorkspaceId, name: String) -> Result<()> {
+        self.request(Pending::Reply, |req| ClientMsg::RenameWorkspace { req, id, name }).map(drop)
+    }
+
+    /// Forget workspace `id` on the host; its sessions keep running (move
+    /// or end them first). Blocks.
+    pub fn close_workspace(&self, id: WorkspaceId) -> Result<()> {
+        self.request(Pending::Reply, |req| ClientMsg::CloseWorkspace { req, id }).map(drop)
+    }
+
+    /// Whether a pane on this connection shows `session`.
+    pub fn shows(&self, session: SessionId) -> bool {
+        self.shared.panes.lock().contains_key(&session)
     }
 
     /// Reconnect now, with prompts (password, passphrase) if ssh needs them.
@@ -1266,10 +1284,9 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
         log::warn!("link to goattyd lost: {err}");
         // Fail in-flight requests; keep panes for reattach.
         let failed: Vec<Pending> = s.pending.lock().drain().map(|(_, p)| p).collect();
-        // Geometry and layout claims from the old link are released on disconnect.
+        // Geometry from the old link is released on disconnect.
         s.attaching.lock().clear();
         s.early_size.lock().clear();
-        s.claimed_layouts.lock().clear();
         for p in failed {
             if let Pending::History(session) = p
                 && let Some(sink) = s.panes.lock().get(&session).map(|p| p.sink.clone())
@@ -1333,36 +1350,25 @@ fn reader_main(s: Arc<Shared>, mut reader: Reader) {
                         s.send(&ClientMsg::Attach { req, session, size: p.size, opts: s.opts });
                     }
                     drop(panes);
-                    let mut layout = s.layout.lock();
-                    let cur = s.link_gen.load(Ordering::Acquire);
-                    let release = s.version.load(Ordering::Relaxed) >= LAYOUT_LIST_SINCE;
-                    layout.retain(|_, saved| {
-                        saved.sent_gen = Some(cur);
-                        if saved.detached && release {
-                            // Detached (offline, or its release may not have
-                            // arrived): free it on the daemon now. Never takes it
-                            // from a window that claimed it meanwhile.
-                            saved.released_before = Some(s.next_req.load(Ordering::Relaxed));
-                            s.send(&ClientMsg::ReleaseLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
-                            let mut claimed = s.claimed_layouts.lock();
-                            claimed.gens.remove(&saved.id);
-                            claimed.unclaimed.retain(|(_, info)| info.id != saved.id);
-                            return true;
+                    // Every window joins its workspace again (the daemon
+                    // forgot this connection's windows when the link dropped).
+                    // Hold `left` > `views` > `pending` so an explicit join or
+                    // leave after reconnect supersedes any replayed rejoin.
+                    let left = s.left.lock();
+                    let views = s.views.lock();
+                    let mut pending = s.pending.lock();
+                    for (&view, v) in views.iter() {
+                        if pending.values().any(|p| matches!(p, Pending::Join { view: pv, .. } if *pv == view)) {
+                            continue;
                         }
-                        s.send(&ClientMsg::SaveLayout { id: saved.id, sessions: saved.sessions.clone(), json: saved.json.clone() });
-                        if saved.detached {
-                            let mut claimed = s.claimed_layouts.lock();
-                            claimed.gens.remove(&saved.id);
-                            claimed.unclaimed.retain(|(_, info)| info.id != saved.id);
-                            claimed.unclaimed.push_front((
-                                cur,
-                                LayoutInfo { id: saved.id, json: saved.json.clone(), sessions: saved.sessions.clone(), saved_unix: 0 },
-                            ));
-                        }
-                        // A forget made offline is done once sent.
-                        !saved.sessions.is_empty()
-                    });
-                    drop(layout);
+                        let req = s.req_id();
+                        let left_gen = left.get(&view).copied().unwrap_or(0);
+                        pending.insert(req, Pending::Rejoin { view, left_gen });
+                        s.send(&ClientMsg::JoinWorkspace { req, view, id: Some(v.workspace) });
+                    }
+                    drop(pending);
+                    drop(views);
+                    drop(left);
                     break;
                 }
                 Err(e) => {
@@ -1425,6 +1431,12 @@ fn read_loop(s: &Shared, reader: &mut Reader) -> anyhow::Error {
             s.send(&ClientMsg::Ack { session, consumed });
         }
     }
+}
+
+/// The request `req`'s waiter, taken out of the map (not held across the
+/// handling: it locks the views and panes too).
+fn take_pending(s: &Shared, req: ReqId) -> Option<Pending> {
+    s.pending.lock().remove(&req)
 }
 
 /// Feed `bytes` to the pane's sink outside the lock, then count them.
@@ -1585,14 +1597,49 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::Generations { req, .. }
         | ServerMsg::ShellsReloaded { req, .. }
         | ServerMsg::Plugin { req, .. }
-        | ServerMsg::Layout { req, .. }
-        | ServerMsg::Layouts { req, .. }
+        | ServerMsg::Workspaces { req, .. }
+        | ServerMsg::Joined { req, .. }
+        | ServerMsg::WorkspaceSaved { req, .. }
+        | ServerMsg::WorkspaceLayout { req, .. }
         | ServerMsg::Shell { req, .. }
         | ServerMsg::Net { req, .. }
         | ServerMsg::PathStat { req, .. }
-        | ServerMsg::FileData { req, .. } => match s.pending.lock().remove(&req) {
+        | ServerMsg::FileData { req, .. } => match take_pending(s, req) {
             Some(Pending::Reply(tx)) => {
                 let _ = tx.send(msg);
+            }
+            Some(Pending::Join { tx, view, sink, left_gen }) => {
+                // The window left while it was joining: not registered. (Its
+                // `LeaveWorkspace` went out after the join, and the daemon
+                // handles a connection's messages in order, so it left there
+                // too; a later join of the same window isn't touched.)
+                // Lock order: `left`, then `views` (same as `leave_workspace`).
+                if let ServerMsg::Joined { info, .. } = &msg {
+                    let left = s.left.lock();
+                    if left.get(&view).copied().unwrap_or(0) == left_gen {
+                        s.views.lock().insert(view, View { workspace: info.id, sink });
+                    }
+                }
+                let _ = tx.send(msg);
+            }
+            Some(Pending::Rejoin { view, left_gen }) => {
+                if let ServerMsg::Joined { info, layout, .. } = msg {
+                    let sink = {
+                        let left = s.left.lock();
+                        if left.get(&view).copied().unwrap_or(0) != left_gen {
+                            None
+                        } else {
+                            let mut views = s.views.lock();
+                            views.get_mut(&view).map(|v| {
+                                v.workspace = info.id;
+                                v.sink.clone()
+                            })
+                        }
+                    };
+                    if let Some(sink) = sink {
+                        sink.workspace(s as *const Shared as usize, WorkspaceEvent::Rejoined { info, layout });
+                    }
+                }
             }
             Some(Pending::Attach { tx, session, state, .. }) => {
                 let committed = state
@@ -1650,9 +1697,10 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                         let _ = tx.send(msg);
                     }
                 }
-                Some(Pending::Reply(tx)) => {
+                Some(Pending::Reply(tx) | Pending::Join { tx, .. }) => {
                     let _ = tx.send(msg);
                 }
+                Some(Pending::Rejoin { view, .. }) => log::warn!("window {view:x} couldn't join its workspace again: {message}"),
                 Some(Pending::Reattach(session)) => {
                     if let Some(p) = s.panes.lock().remove(&session) {
                         p.sink.event(PaneEvent::Lost(message.clone()));
@@ -1668,6 +1716,25 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
                 None => {}
             }
         }
+        ServerMsg::LayoutChanged { by, layout } => {
+            let sinks: Vec<Arc<dyn WorkspaceSink>> =
+                s.views.lock().iter().filter(|(view, v)| **view != by && v.workspace == layout.id).map(|(_, v)| v.sink.clone()).collect();
+            for sink in sinks {
+                sink.workspace(s as *const Shared as usize, WorkspaceEvent::Changed(layout.clone()));
+            }
+        }
+        ServerMsg::WorkspacesChanged { seq, list } => {
+            let mut sinks: Vec<Arc<dyn WorkspaceSink>> = Vec::new();
+            for v in s.views.lock().values() {
+                if !sinks.iter().any(|x| Arc::ptr_eq(x, &v.sink)) {
+                    sinks.push(v.sink.clone());
+                }
+            }
+            for sink in sinks {
+                sink.workspace(s as *const Shared as usize, WorkspaceEvent::List { seq, list: list.clone() });
+            }
+        }
+        ServerMsg::RetiredLayout | ServerMsg::RetiredLayouts => log::warn!("goattyd sent a retired layout message"),
         ServerMsg::Error { req: None, message } => log::error!("goattyd: {message}"),
         ServerMsg::Hello { .. } => log::warn!("unexpected second Hello"),
     }
@@ -1749,8 +1816,8 @@ mod tests {
             out,
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
-            layout: Mutex::new(HashMap::new()),
-            claimed_layouts: Mutex::new(ClaimedLayouts::default()),
+            views: Mutex::new(HashMap::new()),
+            left: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -1846,8 +1913,8 @@ mod tests {
             out,
             panes: Mutex::new(HashMap::new()),
             attaching: Mutex::new(HashMap::new()),
-            layout: Mutex::new(HashMap::new()),
-            claimed_layouts: Mutex::new(ClaimedLayouts::default()),
+            views: Mutex::new(HashMap::new()),
+            left: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
@@ -2065,47 +2132,6 @@ mod tests {
     }
 
     #[test]
-    fn release_claimed_layout_allows_retry_on_live_link_and_clears_on_disconnect() {
-        let layout = LayoutInfo { id: 0x42, sessions: vec![1, 2], json: r#"{"version":1}"#.into(), saved_unix: 10 };
-        let server_layout = layout.clone();
-        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection_v(15, move |mut r, mut w| {
-            // Answer only ONE ClaimLayout from the wire: the retry must come
-            // from the stashed layout on the live connection.
-            match read_msg::<_, ClientMsg>(&mut r).unwrap() {
-                ClientMsg::ClaimLayout { req } => {
-                    let msg = ServerMsg::Layout { req, layout: Some(server_layout) };
-                    w.write_all(&encode(&msg).unwrap()).unwrap();
-                    w.flush().unwrap();
-                }
-                other => panic!("unexpected client msg: {other:?}"),
-            }
-            let _ = rx_drop.recv_timeout(Duration::from_secs(2));
-            drop(w);
-        });
-
-        let first = conn.claim_layout().unwrap().expect("initial claim");
-        assert_eq!(first, layout);
-
-        // Returning the claim while the link is still live makes it reclaimable
-        // on the next `claim_layout` call without hitting the daemon again.
-        conn.release_claimed_layout(first.clone());
-        let retry = conn.claim_layout().unwrap().expect("retry claim on same live link");
-        assert_eq!(retry, layout);
-
-        // Once the link drops, releasing a claim from the old link must not
-        // stash it (the daemon releases claims automatically on disconnect).
-        let _ = tx_drop.send(());
-        reader_h.join().unwrap();
-        assert!(!conn.is_connected());
-        conn.release_claimed_layout(retry);
-        assert!(conn.shared.claimed_layouts.lock().unclaimed.is_empty());
-
-        drop(conn);
-        server_h.join().unwrap();
-    }
-
-    #[test]
     fn attach_many_timeout_during_slow_sink_feed_does_not_leak_pane() {
         struct SlowSink {
             entered: flume::Sender<()>,
@@ -2160,113 +2186,64 @@ mod tests {
     }
 
     #[test]
-    fn detach_layout_allows_reclaim_on_live_link_and_clears_reconnect_layout() {
-        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection_v(15, move |mut r, w| {
-            // Drain the initial SaveLayout frame.
-            match read_msg::<_, ClientMsg>(&mut r).unwrap() {
-                ClientMsg::SaveLayout { id: 99, ref sessions, ref json } => {
-                    assert_eq!(sessions, &[10, 20]);
-                    assert_eq!(json, "{\"version\":1}");
-                }
-                other => panic!("unexpected msg: {other:?}"),
+    fn workspace_views_hear_changes_from_others_and_lists() {
+        #[derive(Default)]
+        struct Heard(Mutex<Vec<(usize, String)>>);
+        impl WorkspaceSink for Heard {
+            fn workspace(&self, conn: usize, ev: WorkspaceEvent) {
+                let what = match ev {
+                    WorkspaceEvent::Changed(l) => format!("changed {} r{}", l.json, l.revision),
+                    WorkspaceEvent::List { list, .. } => format!("list {}", list.len()),
+                    WorkspaceEvent::Rejoined { info, .. } => format!("rejoined {}", info.id),
+                };
+                self.0.lock().push((conn, what));
             }
-            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
-            drop(w);
-        });
-
-        conn.save_layout(99, vec![10, 20], "{\"version\":1}".into());
-        assert!(conn.shared.layout.lock().contains_key(&99));
-
-        conn.detach_layout(99, vec![10, 20], "{\"version\":1}".into());
-        assert!(conn.shared.layout.lock().get(&99).is_some_and(|s| s.detached), "detached layout stays replayable until claimed");
-
-        let reclaimed = conn.claim_layout().unwrap().expect("detached layout should be claimable on live link");
-        assert!(conn.shared.layout.lock().is_empty(), "claiming the detached layout clears the replay record");
-        assert_eq!(reclaimed.id, 99);
-        assert_eq!(reclaimed.sessions, vec![10, 20]);
-        assert_eq!(reclaimed.json, "{\"version\":1}");
-
-        let _ = tx_drop.send(());
-        reader_h.join().unwrap();
-        drop(conn);
-        server_h.join().unwrap();
-    }
-
-    #[test]
-    fn layouts_of_several_windows_are_kept_apart_and_listed_and_claimed_by_id() {
-        let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection_v(15, move |_r, w| {
-            let _ = rx_drop.recv_timeout(Duration::from_secs(5));
-            drop(w);
-        });
-        // Two windows on one pooled connection: both are replayed after a reconnect.
-        conn.save_layout(4, vec![2], "window a".into());
-        conn.save_layout(5, vec![1], "window b".into());
-        assert_eq!(conn.shared.layout.lock().len(), 2);
-        // Window b detaches its tabs: listed first, once.
-        conn.detach_layout(5, vec![1], "window b".into());
-        // A v15 daemon lists nothing: only what this connection detached.
-        let ids: Vec<_> = conn.list_layouts().unwrap().iter().map(|l| (l.id, l.json.clone())).collect();
-        assert_eq!(ids, [(5, "window b".to_string())]);
-        // Claiming by id takes the detached one locally.
-        assert_eq!(conn.claim_layout_id(5).unwrap().unwrap().json, "window b");
-        assert!(!conn.shared.layout.lock().contains_key(&5));
-        // Forgetting window a while connected drops its replay record.
-        conn.save_layout(4, Vec::new(), String::new());
-        assert!(conn.shared.layout.lock().is_empty());
-
-        let _ = tx_drop.send(());
-        reader_h.join().unwrap();
-        drop(conn);
-        server_h.join().unwrap();
-    }
-
-    #[test]
-    fn v16_detach_releases_on_the_daemon_and_lists_and_claims_from_there() {
-        let (seen_tx, seen_rx) = flume::unbounded::<ClientMsg>();
+        }
+        let info = |id| WorkspaceInfo { id, name: "Main".into(), revision: 1, tabs: 1, sessions: vec![1], views: 2, active: 1 };
+        let layout = |id, json: &str| WorkspaceLayout { id, revision: 2, json: json.into(), sessions: vec![1] };
         let (tx_drop, rx_drop) = flume::bounded::<()>(1);
         let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
-            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
-                let reply = match &msg {
-                    ClientMsg::ListLayouts { req } => Some(ServerMsg::Layouts {
-                        req: *req,
-                        layouts: vec![LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 }],
-                    }),
-                    ClientMsg::ClaimLayoutId { req, id } => Some(ServerMsg::Layout {
-                        req: *req,
-                        layout: (*id == 6).then(|| LayoutInfo { id: 6, json: "free".into(), sessions: vec![3], saved_unix: 9 }),
-                    }),
-                    _ => None,
-                };
-                let done = matches!(&reply, Some(ServerMsg::Layout { layout: None, .. }));
-                let _ = seen_tx.send(msg);
-                if let Some(reply) = reply {
-                    w.write_all(&encode(&reply).unwrap()).unwrap();
-                    w.flush().unwrap();
+            let mut send = |m: ServerMsg| {
+                w.write_all(&encode(&m).unwrap()).unwrap();
+                w.flush().unwrap();
+            };
+            for _ in 0..2 {
+                match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                    ClientMsg::JoinWorkspace { req, id, .. } => {
+                        let id = id.unwrap_or(7);
+                        send(ServerMsg::Joined { req, info: info(id), layout: layout(id, "") });
+                    }
+                    other => panic!("unexpected {other:?}"),
                 }
-                if done {
-                    break;
-                }
+            }
+            // Window 1 saved: window 2 hears it, window 1 doesn't.
+            send(ServerMsg::LayoutChanged { by: 1, layout: layout(7, "a") });
+            // Another workspace's change: nobody here shows it.
+            send(ServerMsg::LayoutChanged { by: 9, layout: layout(8, "b") });
+            send(ServerMsg::WorkspacesChanged { seq: 3, list: vec![info(7), info(8)] });
+            match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::LeaveWorkspace { view: 2 } => {}
+                other => panic!("unexpected {other:?}"),
             }
             let _ = rx_drop.recv_timeout(Duration::from_secs(5));
             drop(w);
         });
-        conn.save_layout(4, vec![2], "window a".into());
-        conn.save_layout(5, vec![1], "window b".into());
-        conn.detach_layout(5, vec![1], "window b".into());
-        // Released on the daemon: kept here only until a reply proves it arrived.
-        assert!(conn.shared.layout.lock().get(&5).is_some_and(|s| s.released_before.is_some()));
-        assert!(conn.shared.claimed_layouts.lock().unclaimed.is_empty());
-        assert_eq!(conn.list_layouts().unwrap().iter().map(|l| l.id).collect::<Vec<_>>(), [6]);
-        assert!(!conn.shared.layout.lock().contains_key(&5), "the reply proved the release arrived");
-        assert_eq!(conn.claim_layout_id(6).unwrap().unwrap().sessions, [3]);
-        assert!(conn.claim_layout_id(7).unwrap().is_none());
-        let sent: Vec<ClientMsg> = seen_rx.drain().collect();
-        assert!(
-            matches!(&sent[..3], [ClientMsg::SaveLayout { id: 4, .. }, ClientMsg::SaveLayout { id: 5, .. }, ClientMsg::ReleaseLayout { id: 5, sessions, .. }] if sessions == &[1]),
-            "{sent:?}"
-        );
+        let (one, two) = (Arc::new(Heard::default()), Arc::new(Heard::default()));
+        assert_eq!(conn.join_workspace(1, None, one.clone()).unwrap().0.id, 7);
+        assert_eq!(conn.join_workspace(2, Some(7), two.clone()).unwrap().1.revision, 2);
+        assert_eq!(conn.shown_workspace(2), Some(7));
+        // Both windows have the list (the last event each one gets).
+        let has_list = |h: &Heard| h.0.lock().iter().any(|(_, e)| e.starts_with("list"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !(has_list(&one) && has_list(&two)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let key = conn.key();
+        assert_eq!(*one.0.lock(), [(key, "list 2".to_string())]);
+        assert_eq!(*two.0.lock(), [(key, "changed a r2".to_string()), (key, "list 2".to_string())]);
+        conn.leave_workspace(2);
+        assert_eq!(conn.shown_workspace(2), None);
+        conn.leave_workspace(2);
 
         let _ = tx_drop.send(());
         reader_h.join().unwrap();
@@ -2275,36 +2252,49 @@ mod tests {
     }
 
     #[test]
-    fn detach_layout_while_offline_preserves_unsent_layout_for_recovery() {
+    fn a_window_that_leaves_while_joining_isnt_registered() {
+        struct Quiet;
+        impl WorkspaceSink for Quiet {
+            fn workspace(&self, _: usize, _: WorkspaceEvent) {}
+        }
+        let (seen_tx, seen_rx) = flume::unbounded::<String>();
+        let (go_tx, go_rx) = flume::bounded::<()>(1);
         let (tx_drop, rx_drop) = flume::bounded::<()>(1);
-        let (conn, reader_h, server_h) = mock_connection_v(15, move |mut r, w| {
-            let _ = read_msg::<_, ClientMsg>(&mut r);
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            let req = match read_msg::<_, ClientMsg>(&mut r).unwrap() {
+                ClientMsg::JoinWorkspace { req, .. } => req,
+                other => panic!("unexpected {other:?}"),
+            };
+            let _ = seen_tx.send("join".into());
+            // The window leaves before the answer comes.
+            assert!(matches!(read_msg::<_, ClientMsg>(&mut r).unwrap(), ClientMsg::LeaveWorkspace { view: 4 }));
+            let _ = go_rx.recv_timeout(Duration::from_secs(5));
+            let info = WorkspaceInfo { id: 7, name: "Main".into(), revision: 0, tabs: 0, sessions: vec![], views: 1, active: 1 };
+            let layout = WorkspaceLayout { id: 7, revision: 0, json: String::new(), sessions: vec![] };
+            w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
+            w.flush().unwrap();
+            // Nothing more: the leave came after the join already.
+            r.get_ref().set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            if read_msg::<_, ClientMsg>(&mut r).is_err() {
+                let _ = seen_tx.send("nothing more".into());
+            }
             let _ = rx_drop.recv_timeout(Duration::from_secs(5));
             drop(w);
         });
+        let conn = Arc::new(conn);
+        let joining = {
+            let conn = conn.clone();
+            std::thread::spawn(move || conn.join_workspace(4, None, Arc::new(Quiet)))
+        };
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "join");
+        conn.leave_workspace(4);
+        let _ = go_tx.send(());
+        assert_eq!(joining.join().unwrap().unwrap().0.id, 7);
+        assert_eq!(conn.shown_workspace(4), None, "not registered: it left");
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(5)).unwrap(), "nothing more");
 
-        // Initial online save.
-        conn.save_layout(77, vec![1, 2], "{\"version\":1,\"old\":true}".into());
         let _ = tx_drop.send(());
         reader_h.join().unwrap();
-        assert!(!conn.is_connected());
-
-        // User edits layout (e.g. renames a tab) while offline, then detaches.
-        conn.save_layout(77, vec![1, 2], "{\"version\":1,\"renamed\":true}".into());
-        conn.detach_layout(77, vec![1, 2], "{\"version\":1,\"renamed\":true}".into());
-
-        let pending = conn.shared.layout.lock();
-        let saved = pending.get(&77).expect("offline unsent layout must be preserved for reconnect");
-        assert_eq!(saved.id, 77);
-        assert_eq!(saved.json, "{\"version\":1,\"renamed\":true}");
-        assert!(saved.detached);
-        assert!(saved.sent_gen.is_none());
-        drop(pending);
-
-        let unclaimed = conn.shared.claimed_layouts.lock();
-        assert_eq!(unclaimed.unclaimed.front().map(|(_, i)| i.json.as_str()), Some("{\"version\":1,\"renamed\":true}"));
-        drop(unclaimed);
-
         drop(conn);
         server_h.join().unwrap();
     }
@@ -2431,5 +2421,77 @@ mod tests {
         reader_h.join().unwrap();
         drop(conn);
         server_h.join().unwrap();
+    }
+
+    #[test]
+    fn restore_workspace_if_unchanged_respects_newer_join_and_leave() {
+        struct Quiet;
+        impl WorkspaceSink for Quiet {
+            fn workspace(&self, _: usize, _: WorkspaceEvent) {}
+        }
+
+        let (seen_tx, seen_rx) = flume::unbounded::<String>();
+        let (conn, reader_h, server_h) = mock_connection(move |mut r, mut w| {
+            while let Ok(msg) = read_msg::<_, ClientMsg>(&mut r) {
+                match msg {
+                    ClientMsg::JoinWorkspace { req, id, .. } => {
+                        let ws = id.unwrap_or(1);
+                        let _ = seen_tx.send(format!("join:{ws}"));
+                        let info =
+                            WorkspaceInfo { id: ws, name: format!("W{ws}"), revision: 0, tabs: 0, sessions: vec![], views: 1, active: 1 };
+                        let layout = WorkspaceLayout { id: ws, revision: 0, json: String::new(), sessions: vec![] };
+                        w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    ClientMsg::CreateWorkspace { req, .. } => {
+                        let _ = seen_tx.send("create".into());
+                        let info = WorkspaceInfo { id: 9, name: "New".into(), revision: 0, tabs: 0, sessions: vec![], views: 1, active: 1 };
+                        let layout = WorkspaceLayout { id: 9, revision: 0, json: String::new(), sessions: vec![] };
+                        w.write_all(&encode(&ServerMsg::Joined { req, info, layout }).unwrap()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    ClientMsg::LeaveWorkspace { view } => {
+                        let _ = seen_tx.send(format!("leave:{view}"));
+                    }
+                    _ => {}
+                }
+            }
+            drop(w);
+        });
+
+        let sink: Arc<dyn WorkspaceSink> = Arc::new(Quiet);
+        conn.join_workspace(4, Some(1), sink.clone()).unwrap();
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join:1");
+        let gen1 = conn.view_gen(4);
+
+        // Create succeeds and bumps generation to gen2.
+        let (gen2, created) = conn.create_workspace_if_unchanged(4, gen1, None, sink.clone());
+        assert_eq!(created.unwrap().unwrap().0.id, 9);
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "create");
+        assert!(gen2 > gen1);
+
+        // Stale create with old `gen1` is skipped without hitting the wire.
+        let (_, skipped) = conn.create_workspace_if_unchanged(4, gen1, None, sink.clone());
+        assert!(skipped.unwrap().is_none());
+        assert!(seen_rx.try_recv().is_err());
+
+        // Restore with matching `gen2` re-joins workspace 1.
+        let restored = conn.restore_workspace_if_unchanged(4, gen2, Some(1), sink.clone()).unwrap();
+        assert_eq!(restored.unwrap().0.id, 1);
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join:1");
+        assert_eq!(conn.shown_workspace(4), Some(1));
+
+        // A newer join to workspace 2 supersedes `gen2`; restoring with `gen2`
+        // (for either Some(1) or None) must be a no-op.
+        conn.join_workspace(4, Some(2), sink.clone()).unwrap();
+        assert_eq!(seen_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "join:2");
+        assert!(conn.restore_workspace_if_unchanged(4, gen2, Some(1), sink.clone()).unwrap().is_none());
+        assert!(conn.restore_workspace_if_unchanged(4, gen2, None, sink.clone()).unwrap().is_none());
+        assert_eq!(conn.shown_workspace(4), Some(2));
+        assert!(seen_rx.try_recv().is_err());
+
+        drop(conn);
+        server_h.join().unwrap();
+        reader_h.join().unwrap();
     }
 }

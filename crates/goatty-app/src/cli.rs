@@ -33,7 +33,7 @@ impl RemoteArgs {
 #[derive(Debug, Parser)]
 #[command(name = "goatty", version, about = "A fast, batteries-included terminal")]
 pub struct Cli {
-    /// Always create a new session (default: restore the last closed window, else reattach the newest detached session).
+    /// Always create a new session: a fresh tab in the most recently active workspace (default: restore the windows of the last run, else join that workspace, with a fresh shell when it has no tabs).
     #[arg(long, conflicts_with_all = ["attach", "local"])]
     pub new: bool,
 
@@ -166,7 +166,7 @@ impl Cli {
             (true, _) => AttachMode::New,
             (false, Some(id)) => AttachMode::Id(id),
             (false, None) if prefer_new => AttachMode::New,
-            (false, None) => AttachMode::Auto,
+            (false, None) => AttachMode::Join(None),
         }
     }
 
@@ -213,7 +213,7 @@ mod tests {
         let cli = Cli::parse_from(["goatty", "--attach", "3"]);
         assert!(matches!(cli.attach_mode(true), AttachMode::Id(3)));
         assert!(matches!(Cli::parse_from(["goatty"]).attach_mode(true), AttachMode::New));
-        assert!(matches!(Cli::parse_from(["goatty"]).attach_mode(false), AttachMode::Auto));
+        assert!(matches!(Cli::parse_from(["goatty"]).attach_mode(false), AttachMode::Join(None)));
         assert!(matches!(cli.endpoint().unwrap(), Some(Endpoint::Local)));
         assert!(Cli::parse_from(["goatty", "--local"]).endpoint().unwrap().is_none());
         assert!(Cli::try_parse_from(["goatty", "--local", "--ssh", "h"]).is_err());

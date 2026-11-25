@@ -18,6 +18,7 @@ use goatty_term::Palette;
 use crate::flow::FlowControl;
 use crate::server::Daemon;
 use crate::session::{Session, SubConn, SubFeatures, Subscriber};
+use crate::workspaces::Changes;
 
 /// Max concurrent `StatPath` worker threads per connection (bounds thread
 /// leaks if a remote mount stalls `stat`).
@@ -49,8 +50,10 @@ pub(crate) struct Liveness {
     dropped: AtomicBool,
     stream: UnixStream,
     /// The connection's writer queue, to stop the writer even while workers
-    /// (a stat on a hung mount) still hold senders.
-    writer: flume::WeakSender<Outbound>,
+    /// (a stat on a hung mount) still hold senders, and for workspace news.
+    pub(crate) writer: flume::WeakSender<Outbound>,
+    /// It listed or joined workspaces: it hears `WorkspacesChanged`.
+    watching: AtomicBool,
 }
 
 impl Liveness {
@@ -62,7 +65,12 @@ impl Liveness {
             dropped: AtomicBool::new(false),
             stream,
             writer,
+            watching: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn watches_workspaces(&self) -> bool {
+        self.watching.load(Ordering::Relaxed)
     }
 
     fn heard(&self, ping: bool) {
@@ -433,16 +441,71 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the tailnet operation: {e}") });
                     }
                 }
-                ClientMsg::SaveLayout { id, sessions, json } => {
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    daemon.layouts.lock().save(conn, id, sessions, json, now);
+                ClientMsg::RetiredSaveLayout
+                | ClientMsg::RetiredClaimLayout
+                | ClientMsg::RetiredListLayouts
+                | ClientMsg::RetiredClaimLayoutId
+                | ClientMsg::RetiredReleaseLayout => {
+                    reply(ServerMsg::Error { req: None, message: "window layouts were replaced by workspaces (protocol v17)".into() });
                 }
-                ClientMsg::ClaimLayout { req } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout(conn) }),
-                ClientMsg::ClaimLayoutId { req, id } => reply(ServerMsg::Layout { req, layout: daemon.claim_layout_id(conn, id) }),
-                ClientMsg::ListLayouts { req } => reply(ServerMsg::Layouts { req, layouts: daemon.free_layouts() }),
-                ClientMsg::ReleaseLayout { id, sessions, json } => {
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    daemon.layouts.lock().release_one(conn, id, sessions, json, now);
+                ClientMsg::ListWorkspaces { req } => {
+                    live.watching.store(true, Ordering::Relaxed);
+                    let (list, seq) = daemon.with_workspaces(|w, alive| (w.list(alive), w.version()));
+                    reply(ServerMsg::Workspaces { req, seq, list });
+                }
+                ClientMsg::JoinWorkspace { req, view, id } => {
+                    live.watching.store(true, Ordering::Relaxed);
+                    let (info, layout) = daemon.with_workspaces(|w, alive| w.join(conn, view, id, alive));
+                    reply(ServerMsg::Joined { req, info, layout });
+                    daemon.announce(Changes { list: true, layout: None });
+                }
+                ClientMsg::CreateWorkspace { req, view, name } => {
+                    live.watching.store(true, Ordering::Relaxed);
+                    let (info, layout) = daemon.with_workspaces(|w, alive| w.create(conn, view, name.as_deref(), alive));
+                    log::info!("connection {conn}: made workspace {:?}", info.name);
+                    reply(ServerMsg::Joined { req, info, layout });
+                    daemon.announce(Changes { list: true, layout: None });
+                }
+                ClientMsg::LeaveWorkspace { view } => {
+                    if daemon.workspaces.lock().leave(conn, view) {
+                        daemon.announce(Changes { list: true, layout: None });
+                    }
+                }
+                ClientMsg::SaveWorkspace { req, view, id, base, tabs, sessions, json } => {
+                    let saved = daemon.with_workspaces(|w, alive| w.save((conn, view), id, base, tabs, sessions, json, alive));
+                    match saved {
+                        Ok((outcome, changes)) => {
+                            reply(ServerMsg::WorkspaceSaved { req, outcome });
+                            daemon.announce(changes);
+                        }
+                        Err(message) => reply(ServerMsg::Error { req: Some(req), message }),
+                    }
+                }
+                ClientMsg::RenameWorkspace { req, id, name } => {
+                    // Not in the match: `announce` takes the lock again.
+                    let renamed = daemon.workspaces.lock().rename(id, &name);
+                    match renamed {
+                        Ok(()) => {
+                            reply(ServerMsg::Ok { req });
+                            daemon.announce(Changes { list: true, layout: None });
+                        }
+                        Err(message) => reply(ServerMsg::Error { req: Some(req), message }),
+                    }
+                }
+                ClientMsg::CloseWorkspace { req, id } => {
+                    let closed = daemon.workspaces.lock().close(id);
+                    match closed {
+                        Ok(()) => {
+                            log::info!("connection {conn}: closed workspace {id:x}");
+                            reply(ServerMsg::Ok { req });
+                            daemon.announce(Changes { list: true, layout: None });
+                        }
+                        Err(message) => reply(ServerMsg::Error { req: Some(req), message }),
+                    }
+                }
+                ClientMsg::GetWorkspace { req, id } => {
+                    let layout = daemon.with_workspaces(|w, alive| w.get(id, alive));
+                    reply(ServerMsg::WorkspaceLayout { req, layout });
                 }
                 ClientMsg::FetchHistory { req, session, before, count } => match daemon.get(session) {
                     Some(s) => {
@@ -534,7 +597,9 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         }
     })();
 
-    daemon.layouts.lock().release(conn);
+    if daemon.workspaces.lock().drop_conn(conn) {
+        daemon.announce(crate::workspaces::Changes { list: true, layout: None });
+    }
     for (id, (s, _)) in subs {
         s.unsubscribe(conn);
         log::info!("connection {conn} detached from session {id}");

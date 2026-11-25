@@ -2,20 +2,20 @@
 //! open when goatty quit, with its tabs on every host, not only this
 //! computer's.
 //!
-//! Each goattyd keeps a window's layout of the tabs on it (`saved`), but
-//! only goatty knows which goattyds a window had tabs on. So each window
-//! records here which hosts it has tabs on, in tab order, with the id of
-//! its layout on each, its size and the host of its active tab. The next
+//! Each goattyd keeps its workspaces' tabs (#215), but only goatty knows
+//! which goattyds a window had tabs on. So each window records here which
+//! hosts it has tabs on, in tab order, with the workspace it shows on each
+//! and the tab it had active there, its size and the host of its active
+//! tab: what's this window's alone and not the workspace's. The next
 //! `goatty` (without `--ssh`, `--new` or `--attach`, with
 //! `workspace.on_launch` = `reattach`) opens one window per record whose
-//! process is gone, connects to each host and claims exactly that layout
-//! there (`AttachMode::Layout`).
+//! process is gone, connects to each host and joins that workspace there
+//! (`AttachMode::Restore`; the most recently active one when it's gone).
 //!
 //! Like a browser's session restore: closing one window while others stay
-//! open forgets it (its sessions stay detached on their hosts, and the
-//! sessions picker offers to restore its tabs); closing the last window
-//! (quitting) keeps every window that was still open. A window whose tabs
-//! were all closed or detached has nothing to record.
+//! open forgets it (its workspaces stay on their hosts); closing the last
+//! window (quitting) keeps every window that was still open. A window whose
+//! tabs were all closed or detached has nothing to record.
 //!
 //! State, not a setting: `$XDG_STATE_HOME/goatty/windows.json`. Several
 //! goatty processes share the file: each one rewrites only its own records
@@ -28,14 +28,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use goatty_client::Endpoint;
-use goatty_proto::LayoutId;
+use goatty_proto::WorkspaceId;
 use gpui::{App, Global, WindowId};
 use serde::{Deserialize, Serialize};
 
 use super::saved::SavedWindow;
 use crate::hosts::HostRef;
 
-pub const VERSION: u32 = 1;
+/// v1 recorded window layouts from before workspaces; such a file is
+/// dropped (#215: no migration).
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OpenWindows {
@@ -61,12 +63,14 @@ pub struct WindowRecord {
     pub window: Option<SavedWindow>,
 }
 
-/// A host a window has tabs on, and the id of the layout of those tabs on
-/// that host's goattyd.
+/// A host a window has tabs on: the workspace it shows there, and the tab
+/// it had active there (each window has its own).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostRecord {
     pub host: SavedHost,
-    pub layout: LayoutId,
+    pub workspace: WorkspaceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<u64>,
 }
 
 /// A host as [`HostRef`] names it, in the file.
@@ -104,7 +108,7 @@ impl OpenWindows {
     #[cfg(test)]
     pub fn load(path: &Path) -> Self {
         let loaded: Self = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        if loaded.version > VERSION {
+        if loaded.version != VERSION {
             log::info!("{} has format {} (this goatty reads {VERSION}); ignoring it", path.display(), loaded.version);
             return Self::default();
         }
@@ -145,8 +149,8 @@ impl OpenWindows {
                     // A newer goatty's file: leave it alone.
                     return Err(std::io::Error::other(format!("{} has format {v}, newer than this goatty's", path.display())));
                 }
-                // Damaged: start over.
-                serde_json::from_slice::<Self>(&bytes).unwrap_or_default()
+                // Damaged, or from before workspaces (v1): start over.
+                serde_json::from_slice::<Self>(&bytes).ok().filter(|f| f.version == VERSION).unwrap_or_default()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e),
@@ -416,11 +420,11 @@ pub fn new_key() -> u64 {
 mod tests {
     use super::*;
 
-    fn rec(pid: u32, hosts: &[(SavedHost, LayoutId)]) -> WindowRecord {
+    fn rec(pid: u32, hosts: &[(SavedHost, WorkspaceId)]) -> WindowRecord {
         WindowRecord {
             pid,
             key: pid as u64 * 10,
-            hosts: hosts.iter().map(|(h, l)| HostRecord { host: h.clone(), layout: *l }).collect(),
+            hosts: hosts.iter().map(|(h, w)| HostRecord { host: h.clone(), workspace: *w, active_tab: None }).collect(),
             active: 0,
             window: None,
         }
@@ -429,11 +433,16 @@ mod tests {
     #[test]
     fn json_format() {
         let mut r = rec(7, &[(SavedHost::Local, 1), (SavedHost::Ssh { host: "prod".into() }, 2)]);
-        r.hosts.push(HostRecord { host: SavedHost::Tailnet { dns: "pi.ts.net".into(), name: "pi".into() }, layout: 3 });
+        r.hosts.push(HostRecord {
+            host: SavedHost::Tailnet { dns: "pi.ts.net".into(), name: "pi".into() },
+            workspace: 3,
+            active_tab: Some(9),
+        });
         r.active = 1;
         let file = OpenWindows { version: VERSION, windows: vec![r] };
         let json = serde_json::to_string(&file).unwrap();
-        assert!(json.contains(r#"{"host":{"kind":"ssh","host":"prod"},"layout":2}"#), "{json}");
+        assert!(json.contains(r#"{"host":{"kind":"ssh","host":"prod"},"workspace":2}"#), "{json}");
+        assert!(json.contains(r#""workspace":3,"active_tab":9"#), "{json}");
         assert!(json.contains(r#"{"kind":"local"}"#) && json.contains(r#""kind":"tailnet","dns":"pi.ts.net","name":"pi""#), "{json}");
         assert_eq!(serde_json::from_str::<OpenWindows>(&json).unwrap(), file);
     }
@@ -451,7 +460,7 @@ mod tests {
         assert_eq!(file.windows.len(), 2, "a window without hosts isn't recorded");
         // Process 1 updates its windows; 2's stay.
         file.replace_own(1, [rec(1, &[(SavedHost::Local, 8)])]);
-        assert_eq!(file.windows.iter().map(|w| (w.pid, w.hosts[0].layout)).collect::<Vec<_>>(), [(2, 6), (1, 8)]);
+        assert_eq!(file.windows.iter().map(|w| (w.pid, w.hosts[0].workspace)).collect::<Vec<_>>(), [(2, 6), (1, 8)]);
         // Process 2 is still running: only 1's window is reopened, by 3,
         // which holds it now (so nobody else reopens it, and it's kept if 3
         // exits before its window records itself).
@@ -469,11 +478,15 @@ mod tests {
         let path = dir.path().join("windows.json");
         std::fs::write(&path, "garbage").unwrap();
         assert_eq!(OpenWindows::load(&path), OpenWindows::default());
-        std::fs::write(&path, r#"{"version":99,"windows":[{"pid":1,"key":1,"hosts":[{"host":{"kind":"local"},"layout":1}]}]}"#).unwrap();
+        std::fs::write(&path, r#"{"version":99,"windows":[{"pid":1,"key":1,"hosts":[{"host":{"kind":"local"},"workspace":1}]}]}"#).unwrap();
         assert_eq!(OpenWindows::load(&path), OpenWindows::default());
         // ... and not overwritten.
         assert!(OpenWindows::edit(&path, |f| f.replace_own(1, [])).is_err());
         assert!(std::fs::read_to_string(&path).unwrap().contains(r#""version":99"#));
+        // A file from before workspaces (window layouts) is dropped.
+        std::fs::write(&path, r#"{"version":1,"windows":[{"pid":1,"key":1,"hosts":[{"host":{"kind":"local"},"layout":1}]}]}"#).unwrap();
+        assert_eq!(OpenWindows::load(&path), OpenWindows::default());
+        assert!(OpenWindows::edit(&path, |f| f.take_dead(|_| false)).unwrap().is_empty());
     }
 
     #[test]

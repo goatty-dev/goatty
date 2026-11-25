@@ -4,7 +4,7 @@
 //! What has to carry over is each session's PTY master (the shell keeps
 //! running as long as one is open) and what the daemon knows about it: the
 //! screens and scrollback (`Terminal::restore_snapshot`), size, ids, and the
-//! saved window layouts.
+//! workspaces.
 //!
 //! * **Restart** (protocol `Restart`, `goattyd restart`): every output pump
 //!   pauses between two reads, the state goes to `<socket>.restore/`, the
@@ -40,14 +40,16 @@ use goatty_term::pty::{self, Pty};
 use goatty_term::{Palette, TermSize, Terminal};
 use serde::{Deserialize, Serialize};
 
-use crate::layouts::{Layouts, SavedLayout};
 use crate::server::{Daemon, NewSession};
 use crate::session::Session;
 use crate::systemd::StoredPty;
+use crate::workspaces::{SavedWorkspace, Workspaces};
 
 /// The newest state format this build reads; `goattyd restore-version`
 /// prints it, and a restart only runs a goattyd that reads ours.
-pub const STATE_VERSION: u32 = 2;
+/// 3: workspaces (#215) instead of window layouts. A build that reads 2
+/// would take the sessions and drop the workspaces, so a restart refuses it.
+pub const STATE_VERSION: u32 = 3;
 
 /// How long a restart waits for a session's output pump to pause.
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -62,7 +64,13 @@ struct State {
     #[serde(default)]
     socket_activated: bool,
     sessions: Vec<SavedSession>,
-    layouts: Vec<SavedLayout>,
+    /// Always empty: builds before v17 read their window layouts here (a
+    /// state without it fails to load there), and a v17 build drops what an
+    /// older one wrote (#215: old layouts aren't migrated).
+    #[serde(default, skip_deserializing)]
+    layouts: [(); 0],
+    #[serde(default)]
+    workspaces: Vec<SavedWorkspace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,7 +150,7 @@ fn resume_all(sessions: &HashMap<SessionId, Arc<Session>>) {
 
 /// Write the state of `sessions` (paused) to the state dir; `with_fds`
 /// records the fds for an `execve`. Returns the state file.
-fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: bool) -> Result<PathBuf> {
+fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, workspaces: &Workspaces, with_fds: bool) -> Result<PathBuf> {
     let dir = state_dir(&daemon.socket);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -167,7 +175,8 @@ fn save(daemon: &Daemon, sessions: &HashMap<SessionId, Arc<Session>>, with_fds: 
         listener_fd: if with_fds { *daemon.listener_fd.lock() } else { None },
         socket_activated: daemon.socket_activated.load(Ordering::SeqCst),
         sessions: saved,
-        layouts: daemon.layouts.lock().export(),
+        layouts: [],
+        workspaces: workspaces.export(),
     };
     let file = dir.join("state.json");
     write_private(&file, &serde_json::to_vec(&state)?)?;
@@ -236,7 +245,9 @@ pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
     if !close_admission(daemon) {
         bail!("a restart is already under way");
     }
-    // Held until the exec: no session starts or ends meanwhile.
+    // Held until the exec: no session or workspace changes meanwhile.
+    // Lock order: `workspaces`, then `sessions` (same as `Daemon::with_workspaces`).
+    let workspaces = daemon.workspaces.lock();
     let sessions = daemon.sessions.lock();
     let result = (|| -> Result<std::io::Error> {
         // Whatever a pump read and didn't feed, or an answer not written
@@ -247,7 +258,7 @@ pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
         if !settle_replies(&sessions) {
             bail!("a session's program doesn't take its input; not restarting");
         }
-        let file = save(daemon, &sessions, true)?;
+        let file = save(daemon, &sessions, &workspaces, true)?;
         let listener = daemon.listener_fd.lock().context("no listening socket")?;
         let mut fds = vec![listener];
         fds.extend(sessions.values().map(|s| s.master_fd));
@@ -270,6 +281,7 @@ pub(crate) fn restart(daemon: &Arc<Daemon>, exe: &Path) -> Result<()> {
     })();
     resume_all(&sessions);
     drop(sessions);
+    drop(workspaces);
     daemon.restarting.store(false, Ordering::SeqCst);
     match result {
         Ok(err) => Err(err).with_context(|| format!("couldn't run {}", exe.display())),
@@ -326,7 +338,8 @@ pub(crate) fn take_over(daemon: &Arc<Daemon>, file: &Path) -> Result<Option<Unix
     }
     bump_next_session(daemon, state.next_session);
     daemon.socket_activated.store(state.socket_activated, Ordering::SeqCst);
-    *daemon.layouts.lock() = Layouts::import(state.layouts);
+    let live = daemon.live();
+    *daemon.workspaces.lock() = Workspaces::import(state.workspaces, |s| live.contains(&s));
     let _ = std::fs::remove_dir_all(&dir);
     state.listener_fd.map(crate::server::listener_from_fd).transpose()
 }
@@ -366,7 +379,8 @@ pub(crate) fn adopt_stored(daemon: &Arc<Daemon>, ptys: Vec<(StoredPty, OwnedFd)>
     if let Some(state) = state {
         bump_next_session(daemon, state.next_session);
         if !adopted.is_empty() {
-            *daemon.layouts.lock() = Layouts::import(state.layouts);
+            let live = daemon.live();
+            *daemon.workspaces.lock() = Workspaces::import(state.workspaces, |s| live.contains(&s));
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -417,12 +431,14 @@ pub(crate) fn save_on_sigterm(daemon: Arc<Daemon>) -> Result<()> {
         // SAFETY: reading one byte into a valid buffer from our own pipe.
         while unsafe { libc::read(rx.as_raw_fd(), b.as_mut_ptr().cast(), 1) } != 1 {}
         close_admission(&daemon);
+        // Lock order: `workspaces`, then `sessions` (same as `Daemon::with_workspaces`).
+        let workspaces = daemon.workspaces.lock();
         let sessions = daemon.sessions.lock();
         // Best effort: the process ends either way.
         if !(pause_all(&sessions) && settle_replies(&sessions)) {
             log::warn!("SIGTERM: saving the screens anyway");
         }
-        match save(&daemon, &sessions, false) {
+        match save(&daemon, &sessions, &workspaces, false) {
             Ok(_) => log::info!("SIGTERM: saved {} sessions; systemd keeps their PTYs", sessions.len()),
             Err(e) => log::error!("SIGTERM: couldn't save the sessions' screens: {e:#}"),
         }

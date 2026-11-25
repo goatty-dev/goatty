@@ -306,6 +306,14 @@ pub struct TerminalView {
     seen_bytes: u64,
     /// Title set by the application (OSC 0/2).
     app_title: String,
+    /// This view's wake-ups and where it is in the session's UI events
+    /// (another window may show the same session, #215).
+    wake: Arc<crate::session::WakeListener>,
+    ui_cursor: u64,
+    /// Identifies this view to the session's size ownership.
+    token: u64,
+    /// The session's CWD change count this view has seen.
+    cwd_gen: u64,
     /// Last decorated title reported via [`TerminalEvent::TitleChanged`].
     title: String,
     /// Last foreground program reported the same way.
@@ -379,7 +387,13 @@ impl TerminalView {
         window.focus(&focus, cx);
 
         // I/O threads wake us; one notify per frame at most.
-        let wake_rx = session.wake_rx.clone();
+        let (wake, wake_rx) = session.subscribe_wake();
+        let (ui_cursor, title) = session.ui_cursor();
+        static TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = TOKENS.fetch_add(1, Ordering::Relaxed);
+        // The pane that has focus sets the session's size.
+        cx.on_focus_in(&focus, window, |view: &mut Self, _, _| view.session.own_size(view.token)).detach();
+        cx.on_release(|view: &mut Self, _| view.session.disown_size(view.token)).detach();
         cx.spawn_in(window, async move |this, cx| {
             while wake_rx.recv_async().await.is_ok() {
                 if this.update(cx, |view, cx| view.on_wake(cx)).is_err() {
@@ -453,7 +467,11 @@ impl TerminalView {
             last_activity: Instant::now(),
             last_bytes: 0,
             seen_bytes,
-            app_title: DEFAULT_TITLE.into(),
+            app_title: title.unwrap_or_else(|| DEFAULT_TITLE.into()),
+            wake,
+            ui_cursor,
+            token,
+            cwd_gen: 0,
             title: String::new(),
             process: None,
             status: initial_status,
@@ -584,18 +602,26 @@ impl TerminalView {
         &self.session
     }
 
+    /// The pane went out of sight (its workspace was parked): another
+    /// window showing the session sets its size from now on.
+    pub fn disown_size(&self) {
+        self.session.disown_size(self.token);
+    }
+
     fn on_wake(&mut self, cx: &mut Context<'_, Self>) {
-        self.session.clear_wake();
+        self.wake.clear();
         self.poke_cursor();
         // Tabs fall back to the directory when there's no title.
-        let mut cwd_changed = self.session.take_cwd_dirty();
+        let cwd_gen = self.session.cwd_generation();
+        let mut cwd_changed = cwd_gen != self.cwd_gen;
+        self.cwd_gen = cwd_gen;
         let mut clear_stats = false;
         let mut status_changed = false;
         // Told after the drain: agents' news first, so a program's own
         // notification of the same event is seen as its echo.
         let mut news = Vec::new();
         let mut program_notices = Vec::new();
-        while let Ok(ev) = self.session.ui_events.try_recv() {
+        for ev in self.session.ui_events(&mut self.ui_cursor) {
             match ev {
                 UiEvent::Title(t) => self.app_title = t,
                 UiEvent::ResetTitle => self.app_title = DEFAULT_TITLE.into(),
@@ -2624,6 +2650,7 @@ impl Render for TerminalView {
             .on_scroll(cx.listener(Self::on_scroll))
             .child(TerminalElement {
                 session: self.session.clone(),
+                token: self.token,
                 frame: self.frame.clone(),
                 geom: self.geom.clone(),
                 stats: self.stats.clone(),

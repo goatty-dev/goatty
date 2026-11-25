@@ -8,7 +8,6 @@
 //!   limit errors, directory & FIFO rejection without blocking),
 //! * Handshake compatibility with v12 clients (`ServerMsg::Cwd` is suppressed).
 
-use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use goatty_client::{Connection, Endpoint, PaneEvent, PaneSink};
-use goatty_proto::{ClientMsg, HARD_MAX_FILE_BYTES, REMOTE_FILES_SINCE, ServerMsg, StreamOpts, WinSize, encode, read_msg};
+use goatty_proto::{HARD_MAX_FILE_BYTES, WinSize};
 use parking_lot::Mutex;
 
 const SIZE: WinSize = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
@@ -105,14 +104,6 @@ impl Sink {
             assert!(Instant::now() < deadline, "never saw cwd {target:?} in {:?}", self.cwds.lock());
             std::thread::sleep(Duration::from_millis(20));
         }
-    }
-}
-
-fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -209,43 +200,6 @@ fn cwd_stat_and_read_work_over_proxy() {
         conn.stat_path(Some(id), Some(repo.to_string_lossy().into_owned()), vec!["src/main.rs".into()]).unwrap().expect("pinned cwd");
     assert_eq!(pinned.path, file_rs.to_string_lossy());
     assert_eq!(conn.stat_path(Some(id), Some(repo.to_string_lossy().into_owned()), vec!["inside.txt".into()]).unwrap(), None);
-}
-
-#[test]
-fn older_v12_clients_do_not_receive_cwd_messages() {
-    let d = start_daemon();
-    let mut s = UnixStream::connect(&d.sock).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
-    let v12 = REMOTE_FILES_SINCE - 1;
-    s.write_all(&encode(&ClientMsg::Hello { version: v12, client: "old".into() }).unwrap()).unwrap();
-    assert!(matches!(read_msg::<_, ServerMsg>(&mut s).unwrap(), ServerMsg::Hello { version, .. } if version == v12));
-
-    s.write_all(&encode(&ClientMsg::Create { req: 1, size: SIZE, cwd: None, opts: StreamOpts::LOCAL }).unwrap()).unwrap();
-    let session = loop {
-        match read_msg::<_, ServerMsg>(&mut s).unwrap() {
-            ServerMsg::Attached { req: 1, session, .. } => break session,
-            ServerMsg::Cwd { .. } => panic!("daemon sent v13 ServerMsg::Cwd to a v12 client"),
-            ServerMsg::SizeControl { .. } => panic!("daemon sent v14 ServerMsg::SizeControl to a v12 client"),
-            ServerMsg::Process { .. } | ServerMsg::TopLine { .. } => {}
-            other => panic!("unexpected {other:?}"),
-        }
-    };
-
-    s.write_all(&encode(&ClientMsg::Input { session, data: b"cd / && echo ok-v12\r".to_vec() }).unwrap()).unwrap();
-    let mut seen = Vec::new();
-    eventually("v12 client sees output without ServerMsg::Cwd", || {
-        let msg = read_msg::<_, ServerMsg>(&mut s).unwrap();
-        match msg {
-            ServerMsg::Cwd { .. } => panic!("daemon sent v13 ServerMsg::Cwd to a v12 client"),
-            ServerMsg::SizeControl { .. } => panic!("daemon sent v14 ServerMsg::SizeControl to a v12 client"),
-            ServerMsg::Output { data, .. } => {
-                seen.extend_from_slice(&data);
-                String::from_utf8_lossy(&seen).contains("ok-v12")
-            }
-            _ => false,
-        }
-    });
 }
 
 #[test]

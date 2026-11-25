@@ -26,6 +26,8 @@ enum Cmd {
     Proxy,
     /// List sessions.
     List,
+    /// List workspaces: each one's tabs, sessions and the windows showing it.
+    Workspaces,
     /// Kill a session.
     Kill { id: SessionId },
     /// Type text into a session. `\r`, `\n` and `\e` are unescaped (`\r` = Enter).
@@ -424,6 +426,23 @@ fn main() -> Result<()> {
                     s.process.unwrap_or_else(|| "?".into()),
                     s.cwd.unwrap_or_default(),
                     s.title
+                );
+            }
+            Ok(())
+        }
+        Cmd::Workspaces => {
+            let list = Control::connect_local(CLIENT)?.list_workspaces()?;
+            let width = list.iter().map(|w| w.name.chars().count()).max().unwrap_or(0);
+            let newest = list.iter().map(|w| w.active).max();
+            for w in list {
+                let count = |n: usize, one: &str, many: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {many}") };
+                println!(
+                    "{:<width$}  {:<8} {:<12} {:<10}{}",
+                    w.name,
+                    count(w.tabs as usize, "tab", "tabs"),
+                    count(w.sessions.len(), "session", "sessions"),
+                    count(w.views as usize, "window", "windows"),
+                    if Some(w.active) == newest { "  (most recent)" } else { "" },
                 );
             }
             Ok(())

@@ -167,7 +167,8 @@ impl Workspace {
 
         let dest = match target {
             None => {
-                let tab = self.next_id();
+                // Tab ids are shared with every window showing the workspace.
+                let tab = super::saved::new_id();
                 self.tabs.insert(from + 1, Tab::single(tab, id, pane, host));
                 tab
             }

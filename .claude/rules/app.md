@@ -12,6 +12,7 @@ paths:
   - `key` for feedback that replaces itself
   - `.action(…)` for buttons
 - Right-click menus are `ui::context_menu` entries (icon, label, the action's shortcut via `Item::action`), opened by `Workspace` (`workspace/menu.rs`); a pane adds its part through `TerminalView::menu_entries`. A new action that fits a pane's or tab's context belongs in that menu too, kept short: group with separators, hide what can't apply here, disable (with a reason) what can't apply right now.
+- Workspaces (`workspace/sync.rs`, `docs/workspaces.md`): what goes into the shared layout (`saved::Layout`) is shared by every window showing it; per-window state (active tab, focus, zoom, window size) never goes there (`reopen::HostRecord` keeps what a window needs back). Change a host's tabs through the window's tabs and `save_layout`, or through `reconcile` with a target layout; panes that leave a window call `Session::release_view`, never `detach` (another window may show the session).
 - Panes don't touch the window. `TerminalView` emits `TerminalEvent`s, and `Workspace` owns titles, closing, tabs and splits.
 - Read client settings from the `AppSettings` global and change them only through `AppSettings::update`. Host settings go through the daemon (`HostLink`/`HostService`); never write another host's file.
 - Reuse the widgets in `ui/` (controls, text_input, color_picker, and icons, whose SVGs are in `assets/icons/`) before writing new ones. Settings pages are built from `settings_window/kit.rs`; the look is in `settings-ui.md`.

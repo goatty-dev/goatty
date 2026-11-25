@@ -81,7 +81,7 @@ const NARROW_TAB: f32 = 120.0;
 
 /// Colors of the tabs, from the theme.
 #[derive(Clone, Copy)]
-pub(super) struct Colors {
+pub(crate) struct Colors {
     pub ui: Ui,
     /// Behind the tabs: the strip, the sidebar, the frame around the card.
     pub bar: Hsla,
@@ -229,7 +229,7 @@ impl Workspace {
         let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
         // The settings button, the new-tab menu's chevron, and the window
         // buttons when goatty draws them.
-        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx);
+        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx) + self.chip_width();
         let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
@@ -341,6 +341,10 @@ impl Workspace {
             // The seam to the panes, which the active tab opens.
             .child(div().absolute().bottom_0().left_0().right_0().h(px(1.)).bg(seam(c)))
             .children(left)
+            .children(
+                self.workspace_chip(false, cx)
+                    .map(|chip| div().flex_none().h_full().flex().items_center().when(modern, |d| d.mb(px(MODERN_LIFT))).child(chip)),
+            )
             .child(
                 // The tabs scroll sideways when they don't fit.
                 div()

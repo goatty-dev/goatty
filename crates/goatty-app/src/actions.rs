@@ -119,8 +119,17 @@ actions!(
         /// Bring back what was detached last on the active tab's host: its
         /// tabs (a detached host or window), else the newest detached session.
         ReattachDetached,
-        /// A new window with a new shell on the active tab's host.
+        /// A new window on the active tab's host's workspace.
         NewWindow,
+        /// The workspace switcher (#215): this host's workspaces.
+        SwitchWorkspace,
+        NextWorkspace,
+        PreviousWorkspace,
+        /// A new workspace on the active tab's host, with a fresh tab.
+        NewWorkspace,
+        RenameWorkspace,
+        /// Close the active tab's host's workspace (asks what to do with its tabs).
+        CloseWorkspace,
         /// Fold the vertical tab sidebar into a rail of icons, or unfold it.
         ToggleTabSidebar,
         /// Switch `tabs.style` between vertical and horizontal.
@@ -235,6 +244,12 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
         "detach_host" => Box::new(DetachHost),
         "reattach_detached" => Box::new(ReattachDetached),
         "new_window" => Box::new(NewWindow),
+        "switch_workspace" => Box::new(SwitchWorkspace),
+        "next_workspace" => Box::new(NextWorkspace),
+        "previous_workspace" => Box::new(PreviousWorkspace),
+        "new_workspace" => Box::new(NewWorkspace),
+        "rename_workspace" => Box::new(RenameWorkspace),
+        "close_workspace" => Box::new(CloseWorkspace),
         "toggle_tab_sidebar" => Box::new(ToggleTabSidebar),
         "toggle_vertical_tabs" => Box::new(ToggleVerticalTabs),
         "next_host" => Box::new(NextHost),

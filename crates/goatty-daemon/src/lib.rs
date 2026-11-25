@@ -8,7 +8,7 @@
 //! * [`server`]: socket setup, accept loop, session registry,
 //! * `client`: one connection's protocol loop,
 //! * `session`: PTY + terminal + subscribers with flow control,
-//! * `layouts`: each window's tabs and splits, restored by the next window,
+//! * `workspaces`: the tabs and splits every client window shares (#215),
 //! * `settings`: host settings, generations and rollback over the protocol,
 //! * `net`: this host on the user's tailnet (the gateway socket, pairing),
 //! * [`proxy`]: stdio ⇄ socket relay for remote transports,
@@ -22,7 +22,6 @@ mod client;
 mod files;
 mod flow;
 mod launchd;
-mod layouts;
 mod net;
 pub mod proxy;
 mod restore;
@@ -30,6 +29,7 @@ pub mod server;
 mod session;
 mod settings;
 pub mod systemd;
+mod workspaces;
 mod writer;
 
 pub use proxy::proxy;
