@@ -259,7 +259,11 @@ impl SettingsWindow {
                             ui,
                             Tone::Warning,
                             "Tailscale doesn't let goatty add its route yet",
-                            vec!["Run this once in a terminal (it needs sudo rights), then turn availability on again:".into()],
+                            vec![if cfg!(windows) {
+                                "Do this once, then turn availability on again:".into()
+                            } else {
+                                "Run this once in a terminal (it needs sudo rights), then turn availability on again:".into()
+                            }],
                         ))
                         .child(copy("net-copy-operator", p.operator.clone()))
                         .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("Or add the route yourself:"))

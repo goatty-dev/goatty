@@ -832,7 +832,8 @@ mod imp {
             self.0.shutdown(how)
         }
 
-        /// Connected pair of Named Pipe streams, for unit tests.
+        /// Connected pair of Named Pipe streams (unit tests, and goattyd's bridge
+        /// for tailnet gateway connections).
         pub fn pair() -> io::Result<(Self, Self)> {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let id = COUNTER.fetch_add(1, Ordering::Relaxed);

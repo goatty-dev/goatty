@@ -153,7 +153,7 @@ ssh's stderr is captured (logged, last 40 lines kept): a failed connect shows ss
 **Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. Without SSH, paired tailnet hosts connect through `Endpoint::Tailnet` ([`tailnet.md`](tailnet.md)): still no network socket in goattyd, because tailscaled forwards into a Unix socket.
 
 ### Any stdio command (implemented: `goatty --via '<cmd>'`)
-E.g. `--via 'docker exec -i devbox goattyd proxy'`. The command line runs under `sh -c`, so shell quoting works for arguments with spaces. The tests use this with the local `goattyd proxy` to exercise the full remote path, including reconnect, without ssh.
+E.g. `--via 'docker exec -i devbox goattyd proxy'`. The command line runs under `sh -c`, so shell quoting works for arguments with spaces. Windows has no `sh`: there the line is split into words (`'…'` and `"…"` group, backslashes stay) and run directly, so `--via 'wsl.exe -d Ubuntu -- goattyd proxy'` works but pipes and variables don't. The tests use this with the local `goattyd proxy` to exercise the full remote path, including reconnect, without ssh.
 
 ### Socket watchdog (implemented)
 If another listener has taken over the path (a second daemon, or a systemd socket installed meanwhile), the watchdog leaves it alone and says so once.
@@ -337,7 +337,7 @@ Guesses belong to *epochs*. Input we can't predict (Enter, arrows, control keys,
 | Security: proxy access = full control of the daemon | Same trust as an SSH shell on that host; the daemon socket stays 0600 and is never exposed |
 | `$XDG_RUNTIME_DIR` removed on logout | Watchdog re-bind (done); systemd user unit + linger (done, opt-in) |
 | `goattyd` not in PATH for non-interactive SSH | Script searches common dirs; `--remote-daemon`; auto-install (done) |
-| Windows client | `Endpoint::Command` with `ssh.exe` works unchanged; local transport needs named pipes instead of Unix sockets, and process detaching instead of `setsid` |
+| Windows client | Named pipes and a detached goattyd locally; Windows's own `ssh.exe` (`ssh_program`: `PATH`, else `%SystemRoot%\System32\OpenSSH`) with askpass (`DISPLAY` for Win32-OpenSSH < 8.4, 8.3 path for a goatty under `Program Files`); `--via` split into words and run without `sh`; helper programs never open a console window (`goatty_proto::process::hide_console`). Windows *as* an SSH host (remote probe/install without `sh`) is not done yet |
 | Session size conflicts with two clients | R1 controlling-client policy |
 
 ## 10. How to try it

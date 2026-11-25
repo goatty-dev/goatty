@@ -101,6 +101,7 @@ impl RouteStatus {
             RouteStatus::PortTaken { what } => {
                 format!("port {port} already serves {what}; goatty leaves it alone: pick another port")
             }
+            RouteStatus::Permission(p) if cfg!(windows) => format!("Tailscale doesn't let goatty add its route: {}", p.operator),
             RouteStatus::Permission(p) => format!("Tailscale doesn't let goatty add its route: run `{}` once", p.operator),
             RouteStatus::Failed { message } => message.clone(),
         }

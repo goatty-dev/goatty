@@ -70,9 +70,26 @@ pub struct SshTarget {
     pub program: String,
 }
 
+/// The OpenSSH client to run: `ssh` from `PATH`. On Windows, when it isn't
+/// on `PATH`, the one Windows ships (`%SystemRoot%\System32\OpenSSH\ssh.exe`,
+/// Windows 10 1809 and later) if it's there.
+pub fn ssh_program() -> String {
+    #[cfg(windows)]
+    {
+        let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("ssh.exe").is_file()));
+        if !on_path && let Some(root) = std::env::var_os("SystemRoot").filter(|r| !r.is_empty()) {
+            let bundled = PathBuf::from(root).join(r"System32\OpenSSH\ssh.exe");
+            if bundled.is_file() {
+                return bundled.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "ssh".into()
+}
+
 impl SshTarget {
     pub fn new(host: &str) -> Self {
-        Self { host: host.into(), remote_daemon: None, askpass: None, program: "ssh".into() }
+        Self { host: host.into(), remote_daemon: None, askpass: None, program: ssh_program() }
     }
 
     /// `ssh … host <remote>`: no remote PTY (we carry raw bytes), no `~`
@@ -95,10 +112,48 @@ impl SshTarget {
         // `--`: a host that starts with `-` is a host, not an option.
         c.arg("--").arg(&self.host).arg(remote);
         if let Some(askpass) = &self.askpass {
-            c.env("SSH_ASKPASS", askpass).env("SSH_ASKPASS_REQUIRE", "force").env(crate::askpass::ENV, "1");
+            c.env("SSH_ASKPASS", askpass_path(askpass)).env("SSH_ASKPASS_REQUIRE", "force").env(crate::askpass::ENV, "1");
+            // Win32-OpenSSH before 8.4 ignores SSH_ASKPASS_REQUIRE and only
+            // uses askpass when DISPLAY is set (and there's no console).
+            #[cfg(windows)]
+            if std::env::var_os("DISPLAY").is_none() {
+                c.env("DISPLAY", "1");
+            }
         }
+        goatty_proto::process::hide_console(&mut c);
         c
     }
+}
+
+/// `SSH_ASKPASS` for `path`. On Windows a path with spaces
+/// (`C:\Program Files\goatty\goatty.exe`) becomes its 8.3 short form when
+/// the volume has one, as older Win32-OpenSSH builds don't quote it when they
+/// start the program.
+fn askpass_path(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    if path.as_os_str().to_string_lossy().contains(' ')
+        && let Some(short) = short_path(path)
+    {
+        return short;
+    }
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn short_path(path: &std::path::Path) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated and `buf` is writable for its length.
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let short = PathBuf::from(OsString::from_wide(&buf[..n]));
+    // Volumes without 8.3 names give the long path back.
+    (!short.as_os_str().to_string_lossy().contains(' ')).then_some(short)
 }
 
 pub(crate) fn sh_quote(s: &str) -> String {
@@ -113,8 +168,18 @@ impl Endpoint {
 
     /// An arbitrary command line, run by `sh -c`, so quoting, variables and
     /// pipes work as in a shell. Labelled by its first word.
+    ///
+    /// Windows has no `sh`: there the line is split into words (`'…'` and
+    /// `"…"` group, backslashes are path separators) and run directly, so
+    /// `wsl.exe -d Ubuntu -- goattyd proxy` or `docker exec -i box goattyd
+    /// proxy` work, but pipes and variables don't.
     pub fn command_line(cmdline: &str) -> Result<Self> {
         let label = cmdline.split_whitespace().next().context("empty --via command")?.to_string();
+        if cfg!(windows) {
+            let mut words = split_words(cmdline)?.into_iter();
+            let program = words.next().context("empty --via command")?;
+            return Ok(Endpoint::Command { label, program, args: words.collect() });
+        }
         Ok(Endpoint::Command { label, program: "sh".into(), args: vec!["-c".into(), cmdline.to_string()] })
     }
 
@@ -178,11 +243,38 @@ impl Endpoint {
             Endpoint::Command { program, args, label } => {
                 let mut c = Command::new(program);
                 c.args(args);
+                goatty_proto::process::hide_console(&mut c);
                 spawn_stdio(c, label)
             }
             Endpoint::Tailnet(t) => crate::tailnet::connect(t),
         }
     }
+}
+
+/// `cmdline` split into words without a shell: whitespace separates them,
+/// `'…'` and `"…"` group (and may be part of a word), nothing else is
+/// special, so Windows paths keep their backslashes.
+fn split_words(cmdline: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    for c in cmdline.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.get_or_insert_default().push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            None if c.is_whitespace() => words.extend(word.take()),
+            None => word.get_or_insert_default().push(c),
+        }
+    }
+    if let Some(q) = quote {
+        bail!("unclosed {q} in the --via command");
+    }
+    words.extend(word);
+    Ok(words)
 }
 
 /// Run `cmd` with the protocol on its stdin/stdout. Its stderr (ssh errors,
@@ -434,6 +526,30 @@ mod tests {
         let out = Command::new(program).args(args).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "a b|c  d|e|");
         assert!(Endpoint::command_line("  ").is_err());
+    }
+
+    #[test]
+    fn words_split_without_a_shell() {
+        let w = |s: &str| split_words(s).unwrap();
+        assert_eq!(w("wsl.exe -d Ubuntu -- goattyd proxy"), ["wsl.exe", "-d", "Ubuntu", "--", "goattyd", "proxy"]);
+        assert_eq!(
+            w(r#"  "C:\Program Files\Docker\docker.exe" exec -i 'my box'  x"#),
+            [r"C:\Program Files\Docker\docker.exe", "exec", "-i", "my box", "x"]
+        );
+        assert_eq!(w(r#"a"b c"d '' e"#), ["ab cd", "", "e"]);
+        assert!(w("   ").is_empty());
+        assert!(split_words("ssh 'box").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_line_runs_without_sh_on_windows() {
+        let Endpoint::Command { program, args, label } = Endpoint::command_line("wsl.exe -d 'Ubuntu 24.04' -- goattyd proxy").unwrap()
+        else {
+            panic!("not a command endpoint")
+        };
+        assert_eq!((label.as_str(), program.as_str()), ("wsl.exe", "wsl.exe"));
+        assert_eq!(args, ["-d", "Ubuntu 24.04", "--", "goattyd", "proxy"]);
     }
 
     #[cfg(unix)]

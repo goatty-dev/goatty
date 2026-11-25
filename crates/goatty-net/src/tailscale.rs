@@ -7,16 +7,19 @@
 //!
 //! * goatty adds one TCP route on one port and removes only that route. It
 //!   never runs `serve reset`.
-//! * A route is goatty's when its target is goatty's gateway socket. A port
-//!   that serves anything else is left alone ([`Route::Other`]).
+//! * A route is goatty's when its target is goatty's gateway ([`Target`]):
+//!   its Unix socket, or on Windows (where Serve can't forward into a Unix
+//!   socket or a named pipe) its loopback port. A port that serves anything
+//!   else is left alone ([`Route::Other`]).
 //! * Serving a Unix socket needs root, or the Tailscale operator who may
 //!   also run `sudo tailscale` (tailscaled checks that itself). goatty never
 //!   runs sudo: it reports [`ServeError::Permission`] with the commands to
-//!   run.
+//!   run. On Windows only the user signed in to Tailscale (or an
+//!   Administrator) may change Serve.
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -42,12 +45,55 @@ impl Default for Tailscale {
     }
 }
 
+/// Where goatty's gateway listens, as a Serve target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The gateway's Unix socket (`unix:<path>`).
+    Unix(PathBuf),
+    /// A loopback TCP port (`tcp://127.0.0.1:<port>`): Windows, where Serve
+    /// forwards only to TCP.
+    Loopback(u16),
+}
+
+impl Target {
+    /// The target argument of `tailscale serve --tcp=<port> <target>`.
+    pub fn serve_arg(&self) -> String {
+        match self {
+            Target::Unix(path) => format!("unix:{}", path.display()),
+            Target::Loopback(port) => format!("tcp://127.0.0.1:{port}"),
+        }
+    }
+
+    /// Whether a route's `TCPForward` (as `serve status --json` shows it)
+    /// goes here. Serve stores a loopback target as `127.0.0.1:<port>`.
+    pub fn matches(&self, forward: &str) -> bool {
+        match self {
+            Target::Unix(_) => forward == self.serve_arg(),
+            Target::Loopback(port) => {
+                let addr = forward.strip_prefix("tcp://").unwrap_or(forward);
+                addr == format!("127.0.0.1:{port}") || addr == format!("localhost:{port}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Unix(path) => write!(f, "{}", path.display()),
+            Target::Loopback(port) => write!(f, "127.0.0.1:{port}"),
+        }
+    }
+}
+
 impl Tailscale {
-    /// `tailscale` from `PATH`, or the macOS app's CLI.
+    /// `tailscale` from `PATH`, or where the macOS app or the Windows
+    /// installer puts its CLI.
     pub fn system() -> Self {
-        let mac = Path::new("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
-        if cfg!(target_os = "macos") && find_in_path("tailscale").is_none() && mac.exists() {
-            return Self { program: mac.into() };
+        if find_in_path("tailscale").is_none()
+            && let Some(installed) = installed_cli()
+        {
+            return Self { program: installed };
         }
         Self { program: "tailscale".into() }
     }
@@ -61,12 +107,13 @@ impl Tailscale {
     /// replacing it or, in tests, a script just written while another
     /// thread's `fork` still holds the descriptor until its `exec`.
     fn spawn(&self, args: &[&str]) -> std::io::Result<std::process::Child> {
-        const ETXTBSY: i32 = 26;
         let mut tries = 0;
         loop {
-            let spawned = Command::new(&self.program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+            let mut cmd = Command::new(&self.program);
+            cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            let spawned = crate::hide_console(&mut cmd).spawn();
             match spawned {
-                Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 100 => {
+                Err(e) if is_text_busy(&e) && tries < 100 => {
                     tries += 1;
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -129,9 +176,9 @@ impl Tailscale {
         ServeConfig::parse(&stdout)
     }
 
-    /// `tailscale serve --bg --tcp=<port> unix:<socket>`.
-    pub fn serve_tcp(&self, port: u16, socket: &Path) -> Result<(), ServeError> {
-        let target = format!("unix:{}", socket.display());
+    /// `tailscale serve --bg --tcp=<port> <target>`.
+    pub fn serve_tcp(&self, port: u16, target: &Target) -> Result<(), ServeError> {
+        let target = target.serve_arg();
         let port = format!("--tcp={port}");
         self.change_serve(&["serve", "--bg", &port, &target])
     }
@@ -161,12 +208,33 @@ impl Tailscale {
     pub fn nc(&self, addr: &str, port: u16) -> Command {
         let mut c = Command::new(&self.program);
         c.arg("nc").arg(addr).arg(port.to_string());
+        crate::hide_console(&mut c);
         c
     }
 }
 
+/// `ETXTBSY`: only Unix has it (26 is another error on Windows).
+fn is_text_busy(e: &std::io::Error) -> bool {
+    cfg!(unix) && e.raw_os_error() == Some(26)
+}
+
+/// The CLI where Tailscale's own installer puts it, when that exists.
+fn installed_cli() -> Option<PathBuf> {
+    let path = if cfg!(target_os = "macos") {
+        PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    } else if cfg!(windows) {
+        let base =
+            std::env::var_os("ProgramFiles").filter(|p| !p.is_empty()).map_or_else(|| PathBuf::from(r"C:\Program Files"), PathBuf::from);
+        base.join("Tailscale").join("tailscale.exe")
+    } else {
+        return None;
+    };
+    path.is_file().then_some(path)
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(&name)).find(|p| p.is_file())
 }
 
 fn first_line(s: &str) -> Option<String> {
@@ -197,8 +265,21 @@ pub struct Permission {
 
 impl Permission {
     fn commands(args: &[&str]) -> Self {
+        Self::commands_for(cfg!(windows), args)
+    }
+
+    /// Windows has no operator and no sudo: Serve belongs to the user signed
+    /// in to Tailscale, and an Administrator may change it.
+    fn commands_for(windows: bool, args: &[&str]) -> Self {
+        let args = args.join(" ");
+        if windows {
+            return Self {
+                operator: "Sign in to the Tailscale app as this Windows user".into(),
+                direct: format!("tailscale {args}  (in a terminal opened as Administrator)"),
+            };
+        }
         let user = std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "$USER".into());
-        Self { operator: format!("sudo tailscale set --operator={user}"), direct: format!("sudo tailscale {}", args.join(" ")) }
+        Self { operator: format!("sudo tailscale set --operator={user}"), direct: format!("sudo tailscale {args}") }
     }
 }
 
@@ -212,6 +293,7 @@ pub enum ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServeError::Permission(p) if cfg!(windows) => write!(f, "Tailscale doesn't let goatty change Serve: {}", p.operator),
             ServeError::Permission(p) => write!(f, "Tailscale doesn't let goatty change Serve: run `{}` once", p.operator),
             ServeError::Failed(m) => write!(f, "tailscale serve: {m}"),
         }
@@ -429,7 +511,7 @@ pub struct TcpHandler {
 #[serde(tag = "route", rename_all = "snake_case")]
 pub enum Route {
     Free,
-    /// Forwards to goatty's gateway socket.
+    /// Forwards to goatty's gateway.
     Ours,
     /// Serves something else (described), which goatty won't overwrite.
     Other {
@@ -459,27 +541,34 @@ impl ServeConfig {
         Ok(Self { tcp, web_ports })
     }
 
-    /// What `port` serves.
-    pub fn route(&self, port: u16, socket: &Path) -> Route {
-        let ours = format!("unix:{}", socket.display());
+    /// What `port` serves; [`Route::Ours`] when it forwards to one of
+    /// `ours` (goatty's gateway, now or as it was before a restart).
+    pub fn route(&self, port: u16, ours: &[Target]) -> Route {
         match self.tcp.get(&port) {
             None if self.web_ports.contains(&port) => Route::Other { what: "a web server".into() },
             None => Route::Free,
-            Some(h) if h.tcp_forward == ours => Route::Ours,
+            Some(h) if ours.iter().any(|t| t.matches(&h.tcp_forward)) => Route::Ours,
             Some(h) if !h.tcp_forward.is_empty() => Route::Other { what: h.tcp_forward.clone() },
             Some(h) if h.https || h.http || self.web_ports.contains(&port) => Route::Other { what: "a web server".into() },
             Some(_) => Route::Other { what: "something else".into() },
         }
     }
 
-    /// Ports forwarding to `socket` (goatty's routes).
-    pub fn our_ports(&self, socket: &Path) -> Vec<u16> {
-        self.tcp.keys().copied().filter(|p| self.route(*p, socket) == Route::Ours).collect()
+    /// Ports forwarding to one of `ours` (goatty's routes).
+    pub fn our_ports(&self, ours: &[Target]) -> Vec<u16> {
+        self.tcp.keys().copied().filter(|p| self.route(*p, ours) == Route::Ours).collect()
+    }
+
+    /// Whether `port` forwards to exactly `target`.
+    pub fn forwards_to(&self, port: u16, target: &Target) -> bool {
+        self.tcp.get(&port).is_some_and(|h| target.matches(&h.tcp_forward))
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::Path;
+
     use super::*;
 
     pub const STATUS: &str = r#"{
@@ -555,7 +644,8 @@ pub(crate) mod tests {
 
     #[test]
     fn routes_tell_ours_from_others() {
-        let sock = Path::new("/run/user/1/goatty/goattyd.gateway.sock");
+        let path = Path::new("/run/user/1/goatty/goattyd.gateway.sock");
+        let sock = &[Target::Unix(path.into())][..];
         let cfg = ServeConfig::parse(
             r#"{
               "TCP": {"443": {"HTTPS": true}, "7422": {"TCPForward": "unix:/run/user/1/goatty/goattyd.gateway.sock"},
@@ -570,10 +660,38 @@ pub(crate) mod tests {
         assert_eq!(cfg.route(443, sock), Route::Other { what: "a web server".into() });
         assert_eq!(cfg.route(8080, sock), Route::Other { what: "a web server".into() });
         assert_eq!(cfg.route(1234, sock), Route::Free);
-        assert_eq!(cfg.route(7422, Path::new("/elsewhere.sock")), Route::Other { what: format!("unix:{}", sock.display()) });
+        assert_eq!(cfg.route(7422, &[Target::Unix("/elsewhere.sock".into())]), Route::Other { what: format!("unix:{}", path.display()) });
+        assert!(cfg.forwards_to(7422, &sock[0]));
+        assert!(!cfg.forwards_to(22, &sock[0]));
         assert_eq!(cfg.our_ports(sock), [7422, 9000]);
         assert_eq!(ServeConfig::parse("{}").unwrap(), ServeConfig::default());
         assert_eq!(ServeConfig::parse("").unwrap(), ServeConfig::default());
+    }
+
+    #[test]
+    fn loopback_routes_are_recognized() {
+        // Serve stores `tcp://127.0.0.1:N` as `127.0.0.1:N`.
+        let cfg =
+            ServeConfig::parse(r#"{"TCP": {"7422": {"TCPForward": "127.0.0.1:50123"}, "22": {"TCPForward": "127.0.0.1:22"}}}"#).unwrap();
+        let now = Target::Loopback(50123);
+        assert_eq!(now.serve_arg(), "tcp://127.0.0.1:50123");
+        assert_eq!(cfg.route(7422, std::slice::from_ref(&now)), Route::Ours);
+        assert_eq!(cfg.route(22, std::slice::from_ref(&now)), Route::Other { what: "127.0.0.1:22".into() });
+        // A route to the port the gateway had before is still goatty's.
+        let moved = [Target::Loopback(50999), Target::Loopback(50123)];
+        assert_eq!(cfg.route(7422, &moved), Route::Ours);
+        assert!(!cfg.forwards_to(7422, &moved[0]));
+        assert_eq!(cfg.our_ports(&moved), [7422]);
+        assert!(Target::Loopback(5).matches("localhost:5") && Target::Loopback(5).matches("tcp://127.0.0.1:5"));
+        assert!(!Target::Loopback(5).matches("127.0.0.1:55") && !Target::Loopback(5).matches("10.0.0.1:5"));
+    }
+
+    #[test]
+    fn windows_permission_has_no_sudo() {
+        let p = Permission::commands_for(true, &["serve", "--bg", "--tcp=7422", "tcp://127.0.0.1:5"]);
+        assert!(!p.operator.contains("sudo") && !p.direct.contains("sudo"), "{p:?}");
+        assert!(p.direct.starts_with("tailscale serve --bg --tcp=7422 tcp://127.0.0.1:5"));
+        assert!(Permission::commands_for(false, &["serve"]).direct.starts_with("sudo tailscale serve"));
     }
 
     #[test]
