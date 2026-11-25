@@ -239,28 +239,36 @@ fn native_embedded_quotes_and_snippets_survive_pwsh_and_ps51() {
         assert_eq!(stdout, format!("ARG:{json_val}\nARG:{spaced_val}\nARG:plain\n"), "host={ps}, line={line}");
     }
 
-    // Embedded snippet placeholders must arrive as single complete arguments.
-    let ps_toml = shells[0].replace('\\', "\\\\").replace('\'', "''");
-    let dump_toml = dump_str.replace('\\', "\\\\").replace('\'', "''");
+    // Embedded snippet placeholders must arrive as single complete arguments at a native executable.
+    let argv_src = tmp.path().join("sn_argv.rs");
+    std::fs::write(&argv_src, "fn main() { for a in std::env::args().skip(1) { println!(\"ARG:{a}\"); } }\n").unwrap();
+    let argv_exe = tmp.path().join("sn-argv.exe");
+    let compile = Command::new("rustc").arg(&argv_src).arg("-o").arg(&argv_exe).output().expect("run rustc");
+    assert!(compile.status.success(), "rustc failed: {}", String::from_utf8_lossy(&compile.stderr));
+    let exe_toml = argv_exe.to_string_lossy().replace('\\', "\\\\").replace('\'', "''");
     let sn: goatty_plugin::snippets::Snippet = toml::from_str(&format!(
-        "id = \"emb\"\ntitle = \"Emb\"\nline = \"& '{ps_toml}' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{dump_toml}' --out={{dir}}/file.txt --tag=pre-{{x}}-post {{dir}}\"\n[[input]]\nid = \"dir\"\nlabel = \"Dir\"\ntype = \"folder\"\n[[input]]\nid = \"x\"\nlabel = \"X\"\n",
+        "id = \"emb\"\ntitle = \"Emb\"\nline = \"& '{exe_toml}' --out={{dir}}/file.txt --tag=pre-{{x}}-post {{dir}}\"\n[[input]]\nid = \"dir\"\nlabel = \"Dir\"\ntype = \"folder\"\n[[input]]\nid = \"x\"\nlabel = \"X\"\n",
     ))
     .unwrap();
     let mut sn_vals = BTreeMap::new();
     sn_vals.insert("dir".into(), "~/src".into());
     sn_vals.insert("x".into(), "a\u{2019}b".into());
     let sn_line = sn.render_powershell(&sn_vals);
-    let out = Command::new(&shells[0])
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &sn_line])
-        .output()
-        .expect("run snippet");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
-    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 3, "expected 3 args, got: {lines:?}\nline={sn_line}");
-    assert!(lines[0].starts_with("ARG:--out=") && lines[0].ends_with("/src/file.txt"), "{lines:?}");
-    assert_eq!(lines[1], "ARG:--tag=pre-a\u{2019}b-post");
-    assert!(lines[2].starts_with("ARG:") && lines[2].ends_with("src"), "{lines:?}");
+    let sn_cmd =
+        format!("$u = New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding = $u; $OutputEncoding = $u; {sn_line}");
+    for ps in &shells {
+        let out = Command::new(ps)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &sn_cmd])
+            .output()
+            .unwrap_or_else(|e| panic!("run snippet on {ps}: {e}"));
+        assert!(out.status.success(), "{ps} stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 3, "{ps}: expected 3 args, got: {lines:?}\nline={sn_line}");
+        assert!(lines[0].starts_with("ARG:--out=") && lines[0].ends_with("/src/file.txt"), "{ps}: {lines:?}");
+        assert_eq!(lines[1], "ARG:--tag=pre-a\u{2019}b-post", "{ps}");
+        assert!(lines[2].starts_with("ARG:") && lines[2].ends_with("src"), "{ps}: {lines:?}");
+    }
 }
 
 #[test]
