@@ -350,6 +350,7 @@ fn run_source(dirs: &Dirs, settings: &HostSettings, src: &snippets::Source, cmd:
     Ok(Suggestions { items, note: (out.capped || truncated).then(|| "Showing the first ones".into()), truncated: truncated || out.capped })
 }
 
+#[derive(Debug)]
 struct Output {
     stdout: String,
     stderr: String,

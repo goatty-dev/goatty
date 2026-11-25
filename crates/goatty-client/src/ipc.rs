@@ -779,10 +779,10 @@ mod imp {
                 };
                 if h != INVALID_HANDLE_VALUE && !h.is_null() {
                     let handle = OwnedHandle(h);
-                    let mut mode = PIPE_READMODE_MESSAGE;
+                    let mode = PIPE_READMODE_MESSAGE;
                     // SAFETY: `handle.raw()` is open with `GENERIC_READ | GENERIC_WRITE`
                     // (which includes `FILE_WRITE_ATTRIBUTES`), and `mode` is valid.
-                    if unsafe { SetNamedPipeHandleState(handle.raw(), &raw mut mode, std::ptr::null(), std::ptr::null()) } == 0 {
+                    if unsafe { SetNamedPipeHandleState(handle.raw(), &raw const mode, std::ptr::null(), std::ptr::null()) } == 0 {
                         return Err(io::Error::last_os_error());
                     }
                     return PipeInner::new(handle).map(Self);

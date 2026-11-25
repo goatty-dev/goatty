@@ -914,6 +914,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::TermSize;
 
     #[cfg(unix)]
     fn sh(script: &str) -> ShellCommand {
