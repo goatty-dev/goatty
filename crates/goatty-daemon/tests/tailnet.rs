@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! goatty over the tailnet end to end, against a fake `tailscale` (never
 //! the user's Tailscale or daemon): the host's goattyd adds its Serve route
 //! and opens pairing through the `Net` carrier, a "client computer" (its

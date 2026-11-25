@@ -711,6 +711,7 @@ mod tests {
         assert!(!s.should_offer());
     }
 
+    #[cfg(unix)]
     #[test]
     fn tool_reports_download_size_for_outdated_managed_copy() {
         let tmp = tempfile::tempdir().unwrap();

@@ -2,22 +2,26 @@
 //! connections subscribed to its output (with per-subscriber flow control).
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use goatty_proto::{Frame, ReqId, ServerMsg, SessionId, SessionInfo, StreamOpts, TopLineCause, WinSize, encode, encode_server};
 use goatty_term::process::ForegroundWatch;
-use goatty_term::pty::{Pty, PtyInput};
+use goatty_term::pty::{Pty, PtyInput, PtyReader};
 use goatty_term::{TermSize, Terminal, UiEvent};
-use parking_lot::{Condvar, Mutex};
+#[cfg(unix)]
+use parking_lot::Condvar;
+use parking_lot::Mutex;
 
 use crate::client::{Outbound, try_acquire_worker};
 use crate::flow::FlowControl;
+#[cfg(unix)]
 use crate::systemd::StoredPty;
 
 /// Max concurrent OSC 7 `canonicalize` worker threads per session (bounds
@@ -390,18 +394,23 @@ pub(crate) struct Session {
     pub(crate) cwd: Arc<CwdCoordinator>,
     pub(crate) fg: OnceLock<ForegroundWatch>,
     /// goatty's managed zsh (it handles reload requests).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) managed: bool,
-    /// Lets a restart stop the output pump between two reads.
+    /// Lets a restart stop the output pump between two reads (Unix only).
+    #[cfg(unix)]
     pub(crate) pause: Pause,
-    /// The process and the PTY master, known without taking a lock.
-    /// The fd is open as long as `pty` is.
+    /// The process and the PTY master/resizer, known without taking a lock.
     pub(crate) pid: Option<u32>,
+    #[cfg(unix)]
     pub(crate) master_fd: RawFd,
+    #[cfg(windows)]
+    pub(crate) resizer: goatty_term::pty::PtyResizer,
     /// Terminal UI events (used to observe OSC 7 `CwdChanged`).
     pub(crate) ui_events: flume::Receiver<UiEvent>,
     /// The terminal's query answers on their way to the PTY: the replies
     /// thread's queue and how many it took and wrote, so a restart can wait
     /// until none is left behind.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) replies: flume::Receiver<Vec<u8>>,
     pub(crate) replies_taken: AtomicU64,
     pub(crate) replies_written: AtomicU64,
@@ -414,6 +423,7 @@ pub(crate) struct Session {
     pub(crate) creator: Mutex<Option<u64>>,
 }
 
+#[cfg(unix)]
 impl Session {
     /// No query answer waits to be written.
     pub(crate) fn replies_idle(&self) -> bool {
@@ -429,6 +439,7 @@ impl Session {
 /// Stopping the output pump without losing output: once it's paused, every
 /// byte it read is in the terminal, and the rest waits in the PTY for
 /// whoever reads it next (the next goattyd, after a restart).
+#[cfg(unix)]
 pub(crate) struct Pause {
     requested: AtomicBool,
     /// The pump is parked.
@@ -439,6 +450,7 @@ pub(crate) struct Pause {
     wake_tx: OwnedFd,
 }
 
+#[cfg(unix)]
 impl Pause {
     pub(crate) fn new() -> std::io::Result<Self> {
         let (wake_rx, wake_tx) = std::io::pipe()?;
@@ -634,10 +646,19 @@ impl Session {
     /// True when the size changed.
     fn apply_size(&self, ws: WinSize) -> bool {
         let size = to_size(ws);
-        // SAFETY: `master_fd` is open as long as `pty`, which `self` owns.
-        let master = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
-        if let Err(e) = goatty_term::pty::set_window_size(master, size) {
-            log::warn!("session {}: resize failed: {e}", self.id);
+        #[cfg(unix)]
+        {
+            // SAFETY: `master_fd` is open as long as `pty`, which `self` owns.
+            let master = unsafe { BorrowedFd::borrow_raw(self.master_fd) };
+            if let Err(e) = goatty_term::pty::set_window_size(master, size) {
+                log::warn!("session {}: resize failed: {e}", self.id);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Err(e) = self.resizer.resize(size) {
+                log::warn!("session {}: resize failed: {e}", self.id);
+            }
         }
         let changed = self.term.size() != (size.cols, size.rows);
         if changed {
@@ -887,10 +908,47 @@ pub(crate) fn to_size(ws: WinSize) -> TermSize {
     TermSize { cols: ws.cols.max(2), rows: ws.rows.max(1), cell_width: ws.cell_width, cell_height: ws.cell_height }
 }
 
+fn dispatch_output_chunk(s: &Session, chunk: &[u8]) {
+    let n = chunk.len();
+    s.poke_foreground();
+    {
+        let mut subs = s.subs.lock();
+        s.term.feed(chunk);
+        // Encode once, lazily: nobody may be listening, or everyone
+        // may be lagging.
+        let mut frame: Option<Frame> = None;
+        subs.retain(|sub| {
+            if sub.lagging.load(Ordering::Acquire) {
+                sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
+                return true;
+            }
+            let in_flight = sub.in_flight();
+            if in_flight > 0 && in_flight + n as u64 > sub.window() {
+                sub.lagging.store(true, Ordering::Release);
+                sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
+                return true;
+            }
+            let f =
+                frame.get_or_insert_with(|| encode(&ServerMsg::Output { session: s.id, data: chunk.to_vec() }).expect("encode")).clone();
+            sub.push(f, n)
+        });
+    }
+    let mut cwd_changed = false;
+    for ev in s.ui_events.try_iter() {
+        if matches!(ev, UiEvent::CwdChanged) {
+            cwd_changed = true;
+        }
+    }
+    if cwd_changed && let Some(dir) = s.term.current_directory() {
+        s.set_osc_cwd(dir.to_string_lossy().into_owned());
+    }
+}
+
 /// Read PTY output until EOF, feeding the authoritative terminal and every
-/// subscriber. Runs on the session's reader thread. Between two reads it
-/// can be paused ([`Pause`]).
-pub(crate) fn pump_output(s: &Session, mut reader: File) {
+/// subscriber. Runs on the session's reader thread. On Unix, between two reads
+/// it can be paused ([`Pause`]).
+#[cfg(unix)]
+pub(crate) fn pump_output(s: &Session, mut reader: PtyReader) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let mut fds = [
@@ -913,46 +971,27 @@ pub(crate) fn pump_output(s: &Session, mut reader: File) {
         }
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => {
-                s.poke_foreground();
-                {
-                    let mut subs = s.subs.lock();
-                    s.term.feed(&buf[..n]);
-                    // Encode once, lazily: nobody may be listening, or everyone
-                    // may be lagging.
-                    let mut frame: Option<Frame> = None;
-                    subs.retain(|sub| {
-                        if sub.lagging.load(Ordering::Acquire) {
-                            sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
-                            return true;
-                        }
-                        let in_flight = sub.in_flight();
-                        if in_flight > 0 && in_flight + n as u64 > sub.window() {
-                            sub.lagging.store(true, Ordering::Release);
-                            sub.skipped.fetch_add(n as u64, Ordering::Relaxed);
-                            return true;
-                        }
-                        let f = frame
-                            .get_or_insert_with(|| encode(&ServerMsg::Output { session: s.id, data: buf[..n].to_vec() }).expect("encode"))
-                            .clone();
-                        sub.push(f, n)
-                    });
-                }
-                let mut cwd_changed = false;
-                for ev in s.ui_events.try_iter() {
-                    if matches!(ev, UiEvent::CwdChanged) {
-                        cwd_changed = true;
-                    }
-                }
-                if cwd_changed && let Some(dir) = s.term.current_directory() {
-                    s.set_osc_cwd(dir.to_string_lossy().into_owned());
-                }
-            }
+            Ok(n) => dispatch_output_chunk(s, &buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break, // EIO when the child exits
         }
     }
     s.pause.finished();
+}
+
+/// Read ConPTY output until EOF on Windows (direct blocking `reader.read()`
+/// loop; Windows has no in-place restart / `Pause`).
+#[cfg(windows)]
+pub(crate) fn pump_output(s: &Session, mut reader: PtyReader) {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => dispatch_output_chunk(s, &buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -995,10 +1034,10 @@ mod tests {
     }
 
     fn wait_workers_idle(coord: &CwdCoordinator) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while coord.workers.load(Ordering::Acquire) > 0 {
-            assert!(Instant::now() < deadline, "cwd workers did not finish");
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(std::time::Instant::now() < deadline, "cwd workers did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -1046,10 +1085,10 @@ mod tests {
 
         // 2. Newer fast OSC 7 event arrives and completes immediately.
         coord.apply_osc_with("/tmp/fast".into(), |_| Some(PathBuf::from("/tmp/fast")));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while coord.current().as_deref() != Some("/tmp/fast") {
-            assert!(Instant::now() < deadline, "fast cwd update did not apply");
-            std::thread::sleep(Duration::from_millis(5));
+            assert!(std::time::Instant::now() < deadline, "fast cwd update did not apply");
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         // 3. Release the slow worker: its stale completion must be discarded.

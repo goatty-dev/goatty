@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `goattyd settings …` against a sandboxed `$HOME`.
 
 use std::path::Path;

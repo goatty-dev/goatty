@@ -17,6 +17,9 @@ log.workspace = true
 flume.workspace = true
 memchr.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [[example]]
 name = "vtbench"
 

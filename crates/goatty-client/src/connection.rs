@@ -1758,6 +1758,7 @@ mod tests {
         assert!(!needs_user_input(&busy));
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_once_times_out_silent_handshake() {
         let ep = Endpoint::command_line("exec sleep 5").unwrap();
@@ -1770,6 +1771,7 @@ mod tests {
         assert!(err.to_string().contains("timed out waiting for goattyd greeting"), "{err:#}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_once_times_out_when_descendant_keeps_pipe_open() {
         // `; true` prevents shells from exec-replacing sh, so a child keeps stdout open if only sh is killed.
@@ -1786,8 +1788,8 @@ mod tests {
     #[test]
     fn open_once_does_not_reconnect_and_reports_reply_lost() {
         let (tx_req, rx_req) = flume::unbounded::<ClientMsg>();
-        let (client_w, server_r) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (mut server_w, client_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (client_w, server_r) = crate::ipc::LocalStream::pair().unwrap();
+        let (mut server_w, client_r) = crate::ipc::LocalStream::pair().unwrap();
         let server = std::thread::spawn(move || {
             let mut r = std::io::BufReader::new(server_r);
             let hello = ServerMsg::Hello {
@@ -1880,7 +1882,7 @@ mod tests {
     }
 
     fn mock_connection(
-        server_fn: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>, std::os::unix::net::UnixStream) + Send + 'static,
+        server_fn: impl FnOnce(std::io::BufReader<crate::ipc::LocalStream>, crate::ipc::LocalStream) + Send + 'static,
     ) -> (Connection, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
         mock_connection_v(PROTOCOL_VERSION, server_fn)
     }
@@ -1888,10 +1890,10 @@ mod tests {
     /// [`mock_connection`] with a daemon that speaks `version`.
     fn mock_connection_v(
         version: u32,
-        server_fn: impl FnOnce(std::io::BufReader<std::os::unix::net::UnixStream>, std::os::unix::net::UnixStream) + Send + 'static,
+        server_fn: impl FnOnce(std::io::BufReader<crate::ipc::LocalStream>, crate::ipc::LocalStream) + Send + 'static,
     ) -> (Connection, std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-        let (client_w, server_r) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (mut server_w, client_r) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (client_w, server_r) = crate::ipc::LocalStream::pair().unwrap();
+        let (mut server_w, client_r) = crate::ipc::LocalStream::pair().unwrap();
         let server = std::thread::spawn(move || {
             let hello = ServerMsg::Hello {
                 version,

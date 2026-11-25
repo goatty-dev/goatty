@@ -33,9 +33,9 @@ impl ConfigHost {
     }
 }
 
-/// `~/.ssh`, if `$HOME` is set.
+/// `~/.ssh`, if a home directory is set.
 pub fn ssh_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".ssh"))
+    goatty_proto::home_dir().map(|h| h.join(".ssh"))
 }
 
 /// The hosts in `~/.ssh/config` and the files it includes (none when it

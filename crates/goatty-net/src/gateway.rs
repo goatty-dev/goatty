@@ -634,10 +634,20 @@ impl Pairing {
 #[cfg(test)]
 mod tests {
     use std::io::BufReader;
-    use std::os::unix::net::UnixStream;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
 
     use super::*;
+
+    fn stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (host, _) = listener.accept().unwrap();
+        let _ = client.set_nodelay(true);
+        let _ = host.set_nodelay(true);
+        (client, host)
+    }
 
     fn gateway(dir: &std::path::Path) -> Arc<Gateway> {
         let info = HostInfo { name: "desk".into(), goatty: "0.1.0".into(), protocol: (7, 12) };
@@ -646,8 +656,8 @@ mod tests {
 
     /// Run the host side of one connection in a thread; returns the client
     /// end and the host's outcome.
-    fn connect(g: &Arc<Gateway>) -> (BufReader<UnixStream>, UnixStream, std::thread::JoinHandle<Result<Accepted>>) {
-        let (client, mut host) = UnixStream::pair().unwrap();
+    fn connect(g: &Arc<Gateway>) -> (BufReader<TcpStream>, TcpStream, std::thread::JoinHandle<Result<Accepted>>) {
+        let (client, mut host) = stream_pair();
         let g = g.clone();
         let handle = std::thread::spawn(move || {
             let r = g.accept(&mut host);
@@ -799,7 +809,7 @@ mod tests {
     #[test]
     fn a_reveal_that_doesnt_match_the_commitment_is_refused() {
         // A "host" that picks its pairing nonce after seeing the client's.
-        let (client, mut host) = UnixStream::pair().unwrap();
+        let (client, mut host) = stream_pair();
         let fake = Identity::generate().unwrap();
         let fake_key = fake.public();
         std::thread::spawn(move || {
@@ -866,7 +876,7 @@ mod tests {
 
     #[test]
     fn garbage_is_not_a_gateway() {
-        let (a, mut b) = UnixStream::pair().unwrap();
+        let (a, mut b) = stream_pair();
         std::thread::spawn(move || b.write_all(b"SSH-2.0-OpenSSH_9.9\r\n"));
         let mut r = BufReader::new(a);
         let err = read_greeting(&mut r).unwrap_err();

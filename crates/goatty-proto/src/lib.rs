@@ -29,4 +29,4 @@ mod paths;
 
 pub use codec::{Frame, MAX_FRAME, ZSTD_LEVEL, encode, encode_server, read_msg, write_msg};
 pub use msg::*;
-pub use paths::{legacy_socket_path, runtime_dir, socket_path};
+pub use paths::{default_windows_pipe_path, home_dir, home_dir_from, legacy_socket_path, runtime_dir, socket_path, windows_pipe_name};

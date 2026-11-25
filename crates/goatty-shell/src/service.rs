@@ -281,15 +281,22 @@ impl HostService {
     /// `exec bash`, or the pid was reused) is unaffected. Returns how many
     /// shells were signaled.
     pub fn reload_shells(&self) -> usize {
-        let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
-        shells.retain(|&pid| {
-            let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
-            // SAFETY: kill(2) has no memory-safety preconditions; a stale
-            // pid at worst gets an ignored-by-default signal.
-            unsafe { libc::kill(pid, libc::SIGURG) == 0 }
-        });
-        log::info!("asked {} managed shell(s) to reload", shells.len());
-        shells.len()
+        #[cfg(unix)]
+        {
+            let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
+            shells.retain(|&pid| {
+                let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+                // SAFETY: kill(2) has no memory-safety preconditions; a stale
+                // pid at worst gets an ignored-by-default signal.
+                unsafe { libc::kill(pid, libc::SIGURG) == 0 }
+            });
+            log::info!("asked {} managed shell(s) to reload", shells.len());
+            shells.len()
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
     }
 
     /// Activate generation `to` (default: the previous one) and restore its

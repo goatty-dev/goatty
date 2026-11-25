@@ -21,6 +21,9 @@ enum Cmd {
         /// Take over from the previous goattyd (what a restart runs).
         #[arg(long, hide = true, value_name = "FILE")]
         restore: Option<std::path::PathBuf>,
+        /// Append logs to FILE (used by the Windows Scheduled Task).
+        #[arg(long, hide = true, value_name = "FILE")]
+        log: Option<std::path::PathBuf>,
     },
     /// Relay stdin/stdout to the daemon, starting it if needed (`ssh host goattyd proxy`).
     Proxy,
@@ -48,7 +51,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Run goattyd as a user service (systemd on Linux, launchd on macOS).
+    /// Run goattyd as a user service (systemd on Linux, launchd on macOS, Scheduled Task on Windows).
     #[command(subcommand)]
     Service(ServiceCmd),
     /// goatty's managed zsh on this host: status, tool installs and updates.
@@ -78,7 +81,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Install and enable the user service (systemd units on Linux, LaunchAgent on macOS).
+    /// Install and enable the user service (systemd on Linux, LaunchAgent on macOS, Scheduled Task on Windows).
     Install,
     /// Disable and remove the user service.
     Uninstall,
@@ -359,7 +362,7 @@ const CLIENT: &str = concat!("goattyd-cli ", env!("CARGO_PKG_VERSION"));
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cmd = cli.cmd.unwrap_or(Cmd::Serve { restore: None });
+    let cmd = cli.cmd.unwrap_or(Cmd::Serve { restore: None, log: None });
     if matches!(cmd, Cmd::Serve { .. }) {
         // systemd's variables, before any thread starts.
         goatty_daemon::systemd::capture_env();
@@ -381,10 +384,19 @@ fn main() -> Result<()> {
     } else {
         "info,rio_vt=error"
     };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level));
+    if let Cmd::Serve { log: Some(ref path), .. } = cmd {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            logger.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+    }
+    logger.init();
 
     match cmd {
-        Cmd::Serve { restore } => {
+        Cmd::Serve { restore, .. } => {
             // Keep goattyd's completions (and those of goatty's tool copies)
             // in the managed shell current, off the startup path.
             let _ = std::thread::Builder::new().name("completions".into()).spawn(|| {
@@ -639,7 +651,19 @@ fn service_install() -> Result<()> {
             );
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        println!("registered Scheduled Task \\{} (logs: {})", service::WINDOWS_TASK_NAME, service::logs_hint());
+        if done.started {
+            println!("goattyd is now running in the background and will start automatically at logon");
+        } else {
+            println!(
+                "a goattyd started outside Task Scheduler is still running; the Scheduled Task takes over once it stops\n\
+                 (`goattyd stop` ends its sessions now, or it happens at your next logon)"
+            );
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         println!("installed {} and {} in {}", service::SOCKET_UNIT, service::SERVICE_UNIT, done.unit_dir.display());
         if done.started {
@@ -655,7 +679,7 @@ fn service_install() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn print_linger(linger: Option<bool>) {
     match linger {
         Some(true) => println!("lingering is on: goattyd and its sessions keep running after you log out"),
@@ -677,7 +701,15 @@ fn service_uninstall() -> Result<()> {
             println!("goattyd's launchd agent isn't installed");
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        if removed {
+            println!("removed Scheduled Task \\{}", goatty_client::service::WINDOWS_TASK_NAME);
+        } else {
+            println!("goattyd's Scheduled Task isn't installed");
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         if removed {
             println!("removed goattyd's systemd units; a running goattyd keeps its sessions until `goattyd stop`");
@@ -694,10 +726,15 @@ fn service_status() -> Result<()> {
     if !s.installed {
         #[cfg(target_os = "macos")]
         println!("not installed (plist would go to {dir}); `goattyd service install` sets it up");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        println!("not installed (Scheduled Task \\{}); `goattyd service install` sets it up", goatty_client::service::WINDOWS_TASK_NAME);
+        #[cfg(all(not(target_os = "macos"), not(windows)))]
         println!("not installed (units would go to {dir}); `goattyd service install` sets them up");
         return Ok(());
     }
+    #[cfg(windows)]
+    println!("installed as Scheduled Task \\{}", goatty_client::service::WINDOWS_TASK_NAME);
+    #[cfg(not(windows))]
     println!("installed in {dir}");
     if let Some(exec) = &s.exec_start {
         println!("runs      {exec}");
@@ -712,7 +749,14 @@ fn service_status() -> Result<()> {
         }
         println!("sessions  survive `goattyd restart` (re-exec); crashes and `launchctl kickstart -k` end them (launchd has no fd store)");
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        if let Some(log) = &s.log_path {
+            println!("logs      {}", log.display());
+        }
+        println!("sessions  end when goattyd stops or restarts (Windows has no execve or ConPTY handle handoff)");
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         if s.keeps_sessions {
             println!("sessions  survive daemon restarts and crashes; `systemctl --user stop goattyd` ends them");

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Importing the user's shell setup, run for real: zsh and bash with
 //! startup files in a sandboxed `$HOME`, harvested the way goattyd does.
 //!

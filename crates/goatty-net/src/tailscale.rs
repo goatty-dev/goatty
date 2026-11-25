@@ -497,6 +497,7 @@ pub(crate) mod tests {
       "User": {"1": {"ID": 1, "LoginName": "me@github"}}
     }"#;
 
+    #[cfg(unix)]
     #[test]
     fn a_program_busy_for_writing_is_retried() {
         use std::os::unix::fs::PermissionsExt;

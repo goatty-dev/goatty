@@ -196,6 +196,7 @@ fn validate(zdir: &Path, files: &[GeneratedFile]) -> Result<()> {
 }
 
 /// Point `current` at generation `number` (relative link, renamed into place).
+#[cfg(unix)]
 fn switch(dirs: &Dirs, number: u32) -> Result<()> {
     let link = dirs.current_link();
     let tmp = dirs.data.join(format!(".current.tmp-{}", std::process::id()));
@@ -203,6 +204,12 @@ fn switch(dirs: &Dirs, number: u32) -> Result<()> {
     std::os::unix::fs::symlink(Path::new("generations").join(number.to_string()), &tmp)?;
     std::fs::rename(&tmp, &link).with_context(|| format!("activate generation {number}"))?;
     Ok(())
+}
+
+/// Windows fallback until managed PowerShell / NTFS junctions land (#278).
+#[cfg(not(unix))]
+fn switch(_dirs: &Dirs, _number: u32) -> Result<()> {
+    bail!("managed shell generations aren't supported on Windows yet (tracked in #278)")
 }
 
 fn prune(dirs: &Dirs) {

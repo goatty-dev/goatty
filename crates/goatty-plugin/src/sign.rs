@@ -5,7 +5,6 @@
 //! only by you. The public key goes into the registry's `registry.toml`
 //! and into the clients that trust the registry.
 
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -40,23 +39,24 @@ fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
 /// A new secret key from the OS's random source. Returns (secret hex, public hex).
 pub fn keygen() -> Result<(String, String)> {
     let mut seed = [0u8; 32];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut seed)).context("read /dev/urandom")?;
+    getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("read OS randomness: {e}"))?;
     let key = SigningKey::from_bytes(&seed);
     Ok((hex(&seed), hex(key.verifying_key().as_bytes())))
 }
 
-/// Write a new secret key to `path` (mode 0600, refusing to overwrite).
+/// Write a new secret key to `path` (mode 0600 on Unix, refusing to overwrite).
 /// Returns the public key.
 pub fn keygen_file(path: &Path) -> Result<String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let (secret, public) = keygen()?;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("create {} (it must not exist yet)", path.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).with_context(|| format!("create {} (it must not exist yet)", path.display()))?;
     writeln!(f, "# goatty registry signing key (SECRET). Public key: {public}")?;
     writeln!(f, "{secret}")?;
     Ok(public)
@@ -105,8 +105,11 @@ mod tests {
         let path = tmp.path().join("k.key");
         let public = keygen_file(&path).unwrap();
         assert!(keygen_file(&path).is_err(), "never overwrites a key");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         let key = load_secret(&path).unwrap();
         assert_eq!(public_of(&key), public);
 

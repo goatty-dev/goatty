@@ -24,6 +24,7 @@
 //! Everything here runs on the host whose `.zshenv` it is: for a remote
 //! goattyd, the remote host.
 
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -308,16 +309,16 @@ fn backup(dirs: &Dirs, file: &Path, text: &str, shown: &str) -> Result<Option<Pa
     let text = text.as_bytes();
     let dir = dirs.zshenv_backups();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let name: String = shown.chars().map(|c| if c == '/' { '%' } else { c }).collect();
     let path = dir.join(format!("{:010}.{:09}-{:010}-{:06}.{name}", now.as_secs(), now.subsec_nanos(), std::process::id(), unique()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(&path).with_context(|| format!("create {}", path.display()))?;
     std::io::Write::write_all(&mut f, text)?;
     let mut all = backups(dirs);
     while all.len() > BACKUPS_KEPT {
@@ -343,6 +344,7 @@ fn write(file: &Path, text: &str) -> Result<()> {
     } else {
         file.to_path_buf()
     };
+    #[cfg(unix)]
     let mode = std::fs::metadata(&real).map_or(0o644, |m| m.permissions().mode() & 0o7777);
     let dir = real.parent().context("the file has no folder")?;
     if !dir.exists() {
@@ -351,14 +353,15 @@ fn write(file: &Path, text: &str) -> Result<()> {
     let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("zshenv");
     let tmp = dir.join(format!(".{name}.goatty-{}-{}", std::process::id(), unique()));
     let written = (|| -> Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("can't write in {}", dir.display()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts.open(&tmp).with_context(|| format!("can't write in {}", dir.display()))?;
         std::io::Write::write_all(&mut f, text.as_bytes())?;
         f.sync_all()?;
+        drop(f);
+        #[cfg(unix)]
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
         std::fs::rename(&tmp, &real).with_context(|| format!("replace {}", real.display()))
     })();
@@ -419,13 +422,11 @@ impl<'a> Hook<'a> {
     fn lock(&self) -> Result<std::fs::File> {
         std::fs::create_dir_all(&self.dirs.state).with_context(|| format!("create {}", self.dirs.state.display()))?;
         let path = self.dirs.state.join(".zshenv.lock");
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let f = opts.open(&path).with_context(|| format!("open {}", path.display()))?;
         f.lock()?;
         Ok(f)
     }
@@ -669,7 +670,7 @@ impl HostService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

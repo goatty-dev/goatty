@@ -205,6 +205,7 @@ mod tests {
         assert!(!file(&dirs, "bad").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_program_busy_for_writing_is_retried() {
         use std::os::unix::fs::PermissionsExt;

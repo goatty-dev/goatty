@@ -343,6 +343,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn find_tool(name: &str) -> PathBuf {
         std::env::var_os("PATH")
             .into_iter()
@@ -353,6 +354,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} not found in PATH or /usr/bin:/bin"))
     }
 
+    #[cfg(unix)]
     #[test]
     fn proxy_script_reports_a_missing_daemon() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end tests of the size policy (#12) against a real goattyd: one
 //! controlling client per session sets the size, the others watch at it
 //! (`SizeControl`) until they take over (`TakeSize`) or the controller

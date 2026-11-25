@@ -3,70 +3,29 @@
 //! [`crate::Connection`] it never starts a daemon.
 
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use goatty_proto::{ClientMsg, HostInfo, PROTOCOL_VERSION, ReqId, ServerMsg, SessionId, SessionInfo, encode, read_msg};
 
 use crate::handshake::{self, Outcome};
+use crate::ipc::LocalStream;
 
 pub struct Control {
-    stream: UnixStream,
+    stream: LocalStream,
     host: HostInfo,
     pid: u32,
     version: u32,
     next_req: ReqId,
 }
 
-/// The pid of the process listening on the Unix socket at `path`
-/// (`SO_PEERCRED`; `LOCAL_PEERPID` on macOS), whatever protocol it speaks.
-/// Only processes of this user count (the socket directory is 0700 anyway).
+/// The pid of the process listening on the local IPC endpoint at `path`
+/// (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS,
+/// `GetNamedPipeServerProcessId` on Windows), whatever protocol it speaks.
+/// Only processes belonging to this user count.
 pub fn socket_owner(path: &Path) -> Result<u32> {
-    let stream = UnixStream::connect(path).with_context(|| format!("nothing is listening on {}", path.display()))?;
-    let (pid, uid) = peer_cred(&stream)?;
-    // SAFETY: getuid has no preconditions.
-    let me = unsafe { libc::getuid() };
-    if uid != me || pid <= 0 {
-        bail!("{} belongs to another user (uid {uid})", path.display());
-    }
-    Ok(pid as u32)
-}
-
-/// The pid and uid of the process at the other end of `stream`.
-#[cfg(target_os = "linux")]
-fn peer_cred(stream: &UnixStream) -> Result<(libc::pid_t, libc::uid_t)> {
-    use std::os::fd::AsRawFd;
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` and `len` are valid for writes of the sizes passed, and
-    // the fd stays open for the duration of the call.
-    let rc = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &raw mut len) };
-    if rc != 0 {
-        bail!("SO_PEERCRED: {}", std::io::Error::last_os_error());
-    }
-    Ok((cred.pid, cred.uid))
-}
-
-/// The pid and uid of the process at the other end of `stream`.
-#[cfg(target_os = "macos")]
-fn peer_cred(stream: &UnixStream) -> Result<(libc::pid_t, libc::uid_t)> {
-    use std::os::fd::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    // SAFETY: `pid` and `len` are valid for writes of the sizes passed, and
-    // the fd stays open for the duration of the call.
-    let rc = unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &raw mut len) };
-    if rc != 0 {
-        bail!("LOCAL_PEERPID: {}", std::io::Error::last_os_error());
-    }
-    let (mut uid, mut gid) = (0, 0);
-    // SAFETY: `uid` and `gid` are valid for writes; the fd is open.
-    if unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) } != 0 {
-        bail!("getpeereid: {}", std::io::Error::last_os_error());
-    }
-    Ok((pid, uid))
+    let stream = LocalStream::connect(path).with_context(|| format!("nothing is listening on {}", path.display()))?;
+    stream.peer_owner_pid(path)
 }
 
 impl Control {
@@ -94,7 +53,7 @@ impl Control {
         let mut announce = PROTOCOL_VERSION;
         loop {
             let mut stream =
-                UnixStream::connect(path).with_context(|| format!("goattyd is not running (no socket at {})", path.display()))?;
+                LocalStream::connect(path).with_context(|| format!("goattyd is not running (no socket at {})", path.display()))?;
             stream.set_read_timeout(timeout)?;
             stream.set_write_timeout(timeout)?;
             stream.write_all(&handshake::hello(client, announce)?)?;
@@ -118,9 +77,9 @@ impl Control {
         match Self::connect(&primary, client) {
             Ok(c) => Ok(c),
             Err(err) => {
-                if UnixStream::connect(&primary).is_err()
+                if LocalStream::connect(&primary).is_err()
                     && let Some(legacy) = goatty_proto::legacy_socket_path()
-                    && UnixStream::connect(&legacy).is_ok()
+                    && LocalStream::connect(&legacy).is_ok()
                 {
                     return Self::connect(&legacy, client);
                 }
@@ -280,7 +239,7 @@ mod tests {
     fn socket_owner_is_the_listener() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _listener = crate::ipc::LocalListener::bind(&path).unwrap();
         assert_eq!(socket_owner(&path).unwrap(), std::process::id());
         assert!(socket_owner(&dir.path().join("none.sock")).is_err());
     }

@@ -2073,6 +2073,7 @@ dependencies = [
  "log",
  "parking_lot 0.13.0",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2107,6 +2108,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2115,6 +2117,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "libc",
  "log",
  "parking_lot 0.13.0",
@@ -2132,6 +2135,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "flate2",
+ "getrandom 0.4.3",
  "lzma-rust2",
  "regex",
  "semver",
@@ -2154,6 +2158,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_bytes",
+ "sha2 0.11.1",
  "zstd",
 ]
 
@@ -2176,6 +2181,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml 1.2.1+spec-1.1.0",
+ "windows-sys",
  "zip",
 ]
 
@@ -2191,6 +2197,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "portable-pty",
  "rio-vt",
+ "windows-sys",
 ]
 
 [[package]]

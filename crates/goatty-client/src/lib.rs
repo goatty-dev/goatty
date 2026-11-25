@@ -28,6 +28,7 @@ pub mod askpass;
 mod connection;
 pub mod control;
 mod handshake;
+pub mod ipc;
 pub mod local;
 pub mod remote;
 pub mod service;
@@ -38,18 +39,49 @@ pub mod transport;
 pub use connection::{AttachRequest, Connection, HostSettingsApplied, HostSettingsReply, ReplyLost, WorkspaceEvent, WorkspaceSink};
 pub use control::Control;
 pub use goatty_proto::{RemotePathInfo, TopLineCause};
+pub use ipc::{LocalListener, LocalStream};
 
-/// This computer's host name (`gethostname`, else `/etc/hostname`); empty
-/// when neither works.
+/// This computer's host name (`gethostname` / `/etc/hostname` on Unix;
+/// `GetComputerNameExW` / `COMPUTERNAME` on Windows); empty when unavailable.
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: `buf` is valid for writes of the length passed.
-    let from_libc = (unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0)
-        .then(|| String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(buf.len())]).trim().to_string());
-    from_libc
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
-        .unwrap_or_default()
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` is valid for writes of the length passed.
+        let from_libc = (unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0)
+            .then(|| String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(buf.len())]).trim().to_string());
+        from_libc
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()))
+            .unwrap_or_default()
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
+
+        let mut len = 0u32;
+        // SAFETY: probes the required UTF-16 buffer length including NUL.
+        unsafe {
+            GetComputerNameExW(ComputerNameDnsHostname, std::ptr::null_mut(), &raw mut len);
+        }
+        if len > 0 {
+            let mut buf = vec![0u16; len as usize];
+            // SAFETY: `buf` has space for `len` UTF-16 code units.
+            if unsafe { GetComputerNameExW(ComputerNameDnsHostname, buf.as_mut_ptr(), &raw mut len) } != 0 {
+                let s = OsString::from_wide(&buf[..len as usize]).to_string_lossy().trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+        std::env::var("COMPUTERNAME").map(|s| s.trim().to_string()).unwrap_or_default()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        String::new()
+    }
 }
 pub use handshake::VersionMismatch;
 pub use local::LocalProblem;

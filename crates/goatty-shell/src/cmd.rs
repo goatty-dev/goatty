@@ -725,7 +725,6 @@ pub fn refresh(svc: &crate::HostService) -> Result<()> {
 /// That process starts without `ZDOTDIR`: the shell asking is in the middle
 /// of the user's `.zshenv`, which may have set it.
 pub fn refresh_detached(wait: Duration) -> Result<()> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().context("where is goattyd")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["shell", "refresh"])
@@ -733,12 +732,22 @@ pub fn refresh_detached(wait: Duration) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // SAFETY: setsid is async-signal-safe and only changes the child.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and only changes the child.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     let mut child = cmd.spawn().context("start goattyd shell refresh")?;
     let start = std::time::Instant::now();
@@ -751,7 +760,7 @@ pub fn refresh_detached(wait: Duration) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::BTreeMap;
 

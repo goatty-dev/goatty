@@ -14,8 +14,6 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::Arc;
@@ -25,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use goatty_proto::StreamOpts;
 use parking_lot::{Condvar, Mutex};
 
+use crate::ipc::LocalStream;
 use crate::remote;
 
 /// Where a goattyd lives and how to reach it.
@@ -265,7 +264,7 @@ impl StderrTail {
 }
 
 pub(crate) enum CloseHandle {
-    Socket(UnixStream),
+    Socket(LocalStream),
     Child(Child),
     Net(goatty_net::link::Closer),
 }
@@ -300,18 +299,18 @@ pub struct Transport {
     pub stderr: StderrTail,
 }
 
-fn try_connect_existing(primary: &std::path::Path, legacy: Option<&std::path::Path>) -> Option<UnixStream> {
-    if let Ok(s) = UnixStream::connect(primary) {
+fn try_connect_existing(primary: &std::path::Path, legacy: Option<&std::path::Path>) -> Option<LocalStream> {
+    if let Ok(s) = LocalStream::connect(primary) {
         return Some(s);
     }
-    legacy.and_then(|p| UnixStream::connect(p).ok())
+    legacy.and_then(|p| LocalStream::connect(p).ok())
 }
 
 /// Connect to the local goattyd, starting it if needed: through the user
-/// service (systemd on Linux, launchd on macOS) when installed
-/// ([`crate::service`]), else detached in its own session. `daemon_exe`
-/// defaults to `goattyd` next to the current binary.
-pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream> {
+/// service (systemd on Linux, launchd on macOS, Scheduled Task on Windows)
+/// when installed ([`crate::service`]), else detached from this session.
+/// `daemon_exe` defaults to `goattyd` (or `goattyd.exe`) next to the current binary.
+pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<LocalStream> {
     let path = goatty_proto::socket_path();
     let legacy = goatty_proto::legacy_socket_path();
     if let Some(s) = try_connect_existing(&path, legacy.as_deref()) {
@@ -345,7 +344,7 @@ pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream
     let wait = if via_service { Duration::from_secs(4) } else { Duration::from_secs(3) };
     let deadline = Instant::now() + wait;
     loop {
-        if let Ok(s) = UnixStream::connect(&path) {
+        if let Ok(s) = LocalStream::connect(&path) {
             return Ok(s);
         }
         if Instant::now() > deadline {
@@ -359,13 +358,14 @@ pub fn connect_or_spawn_daemon(daemon_exe: Option<PathBuf>) -> Result<UnixStream
 }
 
 fn spawn_daemon(daemon_exe: Option<PathBuf>, dir: &std::path::Path, log_path: &std::path::Path) -> Result<()> {
+    let daemon_name = format!("goattyd{}", std::env::consts::EXE_SUFFIX);
     let daemon = match daemon_exe {
         Some(p) => p,
         None => {
             let exe = std::env::current_exe()?;
-            let d = exe.with_file_name("goattyd");
+            let d = exe.with_file_name(&daemon_name);
             if !d.exists() {
-                bail!("goattyd not found next to {} (build it with `cargo build -p goatty-daemon`)", exe.display());
+                bail!("{daemon_name} not found next to {} (build it with `cargo build -p goatty-daemon`)", exe.display());
             }
             d
         }
@@ -375,14 +375,28 @@ fn spawn_daemon(daemon_exe: Option<PathBuf>, dir: &std::path::Path, log_path: &s
     log::info!("starting {}", daemon.display());
     let mut cmd = Command::new(&daemon);
     cmd.arg("serve").stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    // SAFETY: setsid is async-signal-safe; detaches goattyd from our
-    // session so it survives the GUI, its launching terminal, or the SSH
-    // session that started it.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe; detaches goattyd from our
+        // session so it survives the GUI, its launching terminal, or the SSH
+        // session that started it.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        // Detach from any parent console and start a fresh process group so
+        // goattyd survives GUI/terminal exit without flashing a console window
+        // (stdin/stdout/stderr are explicitly redirected above; note Win32
+        // ignores CREATE_NO_WINDOW when combined with DETACHED_PROCESS).
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     cmd.spawn().context("spawn goattyd")?;
     Ok(())
@@ -411,6 +425,7 @@ mod tests {
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn command_line_keeps_quoted_arguments() {
         let e = Endpoint::command_line("printf '%s|' 'a b' \"c  d\" e").unwrap();
@@ -421,6 +436,7 @@ mod tests {
         assert!(Endpoint::command_line("  ").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn stderr_tail_keeps_the_last_lines() {
         let mut child = Command::new("sh")
@@ -452,7 +468,7 @@ mod tests {
 
     #[test]
     fn try_connect_existing_falls_back_to_legacy_socket_and_prefers_primary() {
-        use std::os::unix::net::UnixListener;
+        use crate::ipc::LocalListener;
 
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("primary.sock");
@@ -460,18 +476,18 @@ mod tests {
 
         assert!(try_connect_existing(&primary, Some(&legacy)).is_none());
 
-        let legacy_listener = UnixListener::bind(&legacy).unwrap();
+        let legacy_listener = LocalListener::bind(&legacy).unwrap();
         let client = try_connect_existing(&primary, Some(&legacy)).expect("should fall back to legacy socket");
-        let (mut server, _) = legacy_listener.accept().unwrap();
+        let mut server = legacy_listener.accept().unwrap();
         server.write_all(b"legacy").unwrap();
         let mut buf = [0u8; 6];
         let mut client = client;
         client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"legacy");
 
-        let primary_listener = UnixListener::bind(&primary).unwrap();
+        let primary_listener = LocalListener::bind(&primary).unwrap();
         let client = try_connect_existing(&primary, Some(&legacy)).expect("should prefer primary socket");
-        let (mut server, _) = primary_listener.accept().unwrap();
+        let mut server = primary_listener.accept().unwrap();
         server.write_all(b"primry").unwrap();
         let mut client = client;
         client.read_exact(&mut buf).unwrap();

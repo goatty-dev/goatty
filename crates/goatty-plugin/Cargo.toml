@@ -15,6 +15,7 @@ toml.workspace = true
 semver.workspace = true
 sha2.workspace = true
 ed25519-dalek.workspace = true
+getrandom.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true

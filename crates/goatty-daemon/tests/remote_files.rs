@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end tests for protocol v13 remote file links (#110):
 //!
 //! * Session CWD tracking on attach and `cd` (for both non-OSC-7 `/bin/sh`

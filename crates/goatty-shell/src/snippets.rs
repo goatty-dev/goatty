@@ -329,7 +329,6 @@ struct Output {
 /// Run `cmd` in its own process group: no stdin, output capped, killed
 /// (with everything it started) at `timeout`.
 fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Output> {
-    use std::os::unix::process::CommandExt;
     let mut c = match cmd {
         Command::Argv(argv) => {
             let first = argv.first().context("nothing to run")?;
@@ -339,9 +338,18 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
             c
         }
         Command::Shell(text) => {
-            let mut c = std::process::Command::new("/bin/sh");
-            c.arg("-c").arg(text);
-            c
+            #[cfg(unix)]
+            {
+                let mut c = std::process::Command::new("/bin/sh");
+                c.arg("-c").arg(text);
+                c
+            }
+            #[cfg(windows)]
+            {
+                let mut c = std::process::Command::new("cmd.exe");
+                c.args(["/C", text]);
+                c
+            }
         }
     };
     c.current_dir(dir)
@@ -353,9 +361,20 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
         .env_remove("GOATTY_SOCKET")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
     let mut child = c.spawn().context("couldn't start it")?;
+    #[cfg(unix)]
     let pid = child.id();
     let mut stdout = child.stdout.take().context("no stdout")?;
     let mut stderr = child.stderr.take().context("no stderr")?;
@@ -370,11 +389,19 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
         buf
     });
     let deadline = Instant::now() + timeout;
-    let kill = || {
-        // SAFETY: kill(2) with a negative pid signals the process group the
-        // child leads (`process_group(0)`); no memory is involved.
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    let kill = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        {
+            let _ = child;
+            // SAFETY: kill(2) with a negative pid signals the process group the
+            // child leads (`process_group(0)`); no memory is involved.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
         }
     };
     let status = loop {
@@ -382,14 +409,14 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
             break s;
         }
         if Instant::now() >= deadline {
-            kill();
+            kill(&mut child);
             let _ = child.wait();
             bail!("it took longer than {} s", timeout.as_secs_f64());
         }
         std::thread::sleep(Duration::from_millis(5));
     };
     // Whatever it left running in its group (a pager, a subshell) goes too.
-    kill();
+    kill(&mut child);
     let mut out = out_thread.join().unwrap_or_default();
     let capped = out.len() > snippets::MAX_OUTPUT;
     if capped {

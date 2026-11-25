@@ -8,24 +8,32 @@
 //! network socket: tailscaled forwards the tailnet port into the gateway
 //! socket.
 
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{NetStatus, Reply, Request, RouteStatus};
-use crate::gateway::{Accepted, Gateway, HostInfo, PAIRING_WINDOW};
+#[cfg(unix)]
+use crate::gateway::Accepted;
+use crate::gateway::{Gateway, HostInfo, PAIRING_WINDOW};
 use crate::pairing::Device;
 use crate::tailscale::{Route, ServeError, Tailscale};
 use crate::{DEFAULT_PORT, Paths};
 
 /// How long a connection may take to finish the gateway handshake.
+#[cfg(unix)]
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest pairing window a request can open.
 const MAX_PAIRING: Duration = Duration::from_secs(15 * 60);
@@ -46,12 +54,22 @@ impl Default for HostState {
 }
 
 /// Called with each connection that authenticated as a paired device.
+#[cfg(unix)]
 pub type Handler = Box<dyn Fn(UnixStream, Device) + Send + Sync>;
 
+/// Called with each connection that authenticated as a paired device.
+/// Windows host gateway support lands in #280.
+#[cfg(not(unix))]
+pub type Handler = Box<dyn Fn(std::net::TcpStream, Device) + Send + Sync>;
+
+#[cfg(unix)]
 struct Listening {
     stop: Arc<AtomicBool>,
     ino: u64,
 }
+
+#[cfg(not(unix))]
+struct Listening;
 
 pub struct Host {
     ts: Tailscale,
@@ -120,6 +138,7 @@ impl Host {
 
     /// Re-listen when the gateway socket vanished (logind removing
     /// `/run/user/$UID`; the daemon's socket watchdog calls this).
+    #[cfg(unix)]
     pub fn check(self: &Arc<Self>) {
         if !self.state().available {
             return;
@@ -135,6 +154,9 @@ impl Host {
             log::error!("tailnet: couldn't listen again: {e:#}");
         }
     }
+
+    #[cfg(not(unix))]
+    pub fn check(self: &Arc<Self>) {}
 
     pub fn request(self: &Arc<Self>, req: Request) -> Reply {
         let done = match req {
@@ -299,6 +321,7 @@ impl Host {
         problem
     }
 
+    #[cfg(unix)]
     fn listen(self: &Arc<Self>) -> Result<()> {
         let mut listening = self.listening.lock();
         if listening.is_some() {
@@ -339,6 +362,12 @@ impl Host {
         Ok(())
     }
 
+    #[cfg(not(unix))]
+    fn listen(self: &Arc<Self>) -> Result<()> {
+        bail!("tailnet host gateway isn't supported on Windows yet (tracked in #280)")
+    }
+
+    #[cfg(unix)]
     fn stop_listening(&self) {
         let Some(l) = self.listening.lock().take() else { return };
         l.stop.store(true, Ordering::SeqCst);
@@ -349,6 +378,12 @@ impl Host {
         }
     }
 
+    #[cfg(not(unix))]
+    fn stop_listening(&self) {
+        let _ = self.listening.lock().take();
+    }
+
+    #[cfg(unix)]
     fn serve(&self, mut stream: UnixStream) {
         let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
         let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));

@@ -59,6 +59,7 @@ impl Identity {
 
 /// Refuse a key file someone else could have planted or can read: it must
 /// belong to this user and be readable by nobody else.
+#[cfg(unix)]
 fn check_private(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(path).with_context(|| format!("read {}", path.display()))?;
@@ -74,6 +75,12 @@ fn check_private(path: &Path) -> Result<()> {
             m.mode() & 0o777
         );
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private(path: &Path) -> Result<()> {
+    let _ = std::fs::metadata(path).with_context(|| format!("read {}", path.display()))?;
     Ok(())
 }
 
@@ -104,19 +111,22 @@ mod tests {
 
     #[test]
     fn key_is_made_once_and_private() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tailnet/device.key");
         let a = Identity::load_or_create(&path).unwrap();
         let b = Identity::load_or_create(&path).unwrap();
         assert_eq!(a.public(), b.public());
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         assert!(is_public_key(&a.public()));
-        // A key others can read isn't used.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = Identity::load_or_create(&path).unwrap_err();
-        assert!(err.to_string().contains("readable by other users"), "{err:#}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            // A key others can read isn't used.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let err = Identity::load_or_create(&path).unwrap_err();
+            assert!(err.to_string().contains("readable by other users"), "{err:#}");
+        }
     }
 
     #[test]

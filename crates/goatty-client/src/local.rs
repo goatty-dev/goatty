@@ -5,26 +5,29 @@
 //! the old build. It keeps the sessions, so nothing replaces it silently:
 //! [`outdated`] tells the GUI (see `goatty-app/src/connect.rs`), which
 //! restarts it right away when that keeps the sessions ([`restart_daemon`],
-//! protocol v10 on) or there are none, and asks otherwise.
+//! protocol v10 on Unix) or there are none, and asks otherwise.
 
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 
+use crate::ipc::LocalStream;
 use crate::{Control, VersionMismatch, service};
 
 /// The goattyd a fresh start of the local daemon runs
-/// ([`crate::connect_or_spawn_daemon`]): the user service's (systemd/launchd)
-/// when it serves this socket, else `goattyd` next to the current binary.
+/// ([`crate::connect_or_spawn_daemon`]): the user service's (systemd / launchd /
+/// Scheduled Task) when it serves this endpoint, else `goattyd` (`goattyd.exe`
+/// on Windows) next to the current binary.
 pub fn installed_daemon() -> Option<PathBuf> {
     let path = goatty_proto::socket_path();
     if service::unit_socket_path().is_some_and(|p| p == path) && service::installed() {
         return service::service_program();
     }
-    std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists())
+    let name = format!("goattyd{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe().ok().map(|e| e.with_file_name(name)).filter(|d| d.exists())
 }
 
 /// The running local daemon is an older build than [`installed_daemon`].
@@ -38,7 +41,8 @@ pub struct Outdated {
     installed_ino: u64,
 }
 
-/// A file's identity and age.
+/// A file's identity and age (Unix).
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Build {
     dev: u64,
@@ -46,6 +50,7 @@ struct Build {
     modified: SystemTime,
 }
 
+#[cfg(unix)]
 impl Build {
     fn of(path: &Path) -> Option<Self> {
         let m = std::fs::metadata(path).ok()?;
@@ -56,6 +61,7 @@ impl Build {
 /// `installed` is another file than `running`, and not older: a rebuild or
 /// an update. (An older one, e.g. after checking out an older branch, isn't
 /// worth restarting for.)
+#[cfg(any(unix, test))]
 fn is_newer(running: Build, installed: Build) -> bool {
     (running.dev, running.ino) != (installed.dev, installed.ino) && installed.modified >= running.modified
 }
@@ -73,6 +79,9 @@ pub fn outdated(pid: u32) -> Option<Outdated> {
 ///   `PROC_PIDREGIONPATHINFO` (which stays accurate even across in-place
 ///   `execve` restarts), falling back to comparing the process start time
 ///   (`PROC_PIDTBSDINFO`) with `installed`'s mtime.
+/// * **Windows:** inspects the process start time (`GetProcessTimes`) and
+///   executable path (`QueryFullProcessImageNameW`) against `installed`'s
+///   mtime and size.
 pub fn outdated_than(pid: u32, installed: PathBuf) -> Option<Outdated> {
     #[cfg(target_os = "linux")]
     {
@@ -92,11 +101,110 @@ pub fn outdated_than(pid: u32, installed: PathBuf) -> Option<Outdated> {
         let running = macos_pid_path(pid).unwrap_or_else(|| installed.clone());
         (new.modified > started).then_some(Outdated { pid, running, installed, installed_ino: new.ino })
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        windows_outdated_than(pid, installed)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (pid, installed);
         None
     }
+}
+
+#[cfg(windows)]
+fn windows_file_fingerprint(meta: &std::fs::Metadata) -> u64 {
+    let (secs, nanos) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), u64::from(d.subsec_nanos())))
+        .unwrap_or((0, 0));
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in [secs, nanos, meta.len()] {
+        h ^= v;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(windows)]
+fn windows_process_info(pid: u32) -> Option<(PathBuf, SystemTime)> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    const WINDOWS_TO_UNIX_SECS: u64 = 11_644_473_600;
+
+    // SAFETY: plain Win32 call; handle is validated and closed before return.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if handle.is_null() {
+        return None;
+    }
+
+    let path = {
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        // SAFETY: `handle` is open and `buf` has space for `len` UTF-16 code units.
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &raw mut len) };
+        if ok != 0 && len > 0 { Some(PathBuf::from(OsString::from_wide(&buf[..len as usize]))) } else { None }
+    };
+
+    let started = {
+        let mut created = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut exit = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        // SAFETY: `handle` is open and all four `FILETIME` pointers are valid writable locals.
+        let ok = unsafe { GetProcessTimes(handle, &raw mut created, &raw mut exit, &raw mut kernel, &raw mut user) };
+        if ok != 0 {
+            let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+            let secs = ticks / 10_000_000;
+            let nanos = ((ticks % 10_000_000) * 100) as u32;
+            secs.checked_sub(WINDOWS_TO_UNIX_SECS).map(|s| SystemTime::UNIX_EPOCH + Duration::new(s, nanos))
+        } else {
+            None
+        }
+    };
+
+    // SAFETY: `handle` is owned exclusively by this scope.
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    Some((path?, started?))
+}
+
+#[cfg(windows)]
+fn windows_outdated_than(pid: u32, installed: PathBuf) -> Option<Outdated> {
+    let (running, started) = windows_process_info(pid)?;
+    let new_meta = std::fs::metadata(&installed).ok()?;
+    let new_mtime = new_meta.modified().ok()?;
+    let new_key = windows_file_fingerprint(&new_meta);
+
+    let same_path = match (std::fs::canonicalize(&running), std::fs::canonicalize(&installed)) {
+        (Ok(a), Ok(b)) => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
+        _ => running.to_string_lossy().eq_ignore_ascii_case(&installed.to_string_lossy()),
+    };
+
+    let outdated = if new_mtime > started {
+        true
+    } else if !same_path {
+        match std::fs::metadata(&running) {
+            Ok(old_meta) => {
+                let old_mtime = old_meta.modified().ok()?;
+                new_mtime > old_mtime || (new_mtime == old_mtime && new_meta.len() != old_meta.len())
+            }
+            Err(_) => true,
+        }
+    } else {
+        false
+    };
+
+    outdated.then_some(Outdated { pid, running, installed, installed_ino: new_key })
 }
 
 #[cfg(target_os = "macos")]
@@ -272,21 +380,33 @@ pub enum Restarted {
     Kept {
         sessions: usize,
     },
-    /// It was too old to keep its sessions over a restart (or spoke no
-    /// protocol this build does) and was stopped: they ended. The next
-    /// connection starts a new one.
+    /// It couldn't keep its sessions over a restart (too old, Windows lacks
+    /// `execve`/ConPTY handoff, or spoke no protocol this build does) and was
+    /// stopped: they ended. The next connection starts a new one.
     Stopped(Stopped),
 }
 
 /// The running local daemon can restart without ending its sessions.
+///
+/// Always `false` on Windows: Windows has no `execve`, and ConPTY pseudo-console
+/// handles (`HPCON`) are tied to their owning process's `conhost.exe`.
 pub fn can_keep_sessions(protocol: u32) -> bool {
-    protocol >= goatty_proto::RESTART_SINCE
+    #[cfg(windows)]
+    {
+        let _ = protocol;
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        protocol >= goatty_proto::RESTART_SINCE
+    }
 }
 
 /// Restart the local daemon as `exe` (default: the goattyd it was started
 /// as) and wait until it answers again. Sessions carry over when the daemon
-/// can do that (protocol v10 on). One that can't is stopped only with
-/// `force`, which ends its sessions; without it that's an error.
+/// can do that (protocol v10 on Unix). One that can't (or on Windows, where
+/// ConPTY handles cannot survive a process image replacement) is stopped only
+/// with `force`, which ends its sessions; without it that's an error.
 pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     let primary = goatty_proto::socket_path();
     let mut sock = primary.clone();
@@ -296,15 +416,15 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     let mut control = match admin(&primary) {
         Ok(c) => c,
         Err(e) => {
-            if UnixStream::connect(&primary).is_err()
+            if LocalStream::connect(&primary).is_err()
                 && let Some(legacy) = goatty_proto::legacy_socket_path()
-                && UnixStream::connect(&legacy).is_ok()
+                && LocalStream::connect(&legacy).is_ok()
             {
                 sock = legacy;
                 match admin(&sock) {
                     Ok(c) => c,
                     Err(le) => {
-                        if UnixStream::connect(&sock).is_err() {
+                        if LocalStream::connect(&sock).is_err() {
                             return Ok(Restarted::NotRunning);
                         }
                         anyhow::ensure!(force, "{le:#}");
@@ -312,7 +432,7 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
                     }
                 }
             } else {
-                if UnixStream::connect(&primary).is_err() {
+                if LocalStream::connect(&primary).is_err() {
                     return Ok(Restarted::NotRunning);
                 }
                 anyhow::ensure!(force, "{e:#}");
@@ -322,6 +442,13 @@ pub fn restart_daemon(exe: Option<&Path>, force: bool) -> Result<Restarted> {
     };
     if !can_keep_sessions(control.protocol_version()) {
         let n = control.list_sessions()?.len();
+        #[cfg(windows)]
+        anyhow::ensure!(
+            force,
+            "goattyd on Windows (pid {}) cannot keep its {n} session(s) across a restart; pass --force to stop it and end them",
+            control.pid()
+        );
+        #[cfg(not(windows))]
         anyhow::ensure!(
             force,
             "goattyd (pid {}, protocol v{}) is too old to keep its {n} session(s) over a restart; stopping it ends them",
@@ -357,11 +484,11 @@ pub enum Stopped {
     NotRunning,
     /// It shut down when asked.
     Asked,
-    /// It didn't understand the request (`why`); systemd stopped the service.
+    /// It didn't understand the request (`why`); the user service manager stopped it.
     Service {
         why: String,
     },
-    /// It didn't understand the request (`why`); it was signalled.
+    /// It didn't understand the request (`why`); it was terminated.
     Killed {
         pid: u32,
         why: String,
@@ -371,27 +498,55 @@ pub enum Stopped {
 /// The process exists and isn't a zombie. Reaps it if it was our child
 /// (goatty started the daemon it now stops).
 fn alive(pid: u32) -> bool {
-    // SAFETY: plain syscall; for a pid that isn't our child it fails with
-    // ECHILD and changes nothing.
-    unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
-    #[cfg(target_os = "linux")]
-    return std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .is_ok_and(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) != Some('Z'));
-    #[cfg(target_os = "macos")]
-    // SAFETY: `info` is plain data valid for writes of the size passed.
-    return unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
-        libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size && info.pbi_status != libc::SZOMB
-    };
-    // Elsewhere: whether it can still be signalled.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    // SAFETY: plain syscall; signal 0 only checks.
-    return unsafe { libc::kill(pid as i32, 0) } == 0;
+    #[cfg(unix)]
+    {
+        // SAFETY: plain syscall; for a pid that isn't our child it fails with
+        // ECHILD and changes nothing.
+        unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        #[cfg(target_os = "linux")]
+        return std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()) != Some('Z'));
+        #[cfg(target_os = "macos")]
+        // SAFETY: `info` is plain data valid for writes of the size passed.
+        return unsafe {
+            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            libc::proc_pidinfo(pid as i32, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size
+                && info.pbi_status != libc::SZOMB
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        // SAFETY: plain syscall; signal 0 only checks.
+        return unsafe { libc::kill(pid as i32, 0) } == 0;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FALSE, GetLastError, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        // SAFETY: plain Win32 call; returned handle is validated and closed.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+        if handle.is_null() {
+            // SAFETY: `GetLastError` has no preconditions.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut exit_code = 0u32;
+        // SAFETY: `handle` is open and `exit_code` is a valid out-pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) };
+        // SAFETY: `handle` is owned exclusively by this scope.
+        unsafe {
+            CloseHandle(handle);
+        }
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
-/// The name of process `pid` (`/proc/<pid>/comm`; `proc_name` on macOS);
-/// empty when it can't be read.
+/// The name of process `pid` (`/proc/<pid>/comm` on Linux, `proc_name` on
+/// macOS, `QueryFullProcessImageNameW` leaf on Windows); empty when unavailable.
 fn process_name(pid: u32) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -400,8 +555,19 @@ fn process_name(pid: u32) -> String {
         let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
         String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(buf.len())]).into_owned()
     }
-    #[cfg(not(target_os = "macos"))]
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
+    }
+    #[cfg(windows)]
+    {
+        windows_process_info(pid).and_then(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        String::new()
+    }
 }
 
 fn wait_gone(pid: u32, timeout: Duration) -> bool {
@@ -415,13 +581,17 @@ fn wait_gone(pid: u32, timeout: Duration) -> bool {
     true
 }
 
+fn is_goattyd_process_name(name: &str) -> bool {
+    name.trim().to_ascii_lowercase().starts_with("goattyd")
+}
+
 /// Stop the local daemon and wait until it's gone. This ends its sessions:
 /// only after the user agreed (or when it has none).
 ///
 /// It's asked first (`Shutdown`). With `force`, one that doesn't speak our
-/// protocol is stopped anyway: through systemd/launchd when the user service
-/// runs it, else SIGTERM (SIGKILL after 5 s) to the socket's owner once it's
-/// checked to be a goattyd (`SO_PEERCRED` / `LOCAL_PEERPID`).
+/// protocol is stopped anyway: through the user service manager when that
+/// runs it, else SIGTERM/SIGKILL (Unix) or `TerminateProcess` (Windows) to
+/// the endpoint's owner once verified to be a `goattyd`.
 pub fn stop_daemon(force: bool) -> Result<Stopped> {
     let mut path = goatty_proto::socket_path();
     let mut is_service_socket = service::unit_socket_path().is_some_and(|p| p == path);
@@ -432,7 +602,7 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
         let st = service::status();
         if st.socket_active && !st.service_active {
             if let Some(legacy) = goatty_proto::legacy_socket_path()
-                && UnixStream::connect(&legacy).is_ok()
+                && LocalStream::connect(&legacy).is_ok()
             {
                 path = legacy;
                 is_service_socket = false;
@@ -450,10 +620,10 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
             return Ok(Stopped::Asked);
         }
         Err(e) => {
-            if UnixStream::connect(&path).is_err()
+            if LocalStream::connect(&path).is_err()
                 && let Some(legacy) = goatty_proto::legacy_socket_path()
                 && legacy != path
-                && UnixStream::connect(&legacy).is_ok()
+                && LocalStream::connect(&legacy).is_ok()
             {
                 path = legacy;
                 is_service_socket = false;
@@ -480,7 +650,8 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
         return Ok(Stopped::Service { why });
     }
     // Nothing listening: nothing to stop (remote updates run this blindly).
-    if UnixStream::connect(&path).is_err() {
+    if LocalStream::connect(&path).is_err() {
+        #[cfg(unix)]
         if path.exists() {
             let _ = std::fs::remove_file(&path);
         }
@@ -489,18 +660,37 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
     let pid = crate::control::socket_owner(&path)?;
     // Under socket activation the listener belongs to systemd/launchd, never kill that.
     let comm = process_name(pid);
-    anyhow::ensure!(comm.starts_with("goattyd"), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
+    anyhow::ensure!(is_goattyd_process_name(&comm), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
     log::info!("stopping goattyd (pid {pid}): {why}");
-    // SAFETY: plain syscall on a pid we just checked is our goattyd.
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    if !wait_gone(pid, Duration::from_secs(5)) {
-        // SAFETY: as above.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        wait_gone(pid, Duration::from_secs(2));
+    #[cfg(unix)]
+    {
+        // SAFETY: plain syscall on a pid we just checked is our goattyd.
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if !wait_gone(pid, Duration::from_secs(5)) {
+            // SAFETY: as above.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            wait_gone(pid, Duration::from_secs(2));
+        }
+        // The old daemon didn't get to remove its socket.
+        if crate::control::socket_owner(&path).is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
     }
-    // The old daemon didn't get to remove its socket.
-    if crate::control::socket_owner(&path).is_err() {
-        let _ = std::fs::remove_file(&path);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+        // SAFETY: plain Win32 call on a pid we just verified belongs to our user's goattyd.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) };
+        if !handle.is_null() {
+            // SAFETY: `handle` is open with `PROCESS_TERMINATE`.
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+            wait_gone(pid, Duration::from_secs(5));
+        }
     }
     Ok(Stopped::Killed { pid, why })
 }
@@ -523,7 +713,17 @@ mod tests {
         assert!(!is_newer(build(1, 20), build(2, 10)));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn goattyd_process_name_check_handles_unix_and_windows() {
+        assert!(is_goattyd_process_name("goattyd"));
+        assert!(is_goattyd_process_name("goattyd\n"));
+        assert!(is_goattyd_process_name("goattyd.exe"));
+        assert!(is_goattyd_process_name("GOATTYD.EXE"));
+        assert!(!is_goattyd_process_name("systemd"));
+        assert!(!is_goattyd_process_name("launchd"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn this_process_is_not_outdated_against_itself() {
         // Our own exe vs itself: same file.

@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use goatty_client::LocalStream;
 use goatty_proto::{
     ClientMsg, FLOW_CONTROL_SINCE, Frame, HISTORY_SINCE, PROTOCOL_VERSION, REMOTE_FILES_SINCE, SIZE_CONTROL_SINCE, ServerMsg, SessionId,
     encode, encode_server, read_msg,
@@ -48,7 +48,7 @@ pub(crate) struct Liveness {
     pings: AtomicBool,
     /// Already shut down for silence.
     dropped: AtomicBool,
-    stream: UnixStream,
+    stream: LocalStream,
     /// The connection's writer queue, to stop the writer even while workers
     /// (a stat on a hung mount) still hold senders, and for workspace news.
     pub(crate) writer: flume::WeakSender<Outbound>,
@@ -57,7 +57,7 @@ pub(crate) struct Liveness {
 }
 
 impl Liveness {
-    fn new(stream: UnixStream, writer: flume::WeakSender<Outbound>) -> Self {
+    fn new(stream: LocalStream, writer: flume::WeakSender<Outbound>) -> Self {
         Self {
             born: Instant::now(),
             last_ms: AtomicU64::new(0),
@@ -225,7 +225,7 @@ fn try_reserve_bytes(counter: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> 
 
 /// Serve one client connection until it closes. Its subscriptions end with
 /// it; the sessions keep running.
-pub(crate) fn handle(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
+pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
     let conn = daemon.next_conn.fetch_add(1, Ordering::Relaxed);
     // Unbounded for stream/control: stream frames are limited by each
     // subscriber's window, control replies are tiny, and `FileData` frames
@@ -619,7 +619,7 @@ mod tests {
     use super::*;
 
     /// Whether the peer of a reaped stream sees it closed.
-    fn closed(peer: &UnixStream) -> bool {
+    fn closed(peer: &LocalStream) -> bool {
         use std::io::Read;
         peer.set_nonblocking(true).unwrap();
         matches!((&*peer).read(&mut [0u8; 1]), Ok(0))
@@ -627,8 +627,8 @@ mod tests {
 
     #[test]
     fn reaps_only_silent_pinging_connections() {
-        let (quiet, quiet_peer) = UnixStream::pair().unwrap();
-        let (pinging, pinging_peer) = UnixStream::pair().unwrap();
+        let (quiet, quiet_peer) = LocalStream::pair().unwrap();
+        let (pinging, pinging_peer) = LocalStream::pair().unwrap();
         let conns = parking_lot::Mutex::new(HashMap::new());
         // A worker (stuck on a hung mount) still holds a sender of each queue.
         let (quiet_tx, quiet_rx) = flume::unbounded::<Outbound>();

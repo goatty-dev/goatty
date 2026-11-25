@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The local daemon after a rebuild: `goatty_client::local` notices that the
 //! running goattyd is an older build than the file now installed, and
 //! `goattyd stop --force` (the same `local::stop_daemon` the GUI uses) stops
