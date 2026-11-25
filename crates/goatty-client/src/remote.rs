@@ -284,10 +284,12 @@ pub(crate) fn with_stderr(err: anyhow::Error, stderr: &[String]) -> anyhow::Erro
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::io::{Read, Write};
 
     use super::*;
 
+    #[cfg(unix)]
     fn drain(mut r: impl Read) -> String {
         let mut s = String::new();
         let _ = r.read_to_string(&mut s);
@@ -341,6 +343,7 @@ mod tests {
         // Quoted paths survive, and the scripts parse in plain sh.
         let s = proxy_script(Some("/opt/it's/goattyd"));
         assert!(s.contains("'/opt/it'\\''s/goattyd'"));
+        #[cfg(unix)]
         for script in [proxy_script(None), proxy_script(Some("/x y")), install_script(10)] {
             let out = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
             assert!(out.status.success(), "{script}\n{}", String::from_utf8_lossy(&out.stderr));
