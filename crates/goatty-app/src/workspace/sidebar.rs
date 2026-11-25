@@ -81,9 +81,14 @@ impl Workspace {
         self.open_new_tab_menu(ev.position, window, cx);
     }
 
-    /// The sidebar's size: while its edge is dragged, the dragged one.
+    /// The sidebar's size: while its edge is dragged, the dragged one;
+    /// temporarily unfolded while renaming a tab so the inline field is visible.
     fn sidebar(&self, cx: &gpui::App) -> Sidebar {
-        self.sidebar_drag.map_or_else(|| saved_sidebar(cx), |(_, now)| now)
+        let mut s = self.sidebar_drag.map_or_else(|| saved_sidebar(cx), |(_, now)| now);
+        if self.rename.is_some() {
+            s.folded = false;
+        }
+        s
     }
 
     /// How wide the sidebar is drawn in this window.
