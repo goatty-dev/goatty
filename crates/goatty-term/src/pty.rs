@@ -383,7 +383,8 @@ mod windows {
     use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+        WaitForSingleObject,
     };
 
     use super::ShellCommand;
@@ -809,10 +810,13 @@ mod windows {
             let attrs = ProcThreadAttrList::with_pseudoconsole(hpcon).context("init PROC_THREAD_ATTRIBUTE_LIST")?;
 
             // SAFETY: `STARTUPINFOEXW` is plain C data; zeroed with `cb` set is required.
-            // Leaving `STARTF_USESTDHANDLES` unset and standard handle fields zeroed lets
-            // the child attach directly to the ConPTY's console handles.
             let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+            // Setting `STARTF_USESTDHANDLES` with zero-initialized (`NULL`) handle fields
+            // prevents `CreateProcessW` from copying the parent's redirected stdio handles
+            // (e.g. `goattyd.log` or CI pipes) into the child so Windows wires the child's
+            // stdio directly to the ConPTY instead, without passing `INVALID_HANDLE_VALUE`.
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
             si.lpAttributeList = attrs.as_mut_ptr();
 
             let (app_wide, mut cmdline) = build_spawn_command(&cmd.program, &cmd.args)?;
