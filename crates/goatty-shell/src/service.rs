@@ -321,7 +321,7 @@ fn changed(what: String, o: &ApplyOutcome) -> Changed {
     Changed { lines, generation: o.generation, reload: !o.diff.is_empty(), unneeded: Vec::new() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::dirs::Dirs;

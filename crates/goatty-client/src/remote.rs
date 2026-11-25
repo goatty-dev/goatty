@@ -404,6 +404,7 @@ mod tests {
         assert_eq!(last_words(with_backtrace, b""), "Error: not a goattyd");
     }
 
+    #[cfg(unix)]
     fn run_install(home: &Path) {
         let fake = format!("#!/bin/sh\necho goattyd {}\n", env!("CARGO_PKG_VERSION"));
         let mut child = std::process::Command::new("sh")
@@ -419,6 +420,7 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_links_an_unversioned_goattyd() {
         let dir = tempfile::tempdir().unwrap();

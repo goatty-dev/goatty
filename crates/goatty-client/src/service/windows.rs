@@ -244,7 +244,7 @@ fn schtasks(args: &[&str]) -> Result<String> {
 fn decode_windows_output(bytes: &[u8]) -> String {
     // `schtasks /Query /XML` outputs UTF-16LE with BOM on many Windows builds.
     if bytes.starts_with(&[0xFF, 0xFE]) && bytes.len() >= 2 {
-        let words: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let words: Vec<u16> = bytes[2..].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
         return String::from_utf16_lossy(&words);
     }
     String::from_utf8_lossy(bytes).into_owned()
