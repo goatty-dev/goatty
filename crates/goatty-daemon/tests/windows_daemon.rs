@@ -175,6 +175,51 @@ fn windows_daemon_named_pipes_conpty_and_proxy_end_to_end() {
 }
 
 #[test]
+fn windows_proxy_exits_cleanly_after_stdin_eof_and_delivers_replies() {
+    use goatty_proto::{ClientMsg, PROTOCOL_VERSION, ServerMsg, read_msg, write_msg};
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let d = start_daemon();
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_goattyd"))
+        .arg("proxy")
+        .env("GOATTY_SOCKET", &d.sock)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = proxy.stdin.take().unwrap();
+    let mut stdout = proxy.stdout.take().unwrap();
+
+    write_msg(&mut stdin, &ClientMsg::Hello { version: PROTOCOL_VERSION, client: "win-proxy-eof".into() }).unwrap();
+    write_msg(&mut stdin, &ClientMsg::ListSessions { req: 1 }).unwrap();
+    stdin.flush().unwrap();
+    // Close stdin immediately: proxy must signal write-EOF to the daemon,
+    // still flush both replies to stdout, and exit cleanly without hanging.
+    drop(stdin);
+
+    let hello: ServerMsg = read_msg(&mut stdout).unwrap();
+    assert!(matches!(hello, ServerMsg::Hello { .. }), "expected Hello, got {hello:?}");
+    let sessions: ServerMsg = read_msg(&mut stdout).unwrap();
+    assert!(matches!(sessions, ServerMsg::Sessions { req: 1, .. }), "expected Sessions, got {sessions:?}");
+    let mut tail = Vec::new();
+    stdout.read_to_end(&mut tail).unwrap();
+    assert!(tail.is_empty(), "unexpected trailing bytes: {tail:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = proxy.try_wait().unwrap() {
+            assert!(status.success(), "proxy exited with {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "goattyd.exe proxy hung after stdin EOF");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
 fn windows_outdated_detection_restart_policy_and_force_stop() {
     let dir = tempfile::Builder::new().prefix("goatty-win-restart-").tempdir().unwrap();
     let v1_dir = dir.path().join("v1");

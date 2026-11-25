@@ -18,7 +18,12 @@ pub fn proxy() -> Result<()> {
         // Signals write-EOF to the daemon on both Unix sockets (`SHUT_WR`) and
         // Windows message-mode Named Pipes (zero-length EOF message), so the
         // daemon finishes any in-flight replies and closes its end cleanly.
-        let _ = to_daemon.shutdown(std::net::Shutdown::Write);
+        // If signaling write-EOF fails (e.g. timed out on a stalled pipe), fail
+        // closed by shutting down both directions so the proxy never hangs.
+        if let Err(e) = to_daemon.shutdown(std::net::Shutdown::Write) {
+            log::warn!("proxy: write-EOF failed ({e}); closing daemon connection");
+            let _ = to_daemon.shutdown(std::net::Shutdown::Both);
+        }
     });
     relay(&mut from_daemon, &mut *stdout);
     // Daemon closed the connection: we're done, whatever stdin is doing.

@@ -246,6 +246,20 @@ impl Daemon {
                 return Err(e.into());
             }
         }
+        // Windows ConPTY keeps the output pipe open until `ClosePseudoConsole` is
+        // called. Start the exit watcher BEFORE `s{id}-reader` so a failure to
+        // spawn `s{id}-exit` never leaves `s{id}-reader` blocked on an unclosed
+        // pseudoconsole, and a failure to spawn `s{id}-reader` still wakes
+        // `s{id}-exit` once `rollback()` kills the child.
+        #[cfg(windows)]
+        {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-exit")).spawn(move || {
+                exit_watch.wait_and_close_console();
+            }) {
+                rollback();
+                return Err(e.into());
+            }
+        }
         // PTY → terminal + subscribers.
         {
             let s = session.clone();
@@ -276,19 +290,6 @@ impl Daemon {
                 }
                 s.finish(code);
                 daemon.session_ended(s.id);
-            }) {
-                rollback();
-                return Err(e.into());
-            }
-        }
-        // Windows ConPTY keeps the output pipe open until `ClosePseudoConsole` is
-        // called. Watch the child process handle on its own thread (without holding
-        // `Arc<Session>`) so closing the pseudoconsole runs concurrently while
-        // `s{id}-reader` drains remaining output until EOF.
-        #[cfg(windows)]
-        {
-            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-exit")).spawn(move || {
-                exit_watch.wait_and_close_console();
             }) {
                 rollback();
                 return Err(e.into());
@@ -663,31 +664,42 @@ mod tests {
     fn subscribe_before_finish_delivers_exited_once_and_clears_session_list() {
         let dir = tempfile::tempdir().unwrap();
         let daemon = Arc::new(Daemon::new(dir.path().join("d.sock")));
-        let session = daemon.run(1, SIZE, None, exit_cmd(7)).unwrap();
+        // Command waits for a line on stdin before exiting with code 7 so
+        // `subscribe` deterministically runs while the session is still alive.
+        #[cfg(windows)]
+        let wait_cmd = vec!["cmd.exe".into(), "/C".into(), "set /p _= & exit 7".into()];
+        #[cfg(not(windows))]
+        let wait_cmd = vec!["/bin/sh".into(), "-c".into(), "read line; exit 7".into()];
+        let session = daemon.run(1, SIZE, None, wait_cmd).unwrap();
 
         let (tx, rx) = flume::unbounded();
         let flow = Arc::new(FlowControl::new());
         let _sub = session.subscribe(SubConn { id: 1, features: SubFeatures::default(), flow: &flow, tx: &tx }, 9, SIZE, StreamOpts::LOCAL);
+        assert!(session.exited.lock().is_none(), "session exited before subscribe completed");
+        assert!(daemon.get(session.id).is_some(), "live session must be registered in sessions map");
 
+        // Release the waiting child and wait until exit cleanup has completed.
+        session.input.lock().write(b"go\r\n").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.get(session.id).is_some() || session.exited.lock().is_none() {
+            assert!(Instant::now() < deadline, "session did not exit and clean up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(daemon.list().is_empty(), "finished session remained in list()");
+
+        // Drain EVERY message delivered to the subscriber and assert `Exited`
+        // arrived exactly once with exit code 7 (no duplicates).
         let mut exited = Vec::new();
-        while exited.is_empty() {
-            assert!(Instant::now() < deadline, "subscriber never received Exited");
-            if let Ok(out) = rx.recv_timeout(Duration::from_millis(50))
-                && !out.stop
-            {
-                let mut slice: &[u8] = &out.frame;
-                if let ServerMsg::Exited { session: sid, code } = read_msg::<_, ServerMsg>(&mut slice).unwrap() {
-                    assert_eq!(sid, session.id);
-                    exited.push(code);
-                }
+        for out in rx.try_iter() {
+            if out.stop {
+                continue;
+            }
+            let mut slice: &[u8] = &out.frame;
+            if let ServerMsg::Exited { session: sid, code } = read_msg::<_, ServerMsg>(&mut slice).unwrap() {
+                assert_eq!(sid, session.id);
+                exited.push(code);
             }
         }
         assert_eq!(exited, vec![Some(7)]);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !daemon.list().is_empty() {
-            assert!(Instant::now() < deadline, "finished session remained in list()");
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 }

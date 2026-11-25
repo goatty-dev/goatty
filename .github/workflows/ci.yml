@@ -105,3 +105,5 @@ jobs:
         run: cargo test --locked --no-fail-fast -p goatty-proto -p goatty-config -p goatty-plugin -p goatty-term -p goatty-net -p goatty-client -p goatty-daemon
       - name: Tests (goatty-shell dirs)
         run: cargo test --locked -p goatty-shell --lib dirs::tests
+      - name: Tests (goatty-shell snippets)
+        run: cargo test --locked -p goatty-shell --lib snippets::tests

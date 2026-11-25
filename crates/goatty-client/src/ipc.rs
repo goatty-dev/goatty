@@ -646,15 +646,14 @@ mod imp {
 
         /// Transmit a zero-length message on the message-mode pipe to signal
         /// write-direction EOF without closing the reverse read direction.
-        fn send_write_eof(&self) {
+        fn send_write_eof(&self) -> io::Result<()> {
             let guard = self.handle.read();
             let Some(handle) = guard.as_ref() else {
-                return;
+                // Handle already closed (`Shutdown::Both`): peer already sees EOF.
+                return Ok(());
             };
             let raw = handle.raw();
-            let Ok(io_event) = create_manual_event() else {
-                return;
-            };
+            let io_event = create_manual_event()?;
             // SAFETY: `OVERLAPPED` is plain C data; zeroed with `hEvent` set is required.
             let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
             ov.hEvent = io_event.raw();
@@ -662,32 +661,52 @@ mod imp {
             // SAFETY: `raw` is open for `guard`, `dummy` is valid for 0 bytes, and
             // `ov` stays alive until `GetOverlappedResult` completes.
             let ok = unsafe { WriteFile(raw, dummy.as_ptr(), 0, std::ptr::null_mut(), &raw mut ov) };
+            let mut transferred = 0u32;
             if ok != 0 {
-                let mut transferred = 0u32;
                 // SAFETY: `ov` completed synchronously.
-                let _ = unsafe { GetOverlappedResult(raw, &raw const ov, &raw mut transferred, FALSE) };
-                return;
+                if unsafe { GetOverlappedResult(raw, &raw const ov, &raw mut transferred, FALSE) } == 0 {
+                    let err = last_error();
+                    if is_eof_err(err) {
+                        return Ok(());
+                    }
+                    return Err(io::Error::from_raw_os_error(err as i32));
+                }
+                return Ok(());
             }
-            if last_error() != ERROR_IO_PENDING {
-                return;
+            let err = last_error();
+            if err != ERROR_IO_PENDING {
+                if is_eof_err(err) {
+                    return Ok(());
+                }
+                return Err(io::Error::from_raw_os_error(err as i32));
             }
             let handles = [io_event.raw(), self.both_closed_event.raw()];
+            let wait_ms = timeout_ms(Some(self.write_timeout.lock().unwrap_or(Duration::from_secs(5))));
             // SAFETY: both event handles are valid for this call.
-            let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, 5_000) };
-            let mut transferred = 0u32;
+            let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, wait_ms) };
             if wait == WAIT_OBJECT_0 {
                 // SAFETY: I/O event signaled; finalize overlapped state.
-                let _ = unsafe { GetOverlappedResult(raw, &raw const ov, &raw mut transferred, FALSE) };
-            } else {
-                // SAFETY: cancel pending zero-length write before dropping `ov`.
-                unsafe {
-                    CancelIoEx(raw, &raw const ov);
-                    let _ = GetOverlappedResult(raw, &raw const ov, &raw mut transferred, TRUE);
+                if unsafe { GetOverlappedResult(raw, &raw const ov, &raw mut transferred, FALSE) } == 0 {
+                    let err = last_error();
+                    if is_eof_err(err) {
+                        return Ok(());
+                    }
+                    return Err(io::Error::from_raw_os_error(err as i32));
                 }
+                return Ok(());
             }
+            // SAFETY: cancel pending zero-length write before dropping `ov`.
+            let completed = unsafe {
+                CancelIoEx(raw, &raw const ov);
+                GetOverlappedResult(raw, &raw const ov, &raw mut transferred, TRUE)
+            };
+            if completed != 0 {
+                return Ok(());
+            }
+            if wait == WAIT_TIMEOUT { Err(io::Error::new(io::ErrorKind::TimedOut, "named pipe write-EOF timed out")) } else { Ok(()) }
         }
 
-        fn shutdown(&self, how: Shutdown) {
+        fn shutdown(&self, how: Shutdown) -> io::Result<()> {
             match how {
                 Shutdown::Read => {
                     self.read_closed.store(true, Ordering::Release);
@@ -695,10 +714,11 @@ mod imp {
                     unsafe {
                         SetEvent(self.read_closed_event.raw());
                     }
+                    Ok(())
                 }
                 Shutdown::Write => {
                     if self.write_closed.swap(true, Ordering::AcqRel) {
-                        return;
+                        return Ok(());
                     }
                     // Wake any in-flight `write_buf` so it releases `write_mu`.
                     // SAFETY: `write_closed_event` is a valid event handle owned by `self`.
@@ -706,7 +726,7 @@ mod imp {
                         SetEvent(self.write_closed_event.raw());
                     }
                     let _write_guard = self.write_mu.lock();
-                    self.send_write_eof();
+                    self.send_write_eof()
                 }
                 Shutdown::Both => {
                     self.read_closed.store(true, Ordering::Release);
@@ -721,6 +741,7 @@ mod imp {
                     // cancel and drop their `handle` read guards immediately; taking the
                     // handle here closes the pipe so the peer sees EOF right away.
                     let _ = self.handle.write().take();
+                    Ok(())
                 }
             }
         }
@@ -808,8 +829,7 @@ mod imp {
         }
 
         pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-            self.0.shutdown(how);
-            Ok(())
+            self.0.shutdown(how)
         }
 
         /// Connected pair of Named Pipe streams, for unit tests.
@@ -1100,7 +1120,7 @@ mod tests {
             // before sending its final reply.
             std::thread::sleep(Duration::from_millis(400));
             server.write_all(b"delayed-reply").unwrap();
-            server.shutdown(Shutdown::Both).unwrap();
+            drop(server);
         });
         client.write_all(b"request").unwrap();
         client.shutdown(Shutdown::Write).unwrap();
@@ -1121,8 +1141,17 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_r = stop.clone();
 
-        // Reader watches for client write-EOF and then stops the writer and
-        // closes the server end (mirroring `goattyd`'s connection loop).
+        // Writer streams continuously until the reader observes client write-EOF,
+        // then exits cleanly and drops the server end (mirroring `goattyd`).
+        let srv_write = std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if server_writer.write_all(b"tick").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(server_writer);
+        });
         let srv_read = std::thread::spawn(move || {
             let mut buf = [0u8; 64];
             while let Ok(n) = server_reader.read(&mut buf) {
@@ -1131,15 +1160,7 @@ mod tests {
                 }
             }
             stop_r.store(true, Ordering::Release);
-            let _ = server_reader.shutdown(Shutdown::Both);
-        });
-        let srv_write = std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                if server_writer.write_all(b"tick").is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            drop(server_reader);
         });
 
         // Observe at least one chunk of continuous output, then half-close.
@@ -1153,6 +1174,30 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(3), "continuous stream did not terminate promptly after Shutdown::Write");
         srv_read.join().unwrap();
         srv_write.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_write_propagates_timeout_when_peer_stalls() {
+        let (_stalled_peer, mut client) = LocalStream::pair().unwrap();
+        client.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
+        // Fill the pipe's 64 KiB buffer without reading from `_stalled_peer`
+        // until writes backpressure and time out.
+        let chunk = vec![0xAAu8; 64 * 1024];
+        let mut filled = false;
+        for _ in 0..16 {
+            match client.write(&chunk) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    filled = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected write error while filling pipe: {e:?}"),
+            }
+        }
+        assert!(filled, "pipe never backpressured");
+        let err = client.shutdown(Shutdown::Write).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "expected TimedOut from stalled write-EOF, got {err:?}");
     }
 
     #[cfg(windows)]

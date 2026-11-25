@@ -155,9 +155,10 @@ pub(crate) fn find_in(path: &str, program: &str) -> Option<PathBuf> {
     find_in_with_cwd(path, program, None)
 }
 
-/// Like [`find_in`], resolving relative paths containing `/` against `cwd`.
+/// Like [`find_in`], resolving relative paths containing a path separator against `cwd`.
 pub(crate) fn find_in_with_cwd(path: &str, program: &str, cwd: Option<&str>) -> Option<PathBuf> {
-    if program.contains('/') {
+    let has_sep = program.contains('/') || (cfg!(windows) && program.contains('\\'));
+    if has_sep {
         let p = Path::new(program);
         let resolved = if p.is_absolute() {
             p.to_path_buf()
@@ -168,7 +169,34 @@ pub(crate) fn find_in_with_cwd(path: &str, program: &str, cwd: Option<&str>) -> 
         };
         return is_executable(&resolved).then_some(resolved);
     }
-    path.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join(program)).find(|p| is_executable(p))
+    #[cfg(windows)]
+    let exts: Vec<String> = if Path::new(program).extension().is_some() {
+        Vec::new()
+    } else {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let direct = dir.join(program);
+        if is_executable(&direct) {
+            return Some(direct);
+        }
+        #[cfg(windows)]
+        for ext in &exts {
+            let candidate = dir.join(format!("{program}{ext}"));
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Every snippet and expansion on this host, with the programs each
@@ -341,9 +369,9 @@ mod win_proc {
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, bail};
-    use goatty_config::snippets;
+    use goatty_plugin::snippets;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, FALSE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, TRUE, WAIT_OBJECT_0,
+        CloseHandle, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, TRUE, WAIT_OBJECT_0,
         WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -835,6 +863,7 @@ mod tests {
         assert!(l.expansions.iter().any(|e| e.origin.owner == "basics" && e.expansion.say == "| first {n} lines"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn suggestions_come_from_the_hosts_own_definition() {
         let tmp = tempfile::tempdir().unwrap();
