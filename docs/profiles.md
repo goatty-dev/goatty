@@ -46,7 +46,7 @@ Nothing is uninstalled on the host. `~/.config/goatty/zshrc` (your own additions
 
 ## Applying host settings: generations
 
-Host settings compile into shell configuration (plan §6). `goatty_shell::generation`:
+Host settings compile into shell configuration. `goatty_shell::generation`:
 
 1. Render the startup files from the settings (`zsh::render`: `settings.zsh`, `starship.toml`, static `.zshenv/.zprofile/.zshrc/integration.zsh`).
 2. If the active generation has identical files *and* the same settings snapshot, do nothing.
@@ -180,19 +180,3 @@ goattyd shell generations | name N [NAME…] | diff [N] | rollback [N]
 `shell generations` prints one line per generation: `* 8  2h ago  "before trying fish"  history.size 100000 → 5000`. `shell name N` without a name removes it. `shell diff N` prints the generated-file changes of generation N (without N: what the current settings would change).
 
 `set` takes a dotted key and reads the value as JSON when it parses (`5000`, `true`, `null`, `"#ff00ff"`), otherwise as a string (`minimal`, `/bin/zsh`). Unknown keys and invalid values are errors, and nothing is written (`store::set_key`). Entries of open maps (`keybindings.ctrl-k`) are allowed. `goattyd settings set` applies like the settings window's Apply: a validated new generation, then the save. Client changes made with `goatty settings set` reach a running app within half a second, through the file polling. `import` asks for confirmation, and without a terminal it needs `--yes`.
-
-## Verified
-
-- `goatty-config`: 20 unit tests (lenient parsing per field, unknown keys kept across saves, versions, backups and pruning, themes, keybinding edits, profile round trip without private values).
-- `goatty-shell`: generations (idempotence, numbering, settings-only changes, rollback, pruning, `zsh -n` rejection), `HostService` (preview/apply/rollback), launcher through `current`, and the real-zsh tests from Stage 3. `history` (#55): settings changes with defaults filled in and plugin entries aligned, the one-line summary (list vs count, `From N:`), changes recorded at build time against the base after a rollback, names, file diffs, generations from before #55 compared on the fly and a pruned base; the `Shell` JSON operations.
-- `goatty-daemon/tests/settings.rs`: the protocol against a real goattyd with a sandboxed HOME (get, preview, apply, a bad value, generations, rollback, and `SetPalette` changing the actual OSC 11 answer read back from the PTY).
-- Manually, release build, sandboxed HOME: the window renders every page. Editing `settings.json` from outside switched the terminal and the window to Catppuccin Latte, 17 px, bar cursor within the poll interval, and reported the bad value and the unknown key on the Profile page. `goattyd shell diff/status/generations/rollback` behaved as described.
-- Themes and CLI (#50–#52): `theme_import` tests for every format; `ThemeLibrary` loading, shadowing, unique ids and resolution; dotted-key editing; `goatty-app/tests/cli.rs` and `goatty-daemon/tests/settings_cli.rs` run the real binaries in a sandboxed HOME (set/show/validate/unset, theme import/set/export/delete, profile export → import on a "second machine" including the host generation).
-- Manually (release build, sandboxed HOME): a Windows Terminal scheme imported with `goatty theme import` showed up as "Campbell Teal" (`mine`, `dark`). With "Follow the system" on a dark desktop, the terminal used it, and the CLI-set cursor override showed as ● in the editor. `goatty theme set gruvbox-dark` from a shell restyled the running app. The startup switch from the default light appearance to the portal's dark one was the same code path as a live desktop toggle. Not done: toggling the real desktop setting (it would change the user's whole session).
-- Reloading running shells (#56): `zsh_startup.rs::reloads_on_request` drives a managed zsh in a PTY (idle prompt reloads at once with the same pid, also when signaled while the prompt is drawn (`reloads_when_signaled_while_the_prompt_draws`); a running command reloads afterwards; typed text is left alone until Enter; a shell with jobs keeps its state and prints the reminder). `goatty-daemon/tests/settings.rs` checks that `ReloadShells` reaches a managed zsh session (which survives), skips `/bin/sh`, and forgets exited shells.
-- Monospace detection (#57): `fonts::monospace_families` scans the installed fonts with fontdb and calls a family monospace when `i l m M W 0 . space` share one advance and `m`/`M` are distinct glyphs. On a Linux desktop with ~1500 font files it found 61 families: everything `fc-list :spacing=mono` lists except the Material Symbols icon fonts (same glyph for both cases), plus what fontconfig misses (Noto Sans Mono as a variable font, the Noto Sans Mono CJK and WenQuanYi Zen Hei Mono dual-width fonts). Nerd Font "Propo" variants count as monospace (their letters are; only the icons are proportional). Release build, scan time: 0.13 s warm, 3.4 s with a cold page cache; it runs on a background thread at startup, and the picker shows all fonts until it finishes.
-- Not verified yet: clicking through the controls (needs interactive testing, #49).
-
-## Not done yet
-
-Shortcut conflict warnings (#54) and keyboard navigation in the settings window (#58).

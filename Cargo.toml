@@ -10,7 +10,7 @@ repository = "https://github.com/goatty-dev/goatty"
 publish = false
 
 [workspace.dependencies]
-# Terminal core — pinned exactly; API still evolving (see plan §13).
+# Terminal core — pinned exactly; API still evolving (see docs/goatty-project-plan.md).
 rio-vt = { version = "=0.5.29", default-features = false }
 portable-pty = "0.9.0"
 # GPUI from Zed main, pinned. Bump deliberately: `ZED_REV` below + `cargo update -p gpui`.
