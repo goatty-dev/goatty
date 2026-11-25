@@ -49,11 +49,17 @@ pub struct HostState {
     /// Windows: the loopback port the gateway listens on (Serve's target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_port: Option<u16>,
+    /// Windows: the loopback port the gateway had to leave (something else
+    /// took it) while goatty's route may still forward there. A route to it
+    /// counts as goatty's until no route forwards there any more
+    /// ([`Host::prune_moved`]), across restarts too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<u16>,
 }
 
 impl Default for HostState {
     fn default() -> Self {
-        Self { available: false, port: DEFAULT_PORT, local_port: None }
+        Self { available: false, port: DEFAULT_PORT, local_port: None, moved_from: None }
     }
 }
 
@@ -91,10 +97,6 @@ pub struct Host {
     handler: OnceLock<Handler>,
     /// Serializes changes (enable, disable, repairs) to the route.
     changing: Mutex<()>,
-    /// Windows: the loopback port the gateway had before it had to move (the
-    /// saved one was taken), so a route to it still counts as goatty's.
-    #[cfg(not(unix))]
-    moved_from: Mutex<Option<u16>>,
 }
 
 impl Host {
@@ -112,8 +114,6 @@ impl Host {
             listening: Mutex::new(None),
             handler: OnceLock::new(),
             changing: Mutex::new(()),
-            #[cfg(not(unix))]
-            moved_from: Mutex::new(None),
         })
     }
 
@@ -139,12 +139,28 @@ impl Host {
     }
 
     /// Every target a route of goatty's may have: [`Self::target`], and on
-    /// Windows the port the gateway moved away from.
+    /// Windows the port the gateway moved away from while a route still goes
+    /// there ([`HostState::moved_from`]).
     fn targets(&self) -> Vec<Target> {
         let targets = self.target().into_iter();
         #[cfg(not(unix))]
-        let targets = targets.chain(self.moved_from.lock().map(Target::Loopback));
+        let targets = targets.chain(self.state().moved_from.map(Target::Loopback));
         targets.collect()
+    }
+
+    /// Forget the port the gateway moved away from once no route forwards
+    /// there (goatty's was repointed or removed): from then on a route to it
+    /// is someone else's.
+    fn prune_moved(&self) {
+        let state = self.state();
+        let Some(old) = state.moved_from else { return };
+        let Ok(cfg) = self.ts.serve_config() else { return };
+        let old = Target::Loopback(old);
+        if !cfg.tcp.values().any(|h| old.matches(&h.tcp_forward))
+            && let Err(e) = self.save_state(HostState { moved_from: None, ..state })
+        {
+            log::warn!("tailnet: {e:#}");
+        }
     }
 
     fn save_state(&self, state: HostState) -> Result<()> {
@@ -171,6 +187,7 @@ impl Host {
         } else if self.ts.serve_config().is_ok_and(|c| !c.our_ports(&self.targets()).is_empty()) {
             self.remove_routes(None);
         }
+        self.prune_moved();
     }
 
     /// Re-listen when the gateway socket vanished (logind removing
@@ -288,6 +305,7 @@ impl Host {
                     self.remove_routes(Some(port));
                 }
                 self.save_state(HostState { available: true, port, ..self.state() })?;
+                self.prune_moved();
                 Ok(())
             }
             problem => {
@@ -310,6 +328,7 @@ impl Host {
         // Tear down first: a failed save must not leave the gateway serving.
         self.stop_listening();
         let problem = self.remove_routes(None);
+        self.prune_moved();
         *self.route.lock() = RouteStatus::Off;
         let state = self.state();
         self.save_state(HostState { available: false, ..state })?;
@@ -415,12 +434,15 @@ impl Host {
             _ => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).context("bind a loopback port for the tailnet gateway")?,
         };
         let port = listener.local_addr()?.port();
-        if let Some(old) = saved.filter(|&p| p != port) {
-            log::warn!("tailnet: gateway port {old} is taken; moving to {port}");
-            *self.moved_from.lock() = Some(old);
-        }
         if saved != Some(port) {
-            self.save_state(HostState { local_port: Some(port), ..self.state() })?;
+            let state = self.state();
+            // Kept until the route is repaired: goatty's route may still
+            // forward to the old port (or to one it left before that).
+            let moved_from = state.moved_from.or(saved).filter(|&p| p != port);
+            if let Some(old) = saved {
+                log::warn!("tailnet: gateway port {old} is taken; moving to {port}");
+            }
+            self.save_state(HostState { local_port: Some(port), moved_from, ..state })?;
         }
         let (stop, thread) = self.accept_loop(move || {
             let (s, _) = listener.accept()?;
@@ -568,7 +590,17 @@ mod tests {
         h.listen().unwrap();
         let moved = h.state().local_port.unwrap();
         assert_ne!(moved, port);
+        assert_eq!(h.state().moved_from, Some(port));
         assert_eq!(h.targets(), [Target::Loopback(moved), Target::Loopback(port)]);
+        h.stop_listening();
+        drop(h);
+        // The old port stays goatty's across a restart until the route is repaired.
+        let h = host(dir.path());
+        h.listen().unwrap();
+        assert_eq!(h.targets(), [Target::Loopback(moved), Target::Loopback(port)]);
+        // No Serve config to read (no Tailscale): nothing is forgotten on a guess.
+        h.prune_moved();
+        assert_eq!(h.state().moved_from, Some(port));
         drop(squatter);
     }
 }

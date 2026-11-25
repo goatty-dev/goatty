@@ -150,7 +150,7 @@ ssh's stderr is captured (logged, last 40 lines kept): a failed connect shows ss
 
 `goattyd proxy` connects to the host's daemon socket, starting the daemon if needed, and relays bytes in both directions. It writes stdout through the raw fd, because std's `Stdout` is line-buffered and would hold binary frames back.
 
-**Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. Without SSH, paired tailnet hosts connect through `Endpoint::Tailnet` ([`tailnet.md`](tailnet.md)): still no network socket in goattyd, because tailscaled forwards into a Unix socket.
+**Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. Without SSH, paired tailnet hosts connect through `Endpoint::Tailnet` ([`tailnet.md`](tailnet.md)): on Unix still no network socket in goattyd, because tailscaled forwards into a Unix socket. On Windows, where Serve can't forward into a socket or pipe, the gateway listens on `127.0.0.1` only, and every connection must pass the device-key handshake before it reaches the daemon.
 
 ### Any stdio command (implemented: `goatty --via '<cmd>'`)
 E.g. `--via 'docker exec -i devbox goattyd proxy'`. The command line runs under `sh -c`, so shell quoting works for arguments with spaces. Windows has no `sh`: there the line is split into words (`'…'` and `"…"` group, backslashes stay) and run directly, so `--via 'wsl.exe -d Ubuntu -- goattyd proxy'` works but pipes and variables don't. The tests use this with the local `goattyd proxy` to exercise the full remote path, including reconnect, without ssh.

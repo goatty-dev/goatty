@@ -257,13 +257,37 @@ fn is_permission_error(text: &str) -> bool {
 pub struct Permission {
     /// Makes this user Tailscale's operator, so goatty can manage its route
     /// itself from then on (the user also needs sudo rights: tailscaled
-    /// checks `sudo -l tailscale` before it serves a Unix socket).
+    /// checks `sudo -l tailscale` before it serves a Unix socket). Empty
+    /// where Tailscale has no operator (Windows).
     pub operator: String,
-    /// Or: the change itself, run once as root.
+    /// Or: the change itself, a command to run once (as root, or on Windows
+    /// as Administrator). Only the command, so it can be copied and run.
     pub direct: String,
+    /// What to do, in words, for the host's OS: the host decides, as the
+    /// settings window may show a host of another OS. Empty from goattyds
+    /// that predate it ([`Self::advice`] then gives the Unix wording).
+    #[serde(default)]
+    pub advice: String,
 }
 
+/// The advice for Unix hosts (and goattyds that don't send any).
+const UNIX_ADVICE: &str = "Run this once in a terminal (it needs sudo rights), then turn availability on again:";
+
 impl Permission {
+    /// What to do, in words, ending in a colon before the commands.
+    pub fn advice(&self) -> &str {
+        if self.advice.is_empty() { UNIX_ADVICE } else { &self.advice }
+    }
+
+    /// The fix in one line, for status lines and errors.
+    pub fn summary(&self) -> String {
+        if self.operator.is_empty() {
+            format!("sign in to the Tailscale app as this user, or run `{}` as Administrator", self.direct)
+        } else {
+            format!("run `{}` once", self.operator)
+        }
+    }
+
     fn commands(args: &[&str]) -> Self {
         Self::commands_for(cfg!(windows), args)
     }
@@ -274,12 +298,19 @@ impl Permission {
         let args = args.join(" ");
         if windows {
             return Self {
-                operator: "Sign in to the Tailscale app as this Windows user".into(),
-                direct: format!("tailscale {args}  (in a terminal opened as Administrator)"),
+                operator: String::new(),
+                direct: format!("tailscale {args}"),
+                advice: "Sign in to the Tailscale app as this Windows user, or run this once in a terminal opened as Administrator, \
+                         then turn availability on again:"
+                    .into(),
             };
         }
         let user = std::env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "$USER".into());
-        Self { operator: format!("sudo tailscale set --operator={user}"), direct: format!("sudo tailscale {args}") }
+        Self {
+            operator: format!("sudo tailscale set --operator={user}"),
+            direct: format!("sudo tailscale {args}"),
+            advice: UNIX_ADVICE.into(),
+        }
     }
 }
 
@@ -293,8 +324,7 @@ pub enum ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServeError::Permission(p) if cfg!(windows) => write!(f, "Tailscale doesn't let goatty change Serve: {}", p.operator),
-            ServeError::Permission(p) => write!(f, "Tailscale doesn't let goatty change Serve: run `{}` once", p.operator),
+            ServeError::Permission(p) => write!(f, "Tailscale doesn't let goatty change Serve: {}", p.summary()),
             ServeError::Failed(m) => write!(f, "tailscale serve: {m}"),
         }
     }
@@ -689,9 +719,15 @@ pub(crate) mod tests {
     #[test]
     fn windows_permission_has_no_sudo() {
         let p = Permission::commands_for(true, &["serve", "--bg", "--tcp=7422", "tcp://127.0.0.1:5"]);
-        assert!(!p.operator.contains("sudo") && !p.direct.contains("sudo"), "{p:?}");
-        assert!(p.direct.starts_with("tailscale serve --bg --tcp=7422 tcp://127.0.0.1:5"));
-        assert!(Permission::commands_for(false, &["serve"]).direct.starts_with("sudo tailscale serve"));
+        assert!(p.operator.is_empty(), "{p:?}");
+        assert_eq!(p.direct, "tailscale serve --bg --tcp=7422 tcp://127.0.0.1:5", "only the command, so it can be copied");
+        assert!(p.advice().contains("Administrator") && p.summary().contains("Administrator"));
+        let unix = Permission::commands_for(false, &["serve"]);
+        assert!(unix.direct.starts_with("sudo tailscale serve") && unix.summary().contains("--operator="));
+        // From a goattyd that sends no advice: the Unix wording.
+        let old: Permission =
+            serde_json::from_str(r#"{"operator":"sudo tailscale set --operator=u","direct":"sudo tailscale serve"}"#).unwrap();
+        assert!(old.advice().contains("sudo"));
     }
 
     #[test]

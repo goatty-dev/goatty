@@ -62,9 +62,16 @@ fn make(daemon: &Arc<Daemon>) -> Result<Arc<Host>> {
 /// Windows: relay an authenticated gateway connection (loopback TCP) through
 /// a connected named pipe pair, and return the end `client::handle` serves.
 /// Either side closing ends both.
+///
+/// A peer that stops reading must not hold both threads forever (writes to
+/// it would block, and its silence keeps the reader waiting): a write that
+/// makes no progress for `STALLED_WRITE` ends the bridge. Flow control
+/// keeps a live peer's backlog far below what that takes to drain.
 #[cfg(not(unix))]
 fn bridge(tcp: std::net::TcpStream) -> Result<goatty_client::LocalStream> {
     use std::io::{Read, Write};
+    const STALLED_WRITE: std::time::Duration = std::time::Duration::from_secs(60);
+    tcp.set_write_timeout(Some(STALLED_WRITE))?;
     let (ours, theirs) = goatty_client::LocalStream::pair().context("named pipe pair")?;
     fn pump(mut from: impl Read, mut to: impl Write) {
         let mut buf = vec![0u8; 64 << 10];
