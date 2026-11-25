@@ -968,6 +968,28 @@ fn added_folders_join_path_in_order() {
     assert!(!path.iter().any(|p| p.ends_with("missing")), "missing folders are skipped: {path:?}");
 }
 
+/// The goattyd running the shell answers to `goattyd` even when no
+/// `goattyd` is in PATH (#256), and one in PATH wins over it.
+#[test]
+fn goattyd_runs_even_when_not_in_path() {
+    let Some(zsh) = zsh() else { return };
+    // Some distros' /etc/profile puts /usr/bin in PATH, and a packaged
+    // goattyd there would answer instead.
+    if ["/usr/bin/goattyd", "/bin/goattyd"].iter().any(|p| Path::new(p).exists()) {
+        return;
+    }
+    let sb = Sandbox::new(zsh);
+    exe(&sb.home.join("goattyd"), "#!/bin/sh\necho \"daemon $*\"\n");
+    let launch = sb.launch_with(no_highlighting(), None);
+    let out = sb.run(&launch, "goattyd list 'a b'");
+    assert_eq!(stdout(&out).trim(), "daemon list a b", "{}", String::from_utf8_lossy(&out.stderr));
+
+    std::fs::create_dir_all(sb.dirs.bin_dir()).unwrap();
+    exe(&sb.dirs.bin_dir().join("goattyd"), "#!/bin/sh\necho linked\n");
+    let out = sb.run(&launch, "goattyd list");
+    assert_eq!(stdout(&out).trim(), "linked", "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// The PATH page's marks: each folder is attributed to the startup step
 /// that added it.
 #[test]

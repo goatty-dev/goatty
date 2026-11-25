@@ -171,6 +171,7 @@ v=$("$t" --version 2>&1) || {{ echo "the uploaded goattyd doesn't run on this ho
 case "$v" in "goattyd {version}"*) ;; *) echo "unexpected goattyd version: $v" >&2; exit 1;; esac
 mv -f "$t" "$d/$n"
 echo "installed $d/$n"
+if [ -L "$d/goattyd" ] || [ ! -e "$d/goattyd" ]; then ln -sf "$n" "$d/.goattyd.$$" && mv -f "$d/.goattyd.$$" "$d/goattyd"; fi
 if [ -e /proc/self/exe ]; then
   pd=$(cd "$d" && pwd -P)
   for f in "$d"/goattyd-*; do
@@ -188,7 +189,10 @@ fi
 }
 
 /// Upload `binary` to the host as this build's goattyd (see
-/// [`binary_name`]), after checking it arrived whole and runs there.
+/// [`binary_name`]), after checking it arrived whole and runs there, and
+/// point the unversioned `goattyd` symlink in [`BIN_DIR`] at it, so
+/// `goattyd` works in the host's managed zsh (which has that folder on
+/// `PATH`). A `goattyd` there that isn't a symlink is left alone.
 /// Afterwards, older `goattyd-*` builds in [`BIN_DIR`] are deleted unless a
 /// running process uses them (found through `/proc`; hosts without it keep
 /// everything).
@@ -280,7 +284,7 @@ pub(crate) fn with_stderr(err: anyhow::Error, stderr: &[String]) -> anyhow::Erro
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     use super::*;
 
@@ -398,5 +402,38 @@ mod tests {
         assert_eq!(last_words(b"\n", b"a\nb\nc\nd\n"), "b / c / d");
         let with_backtrace = b"Error: not a goattyd\n\nStack backtrace:\n   0: main\n   1: _start\n";
         assert_eq!(last_words(with_backtrace, b""), "Error: not a goattyd");
+    }
+
+    fn run_install(home: &Path) {
+        let fake = format!("#!/bin/sh\necho goattyd {}\n", env!("CARGO_PKG_VERSION"));
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &install_script(fake.len() as u64)])
+            .env("HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(fake.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn install_links_an_unversioned_goattyd() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join(BIN_DIR);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("goattyd-0.0.1-p1", bin.join("goattyd")).unwrap();
+        run_install(dir.path());
+        assert_eq!(std::fs::read_link(bin.join("goattyd")).unwrap(), PathBuf::from(binary_name()));
+        let out = std::process::Command::new(bin.join("goattyd")).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("goattyd "));
+
+        // A goattyd the user put there themselves stays.
+        std::fs::remove_file(bin.join("goattyd")).unwrap();
+        std::fs::write(bin.join("goattyd"), "mine").unwrap();
+        run_install(dir.path());
+        assert_eq!(std::fs::read_to_string(bin.join("goattyd")).unwrap(), "mine");
     }
 }
