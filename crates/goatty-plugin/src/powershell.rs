@@ -69,81 +69,40 @@ pub(crate) fn escape_legacy_native_arg(s: &str) -> String {
     out
 }
 
-/// PowerShell expression testing whether the active host uses legacy native
-/// command argument passing (Windows PowerShell 5.1, PowerShell 7.0–7.2, or
-/// PowerShell 7.3+ configured with `$PSNativeCommandArgumentPassing = 'Legacy'`).
-pub(crate) const LEGACY_NATIVE_COND: &str = "$PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 3) -or $PSNativeCommandArgumentPassing -eq 'Legacy'";
+/// Build a PowerShell expression that evaluates to `$true` when invoking `prog`
+/// on the active host uses legacy Win32 native command argument passing:
+/// * `prog` resolves to an external `Application` (or a `Function` wrapper with
+///   an `Application` of the same name, such as goatty's alias functions — never
+///   a PowerShell `Cmdlet` like `Write-Output`, and never guessing by name so a
+///   native `get-widget.exe` still gets escaped), AND
+/// * either the host is Windows PowerShell 5.1 / PowerShell 7.0–7.2, or
+///   `$PSNativeCommandArgumentPassing -eq 'Legacy'`, or PowerShell 7.3+
+///   `Windows` mode for one of its documented legacy executables/extensions
+///   (`cmd.exe`, `cscript.exe`, `find.exe`, `msiexec.exe`, `sqlcmd.exe`,
+///   `wscript.exe`, `.bat`, `.cmd`, `.js`, `.vbs`, `.wsf`).
+pub(crate) fn legacy_native_cond_for(prog: &str) -> String {
+    let q = quote(prog);
+    format!(
+        "(& {{ $c = Get-Command -Name {q} -ErrorAction SilentlyContinue | Select-Object -First 1; \
+         if (-not $c) {{ return $false }}; \
+         if ($c.CommandType -eq 'Function') {{ $c = Get-Command -Name {q} -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 }}; \
+         if (-not $c -or $c.CommandType -ne 'Application') {{ return $false }}; \
+         ($PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 3) -or $PSNativeCommandArgumentPassing -eq 'Legacy' -or ($PSNativeCommandArgumentPassing -eq 'Windows' -and $c.Name -match '(?i)^(?:cmd|cscript|find|msiexec|sqlcmd|wscript)\\.exe$|\\.(?:bat|cmd|js|vbs|wsf)$')) }})"
+    )
+}
 
-/// Quote a PowerShell argument for a native executable, preserving embedded
-/// double quotes on both PowerShell 7.3+ and legacy Windows PowerShell 5.1.
-///
-/// Ordinary arguments without embedded `"` (or trailing `\` with whitespace)
-/// are rendered identically to [`word`].
-pub fn native_word(s: &str) -> String {
+/// Quote a PowerShell argument for `prog`, preserving embedded double quotes
+/// (and trailing backslashes in whitespace-containing arguments) on legacy
+/// Windows PowerShell 5.1 and PowerShell 7.3+ `Windows`-mode legacy exceptions,
+/// while leaving cmdlets, modern native calls, and ordinary literals unchanged.
+pub fn native_word_for(prog: &str, s: &str) -> String {
     if !needs_legacy_native_escape(s) {
         return word(s);
     }
+    let cond = legacy_native_cond_for(prog);
     let legacy = quote(&escape_legacy_native_arg(s));
     let modern = quote(s);
-    format!("$(if ({LEGACY_NATIVE_COND}) {{ {legacy} }} else {{ {modern} }})")
-}
-
-/// Whether `prog` looks like a PowerShell `Verb-Noun` cmdlet (e.g.
-/// `Write-Output`, `Set-Location`, `Get-Content`) or built-in cmdlet alias
-/// whose arguments are bound directly as .NET strings without Win32 native
-/// command-line serialization.
-pub(crate) fn is_ps_cmdlet(prog: &str) -> bool {
-    const VERBS: &[&str] = &[
-        "add",
-        "clear",
-        "close",
-        "convertfrom",
-        "convertto",
-        "copy",
-        "disable",
-        "enable",
-        "export",
-        "foreach",
-        "format",
-        "get",
-        "group",
-        "hide",
-        "import",
-        "invoke",
-        "join",
-        "measure",
-        "move",
-        "new",
-        "open",
-        "out",
-        "pop",
-        "push",
-        "read",
-        "register",
-        "remove",
-        "rename",
-        "resolve",
-        "restart",
-        "select",
-        "set",
-        "show",
-        "sort",
-        "split",
-        "start",
-        "stop",
-        "test",
-        "unregister",
-        "update",
-        "where",
-        "write",
-    ];
-    if prog.eq_ignore_ascii_case("echo") {
-        return true;
-    }
-    if let Some((verb, noun)) = prog.split_once('-') {
-        return !noun.is_empty() && noun.bytes().all(|b| b.is_ascii_alphabetic()) && VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb));
-    }
-    false
+    format!("$(if ({cond}) {{ {legacy} }} else {{ {modern} }})")
 }
 
 /// Quote a string as a PowerShell literal expression.

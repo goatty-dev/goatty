@@ -112,7 +112,7 @@ pub fn add(
         bail!("give the command the alias runs: goattyd alias add {name} COMMAND…");
     }
     if cfg!(windows)
-        && let Some(why) = super::powershell_command_problem(command)
+        && let Some(why) = super::powershell_alias_problem(name, command)
     {
         bail!("{name:?}: command isn't valid PowerShell ({why})");
     }
@@ -166,10 +166,11 @@ pub fn edit(svc: &HostService, name: &str, e: Edit) -> Result<()> {
         if c.trim().is_empty() {
             bail!("the command can't be empty (remove the alias with `goattyd alias remove {name}`)");
         }
+        let target_name = e.rename.as_deref().unwrap_or(name);
         if cfg!(windows)
-            && let Some(why) = super::powershell_command_problem(&c)
+            && let Some(why) = super::powershell_alias_problem(target_name, &c)
         {
-            bail!("{name:?}: command isn't valid PowerShell ({why})");
+            bail!("{target_name:?}: command isn't valid PowerShell ({why})");
         }
         alias.command = c.trim().to_owned();
     }

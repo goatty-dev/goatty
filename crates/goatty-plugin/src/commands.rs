@@ -685,7 +685,7 @@ pub fn command_line(c: &PaletteCommand, values: &BTreeMap<String, String>) -> St
 /// quoting arguments with PowerShell single-quote escaping (`''`) and adding
 /// the `&` call operator when the program name requires quoting (#278).
 pub fn command_line_powershell(c: &PaletteCommand, values: &BTreeMap<String, String>) -> String {
-    let is_cmdlet = c.run.first().is_some_and(|p| crate::powershell::is_ps_cmdlet(p));
+    let prog = c.run.first().map(String::as_str).unwrap_or_default();
     let mut words = Vec::new();
     for (i, t) in c.run.iter().enumerate() {
         if i == 0 {
@@ -736,16 +736,14 @@ pub fn command_line_powershell(c: &PaletteCommand, values: &BTreeMap<String, Str
                 exprs.push(crate::powershell::quote(&text));
             }
             let modern = format!("({})", exprs.join(" + "));
-            if !is_cmdlet && exprs.iter().any(|e| e.contains('"')) {
-                let cond = crate::powershell::LEGACY_NATIVE_COND;
+            if exprs.iter().any(|e| e.contains('"')) {
+                let cond = crate::powershell::legacy_native_cond_for(prog);
                 words.push(format!("$(if ({cond}) {{ [regex]::Replace({modern}, '(\\\\*)\"', '$1$1\\\"') }} else {{ {modern} }})"));
             } else {
                 words.push(modern);
             }
-        } else if is_cmdlet {
-            words.push(crate::powershell::word(&text));
         } else {
-            words.push(crate::powershell::native_word(&text));
+            words.push(crate::powershell::native_word_for(prog, &text));
         }
     }
     words.join(" ")

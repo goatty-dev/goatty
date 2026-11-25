@@ -78,7 +78,7 @@ function global:_goatty_cached_init {
         return $null
     }
     $psVer = $PSVersionTable.PSVersion.ToString()
-    $key = "# goatty-cache-key: v1|$psVer|$bin|$($fi.Length):$($fi.LastWriteTimeUtc.Ticks)|$Extra|$($Arguments -join ' ')"
+    $key = "# goatty-cache-key: v2|$psVer|$bin|$($fi.Length):$($fi.LastWriteTimeUtc.Ticks)|$Extra|$($Arguments -join ' ')"
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($key))
@@ -91,9 +91,19 @@ function global:_goatty_cached_init {
 
     if (Test-Path -LiteralPath $cacheFile) {
         try {
-            $firstLine = [System.IO.File]::ReadLines($cacheFile) | Select-Object -First 1
-            if ($firstLine -eq $key) {
-                return $cacheFile
+            $fs = [System.IO.File]::OpenRead($cacheFile)
+            try {
+                $bom = New-Object byte[] 3
+                $nRead = $fs.Read($bom, 0, 3)
+                $hasBom = ($nRead -eq 3 -and $bom[0] -eq 0xEF -and $bom[1] -eq 0xBB -and $bom[2] -eq 0xBF)
+            } finally {
+                $fs.Dispose()
+            }
+            if ($hasBom) {
+                $firstLine = [System.IO.File]::ReadLines($cacheFile) | Select-Object -First 1
+                if ($firstLine -eq $key) {
+                    return $cacheFile
+                }
             }
         } catch {}
     }

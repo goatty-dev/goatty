@@ -82,7 +82,9 @@ fn render_plugins(cfg: &PowerShellConfig<'_>) -> Vec<GeneratedFile> {
         let checked: Result<(), String> = a.shell_files_for("powershell").into_iter().try_for_each(|rel| {
             let bytes = a.read(cfg.dirs, &rel).map_err(|e| format!("{e:#}"))?;
             let text = String::from_utf8(bytes).map_err(|_| format!("{id}: {rel} isn't text"))?;
-            shipped.push(GeneratedFile::new(format!("plugins/{id}/{rel}"), text));
+            let name = format!("plugins/{id}/{rel}");
+            let normalized = crate::generation::normalize_generated_text(&name, &text).to_owned();
+            shipped.push(GeneratedFile::new(name, normalized));
             Ok(())
         });
         if let Err(e) = checked {

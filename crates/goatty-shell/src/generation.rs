@@ -133,14 +133,19 @@ pub fn list(dirs: &Dirs) -> Vec<Generation> {
     v
 }
 
+pub(crate) fn normalize_generated_text<'a>(name: &str, text: &'a str) -> &'a str {
+    if name.ends_with(".ps1") { text.strip_prefix('\u{feff}').unwrap_or(text) } else { text }
+}
+
 fn write_generated_file(path: &Path, f: &GeneratedFile) -> std::io::Result<()> {
     // Windows PowerShell 5.1 decodes `.ps1` files without a UTF-8 BOM using the
     // system ANSI code page, corrupting non-ASCII paths and text. Prepend a
     // UTF-8 BOM to `.ps1` files only so PS 5.1 and PS 7 decode identically.
-    if f.name.ends_with(".ps1") && !f.contents.starts_with('\u{feff}') {
-        let mut bytes = Vec::with_capacity(3 + f.contents.len());
+    if f.name.ends_with(".ps1") {
+        let body = normalize_generated_text(&f.name, &f.contents);
+        let mut bytes = Vec::with_capacity(3 + body.len());
         bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-        bytes.extend_from_slice(f.contents.as_bytes());
+        bytes.extend_from_slice(body.as_bytes());
         std::fs::write(path, bytes)
     } else {
         std::fs::write(path, &f.contents)
@@ -149,12 +154,7 @@ fn write_generated_file(path: &Path, f: &GeneratedFile) -> std::io::Result<()> {
 
 pub(crate) fn read_generated_text(path: &Path, name: &str) -> std::io::Result<String> {
     let text = std::fs::read_to_string(path)?;
-    if name.ends_with(".ps1")
-        && let Some(stripped) = text.strip_prefix('\u{feff}')
-    {
-        return Ok(stripped.to_owned());
-    }
-    Ok(text)
+    Ok(normalize_generated_text(name, &text).to_owned())
 }
 
 fn read_files(dir: &Path, like: &[GeneratedFile]) -> Option<Vec<String>> {
@@ -179,8 +179,8 @@ pub fn activate(dirs: &Dirs, files: &[GeneratedFile], settings_json: &str) -> Re
     let shell_subdir = if cfg!(windows) { "pwsh" } else { "zsh" };
     if let Some(n) = current(dirs) {
         let path = gens.join(n.to_string());
-        let same_files =
-            read_files(&path.join(shell_subdir), files).is_some_and(|old| old.iter().zip(files).all(|(o, f)| *o == f.contents));
+        let same_files = read_files(&path.join(shell_subdir), files)
+            .is_some_and(|old| old.iter().zip(files).all(|(o, f)| o == normalize_generated_text(&f.name, &f.contents)));
         let same_settings = std::fs::read_to_string(path.join("host.json")).is_ok_and(|s| s == settings_json);
         if same_files && same_settings {
             return Ok(Activated { generation: n, created: false });
@@ -203,7 +203,7 @@ pub fn activate(dirs: &Dirs, files: &[GeneratedFile], settings_json: &str) -> Re
         std::fs::write(staging.join("host.json"), settings_json)?;
         let version = env!("CARGO_PKG_VERSION");
         let base = current(dirs).and_then(|n| list(dirs).into_iter().find(|g| g.number == n));
-        let tree = files.iter().map(|f| (f.name.clone(), f.contents.clone())).collect();
+        let tree = files.iter().map(|f| (f.name.clone(), normalize_generated_text(&f.name, &f.contents).to_owned())).collect();
         let info = Info {
             created: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             goatty: version.to_owned(),
@@ -337,9 +337,10 @@ pub fn diff(dirs: &Dirs, files: &[GeneratedFile]) -> Vec<FileDiff> {
         .iter()
         .filter_map(|f| {
             let old = read_generated_text(&dir.join(&f.name), &f.name).unwrap_or_default();
-            (old != f.contents).then(|| FileDiff {
+            let new_text = normalize_generated_text(&f.name, &f.contents);
+            (old != new_text).then(|| FileDiff {
                 name: f.name.clone(),
-                unified: similar::TextDiff::from_lines(&old, &f.contents)
+                unified: similar::TextDiff::from_lines(&old, new_text)
                     .unified_diff()
                     .context_radius(2)
                     .header(&format!("active/{}", f.name), &format!("new/{}", f.name))
@@ -456,5 +457,27 @@ mod tests {
         assert!(err.to_string().contains(&format!("{} doesn't parse", entry_name())), "{err}");
         assert_eq!(current(&dirs), Some(1));
         assert_eq!(list(&dirs).len(), 1, "no half-built generation left");
+    }
+
+    #[test]
+    fn bom_prefixed_ps1_plugin_file_is_idempotent_across_activate_diff_and_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let entry = if cfg!(windows) { "$a = 1\n" } else { "a=1\n" };
+        let files =
+            vec![GeneratedFile::new(entry_name(), entry), GeneratedFile::new("plugins/demo/init.ps1", "\u{feff}$x = 'caf\u{00e9}'\n")];
+        assert_eq!(activate(&dirs, &files, "{}").unwrap(), Activated { generation: 1, created: true });
+        // Second activate with the same BOM-prefixed `.ps1` must not create a new generation.
+        assert_eq!(activate(&dirs, &files, "{}").unwrap(), Activated { generation: 1, created: false });
+        assert!(diff(&dirs, &files).is_empty(), "diff must normalize BOM on both sides");
+        // Stored file must have exactly one UTF-8 BOM, never doubled.
+        let stored = std::fs::read(dirs.shell_dir().join("plugins/demo/init.ps1")).unwrap();
+        assert!(stored.starts_with(&[0xEF, 0xBB, 0xBF]));
+        assert!(!stored[3..].starts_with(&[0xEF, 0xBB, 0xBF]));
+        // Changing only settings must record 0 changed files in history.
+        let g2 = activate(&dirs, &files, r#"{"x":1}"#).unwrap();
+        assert_eq!(g2, Activated { generation: 2, created: true });
+        let info = read_info(&dirs.generations_dir().join("2"));
+        assert_eq!(info.changes.unwrap().files, 0);
     }
 }

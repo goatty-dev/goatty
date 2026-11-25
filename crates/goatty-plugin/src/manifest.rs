@@ -628,7 +628,8 @@ pub fn parse(text: &str, files: Option<&BTreeSet<String>>) -> Result<Manifest, I
         Some(_) => {}
     }
     let m: Manifest = toml::from_str(text).map_err(|e| one("", e.message().to_string()))?;
-    let problems = validate(&m, files);
+    let has_powershell_section = raw.contains_key("powershell");
+    let problems = validate(&m, files, has_powershell_section);
     if problems.is_empty() { Ok(m) } else { Err(Invalid(problems)) }
 }
 
@@ -715,7 +716,7 @@ pub fn is_bundle_path(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('/') && s.split('/').all(is_plain)
 }
 
-fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
+fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_section: bool) -> Vec<Problem> {
     let mut out = Vec::new();
     let mut err = |path: String, message: String| out.push(Problem { path, message });
 
@@ -755,7 +756,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
             err("compat.shells".into(), format!("unknown shell {sh:?}"));
         }
     }
-    if !m.powershell.is_empty() && !m.shells().contains(&"powershell") {
+    if (has_powershell_section || !m.powershell.is_empty()) && !m.shells().contains(&"powershell") {
         err("compat.shells".into(), "include \"powershell\" in compat.shells when declaring a [powershell] section".into());
     }
     for c in &m.requires.commands {
@@ -1306,6 +1307,9 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
         assert!(problems(&missing_shell).iter().any(|p| p.contains("compat.shells")), "{:?}", problems(&missing_shell));
         let omitted_shells = text.replace("shells = [\"powershell\"]\n", "");
         assert!(problems(&omitted_shells).iter().any(|p| p.contains("compat.shells")), "{:?}", problems(&omitted_shells));
+        // An empty `[powershell]` section without `powershell` in `compat.shells` is also rejected.
+        let empty_ps = format!("{EXAMPLE}\n[powershell]\n");
+        assert!(problems(&empty_ps).iter().any(|p| p.contains("compat.shells")), "{:?}", problems(&empty_ps));
         // Missing file is rejected when file list is provided.
         let missing = parse(&text, Some(&BTreeSet::new())).unwrap_err().0;
         assert!(missing.iter().any(|p| p.path == "powershell.init"), "{missing:?}");
