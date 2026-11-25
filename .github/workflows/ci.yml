@@ -13,6 +13,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Line tables keep panic backtraces readable; full debuginfo only bloats the
+  # target dirs (the cache) and slows compiling and linking.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: 1
   RUST_LOG: rio_vt=error,warn
 
@@ -38,6 +41,8 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
@@ -57,13 +62,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
       - name: Benchmarks (smoke, small)
-        # Keeps the examples compiling and catches gross regressions; the
-        # numbers on shared runners are not comparable to docs/.
+        # Catches gross regressions; the numbers on shared runners are not
+        # comparable to docs/. Not on PRs: the examples are compiled by
+        # clippy --all-targets there already.
+        if: github.event_name != 'pull_request'
         run: |
           cargo build --release --locked -p goatty-daemon
           cargo run --release --locked -p goatty-term --example vtbench
@@ -82,6 +91,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --locked --workspace --exclude goatty-app --all-targets -- -D warnings
       - name: Tests
@@ -94,12 +105,18 @@ jobs:
     name: clippy + tests (windows)
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      # lld-link instead of link.exe: faster linking of the large goatty-app
+      # test binaries.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Tests
