@@ -45,7 +45,7 @@ impl Terminal {
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
         self.with_term(|t| {
-            let mut out = serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info());
+            let mut out = serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info(), self.win32_input());
             self.write_status(false, &mut out);
             out.into_bytes()
         })
@@ -68,7 +68,7 @@ impl Terminal {
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
         self.with_term(|t| {
-            let mut out = resync(t, self.shell_info(), self.primary_kitty());
+            let mut out = resync(t, self.shell_info(), self.primary_kitty(), self.win32_input());
             self.write_status(true, &mut out);
             out.into_bytes()
         })
@@ -89,8 +89,11 @@ impl Terminal {
 
 /// `primary`: the primary screen's kitty keyboard flags, used while the
 /// alternate screen is active (each screen has its own).
-fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> String {
-    let mode = TermMode::of(t);
+fn resync(t: &mut Term, shell: ShellInfo, primary: u8, win32_input: bool) -> String {
+    let mut mode = TermMode::of(t);
+    if win32_input {
+        mode |= TermMode::WIN32_INPUT_MODE;
+    }
     let mut out = String::new();
     // Undo state the skipped bytes may have left on the client: scroll
     // region, origin mode, and the alt-screen switch in whichever direction.
@@ -112,8 +115,11 @@ fn resync(t: &mut Term, shell: ShellInfo, primary: u8) -> String {
     out
 }
 
-fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo) -> String {
-    let mode = TermMode::of(t);
+fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo, win32_input: bool) -> String {
+    let mut mode = TermMode::of(t);
+    if win32_input {
+        mode |= TermMode::WIN32_INPUT_MODE;
+    }
     let mut out = String::new();
     // Full reset of the fresh client, then UTF-8 + autowrap defaults.
     out.push_str("\x1bc");
@@ -235,6 +241,7 @@ fn write_modes(t: &Term, mode: TermMode, out: &mut String) {
     set(out, mode.contains(TermMode::LINE_WRAP), 7);
     set(out, mode.contains(TermMode::BRACKETED_PASTE), 2004);
     set(out, mode.contains(TermMode::FOCUS_IN_OUT), 1004);
+    set(out, mode.contains(TermMode::WIN32_INPUT_MODE), 9001);
     if mode.contains(TermMode::MOUSE_REPORT_X10) {
         set(out, true, 9);
     }

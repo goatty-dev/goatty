@@ -29,14 +29,15 @@ pub fn register(cx: &App) -> Vec<String> {
 }
 
 /// The font families goatty can use, found without a window (for
-/// `goatty settings validate`): installed ones named as GPUI names them on
-/// Linux (a face's first family), plus the bundled one. Reads every font
-/// file's header, so it takes a moment. Empty when no font is found, so
-/// font checks are skipped rather than reporting every family missing.
+/// `goatty settings validate`): installed ones (every family name each face
+/// declares, matching both fontconfig on Linux and DirectWrite on Windows),
+/// plus the bundled one. Reads every font file's header, so it takes a moment.
+/// Empty when no font is found, so font checks are skipped rather than
+/// reporting every family missing.
 pub fn installed_families() -> Vec<String> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
-    let mut names: Vec<String> = db.faces().filter_map(|f| f.families.first().map(|(name, _)| name.clone())).collect();
+    let mut names: Vec<String> = db.faces().flat_map(|f| f.families.iter().map(|(name, _)| name.clone())).collect();
     if names.is_empty() {
         return names;
     }

@@ -832,7 +832,7 @@ impl OutputView {
             return;
         }
         let k = &ev.keystroke;
-        if k.modifiers.control || k.modifiers.alt || k.modifiers.platform {
+        if (k.modifiers.control || k.modifiers.alt || k.modifiers.platform) && !crate::terminal::keys::is_windows_altgr(k) {
             return;
         }
         let Some(ch) = k.key_char.as_ref().filter(|c| !c.chars().any(char::is_control)) else { return };

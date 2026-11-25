@@ -130,10 +130,11 @@ impl OpenWindows {
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
         // The new directory entry too, so a power loss keeps the new file.
-        match path.parent() {
-            Some(dir) => std::fs::File::open(dir)?.sync_all(),
-            None => Ok(()),
+        #[cfg(unix)]
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
         }
+        Ok(())
     }
 
     /// Load, change and save the file at `path`, holding the lock that
@@ -194,24 +195,18 @@ struct FileLock(std::fs::File);
 
 impl FileLock {
     fn new(path: &Path) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd as _;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("json.lock"))?;
-        // SAFETY: `f` is an open file for the whole call; flock only takes the fd.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        f.lock()?;
         Ok(Self(f))
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: the file is still open; unlocking an fd we locked.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        let _ = self.0.unlock();
     }
 }
 
@@ -225,22 +220,64 @@ fn alive(pid: u32) -> bool {
     if pid == std::process::id() {
         return true;
     }
-    let Ok(raw) = libc::pid_t::try_from(pid) else { return false };
-    // SAFETY: signal 0 sends nothing; kill only checks that the process
-    // exists and may be signalled.
-    let exists = unsafe { libc::kill(raw, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    if !exists {
-        return false;
+    #[cfg(unix)]
+    {
+        let Ok(raw) = libc::pid_t::try_from(pid) else { return false };
+        // SAFETY: signal 0 sends nothing; kill only checks that the process
+        // exists and may be signalled.
+        let exists = unsafe { libc::kill(raw, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !exists {
+            return false;
+        }
+        // A reused pid is some other program.
+        if Path::new("/proc/self").exists() {
+            return std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "goatty");
+        }
+        // No /proc (macOS): ask ps for the program's name.
+        std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next() == Some("goatty"))
     }
-    // A reused pid is some other program.
-    if Path::new("/proc/self").exists() {
-        return std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|comm| comm.trim() == "goatty");
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FALSE, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        };
+
+        // SAFETY: plain Win32 call; handle is validated and closed before return.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        // SAFETY: `handle` is open and `exit_code` is a valid out-pointer.
+        let still_running = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } != 0 && exit_code == STILL_ACTIVE as u32;
+        let is_goatty = if still_running {
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            // SAFETY: `handle` is open and `buf` has space for `len` u16 units.
+            if unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &raw mut len) } != 0 && len > 0 {
+                let image = String::from_utf16_lossy(&buf[..len as usize]);
+                image.rsplit(['\\', '/']).next().is_some_and(|name| name.eq_ignore_ascii_case("goatty.exe"))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // SAFETY: `handle` is owned exclusively by this scope.
+        unsafe {
+            CloseHandle(handle);
+        }
+        is_goatty
     }
-    // No /proc (macOS): ask ps for the program's name.
-    std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next() == Some("goatty"))
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// The windows to reopen at launch: the records of goatty processes that

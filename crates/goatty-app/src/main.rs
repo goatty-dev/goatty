@@ -4,6 +4,8 @@
 //! `--local` is given. See `goatty --help`, and `goatty_config` for the
 //! `GOATTY_*` environment variables.
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod actions;
 mod agent;
 mod app;
@@ -55,9 +57,17 @@ pub const CLIENT: &str = concat!("goatty ", env!("CARGO_PKG_VERSION"));
 
 fn main() -> Result<()> {
     // Started by ssh to ask a question (we set SSH_ASKPASS to ourselves).
+    // ssh redirects stdio over pipes, which works directly under the Windows
+    // GUI subsystem without attaching to a console.
     if let Some(req) = goatty_client::askpass::request_from_env() {
         askpass::run(req);
     }
+    // Under `#![windows_subsystem = "windows"]` (release builds), attach to
+    // the parent console when invoked from a shell without redirected stdio so
+    // `--help`, `--version`, and CLI subcommands write to it. Detached before
+    // opening the GUI window.
+    #[cfg(windows)]
+    let parent_console = attach_parent_console();
     let cli = Cli::parse();
     // Subcommands work without a window (and without a display).
     if cli.cmd.is_some() {
@@ -92,6 +102,10 @@ fn main() -> Result<()> {
             }
             None => unreachable!(),
         }
+    }
+    #[cfg(windows)]
+    if parent_console {
+        detach_parent_console();
     }
     // goatty's own crates at info; dependencies (wgpu, zbus, ...) only warn, and
     // rio_vt only logs errors so unhandled OSC sequences (e.g. systemd OSC 3008) stay quiet (#20).
@@ -155,4 +169,38 @@ fn main() -> Result<()> {
     };
     app::run(initial, Vec::new(), open_settings);
     Ok(())
+}
+
+#[cfg(windows)]
+fn attach_parent_console() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_UNKNOWN, GetFileType};
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+
+    let has_std = |kind| {
+        // SAFETY: `GetStdHandle` has no preconditions; the returned handle is
+        // checked for null/invalid before querying its file type.
+        let handle = unsafe { GetStdHandle(kind) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        // SAFETY: `handle` is a non-null, valid standard handle.
+        unsafe { GetFileType(handle) != FILE_TYPE_UNKNOWN }
+    };
+    if has_std(STD_OUTPUT_HANDLE) || has_std(STD_ERROR_HANDLE) {
+        return false;
+    }
+    // SAFETY: `AttachConsole(ATTACH_PARENT_PROCESS)` safely fails with
+    // `ERROR_INVALID_HANDLE` when started without a parent console (Start Menu
+    // / Explorer) and never creates a new console window.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+}
+
+#[cfg(windows)]
+fn detach_parent_console() {
+    use windows_sys::Win32::System::Console::FreeConsole;
+    // SAFETY: only called after `AttachConsole` succeeded in this process.
+    unsafe {
+        FreeConsole();
+    }
 }

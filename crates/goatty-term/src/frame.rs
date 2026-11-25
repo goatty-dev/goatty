@@ -20,7 +20,10 @@ impl Terminal {
         let colors = *t.colors();
         let pal = &*self.palette();
         let selection = t.selection.as_ref().and_then(|s| s.to_range(&t));
-        let mode = TermMode::of(&t);
+        let mut mode = TermMode::of(&t);
+        if self.win32_input() {
+            mode |= TermMode::WIN32_INPUT_MODE;
+        }
 
         frame.cols = cols;
         frame.rows = rows;

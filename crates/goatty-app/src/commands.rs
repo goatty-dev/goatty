@@ -66,22 +66,20 @@ fn print_issues(label: &str, issues: &[String]) {
 enum Host {
     Remote(Arc<Connection>),
     Daemon(Control),
-    Local(HostService),
+    Local(Box<HostService>),
 }
 
 impl Host {
     fn open(endpoint: Option<Endpoint>) -> Result<Self> {
+        let local_daemon = || {
+            let name = if cfg!(windows) { "goattyd.exe" } else { "goattyd" };
+            std::env::current_exe().ok().map(|e| e.with_file_name(name)).filter(|d| d.exists())
+        };
         match endpoint {
-            None => {
-                let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
-                Ok(Host::Local(HostService::from_env(daemon)))
-            }
+            None => Ok(Host::Local(Box::new(HostService::from_env(local_daemon())))),
             Some(Endpoint::Local) => Ok(match Control::connect_local(CLIENT) {
                 Ok(c) => Host::Daemon(c),
-                Err(_) => {
-                    let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
-                    Host::Local(HostService::from_env(daemon))
-                }
+                Err(_) => Host::Local(Box::new(HostService::from_env(local_daemon()))),
             }),
             Some(remote) => {
                 let custom_daemon = match &remote {
@@ -671,6 +669,10 @@ version = "0.1.0"
 summary = "Defines a greet function"
 publisher = "tests"
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [[setting]]
 id = "name"
 label = "Name"
@@ -679,6 +681,9 @@ default = "world"
 
 [zsh]
 init = "zsh/init.zsh"
+
+[powershell]
+init = "pwsh/init.ps1"
 
 [permissions]
 shell-code = "defines the greet function in every shell"
@@ -691,11 +696,18 @@ version = "0.2.0"
 summary = "Depends on greet"
 publisher = "tests"
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [requires]
 plugins = ["greet"]
 
 [zsh]
 init = "zsh/init.zsh"
+
+[powershell]
+init = "pwsh/init.ps1"
 
 [permissions]
 shell-code = "uses greet"
@@ -705,13 +717,16 @@ shell-code = "uses greet"
         let key = sign::load_secret(&key_path).unwrap();
         std::fs::create_dir_all(&reg).unwrap();
         std::fs::write(reg.join(index::META), format!("name = \"test\"\nkeys = [\"{public}\"]\n")).unwrap();
-        for (id, v, manifest, init) in
-            [("greet", "0.1.0", greet, "greet() { echo hi }\n"), ("addon", "0.2.0", addon, "addon() { greet }\n")]
-        {
+        for (id, v, manifest, zsh_init, pwsh_init) in [
+            ("greet", "0.1.0", greet, "greet() { echo hi }\n", "function global:greet { Write-Output 'hi' }\n"),
+            ("addon", "0.2.0", addon, "addon() { greet }\n", "function global:addon { greet }\n"),
+        ] {
             let p = reg.join("plugins").join(id).join(v);
             std::fs::create_dir_all(p.join("zsh")).unwrap();
+            std::fs::create_dir_all(p.join("pwsh")).unwrap();
             std::fs::write(p.join("plugin.toml"), manifest).unwrap();
-            std::fs::write(p.join("zsh/init.zsh"), init).unwrap();
+            std::fs::write(p.join("zsh/init.zsh"), zsh_init).unwrap();
+            std::fs::write(p.join("pwsh/init.ps1"), pwsh_init).unwrap();
         }
         let idx = index::build(&reg).unwrap();
         std::fs::write(reg.join(index::INDEX), idx.to_bytes()).unwrap();
@@ -720,7 +735,7 @@ shell-code = "uses greet"
         let source = Source { name: "test".into(), url: reg.to_string_lossy().into_owned(), keys: vec![public], builtin: true };
         let svc = HostService::new(Launcher::new(Some(dirs), None), Some(tmp.path().join("host.json")))
             .with_plugin_sources(Arc::new(Fixed(BTreeMap::new())), vec![source]);
-        (tmp, Host::Local(svc))
+        (tmp, Host::Local(Box::new(svc)))
     }
 
     #[test]

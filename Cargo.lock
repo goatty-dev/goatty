@@ -2059,6 +2059,7 @@ dependencies = [
  "tempfile",
  "ttf-parser",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

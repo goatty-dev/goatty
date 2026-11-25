@@ -84,12 +84,14 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
         _ => SavedWindow::DEFAULT,
     };
     let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+    let title_bar = cx.global::<AppSettings>().client.window.title_bar;
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             app_id: Some("dev.goatty.goatty".into()),
+            titlebar: Some(crate::workspace::titlebar_options(title_bar)),
             window_background: crate::workspace::background_appearance(&cx.global::<AppSettings>().client.terminal),
-            window_decorations: Some(crate::workspace::requested_decorations(cx.global::<AppSettings>().client.window.title_bar)),
+            window_decorations: Some(crate::workspace::requested_decorations(title_bar)),
             ..Default::default()
         },
         |window, cx| {
