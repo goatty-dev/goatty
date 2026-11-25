@@ -366,7 +366,7 @@ mod win_proc {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use anyhow::{Context, Result, bail};
     use goatty_plugin::snippets;
@@ -653,20 +653,16 @@ mod win_proc {
             buf
         });
 
-        let deadline = Instant::now() + timeout;
-        let timed_out = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let wait_ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX - 1);
-            // SAFETY: `proc_handle.0` is a valid waitable process handle.
-            match unsafe { WaitForSingleObject(proc_handle.0, wait_ms) } {
-                WAIT_OBJECT_0 => break false,
-                WAIT_TIMEOUT => break true,
-                _ => {
-                    job.terminate();
-                    let _ = out_thread.join();
-                    let _ = err_thread.join();
-                    return Err(io::Error::last_os_error()).context("wait for snippet subprocess");
-                }
+        let wait_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: `proc_handle.0` is a valid waitable process handle.
+        let timed_out = match unsafe { WaitForSingleObject(proc_handle.0, wait_ms) } {
+            WAIT_OBJECT_0 => false,
+            WAIT_TIMEOUT => true,
+            _ => {
+                job.terminate();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
+                return Err(io::Error::last_os_error()).context("wait for snippet subprocess");
             }
         };
 
