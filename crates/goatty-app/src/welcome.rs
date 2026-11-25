@@ -429,8 +429,11 @@ impl Welcome {
             (false, true) => "Your ~/.zshrc won't run there (its PATH folders and variables still come along).",
             (false, false) => "Your ~/.zshrc won't run there, and with the import off its PATH folders and variables stay out too.",
         };
-        let icons =
-            if self.host.as_ref().is_some_and(|h| h.prompt.plain_elsewhere()) { " Prompt icons fall back to text there." } else { "" };
+        let icons = match self.host.as_ref().map(|h| h.prompt.elsewhere()) {
+            Some(goatty_config::IconsElsewhere::Auto) => " Prompt icons show where the terminal has a Nerd Font, text elsewhere.",
+            Some(goatty_config::IconsElsewhere::Never) => " Prompt icons fall back to text there.",
+            _ => "",
+        };
         Some(sec.footer(format!("{rc}{icons} Change it any time under Settings → Shell.")))
     }
 

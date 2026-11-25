@@ -312,8 +312,15 @@ $_goatty_le = Join-Path $_goatty_dir 'plugins-line-editor.ps1'
 if (Test-Path -LiteralPath $_goatty_le) { . $_goatty_le }
 
 # --- Prompt -----------------------------------------------------------------
+# Other terminals get the prompt without Nerd Font icons unless they draw
+# them: prompt.icons_elsewhere (_goatty_prompt_plain: 0 always keeps them,
+# 1 never, 2 automatic: terminals with Nerd Font glyphs built in).
+if ($global:_goatty_prompt_plain -eq 2) {
+    $_goatty_nerd_term = ($env:TERM_PROGRAM -in 'ghostty', 'WezTerm') -or ($env:TERM -in 'xterm-ghostty', 'xterm-kitty', 'wezterm')
+    $global:_goatty_prompt_plain = if ($_goatty_nerd_term) { 0 } else { 1 }
+}
 $global:_goatty_starship_toml = 'starship.toml'
-if ((-not $global:_goatty_inside) -and $_goatty_prompt_plain) {
+if ((-not $global:_goatty_inside) -and $global:_goatty_prompt_plain -eq 1) {
     $global:_goatty_starship_toml = 'starship-plain.toml'
     $global:_goatty_transient_ok = $_goatty_transient_ok_plain
     $global:_goatty_transient_err = $_goatty_transient_err_plain
@@ -339,7 +346,7 @@ if (-not $global:_goatty_prompt) {
             $cwd = '~' + $cwd.Substring($HOME.Length)
         }
         $symColor = if ($ok) { "$esc[32m" } else { "$esc[31m" }
-        $sym = if ($global:_goatty_inside -or (-not $global:_goatty_prompt_plain)) { [char]0x276F } else { '>' }
+        $sym = if ($global:_goatty_inside -or ($global:_goatty_prompt_plain -ne 1)) { [char]0x276F } else { '>' }
         if ($global:_goatty_prompt_two_line) {
             return "$esc[34m$cwd$esc[0m`n$symColor$sym$esc[0m "
         }

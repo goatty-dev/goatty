@@ -13,8 +13,8 @@ use std::rc::Rc;
 
 use goatty_config::HostSettings;
 use goatty_config::prompt::{
-    self, COLOR_NAMES, Category, Connection, DirectoryPrompt, Edge, Frame, MAX_TEXT, MODULES, Module, ModuleSet, PromptColor,
-    PromptSettings, PromptStyle, Separator, Side, Substitution, Symbols,
+    self, COLOR_NAMES, Category, Connection, DirectoryPrompt, Edge, Frame, IconsElsewhere, MAX_TEXT, MODULES, Module, ModuleSet,
+    PromptColor, PromptSettings, PromptStyle, Separator, Side, Substitution, Symbols,
 };
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, FontWeight, IntoElement, MouseButton, ParentElement, Role, SharedString, Styled,
@@ -449,19 +449,24 @@ impl SettingsWindow {
         let mut sample = PromptSettings { two_line: false, frame: Frame::None, ..p.plain() };
         sample.directory.repo_root = false;
         let preview = Preview { p: &sample, theme: t, starship: true, line_height: 20. };
-        div().flex().flex_col().gap(px(6.)).child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("In other terminals")).child(
-            div()
-                .px(px(12.))
-                .py(px(8.))
-                .rounded(px(radius::CONTROL))
-                .overflow_hidden()
-                .border_1()
-                .border_color(ui.divider)
-                .bg(rgb(t.background.0))
-                .font(Self::mono_font(cx))
-                .text_size(px(12.))
-                .children(preview.prompt(Moment::Fresh, div())),
-        )
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("In terminals without a Nerd Font"))
+            .child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(radius::CONTROL))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(ui.divider)
+                    .bg(rgb(t.background.0))
+                    .font(Self::mono_font(cx))
+                    .text_size(px(12.))
+                    .children(preview.prompt(Moment::Fresh, div())),
+            )
     }
 
     /// The style cards, each showing a small prompt in that style.
@@ -536,83 +541,100 @@ impl SettingsWindow {
                 })
                 .collect();
             let edges = || Edge::ALL.into_iter().map(|e| opt(e, e.label())).collect::<Vec<_>>();
-            let style = section(ui, "Style")
-                .desc(needs(starship, "How modules are drawn"))
-                .child(self.style_cards(ui, &p, cx))
-                .child(
-                    row(ui, "Symbols")
-                        .desc(needs(starship, "Icons, emoji, words or nothing before each value"))
-                        .disabled(!starship)
-                        .control(self.select(
-                            "prompt-symbols",
-                            "Symbols",
-                            symbols,
-                            &p.symbols,
-                            cx,
-                            self.set_prompt(cx, |p, s| p.symbols = s),
-                        )),
-                )
-                .child(
-                    row(ui, "Separators")
-                        .desc(if p.style == PromptStyle::Classic { "Between segments of the bar" } else { "Only for Classic" })
-                        .disabled(p.style != PromptStyle::Classic || !starship)
-                        .control(self.select(
-                            "prompt-separator",
-                            "Separators",
-                            Separator::ALL.into_iter().map(|s| opt(s, s.label())).collect(),
-                            &p.separator,
-                            cx,
-                            self.set_prompt(cx, |p, s| p.separator = s),
-                        )),
-                )
-                .child(
-                    row(ui, "Segment heads")
-                        .desc(if segments { "The end that points toward your input" } else { "Only for Classic and Rainbow" })
-                        .disabled(!segments || !starship)
-                        .control(self.select(
-                            "prompt-heads",
-                            "Segment heads",
-                            edges(),
-                            &p.heads,
-                            cx,
-                            self.set_prompt(cx, |p, e| p.heads = e),
-                        )),
-                )
-                .child(
-                    row(ui, "Segment tails")
-                        .desc(if segments { "The other end" } else { "Only for Classic and Rainbow" })
-                        .disabled(!segments || !starship)
-                        .control(self.select(
-                            "prompt-tails",
-                            "Segment tails",
-                            edges(),
-                            &p.tails,
-                            cx,
-                            self.set_prompt(cx, |p, e| p.tails = e),
-                        )),
-                )
-                .child({
-                    // goatty draws Nerd Font glyphs with its own font; other
-                    // terminals (goatty's shell in every terminal) need one.
-                    let nerd = p.needs_nerd_font();
-                    let row = row(ui, "Icons in other terminals")
-                        .desc(match (starship, nerd) {
-                            (false, _) => "Needs Starship".to_owned(),
-                            (true, false) => "This prompt draws in any font".to_owned(),
-                            (true, true) if p.icons_elsewhere => {
-                                "Keeps Nerd Font icons and Powerline shapes outside goatty: those terminals need a Nerd Font".to_owned()
+            let style =
+                section(ui, "Style")
+                    .desc(needs(starship, "How modules are drawn"))
+                    .child(self.style_cards(ui, &p, cx))
+                    .child(
+                        row(ui, "Symbols")
+                            .desc(needs(starship, "Icons, emoji, words or nothing before each value"))
+                            .disabled(!starship)
+                            .control(self.select(
+                                "prompt-symbols",
+                                "Symbols",
+                                symbols,
+                                &p.symbols,
+                                cx,
+                                self.set_prompt(cx, |p, s| p.symbols = s),
+                            )),
+                    )
+                    .child(
+                        row(ui, "Separators")
+                            .desc(if p.style == PromptStyle::Classic { "Between segments of the bar" } else { "Only for Classic" })
+                            .disabled(p.style != PromptStyle::Classic || !starship)
+                            .control(self.select(
+                                "prompt-separator",
+                                "Separators",
+                                Separator::ALL.into_iter().map(|s| opt(s, s.label())).collect(),
+                                &p.separator,
+                                cx,
+                                self.set_prompt(cx, |p, s| p.separator = s),
+                            )),
+                    )
+                    .child(
+                        row(ui, "Segment heads")
+                            .desc(if segments { "The end that points toward your input" } else { "Only for Classic and Rainbow" })
+                            .disabled(!segments || !starship)
+                            .control(self.select(
+                                "prompt-heads",
+                                "Segment heads",
+                                edges(),
+                                &p.heads,
+                                cx,
+                                self.set_prompt(cx, |p, e| p.heads = e),
+                            )),
+                    )
+                    .child(
+                        row(ui, "Segment tails")
+                            .desc(if segments { "The other end" } else { "Only for Classic and Rainbow" })
+                            .disabled(!segments || !starship)
+                            .control(self.select(
+                                "prompt-tails",
+                                "Segment tails",
+                                edges(),
+                                &p.tails,
+                                cx,
+                                self.set_prompt(cx, |p, e| p.tails = e),
+                            )),
+                    )
+                    .child({
+                        // goatty draws Nerd Font glyphs with its own font; other
+                        // terminals (goatty's shell in every terminal) need one.
+                        let nerd = p.needs_nerd_font();
+                        let row = row(ui, "Icons in other terminals")
+                        .desc(match (starship, nerd, p.icons_elsewhere) {
+                            (false, _, _) => "Needs Starship",
+                            (true, false, _) => "This prompt draws in any font",
+                            (true, true, IconsElsewhere::Auto) => {
+                                "Where they draw: Ghostty, WezTerm, kitty, and any terminal on this computer once a Nerd Font is installed"
                             }
-                            (true, true) => "Off: text and flat edges outside goatty, so no Nerd Font is needed there".to_owned(),
+                            (true, true, IconsElsewhere::Always) => "Your terminals all use a Nerd Font",
+                            (true, true, IconsElsewhere::Never) => "Text and flat edges outside goatty, so no Nerd Font is needed",
                         })
                         .disabled(!starship || !nerd)
-                        .control(toggle(
+                        .control(self.select(
                             "prompt-icons-elsewhere",
-                            p.icons_elsewhere,
-                            ui,
-                            self.host(cx, |h| h.prompt.icons_elsewhere = !h.prompt.icons_elsewhere),
+                            "Icons in other terminals",
+                            IconsElsewhere::ALL
+                                .into_iter()
+                                .map(|m| {
+                                    opt(m, m.label()).desc(match m {
+                                        IconsElsewhere::Auto => "In terminals that draw them",
+                                        IconsElsewhere::Always => "Every terminal has a Nerd Font",
+                                        IconsElsewhere::Never => "Text instead, in any font",
+                                    })
+                                })
+                                .collect(),
+                            &p.icons_elsewhere,
+                            cx,
+                            self.set_prompt(cx, |p, m| p.icons_elsewhere = m),
                         ));
-                    if starship && nerd && !p.icons_elsewhere { row.below(self.plain_prompt_preview(ui, &p, cx)) } else { row }
-                });
+                        if starship && nerd && p.icons_elsewhere != IconsElsewhere::Always {
+                            row.below(self.plain_prompt_preview(ui, &p, cx))
+                        } else {
+                            row
+                        }
+                    });
 
             let mut durations: Vec<u32> = vec![0, 1000, 2000, 3000, 5000, 10_000, 30_000, 60_000];
             if !durations.contains(&p.duration_threshold_ms) {

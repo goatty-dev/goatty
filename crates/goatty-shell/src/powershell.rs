@@ -157,7 +157,9 @@ fn render_settings(cfg: &PowerShellConfig<'_>) -> String {
     scalar(&mut out, "_goatty_transient_ok", &crate::starship::transient_prompt_ansi(&s.prompt, false));
     scalar(&mut out, "_goatty_transient_err", &crate::starship::transient_prompt_ansi(&s.prompt, true));
     let plain = s.prompt.plain();
-    flag(&mut out, "_goatty_prompt_plain", s.prompt.plain_elsewhere());
+    // 0 keeps the icons in other terminals, 1 drops them, 2 keeps them
+    // where they draw (init.ps1 decides).
+    out.push_str(&format!("$global:_goatty_prompt_plain = {}\n", crate::zsh::plain_mode(s.prompt.elsewhere())));
     scalar(&mut out, "_goatty_transient_ok_plain", &crate::starship::transient_prompt_ansi(&plain, false));
     scalar(&mut out, "_goatty_transient_err_plain", &crate::starship::transient_prompt_ansi(&plain, true));
 
