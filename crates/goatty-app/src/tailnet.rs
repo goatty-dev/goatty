@@ -15,17 +15,20 @@
 
 use std::sync::Arc;
 
-use goatty_client::tailnet::{self, Discovery, Found, Pairing};
+use goatty_client::tailnet::{self, DirectPairOutcome, Discovery, Found, Pairing};
+use goatty_client::{Connection, Endpoint, RemoteProblem};
 use goatty_net::Paths;
 use goatty_net::gateway::{GatewayError, Refusal};
-use goatty_net::pairing::{KnownHost, spaced};
+use goatty_net::pairing::{KnownHost, PairToken, spaced};
 use goatty_net::tailscale::Tailscale;
-use gpui::{App, Global};
+use gpui::{App, ClipboardItem, Global, Window};
 use parking_lot::Mutex;
 
-use crate::command_palette::Command;
+use crate::command_palette::input::Suggestion;
+use crate::command_palette::{Ask, Command, Field};
 use crate::hosts::{self, HostRef, OpenRequest};
 use crate::settings::AppSettings;
+use crate::settings_window::{HostLink, HostLinkGlobal};
 use crate::toast::{self, Toast};
 
 /// goatty's tailnet files on this computer (device key, pinned hosts).
@@ -229,6 +232,301 @@ struct PairState {
     pairing: Option<Pairing>,
 }
 
+/// Open a paired tailnet host in a new tab or window (`ssh.open_in`).
+pub fn connect(cx: &mut App, dns: &str, name: &str) {
+    let place = cx.global::<AppSettings>().client.ssh.open_in;
+    hosts::open(
+        cx,
+        OpenRequest {
+            host: HostRef::Tailnet { dns: dns.to_string(), name: name.to_string() },
+            attach: hosts::default_attach(cx),
+            conn: None,
+            place,
+        },
+    );
+}
+
+/// Pair with a user-provided string: either a one-time `goatty-pair:…` code
+/// from `goattyd net pair` or a Tailscale hostname / MagicDNS / IP (optional
+/// `:port`).
+pub fn pair_with_input(cx: &mut App, input: &str) {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        toast::show(cx, Toast::warning("Enter a pairing code or Tailscale host").key("tailnet.pair.input"));
+        return;
+    }
+    if PairToken::looks_like(trimmed) {
+        pair_token(cx, trimmed.to_string());
+    } else {
+        pair_address(cx, trimmed.to_string());
+    }
+}
+
+/// Pair in one step using a one-time `goatty-pair:…` code printed by a host.
+pub fn pair_token(cx: &mut App, token_str: String) {
+    let parsed = match PairToken::decode(&token_str) {
+        Ok(t) => t,
+        Err(e) => {
+            toast::show(cx, Toast::error("Invalid pairing code").body(format!("{e:#}")).key("tailnet.pair.token"));
+            return;
+        }
+    };
+    let name = parsed.display_name().to_string();
+    let key = format!("tailnet.pair.{}", parsed.host_id());
+    let id = toast::show(
+        cx,
+        Toast::loading(format!("Pairing with {name}…")).body("Connecting over Tailscale with your one-time code").key(key.clone()).sticky(),
+    );
+    cx.spawn(async move |cx| {
+        let token_clone = token_str.clone();
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                let paths = paths().ok_or_else(|| anyhow::anyhow!("no $HOME: goatty keeps this computer's tailnet key there"))?;
+                tailnet::pair_with_token(&Tailscale::system(), &paths, &token_clone, &tailnet::my_name())
+            })
+            .await;
+        cx.update(|cx| match result {
+            Ok(h) => {
+                let (dns, host_name) = (h.dns.clone(), h.name.clone());
+                let t = Toast::success(format!("Paired with {}", h.name))
+                    .body("It's in the host switcher (Ctrl+Shift+H) now.")
+                    .key(key)
+                    .action("Connect", move |_, cx| connect(cx, &dns, &host_name));
+                toast::update(cx, id, t);
+                refresh_now(cx);
+            }
+            Err(e) => {
+                let body = match GatewayError::refusal(&e) {
+                    Some(Refusal::PairingClosed) => {
+                        format!("The pairing code expired or was already used. Run `goattyd net pair` on {name} for a fresh code.")
+                    }
+                    _ => format!("{e:#}"),
+                };
+                let retry = token_str.clone();
+                let t = Toast::error(format!("Couldn't pair with {name}"))
+                    .body(body)
+                    .key(key)
+                    .action("Try again", move |_, cx| pair_token(cx, retry.clone()));
+                toast::update(cx, id, t);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Pair with a Tailscale hostname, MagicDNS name, or IP (with optional `:port`)
+/// using the interactive 6-digit code handshake. Works even for tagged servers
+/// or custom ports that discovery didn't list.
+pub fn pair_address(cx: &mut App, target: String) {
+    let key = format!("tailnet.pair.{target}");
+    let state = Arc::new(Mutex::new(PairState::default()));
+    stage(cx, None, &state, Toast::loading(format!("Pairing with {target}…")).body("Asking it for a code").key(key.clone()).sticky());
+    cx.spawn(async move |cx| {
+        let target_clone = target.clone();
+        let started = cx
+            .background_executor()
+            .spawn(async move {
+                let paths = paths().ok_or_else(|| anyhow::anyhow!("no $HOME: goatty keeps this computer's tailnet key there"))?;
+                Pairing::start_target(&Tailscale::system(), &paths, &target_clone, &tailnet::my_name())
+            })
+            .await;
+        let pairing = match started {
+            Ok(p) => p,
+            Err(e) => {
+                let t = match GatewayError::refusal(&e) {
+                    Some(Refusal::PairingClosed) => Toast::warning(format!("{target} isn't ready to pair")).body(format!(
+                        "On {target}, run `goattyd net pair` (or open Settings → Network → Allow a new device), then try again."
+                    )),
+                    _ => Toast::error(format!("Couldn't pair with {target}")).body(format!("{e:#}")),
+                };
+                let retry = target.clone();
+                cx.update(|cx| {
+                    let t = t.key(key.clone()).action("Try again", move |_, cx| pair_address(cx, retry.clone()));
+                    stage(cx, None, &state, t);
+                });
+                return;
+            }
+        };
+        let host_name = if pairing.host_name.is_empty() { target.clone() } else { pairing.host_name.clone() };
+        let retry_target = target.clone();
+        run_interactive_pairing(cx, pairing, host_name, key, state, Arc::new(move |cx| pair_address(cx, retry_target.clone()))).await;
+    })
+    .detach();
+}
+
+/// Command Palette: "Tailnet: Pair with a host or code…".
+pub fn ask_pair_host(window: &mut Window, cx: &mut App) {
+    refresh(cx);
+    let suggestions: Vec<Suggestion> = current(cx)
+        .into_iter()
+        .filter(|e| !e.paired)
+        .map(|e| Suggestion { value: e.dns.clone(), label: e.name.clone(), detail: Some(format!("{} · {}", e.dns, e.detail)) })
+        .collect();
+    let mut field = Field::text("target", "Pairing code or Tailscale host")
+        .placeholder("goatty-pair:… or vps.tailnet.ts.net (optional :port)")
+        .help("On a headless host, run `goattyd net pair` and paste its code here — or type a Tailscale name or IP");
+    field.trim = true;
+    field.suggestions = suggestions;
+    let ask = Ask::new("Pair with a Tailscale host", vec![field], |answers, _, cx| pair_with_input(cx, &answers["target"]));
+    crate::command_palette::ask(window, cx, ask);
+}
+
+/// Command Palette: "Tailnet: Pair this SSH host over Tailscale".
+/// Pairs the active tab's SSH host in one step; if the active tab isn't an SSH
+/// host, opens the SSH host picker instead.
+pub fn pair_current_ssh_host(window: &mut Window, cx: &mut App) {
+    let link = cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone());
+    match link {
+        Some(HostLink::Daemon(conn)) if matches!(conn.endpoint(), Endpoint::Ssh(_)) => pair_ssh_connection(conn, cx),
+        Some(HostLink::Daemon(conn)) if matches!(conn.endpoint(), Endpoint::Tailnet(_)) => {
+            toast::show(
+                cx,
+                Toast::info(format!("Already connected to {} over Tailscale", conn.endpoint().label())).key("tailnet.pair.ssh"),
+            );
+        }
+        _ => ask_pair_ssh(window, cx),
+    }
+}
+
+/// Command Palette: "Tailnet: Pair an SSH host over Tailscale…".
+pub fn ask_pair_ssh(window: &mut Window, cx: &mut App) {
+    let known: Vec<(String, String)> = hosts::current(cx).into_iter().map(|e| (e.host, e.label)).collect();
+    let field = Field::host("host", "SSH host", known)
+        .placeholder("user@example.com, or an alias from ~/.ssh/config")
+        .help("Connects over SSH, enables Tailscale Serve there, and pairs this computer in one step");
+    let ask = Ask::new("Pair an SSH host over Tailscale", vec![field], |answers, _, cx| {
+        pair_ssh_host(cx, answers["host"].clone());
+    });
+    crate::command_palette::ask(window, cx, ask);
+}
+
+/// Connect to `ssh_host` over SSH (reusing an open pooled connection if one
+/// exists) and pair it over Tailscale in one step.
+pub fn pair_ssh_host(cx: &mut App, ssh_host: String) {
+    let endpoint = HostRef::Ssh(ssh_host.clone()).endpoint();
+    if let Some(conn) = hosts::pool::live(&endpoint) {
+        pair_ssh_connection(conn, cx);
+        return;
+    }
+    let key = format!("tailnet.pair.ssh.{ssh_host}");
+    let id = toast::show(
+        cx,
+        Toast::loading(format!("Connecting to {ssh_host} over SSH…"))
+            .body("Enabling Tailscale access and exchanging device keys")
+            .key(key.clone())
+            .sticky(),
+    );
+    cx.spawn(async move |cx| {
+        let ep = endpoint.clone();
+        let opened = cx.background_executor().spawn(async move { hosts::pool::open(ep) }).await;
+        match opened {
+            Ok(conn) => cx.update(|cx| pair_ssh_connection_in(conn, Some(id), cx)),
+            Err(e) => {
+                let needs_install = matches!(
+                    e.downcast_ref::<RemoteProblem>(),
+                    Some(RemoteProblem::NotInstalled { .. } | RemoteProblem::Incompatible { .. })
+                );
+                cx.update(|cx| {
+                    let h = ssh_host.clone();
+                    let t = if needs_install {
+                        Toast::warning(format!("{ssh_host} needs goattyd first"))
+                            .body("Open an SSH tab to install or update goattyd there, then pair over Tailscale.")
+                            .key(key)
+                            .action("Connect over SSH", move |_, cx| hosts::connect(cx, &h))
+                    } else {
+                        let retry = ssh_host.clone();
+                        Toast::error(format!("Couldn't connect to {ssh_host} over SSH"))
+                            .body(format!("{e:#}"))
+                            .key(key)
+                            .action("Try again", move |_, cx| pair_ssh_host(cx, retry.clone()))
+                    };
+                    toast::update(cx, id, t);
+                });
+            }
+        }
+    })
+    .detach();
+}
+
+/// Enable Tailscale Serve on the remote host behind `conn`, authorize this
+/// computer's device key there, and pin the host locally — all in one step.
+pub fn pair_ssh_connection(conn: Arc<Connection>, cx: &mut App) {
+    pair_ssh_connection_in(conn, None, cx);
+}
+
+fn pair_ssh_connection_in(conn: Arc<Connection>, existing_toast: Option<toast::ToastId>, cx: &mut App) {
+    let label = conn.endpoint().label().to_string();
+    let key = format!("tailnet.pair.ssh.{label}");
+    let loading = Toast::loading(format!("Pairing {label} over Tailscale…"))
+        .body("Enabling Tailscale access and exchanging device keys")
+        .key(key.clone())
+        .sticky();
+    let id = match existing_toast {
+        Some(id) => {
+            toast::update(cx, id, loading);
+            id
+        }
+        None => toast::show(cx, loading),
+    };
+    cx.spawn(async move |cx| {
+        let c = conn.clone();
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                let paths = paths().ok_or_else(|| anyhow::anyhow!("no $HOME: goatty keeps this computer's tailnet key there"))?;
+                tailnet::pair_via_remote(
+                    |req| {
+                        let reply = c.net(serde_json::to_string(req)?)?;
+                        serde_json::from_str::<goatty_net::api::Reply>(&reply)?.into_result()
+                    },
+                    &Tailscale::system(),
+                    &paths,
+                    &tailnet::my_name(),
+                )
+            })
+            .await;
+        cx.update(|cx| match result {
+            Ok(DirectPairOutcome::Paired { host, reachability }) => {
+                let (dns, name) = (host.dns.clone(), host.name.clone());
+                let body = match reachability {
+                    Ok(via) => format!("Reachable over Tailscale ({via}). You can connect without SSH from Ctrl+Shift+H."),
+                    Err(note) => note,
+                };
+                let t = Toast::success(format!("Paired {} over Tailscale", host.name))
+                    .body(body)
+                    .key(key)
+                    .action("Connect over Tailnet", move |_, cx| connect(cx, &dns, &name));
+                toast::update(cx, id, t);
+                refresh_now(cx);
+            }
+            Ok(DirectPairOutcome::NeedsPermission { host_name, permission }) => {
+                let cmd = if permission.operator.is_empty() { permission.direct.clone() } else { permission.operator.clone() };
+                let retry_conn = conn.clone();
+                let t = Toast::warning(format!("Tailscale on {host_name} needs permission"))
+                    .body(format!("On {host_name}, {}, then try again.", permission.summary()))
+                    .key(key)
+                    .sticky()
+                    .action("Copy command", move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
+                        toast::show(cx, Toast::success("Copied command").key("tailnet.pair.copy"));
+                    })
+                    .action("Try again", move |_, cx| pair_ssh_connection(retry_conn.clone(), cx));
+                toast::update(cx, id, t);
+            }
+            Err(e) => {
+                let retry_conn = conn.clone();
+                let t = Toast::error(format!("Couldn't pair {label} over Tailscale"))
+                    .body(format!("{e:#}"))
+                    .key(key)
+                    .action("Try again", move |_, cx| pair_ssh_connection(retry_conn.clone(), cx));
+                toast::update(cx, id, t);
+            }
+        });
+    })
+    .detach();
+}
+
 /// Pair with `found`: ask it, show the code in a toast, and pin it once
 /// the users of both computers confirmed the same code.
 pub fn pair(cx: &mut App, found: Found) {
@@ -254,7 +552,7 @@ pub fn pair(cx: &mut App, found: Found) {
             Err(e) => {
                 let t = match GatewayError::refusal(&e) {
                     Some(Refusal::PairingClosed) => Toast::warning(format!("{name} isn't ready to pair")).body(format!(
-                        "On {name}, open Settings → Network → Allow a new device (or run `goattyd net pair` there), then try again."
+                        "On {name}, run `goattyd net pair` (or open Settings → Network → Allow a new device), then try again."
                     )),
                     _ => Toast::error(format!("Couldn't pair with {name}")).body(format!("{e:#}")),
                 };
@@ -265,27 +563,38 @@ pub fn pair(cx: &mut App, found: Found) {
                 return;
             }
         };
-        let code = spaced(&pairing.code);
-        let cancel = pairing.canceller();
-        let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(cancel);
-        cx.update(|cx| ask_code(cx, &name, &code, &key, &state, &cancel, &found));
-        // The host's answer, in the background.
-        let mut pairing = pairing;
-        let (pairing, answer) = cx
-            .background_executor()
-            .spawn(async move {
-                let r = pairing.wait().map_err(|e| format!("{e:#}"));
-                (pairing, r)
-            })
-            .await;
-        {
-            let mut s = state.lock();
-            s.host = Some(answer);
-            s.pairing = Some(pairing);
-        }
-        cx.update(|cx| finish(cx, None, &name, &key, &state, &found));
+        let retry_found = found.clone();
+        run_interactive_pairing(cx, pairing, name, key, state, Arc::new(move |cx| pair(cx, retry_found.clone()))).await;
     })
     .detach();
+}
+
+async fn run_interactive_pairing(
+    cx: &mut gpui::AsyncApp,
+    mut pairing: Pairing,
+    name: String,
+    key: String,
+    state: Arc<Mutex<PairState>>,
+    retry: Arc<dyn Fn(&mut App) + Send + Sync>,
+) {
+    let code = spaced(&pairing.code);
+    let cancel = pairing.canceller();
+    let cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(cancel);
+    cx.update(|cx| ask_code(cx, &name, &code, &key, &state, &cancel, &retry));
+    // The host's answer, in the background.
+    let (pairing, answer) = cx
+        .background_executor()
+        .spawn(async move {
+            let r = pairing.wait().map_err(|e| format!("{e:#}"));
+            (pairing, r)
+        })
+        .await;
+    {
+        let mut s = state.lock();
+        s.host = Some(answer);
+        s.pairing = Some(pairing);
+    }
+    cx.update(|cx| finish(cx, None, &name, &key, &state, &retry));
 }
 
 /// Show the pairing's next stage: in place of its toast in the window it
@@ -312,17 +621,17 @@ fn ask_code(
     key: &str,
     state: &Arc<Mutex<PairState>>,
     cancel: &Arc<dyn Fn() + Send + Sync>,
-    found: &Found,
+    retry: &Arc<dyn Fn(&mut App) + Send + Sync>,
 ) {
     let (s1, s2, c2) = (state.clone(), state.clone(), cancel.clone());
-    let (n, k, f) = (name.to_string(), key.to_string(), found.clone());
+    let (n, k, r) = (name.to_string(), key.to_string(), retry.clone());
     let t = Toast::info(format!("Does {name} show {code}?"))
         .body(format!("Confirm the code on {name} too. Only confirm here if both screens show the same code."))
         .key(key.to_string())
         .sticky()
         .action("Codes match", move |window, cx| {
             s1.lock().confirmed_here = true;
-            finish(cx, Some(window), &n, &k, &s1, &f);
+            finish(cx, Some(window), &n, &k, &s1, &r);
         })
         .action("Cancel", move |_, _| {
             s2.lock().cancelled = true;
@@ -333,7 +642,14 @@ fn ask_code(
 
 /// Called when this side confirmed and when the host answered: pin once
 /// both happened, report what went wrong otherwise.
-fn finish(cx: &mut App, window: Option<&gpui::Window>, name: &str, key: &str, state: &Arc<Mutex<PairState>>, found: &Found) {
+fn finish(
+    cx: &mut App,
+    window: Option<&gpui::Window>,
+    name: &str,
+    key: &str,
+    state: &Arc<Mutex<PairState>>,
+    retry: &Arc<dyn Fn(&mut App) + Send + Sync>,
+) {
     let mut s = state.lock();
     if s.cancelled {
         return;
@@ -347,10 +663,10 @@ fn finish(cx: &mut App, window: Option<&gpui::Window>, name: &str, key: &str, st
             } else {
                 Toast::error(format!("Pairing with {name} failed")).body(e.clone())
             };
-            let f = found.clone();
+            let retry = retry.clone();
             s.cancelled = true;
             drop(s);
-            stage(cx, window, state, t.key(key.to_string()).action("Try again", move |_, cx| pair(cx, f.clone())));
+            stage(cx, window, state, t.key(key.to_string()).action("Try again", move |_, cx| retry(cx)));
         }
         (None, true) => {
             drop(s);
@@ -364,14 +680,11 @@ fn finish(cx: &mut App, window: Option<&gpui::Window>, name: &str, key: &str, st
             drop(s);
             match pinned {
                 Some(Ok(h)) => {
-                    let host = HostRef::Tailnet { dns: h.dns.clone(), name: h.name.clone() };
+                    let (dns, host_name) = (h.dns.clone(), h.name.clone());
                     let t = Toast::success(format!("Paired with {name}"))
                         .body("It's in the host switcher (Ctrl+Shift+H) now.")
                         .key(key.to_string())
-                        .action("Connect", move |_, cx| {
-                            let place = cx.global::<AppSettings>().client.ssh.open_in;
-                            hosts::open(cx, OpenRequest { host: host.clone(), attach: hosts::default_attach(cx), conn: None, place });
-                        });
+                        .action("Connect", move |_, cx| connect(cx, &dns, &host_name));
                     stage(cx, window, state, t);
                     refresh_now(cx);
                 }

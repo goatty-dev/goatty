@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{NetStatus, Reply, Request, RouteStatus};
 use crate::gateway::{Accepted, Gateway, HostInfo, PAIRING_WINDOW};
-use crate::pairing::Device;
+use crate::pairing::{Device, PairToken};
 use crate::tailscale::{Route, ServeError, Tailscale, Target};
 use crate::{DEFAULT_PORT, Paths};
 
@@ -236,6 +236,7 @@ impl Host {
                 Ok(())
             }
             Request::Decide { id, accept } => self.gateway.decide(id, accept),
+            Request::AuthorizeDevice { key, name } => self.gateway.authorize_device(&key, &name).map(|_| ()),
             Request::Revoke { key } => self
                 .gateway
                 .revoke(&key)
@@ -279,15 +280,31 @@ impl Host {
         } else if state.available {
             route = RouteStatus::NoTailscale;
         }
+        let key = self.gateway.public_key();
+        let pairing = self.gateway.pairing().map(|mut w| {
+            if let (Some(secret), Some(ts)) = (self.gateway.pairing_secret(), tailscale.running()) {
+                let tok = PairToken {
+                    version: 1,
+                    dns: ts.me.dns.clone(),
+                    addr: ts.me.addr().unwrap_or_default().to_string(),
+                    name: ts.me.name.clone(),
+                    port: state.port,
+                    key: key.clone(),
+                    secret,
+                };
+                w.token = tok.encode().ok();
+            }
+            w
+        });
         NetStatus {
             tailscale,
             available: state.available,
             port: state.port,
             route,
             listening: self.listening.lock().is_some(),
-            pairing: self.gateway.pairing(),
+            pairing,
             devices: self.gateway.devices().unwrap_or_default(),
-            key: self.gateway.public_key(),
+            key,
         }
     }
 

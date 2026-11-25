@@ -270,15 +270,15 @@ fn remote_flags_reject_unsupported_subcommands() {
 
     let o = goatty(home, &["--local", "settings", "import", "-", "--ssh", "box"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("--local cannot be used with --ssh or --via"), "{}", err(&o));
+    assert!(err(&o).contains("--local cannot be used with --ssh, --via, or --tailnet"), "{}", err(&o));
 
     let o = goatty(home, &["--ssh", "a", "settings", "export", "-", "--via", "b"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("--ssh and --via cannot be used together"), "{}", err(&o));
+    assert!(err(&o).contains("--ssh, --via, and --tailnet cannot be used together"), "{}", err(&o));
 
     let o = goatty(home, &["--via", "b", "settings", "export", "-", "--ssh", "a"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("--ssh and --via cannot be used together"), "{}", err(&o));
+    assert!(err(&o).contains("--ssh, --via, and --tailnet cannot be used together"), "{}", err(&o));
 
     let o = goatty(home, &["settings", "export", "-", "--remote-daemon", "/opt/goattyd"]);
     assert!(!o.status.success());
@@ -570,4 +570,50 @@ wait $p 2>/dev/null
     assert!(!stderr.contains("plugins.greet: not installed on this host"), "redundant issue should be suppressed:\n{stderr}");
     assert!(stdout.contains("1 plugin(s) in this profile are not installed (goattyd on deploy@remote-box):"), "{stdout}");
     assert!(stdout.contains("Review and install on that host with: goattyd plugin install greet"), "{stdout}");
+}
+
+#[test]
+fn net_cli_lists_forgets_and_validates_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+
+    // `goatty net list --no-discover` works cleanly even without Tailscale.
+    let o = ok(goatty(home, &["net", "list", "--no-discover"]));
+    assert!(out(&o).contains("No paired hosts yet."), "{}", out(&o));
+
+    // Seed a paired host and verify list + forget round-trip.
+    let tailnet_dir = home.join(".local/share/goatty/tailnet");
+    std::fs::create_dir_all(&tailnet_dir).unwrap();
+    std::fs::write(
+        tailnet_dir.join("hosts.json"),
+        serde_json::json!({
+            "hosts": [{
+                "dns": "vps.tail1.ts.net",
+                "name": "vps",
+                "addr": "100.64.0.9",
+                "port": 7500,
+                "key": "ab".repeat(32),
+                "paired_unix": 1
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let list = out(&ok(goatty(home, &["net", "list", "--no-discover"])));
+    assert!(list.contains("vps") && list.contains("vps.tail1.ts.net:7500"), "{list}");
+
+    let forgot = out(&ok(goatty(home, &["net", "forget", "vps"])));
+    assert!(forgot.contains("Forgot vps"), "{forgot}");
+    assert!(out(&ok(goatty(home, &["net", "list", "--no-discover"]))).contains("No paired hosts yet."));
+
+    // `--tailnet` for an unpaired host gives a clear pairing hint.
+    let o = goatty(home, &["--tailnet", "vps", "settings", "export", "-"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("isn't paired yet"), "{}", err(&o));
+
+    // Rejects mismatched remote flags on `net list`.
+    let o = goatty(home, &["--ssh", "box", "net", "list"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("don't apply here"), "{}", err(&o));
 }

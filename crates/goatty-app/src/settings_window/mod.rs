@@ -534,7 +534,7 @@ impl SettingsWindow {
                 .label("Command to open remote files")
         });
         let gen_name = cx.new(|cx| TextInput::new("before trying fish", "", cx).label("Name for this version"));
-        let (net, net_sub) = network::NetPage::new(cx);
+        let net = network::NetPage::new(cx);
         let mut subs = vec![
             cx.subscribe(&gen_name, |this, _, ev: &TextInputEvent, cx| {
                 if let TextInputEvent::Submitted(_) = ev {
@@ -685,7 +685,6 @@ impl SettingsWindow {
             gen_diff: None,
             toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
             _subs: {
-                subs.push(net_sub);
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
                 subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
                     let canceled = this.sync_recording(cx);

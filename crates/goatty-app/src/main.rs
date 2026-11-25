@@ -93,6 +93,16 @@ fn main() -> Result<()> {
                 let Some(cli::Command::Theme(c)) = cli.cmd else { unreachable!() };
                 return commands::theme(c);
             }
+            Some(cli::Command::Net(c)) => {
+                let is_pair = matches!(c, cli::NetCmd::Pair { .. });
+                if remote && (!is_pair || cli.remote.via.is_some() || cli.remote.tailnet.is_some()) {
+                    anyhow::bail!("--ssh, --via, and --tailnet don't apply here (use `goatty net pair --ssh HOST`)");
+                }
+                let top_ssh = cli.remote.ssh;
+                let top_daemon = cli.remote.remote_daemon;
+                let Some(cli::Command::Net(c)) = cli.cmd else { unreachable!() };
+                return commands::net(c, top_ssh, top_daemon);
+            }
             Some(cli::Command::Completions { shell }) => {
                 if remote {
                     anyhow::bail!("--ssh and --via don't apply to `completions`");

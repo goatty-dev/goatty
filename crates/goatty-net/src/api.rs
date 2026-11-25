@@ -29,6 +29,12 @@ pub enum Request {
         id: u32,
         accept: bool,
     },
+    /// Authorize a device's public key directly (over an already-authenticated
+    /// local or SSH control link).
+    AuthorizeDevice {
+        key: String,
+        name: String,
+    },
     /// Forget the devices whose key starts with `key` (8+ hex digits).
     Revoke {
         key: String,

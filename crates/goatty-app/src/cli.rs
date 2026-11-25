@@ -11,7 +11,7 @@ use crate::session::AttachMode;
 #[derive(Debug, Default, Clone, clap::Args)]
 pub struct RemoteArgs {
     /// Use goattyd on HOST, via `ssh HOST goattyd proxy`.
-    #[arg(long, value_name = "HOST", conflicts_with = "via")]
+    #[arg(long, value_name = "HOST", conflicts_with_all = ["via", "tailnet"])]
     pub ssh: Option<String>,
 
     /// Path of goattyd on the SSH host, if it isn't in PATH (requires `--ssh`).
@@ -21,13 +21,17 @@ pub struct RemoteArgs {
     /// Use goattyd behind any stdio command, e.g. 'docker exec -i box goattyd proxy'.
     /// It runs under `sh -c`, so quote arguments as in a shell (on Windows it is split
     /// into words and run directly, e.g. 'wsl.exe -d Ubuntu -- goattyd proxy').
-    #[arg(long, value_name = "CMD", conflicts_with = "ssh")]
+    #[arg(long, value_name = "CMD", conflicts_with_all = ["ssh", "tailnet"])]
     pub via: Option<String>,
+
+    /// Use goattyd on a paired Tailscale host (name, MagicDNS, or IP).
+    #[arg(long, value_name = "HOST", conflicts_with_all = ["ssh", "via"])]
+    pub tailnet: Option<String>,
 }
 
 impl RemoteArgs {
     pub fn is_empty(&self) -> bool {
-        self.ssh.is_none() && self.via.is_none() && self.remote_daemon.is_none()
+        self.ssh.is_none() && self.via.is_none() && self.tailnet.is_none() && self.remote_daemon.is_none()
     }
 }
 
@@ -43,7 +47,7 @@ pub struct Cli {
     pub attach: Option<u64>,
 
     /// No daemon: this window owns the shell, which ends when it closes.
-    #[arg(long, conflicts_with_all = ["ssh", "via"])]
+    #[arg(long, conflicts_with_all = ["ssh", "via", "tailnet"])]
     pub local: bool,
 
     #[command(flatten)]
@@ -72,11 +76,44 @@ pub enum Command {
     /// List, import, export and pick color themes.
     #[command(subcommand)]
     Theme(ThemeCmd),
+    /// Pair with and manage remote computers on your tailnet (client side).
+    #[command(subcommand)]
+    Net(NetCmd),
     /// Print the completion script for SHELL (goatty's managed zsh has it already).
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NetCmd {
+    /// Show Tailscale status, paired hosts, and discovered peers running goatty.
+    #[command(visible_alias = "status")]
+    List {
+        /// Also list tagged and other people's devices on your tailnet.
+        #[arg(long)]
+        all: bool,
+        /// Skip probing tailnet peers; only show paired hosts.
+        #[arg(long)]
+        no_discover: bool,
+    },
+    /// Pair with a remote computer on your tailnet: pass a `goatty-pair:…` code
+    /// from `goattyd net pair`, a Tailscale host[:port], or `--ssh HOST` to enable
+    /// Tailscale and pair over an existing SSH connection.
+    Pair {
+        /// A `goatty-pair:…` code, or a Tailscale hostname / MagicDNS / IP (optional :port).
+        #[arg(value_name = "CODE_OR_HOST")]
+        target: Option<String>,
+        /// Pair a host reachable over SSH right now (enables Tailscale Serve and authorizes this device).
+        #[arg(long, value_name = "SSH_HOST", conflicts_with = "target")]
+        ssh: Option<String>,
+        /// Path of goattyd on the SSH host, if it isn't in PATH (requires `--ssh`).
+        #[arg(long, value_name = "PATH")]
+        remote_daemon: Option<String>,
+    },
+    /// Forget a paired host on this computer (name, MagicDNS, or IP).
+    Forget { host: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -179,23 +216,44 @@ impl Cli {
         };
         let ssh = merge_opt(self.remote.ssh.as_deref(), sub_remote.and_then(|r| r.ssh.as_deref()), "--ssh")?;
         let via = merge_opt(self.remote.via.as_deref(), sub_remote.and_then(|r| r.via.as_deref()), "--via")?;
+        let tailnet = merge_opt(self.remote.tailnet.as_deref(), sub_remote.and_then(|r| r.tailnet.as_deref()), "--tailnet")?;
         let remote_daemon =
             merge_opt(self.remote.remote_daemon.as_deref(), sub_remote.and_then(|r| r.remote_daemon.as_deref()), "--remote-daemon")?;
 
-        if self.local && (ssh.is_some() || via.is_some() || remote_daemon.is_some()) {
-            anyhow::bail!("--local cannot be used with --ssh or --via");
+        if self.local && (ssh.is_some() || via.is_some() || tailnet.is_some() || remote_daemon.is_some()) {
+            anyhow::bail!("--local cannot be used with --ssh, --via, or --tailnet");
         }
         if remote_daemon.is_some() && ssh.is_none() {
             anyhow::bail!("--remote-daemon requires --ssh");
         }
-        Ok(match (ssh, via) {
+        let chosen = [ssh.is_some(), via.is_some(), tailnet.is_some()].into_iter().filter(|&b| b).count();
+        if chosen > 1 {
+            anyhow::bail!("--ssh, --via, and --tailnet cannot be used together");
+        }
+        Ok(match (ssh, via, tailnet) {
             _ if self.local => None,
-            (Some(_), Some(_)) => anyhow::bail!("--ssh and --via cannot be used together"),
-            (Some(host), None) => Some(Endpoint::ssh(host, remote_daemon)),
-            (None, Some(cmd)) => Some(Endpoint::command_line(cmd)?),
-            (None, None) => Some(Endpoint::Local),
+            (Some(host), None, None) => Some(Endpoint::ssh(host, remote_daemon)),
+            (None, Some(cmd), None) => Some(Endpoint::command_line(cmd)?),
+            (None, None, Some(host)) => Some(tailnet_endpoint(host)?),
+            (None, None, None) => Some(Endpoint::Local),
+            _ => unreachable!(),
         })
     }
+}
+
+fn tailnet_endpoint(query: &str) -> Result<Endpoint> {
+    let paths = crate::tailnet::paths().ok_or_else(|| anyhow::anyhow!("no $HOME: goatty keeps paired tailnet hosts there"))?;
+    let host = goatty_client::tailnet::find_known_host(&paths, query).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{query} isn't paired yet: run `goattyd net pair` on that host and `goatty net pair <code|host>` here (or Settings → Network)"
+        )
+    })?;
+    Ok(Endpoint::Tailnet(goatty_client::TailnetTarget {
+        dns: host.dns,
+        name: host.name,
+        paths: Some(paths),
+        tailscale: goatty_net::tailscale::Tailscale::system(),
+    }))
 }
 
 #[cfg(test)]
@@ -259,6 +317,18 @@ mod tests {
         assert!(Cli::parse_from(["goatty", "--local", "settings", "import", "p.json", "--ssh", "a"]).endpoint().is_err());
         assert!(Cli::parse_from(["goatty", "settings", "import", "p.json", "--remote-daemon", "/x"]).endpoint().is_err());
         assert!(Cli::try_parse_from(["goatty", "settings", "import", "p.json", "--plain"]).is_err());
+
+        // `goatty net` subcommands and `--tailnet` flag.
+        let cli = Cli::parse_from(["goatty", "net", "list", "--all", "--no-discover"]);
+        assert!(matches!(cli.cmd, Some(Command::Net(NetCmd::List { all: true, no_discover: true }))));
+        let cli = Cli::parse_from(["goatty", "net", "pair", "goatty-pair:abc"]);
+        assert!(matches!(cli.cmd, Some(Command::Net(NetCmd::Pair { target: Some(_), ssh: None, .. }))));
+        let cli = Cli::parse_from(["goatty", "net", "pair", "--ssh", "vps"]);
+        assert!(matches!(cli.cmd, Some(Command::Net(NetCmd::Pair { target: None, ssh: Some(_), .. }))));
+        let cli = Cli::parse_from(["goatty", "net", "forget", "vps"]);
+        assert!(matches!(cli.cmd, Some(Command::Net(NetCmd::Forget { .. }))));
+        assert!(Cli::try_parse_from(["goatty", "--ssh", "a", "--tailnet", "b"]).is_err());
+        assert!(Cli::try_parse_from(["goatty", "--local", "--tailnet", "b"]).is_err());
     }
 
     #[test]

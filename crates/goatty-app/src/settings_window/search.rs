@@ -125,14 +125,21 @@ pub const INDEX: &[Entry] = &[
         .keys(&["ssh.sync"]),
     e(Page::Hosts, "Shell setup", "Sync the active tab's host now", "sync copy mirror plugins aliases prompt remote"),
     e(Page::Hosts, "From ~/.ssh/config", "List these hosts too", "ssh config discover").keys(&["ssh.discover"]),
-    e(Page::Network, "Availability", "Make this computer available", "tailscale tailnet serve remote reach without ssh"),
-    e(Page::Network, "Availability", "Port", "tailscale tailnet serve port"),
-    e(Page::Network, "Pairing", "Allow a new device", "pair pairing code tailscale tailnet trust"),
-    e(Page::Network, "Paired devices", "Paired devices", "revoke forget trust tailscale tailnet"),
+    e(
+        Page::Network,
+        "Your other computers",
+        "Pair with a host or pairing code",
+        "tailscale tailnet pair headless vps server token code port",
+    ),
+    e(Page::Network, "Your other computers", "Pair a headless server", "tailscale tailnet pair headless vps server cli ssh goattyd"),
     e(Page::Network, "Your other computers", "List computers on your tailnet", "tailscale tailnet discover peers switcher")
         .keys(&["tailnet.discover"]),
-    e(Page::Network, "Your other computers", "Include everyone's devices", "tailscale tailnet tagged shared other users")
+    e(Page::Network, "Your other computers", "Include tagged and shared devices", "tailscale tailnet tagged shared vps server other users")
         .keys(&["tailnet.all_devices"]),
+    e(Page::Network, "Share this computer", "Make this computer available", "tailscale tailnet serve remote reach without ssh"),
+    e(Page::Network, "Share this computer", "Port", "tailscale tailnet serve port"),
+    e(Page::Network, "Pairing", "Allow a new device", "pair pairing code tailscale tailnet trust"),
+    e(Page::Network, "Paired devices", "Paired devices", "revoke forget trust tailscale tailnet"),
     e(Page::Plugins, "Updates", "Tell me about plugin updates", "plugin update notify notification new version")
         .keys(&["plugins.notify_updates"]),
     e(Page::Shortcuts, "Custom", "Custom commands", "custom command shortcut lazygit split tab send keys").keys(&["commands.custom"]),

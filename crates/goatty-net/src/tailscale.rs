@@ -437,6 +437,38 @@ impl Node {
     pub fn addr(&self) -> Option<&str> {
         self.addrs.first().map(String::as_str)
     }
+
+    /// Stable identifier for this node: its MagicDNS name, falling back to its
+    /// Tailscale IP (when MagicDNS is off) or host name.
+    pub fn host_id(&self) -> &str {
+        if !self.dns.is_empty() {
+            &self.dns
+        } else if let Some(addr) = self.addr() {
+            addr
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// Split `host`, `host:port`, `[ipv6]:port`, or bare `ipv6` into `(host, port)`.
+pub fn parse_host_port(input: &str) -> (String, Option<u16>) {
+    let s = input.trim();
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some((addr, after)) = rest.split_once(']')
+    {
+        let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).filter(|&p| p > 0);
+        return (addr.to_string(), port);
+    }
+    if let Some((host, port_str)) = s.rsplit_once(':')
+        && !host.contains(':')
+        && !host.is_empty()
+        && let Ok(port) = port_str.parse::<u16>()
+        && port > 0
+    {
+        return (host.trim_end_matches('.').to_string(), Some(port));
+    }
+    (s.trim_end_matches('.').to_string(), None)
 }
 
 impl Status {
@@ -472,6 +504,20 @@ impl Status {
 
     pub fn peer(&self, dns: &str) -> Option<&Node> {
         self.peers.iter().find(|p| p.dns == dns)
+    }
+
+    /// Find a peer by MagicDNS name (with or without trailing dot), Tailscale
+    /// host name (case-insensitive), or Tailscale IP address.
+    pub fn find_peer(&self, query: &str) -> Option<&Node> {
+        let q = query.trim().trim_end_matches('.');
+        if q.is_empty() {
+            return None;
+        }
+        self.peers
+            .iter()
+            .find(|p| !p.dns.is_empty() && p.dns.eq_ignore_ascii_case(q))
+            .or_else(|| self.peers.iter().find(|p| p.name.eq_ignore_ascii_case(q)))
+            .or_else(|| self.peers.iter().find(|p| p.addrs.iter().any(|a| a.eq_ignore_ascii_case(q))))
     }
 }
 
@@ -652,6 +698,15 @@ pub(crate) mod tests {
         let server = s.peer("server.tail1.ts.net").unwrap();
         assert!(server.tagged && !server.direct && !server.online);
         assert_eq!(server.relay, "nue");
+        assert_eq!(s.find_peer("laptop").unwrap().dns, "laptop.tail1.ts.net");
+        assert_eq!(s.find_peer("LAPTOP.TAIL1.TS.NET.").unwrap().name, "Laptop");
+        assert_eq!(s.find_peer("100.64.0.4").unwrap().name, "server");
+        assert!(s.find_peer("missing").is_none());
+        assert_eq!(parse_host_port("vps.ts.net"), ("vps.ts.net".into(), None));
+        assert_eq!(parse_host_port("vps.ts.net:7500"), ("vps.ts.net".into(), Some(7500)));
+        assert_eq!(parse_host_port("100.64.0.1:7422"), ("100.64.0.1".into(), Some(7422)));
+        assert_eq!(parse_host_port("[fd7a::1]:7500"), ("fd7a::1".into(), Some(7500)));
+        assert_eq!(parse_host_port("fd7a::1"), ("fd7a::1".into(), None));
     }
 
     #[test]

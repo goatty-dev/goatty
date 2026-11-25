@@ -88,6 +88,7 @@ enum Hello {
     Probe,
     Auth { key: String, nonce: String, sig: String },
     Pair { key: String, nonce: String, name: String, sig: String },
+    PairToken { key: String, nonce: String, name: String, sig: String, proof: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +106,9 @@ enum Answer {
         sig: String,
     },
     Paired,
+    TokenPaired {
+        sig: String,
+    },
     Refused {
         reason: String,
         code: Refusal,
@@ -180,6 +184,30 @@ const AUTH_HOST: &str = "goatty-gateway-auth-host-v1";
 const PAIR: &str = "goatty-gateway-pair-v1";
 const PAIR_HOST: &str = "goatty-gateway-pair-host-v1";
 const PAIR_COMMIT: &str = "goatty-gateway-pair-commit-v1";
+const PAIR_TOKEN: &str = "goatty-gateway-pair-token-v1";
+const PAIR_TOKEN_HOST: &str = "goatty-gateway-pair-token-host-v1";
+const PAIR_TOKEN_PROOF: &str = "goatty-gateway-pair-token-proof-v1";
+
+fn token_proof(host_key: &str, host_nonce: &str, client_key: &str, client_nonce: &str, secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [PAIR_TOKEN_PROOF, host_key, host_nonce, client_key, client_nonce, secret] {
+        h.update((part.len() as u32).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    hex(&h.finalize())
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 fn send<T: Serialize>(w: &mut impl Write, msg: &T) -> Result<()> {
     let mut line = serde_json::to_vec(msg)?;
@@ -246,6 +274,11 @@ pub struct PendingPair {
 pub struct PairingWindow {
     pub secs_left: u64,
     pub pending: Vec<PendingPair>,
+    /// Single-use pairing code (`goatty-pair:…`) that lets a client pair in
+    /// one paste without a second confirmation step on this host. Populated by
+    /// [`crate::host::Host::status`] when Tailscale is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Default)]
@@ -254,6 +287,8 @@ struct PairingState {
     attempts: u32,
     pending: Vec<(PendingPair, Option<bool>)>,
     next_id: u32,
+    /// Single-use 128-bit secret (hex) active for the current pairing window.
+    token_secret: Option<String>,
 }
 
 impl PairingState {
@@ -304,22 +339,33 @@ impl Gateway {
         self.identity.public()
     }
 
-    /// Accept pairing requests for `duration`.
+    /// Accept pairing requests for `duration`, generating a fresh single-use
+    /// pairing token secret for this window.
     pub fn open_pairing(&self, duration: Duration) {
+        let secret = crate::random::<16>().ok().map(|b| hex(&b));
         let mut p = self.pairing.lock();
         p.open_until = Some(Instant::now() + duration);
         p.attempts = 0;
+        p.token_secret = secret;
         self.changed.notify_all();
     }
 
-    /// Stop accepting pairing requests; waiting ones are rejected.
+    /// Stop accepting pairing requests; waiting ones are rejected and any
+    /// active pairing token is invalidated.
     pub fn close_pairing(&self) {
         let mut p = self.pairing.lock();
         p.open_until = None;
+        p.token_secret = None;
         for (_, decision) in &mut p.pending {
             decision.get_or_insert(false);
         }
         self.changed.notify_all();
+    }
+
+    /// The active single-use pairing secret, if the window is open.
+    pub fn pairing_secret(&self) -> Option<String> {
+        let p = self.pairing.lock();
+        p.is_open().then(|| p.token_secret.clone()).flatten()
     }
 
     /// The pairing window, if it's open.
@@ -329,7 +375,25 @@ impl Gateway {
         Some(PairingWindow {
             secs_left: until.saturating_duration_since(Instant::now()).as_secs().max(1),
             pending: p.pending.iter().filter(|(_, d)| d.is_none()).map(|(r, _)| r.clone()).collect(),
+            token: None,
         })
+    }
+
+    /// Directly authorize a device's public key on this host (used over an
+    /// already-authenticated local or SSH control link).
+    pub fn authorize_device(&self, key: &str, name: &str) -> Result<Device> {
+        if !identity::is_public_key(key) {
+            bail!("invalid device public key");
+        }
+        let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        let name = if name.is_empty() { "goatty".into() } else { name };
+        let device = Device { key: key.into(), name: name.clone(), paired_unix: crate::now_unix() };
+        let _lock = self.devices.lock();
+        let mut d = Devices::load(&self.paths.devices())?;
+        d.add(device.clone());
+        d.save(&self.paths.devices())?;
+        log::info!("authorized device {name} ({})", identity::short(key));
+        Ok(device)
     }
 
     /// The host's user confirmed (or rejected) pairing request `id`.
@@ -441,7 +505,87 @@ impl Gateway {
                 self.pair(stream, &host_key, nonces, &key, &name, &sig)?;
                 Ok(Accepted::Done)
             }
+            Hello::PairToken { key, nonce: client_nonce, name, sig, proof } => {
+                self.pair_token(stream, &host_key, &nonce, &key, &client_nonce, &name, &sig, &proof)?;
+                Ok(Accepted::Done)
+            }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pair_token(
+        &self,
+        stream: &mut (impl Read + Write),
+        host_key: &str,
+        host_nonce: &str,
+        key: &str,
+        client_nonce: &str,
+        name: &str,
+        sig: &str,
+        proof: &str,
+    ) -> Result<()> {
+        if identity::verify(key, &transcript(PAIR_TOKEN, host_key, host_nonce, key, client_nonce), sig).is_err() {
+            refuse(stream, Refusal::BadRequest, "bad signature")?;
+            bail!("token pairing request with a bad signature");
+        }
+        let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        let name = if name.is_empty() { "goatty".into() } else { name };
+        let epoch = *self.devices.lock();
+        let secret = {
+            let mut p = self.pairing.lock();
+            if !p.is_open() {
+                drop(p);
+                let reason = format!("pairing isn't open on {}: run `goattyd net pair` there first", self.info.name);
+                refuse(stream, Refusal::PairingClosed, &reason)?;
+                return Ok(());
+            }
+            p.attempts += 1;
+            if p.attempts > MAX_PAIR_ATTEMPTS {
+                drop(p);
+                refuse(stream, Refusal::TooMany, "too many pairing attempts; run `goattyd net pair` again")?;
+                return Ok(());
+            }
+            let Some(secret) = p.token_secret.clone() else {
+                drop(p);
+                refuse(stream, Refusal::PairingClosed, "this pairing code was already used; generate a new one")?;
+                return Ok(());
+            };
+            secret
+        };
+        let expected = token_proof(host_key, host_nonce, key, client_nonce, &secret);
+        if !ct_eq(proof.as_bytes(), expected.as_bytes()) {
+            refuse(stream, Refusal::Rejected, "invalid or expired pairing code")?;
+            return Ok(());
+        }
+        let saved = {
+            let current = self.devices.lock();
+            // Consume the token atomically under the pairing lock so two
+            // concurrent requests cannot redeem the same single-use code.
+            let mut p = self.pairing.lock();
+            if *current != epoch || !p.is_open() || p.token_secret.as_deref() != Some(secret.as_str()) {
+                false
+            } else {
+                let mut d = Devices::load(&self.paths.devices())?;
+                d.add(Device { key: key.into(), name: name.clone(), paired_unix: crate::now_unix() });
+                d.save(&self.paths.devices())?;
+                // Single-use: close the pairing window and reject any waiting requests.
+                p.open_until = None;
+                p.token_secret = None;
+                for (_, decision) in &mut p.pending {
+                    decision.get_or_insert(false);
+                }
+                self.changed.notify_all();
+                true
+            }
+        };
+        if saved {
+            log::info!("paired with {name} ({}) via pairing code", identity::short(key));
+            let sig = self.identity.sign(&transcript(PAIR_TOKEN_HOST, host_key, host_nonce, key, client_nonce));
+            send(stream, &Answer::TokenPaired { sig })?;
+        } else {
+            refuse(stream, Refusal::Rejected, "the pairing code expired or was already used")?;
+        }
+        Ok(())
     }
 
     fn pair(&self, stream: &mut (impl Read + Write), host_key: &str, n: Nonces<'_>, key: &str, name: &str, sig: &str) -> Result<()> {
@@ -628,6 +772,36 @@ impl Pairing {
             Answer::Refused { reason, code } => bail!(GatewayError::Refused { code, reason }),
             _ => bail!(GatewayError::NotGoatty),
         }
+    }
+}
+
+/// Pair with a host using a one-time [`pairing::PairToken`] printed by the
+/// host (`goattyd net pair` or Settings → Network). Verifies the host's key
+/// before sending the proof and verifies the host's signature on the reply.
+pub fn pair_with_token(
+    r: &mut impl BufRead,
+    w: &mut impl Write,
+    identity: &Identity,
+    name: &str,
+    token: &pairing::PairToken,
+) -> Result<Greeting> {
+    let g = read_greeting(r)?;
+    if g.key != token.key {
+        bail!(GatewayError::HostKeyChanged { name: g.name });
+    }
+    let key = identity.public();
+    let nonce = hex(&crate::random::<32>()?);
+    let sig = identity.sign(&transcript(PAIR_TOKEN, &g.key, &g.nonce, &key, &nonce));
+    let proof = token_proof(&g.key, &g.nonce, &key, &nonce, &token.secret);
+    send(w, &Hello::PairToken { key: key.clone(), nonce: nonce.clone(), name: name.into(), sig, proof })?;
+    match read_answer(r)? {
+        Answer::TokenPaired { sig } => {
+            identity::verify(&g.key, &transcript(PAIR_TOKEN_HOST, &g.key, &g.nonce, &key, &nonce), &sig)
+                .context("the host's answer isn't signed with its key")?;
+            Ok(g)
+        }
+        Answer::Refused { reason, code } => bail!(GatewayError::Refused { code, reason }),
+        _ => bail!(GatewayError::NotGoatty),
     }
 }
 
@@ -881,5 +1055,81 @@ mod tests {
         let mut r = BufReader::new(a);
         let err = read_greeting(&mut r).unwrap_err();
         assert!(matches!(err.downcast_ref::<GatewayError>(), Some(GatewayError::NotGoatty)), "{err:#}");
+    }
+
+    #[test]
+    fn token_pairing_is_single_use_and_checks_key_and_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = gateway(dir.path());
+        let me = Identity::generate().unwrap();
+        let other = Identity::generate().unwrap();
+
+        g.open_pairing(PAIRING_WINDOW);
+        let secret = g.pairing_secret().unwrap();
+        let token = pairing::PairToken {
+            version: 1,
+            dns: "desk.tail1.ts.net".into(),
+            addr: "100.64.0.1".into(),
+            name: "desk".into(),
+            port: 7422,
+            key: g.public_key(),
+            secret: secret.clone(),
+        };
+
+        // Wrong host key in token: client refuses before sending proof.
+        let wrong_key = pairing::PairToken { key: other.public(), ..token.clone() };
+        let (mut r, mut w, _host) = connect(&g);
+        let err = pair_with_token(&mut r, &mut w, &me, "laptop", &wrong_key).unwrap_err();
+        assert!(matches!(err.downcast_ref::<GatewayError>(), Some(GatewayError::HostKeyChanged { .. })), "{err:#}");
+        // Window stays open and secret still valid!
+        assert!(g.pairing().is_some());
+
+        // Wrong secret: host refuses and leaves devices empty.
+        let wrong_secret = pairing::PairToken { secret: "00".repeat(16), ..token.clone() };
+        let (mut r, mut w, host) = connect(&g);
+        let err = pair_with_token(&mut r, &mut w, &me, "laptop", &wrong_secret).unwrap_err();
+        assert_eq!(GatewayError::refusal(&err), Some(Refusal::Rejected));
+        assert_eq!(host.join().unwrap().unwrap(), Accepted::Done);
+        assert!(g.devices().unwrap().is_empty());
+
+        // Valid token: pairs immediately, closes window, and cannot be reused.
+        let (mut r, mut w, host) = connect(&g);
+        let greeting = pair_with_token(&mut r, &mut w, &me, "laptop", &token).unwrap();
+        assert_eq!(greeting.key, g.public_key());
+        assert_eq!(host.join().unwrap().unwrap(), Accepted::Done);
+        assert!(g.pairing().is_none(), "single-use token closes the window");
+        assert_eq!(g.devices().unwrap().len(), 1);
+        assert_eq!(g.devices().unwrap()[0].key, me.public());
+
+        // Reusing the same token is refused.
+        let (mut r, mut w, host) = connect(&g);
+        let err = pair_with_token(&mut r, &mut w, &other, "intruder", &token).unwrap_err();
+        assert_eq!(GatewayError::refusal(&err), Some(Refusal::PairingClosed));
+        assert_eq!(host.join().unwrap().unwrap(), Accepted::Done);
+
+        // Paired device can now authenticate normally.
+        let (mut r, mut w, host) = connect(&g);
+        authenticate(&mut r, &mut w, &me, &g.public_key()).unwrap();
+        w.write_all(b"hello").unwrap();
+        let mut back = [0u8; 5];
+        r.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"hello");
+        assert!(matches!(host.join().unwrap().unwrap(), Accepted::Device(_)));
+    }
+
+    #[test]
+    fn authorize_device_allows_immediate_authentication() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = gateway(dir.path());
+        let me = Identity::generate().unwrap();
+        assert!(g.authorize_device("not-a-key", "laptop").is_err());
+        let d = g.authorize_device(&me.public(), "laptop").unwrap();
+        assert_eq!(d.key, me.public());
+        assert_eq!(d.name, "laptop");
+
+        let (mut r, mut w, host) = connect(&g);
+        authenticate(&mut r, &mut w, &me, &g.public_key()).unwrap();
+        w.write_all(b"hello").unwrap();
+        assert!(matches!(host.join().unwrap().unwrap(), Accepted::Device(_)));
     }
 }
