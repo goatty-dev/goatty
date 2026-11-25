@@ -98,6 +98,9 @@ pub struct Place<'a> {
     pub remote_stat: Option<&'a dyn Fn(&str) -> RemoteLookup>,
     /// Whether `file://` URIs on the session's host can be fetched via `ReadFile`.
     pub remote_can_fetch: bool,
+    /// The remote host runs Windows (`HostInfo::os`): drive paths (`C:\…`)
+    /// are its own, so they go to `StatPath` too.
+    pub remote_windows: bool,
 }
 
 const EVERYDAY_SCHEMES: &[&str] = &["http", "https", "mailto", "ftp"];
@@ -200,7 +203,7 @@ pub fn remote_candidates(text: &str) -> Vec<String> {
 fn resolve_path(text: &str, line: Option<u32>, column: Option<u32>, place: &Place<'_>) -> Option<Target> {
     if let Some(host) = place.remote_host {
         if let Some(stat) = place.remote_stat {
-            if is_windows_drive_path(text) {
+            if is_windows_drive_path(text) && !place.remote_windows {
                 return None;
             }
             return match stat(text) {
@@ -674,6 +677,7 @@ mod tests {
             exists,
             remote_stat: None,
             remote_can_fetch: false,
+            remote_windows: false,
         }
     }
 
@@ -779,6 +783,7 @@ mod tests {
             hostname: Some("server"),
             remote_stat: Some(&stat),
             remote_can_fetch: true,
+            remote_windows: false,
             ..local(&never)
         };
         let mut with_pos = link(LinkKind::Path, "a/src/main.rs");
@@ -814,6 +819,18 @@ mod tests {
         );
         assert_eq!(resolve(&link(LinkKind::Path, "Node.js"), &v13), None);
         assert_eq!(resolve(&link(LinkKind::Path, "pending.rs"), &v13), None);
+
+        // A drive path belongs to a Windows host only.
+        let win_stat = |text: &str| match text {
+            r"C:\src\main.rs" => RemoteLookup::Found(RemotePathInfo { path: r"C:\src\main.rs".into(), is_dir: false, size: 7 }),
+            _ => RemoteLookup::Missing,
+        };
+        let on_linux = Place { remote_stat: Some(&win_stat), ..v13 };
+        assert_eq!(resolve(&link(LinkKind::Path, r"C:\src\main.rs"), &on_linux), None);
+        let on_windows = Place { remote_windows: true, ..on_linux };
+        assert!(
+            matches!(resolve(&link(LinkKind::Path, r"C:\src\main.rs"), &on_windows), Some(Target::Remote { path, .. }) if path == r"C:\src\main.rs")
+        );
 
         // `file://server/...` matches session's remote hostname and is fetchable.
         let osc8 = resolve(&link(LinkKind::Hyperlink, "file://server/srv/x"), &v13);

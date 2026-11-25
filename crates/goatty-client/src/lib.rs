@@ -86,7 +86,7 @@ pub fn hostname() -> String {
 pub use handshake::VersionMismatch;
 pub use local::LocalProblem;
 pub use remote::RemoteProblem;
-pub use transport::{Endpoint, SshTarget, TailnetTarget, connect_or_spawn_daemon};
+pub use transport::{Endpoint, SshTarget, TailnetTarget, connect_or_spawn_daemon, ssh_program};
 
 /// Receives one session's terminal stream. Called on the connection's
 /// reader thread; keep it fast (feed a VT, wake the UI).

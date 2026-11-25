@@ -118,7 +118,8 @@ fn plan_install_render_uninstall() {
     s.plugins.insert("demo".into(), PluginConfig { settings: BTreeMap::from([("loud".into(), true.into())]), ..Default::default() });
     let (active, issues) = active(&w.dirs, &s);
     assert!(issues.is_empty(), "{issues:?}");
-    let files = crate::zsh::render(&crate::zsh::ZshConfig { settings: &s, dirs: &w.dirs, daemon_exe: None, plugins: &active });
+    let files =
+        crate::zsh::render(&crate::zsh::ZshConfig { settings: &s, dirs: &w.dirs, daemon_exe: None, plugins: &active, nerd_font: false });
     let main = &files.iter().find(|f| f.name == "plugins.zsh").unwrap().contents;
     assert!(main.contains("alias -- d='demo --loud'"), "{main}");
 
@@ -149,7 +150,13 @@ fn shell_code_is_shown_and_checked() {
     p.install(&c, &plan.digest, &settings).unwrap();
 
     let (active, _) = active(&w.dirs, &settings);
-    let files = crate::zsh::render(&crate::zsh::ZshConfig { settings: &settings, dirs: &w.dirs, daemon_exe: None, plugins: &active });
+    let files = crate::zsh::render(&crate::zsh::ZshConfig {
+        settings: &settings,
+        dirs: &w.dirs,
+        daemon_exe: None,
+        plugins: &active,
+        nerd_font: false,
+    });
     assert!(files.iter().any(|f| f.name == "plugins/greet/zsh/init.zsh"));
 
     // Changing an installed file after the fact takes the plugin out.

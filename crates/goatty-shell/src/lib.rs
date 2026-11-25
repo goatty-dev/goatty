@@ -41,6 +41,7 @@ pub mod completions;
 pub mod dirs;
 pub mod doctor;
 pub mod everywhere;
+pub mod fonts;
 pub mod generation;
 pub mod history;
 pub mod import;

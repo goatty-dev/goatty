@@ -36,6 +36,10 @@ pub struct ZshConfig<'a> {
     /// Enabled plugins, built-in and installed, in load order
     /// ([`crate::plugins::active`]).
     pub plugins: &'a [Active],
+    /// An installed font draws the prompt's Nerd Font glyphs
+    /// ([`crate::fonts::installed_for`]), so local terminals that fall back to
+    /// it keep the icons with `prompt.icons_elsewhere = auto`.
+    pub nerd_font: bool,
 }
 
 /// A file of the managed ZDOTDIR.
@@ -174,6 +178,16 @@ fn flag(b: bool) -> &'static str {
     if b { "1" } else { "0" }
 }
 
+/// `_goatty_prompt_plain` for the startup files: 0 keeps the icons in other
+/// terminals, 1 drops them, 2 keeps them where they draw.
+pub(crate) fn plain_mode(m: goatty_config::IconsElsewhere) -> &'static str {
+    match m {
+        goatty_config::IconsElsewhere::Always => "0",
+        goatty_config::IconsElsewhere::Never => "1",
+        goatty_config::IconsElsewhere::Auto => "2",
+    }
+}
+
 fn render_settings(cfg: &ZshConfig<'_>) -> String {
     let d = cfg.dirs;
     let s = cfg.settings;
@@ -204,9 +218,11 @@ fn render_settings(cfg: &ZshConfig<'_>) -> String {
     scalar("_goatty_prompt_transient", flag(s.prompt.transient));
     scalar("_goatty_transient_ok", &crate::starship::transient_prompt(&s.prompt, false));
     scalar("_goatty_transient_err", &crate::starship::transient_prompt(&s.prompt, true));
-    // Other terminals: the prompt without Nerd Font icons (starship-plain.toml).
+    // Other terminals: the prompt without Nerd Font icons (starship-plain.toml)
+    // where they don't draw (.zshrc decides for automatic).
     let plain = s.prompt.plain();
-    scalar("_goatty_prompt_plain", flag(s.prompt.plain_elsewhere()));
+    scalar("_goatty_prompt_plain", plain_mode(s.prompt.elsewhere()));
+    scalar("_goatty_nerd_font", flag(cfg.nerd_font));
     scalar("_goatty_transient_ok_plain", &crate::starship::transient_prompt(&plain, false));
     scalar("_goatty_transient_err_plain", &crate::starship::transient_prompt(&plain, true));
 
@@ -265,7 +281,13 @@ mod tests {
         s.shell.path = vec!["~/my bin".into(), "/opt/it's".into()];
         s.shell.import.enabled = true;
         s.shell.import.skip_vars = vec!["LESS".into()];
-        let out = render_settings(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: Some(Path::new("/usr/bin/goattyd")), plugins: &[] });
+        let out = render_settings(&ZshConfig {
+            settings: &s,
+            dirs: &dirs,
+            daemon_exe: Some(Path::new("/usr/bin/goattyd")),
+            plugins: &[],
+            nerd_font: false,
+        });
         assert!(out.contains(r"_goatty_dir='/r o/ot'\''s/data/current/zsh'"), "{out}");
         assert!(out.contains("_goatty_user_rc='1'"));
         assert!(out.contains("_goatty_import='1'"), "{out}");
@@ -293,7 +315,7 @@ mod tests {
         s.plugins.entry("fzf-tab".into()).or_default().settings.insert("previews".into(), false.into());
         let (plugins, issues) = crate::plugins::active(&dirs, &s);
         assert!(issues.is_empty(), "{issues:?}");
-        let files = render(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: None, plugins: &plugins });
+        let files = render(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: None, plugins: &plugins, nerd_font: false });
         let get = |n: &str| &files.iter().find(|f| f.name == n).unwrap_or_else(|| panic!("no {n}")).contents;
         assert!(get("plugins-early.zsh").contains("_goatty_state[starship]=off"));
         let line = get("plugins-line-editor.zsh");
@@ -327,7 +349,7 @@ mod tests {
         let dirs = Dirs::under(tmp.path());
         let s = HostSettings::default();
         let (plugins, _) = crate::plugins::active(&dirs, &s);
-        let files = render(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: None, plugins: &plugins });
+        let files = render(&ZshConfig { settings: &s, dirs: &dirs, daemon_exe: None, plugins: &plugins, nerd_font: false });
         let rc = &files.iter().find(|f| f.name == "plugins/fzf/fzfrc").unwrap().contents;
         let mut child = std::process::Command::new(fzf)
             .args(["--filter", ""])

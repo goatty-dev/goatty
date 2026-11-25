@@ -4,8 +4,11 @@
 //! made this host available before (`tailnet/state.json` exists), else on
 //! the first `Net` request. Connections that authenticated at the gateway
 //! as a paired device are served like any other connection
-//! (`client::handle`). goattyd binds no network socket: tailscaled forwards
-//! the tailnet port into the gateway socket.
+//! (`client::handle`). On Unix goattyd binds no network socket: tailscaled
+//! forwards the tailnet port into the gateway socket. On Windows the gateway
+//! listens on a loopback port (Serve can't forward into a pipe) and each
+//! authenticated connection is bridged into a named pipe pair ([`bridge`]),
+//! as connections are named pipes there.
 
 use std::sync::{Arc, Weak};
 
@@ -39,14 +42,63 @@ fn make(daemon: &Arc<Daemon>) -> Result<Arc<Host>> {
             let Some(daemon) = weak.upgrade() else { return };
             log::info!("tailnet: serving {}", device.name);
             #[cfg(unix)]
-            if let Err(e) = crate::client::handle(daemon, goatty_client::LocalStream::from(stream)) {
+            let stream = goatty_client::LocalStream::from(stream);
+            #[cfg(not(unix))]
+            let stream = match bridge(stream) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("tailnet: couldn't serve {}: {e:#}", device.name);
+                    return;
+                }
+            };
+            if let Err(e) = crate::client::handle(daemon, stream) {
                 log::debug!("tailnet client error: {e:#}");
             }
-            #[cfg(not(unix))]
-            let _ = (daemon, stream);
         }));
     })?;
     Ok(host)
+}
+
+/// Windows: relay an authenticated gateway connection (loopback TCP) through
+/// a connected named pipe pair, and return the end `client::handle` serves.
+/// Either side closing ends both.
+///
+/// A peer that stops reading must not hold both threads forever (writes to
+/// it would block, and its silence keeps the reader waiting): a write that
+/// makes no progress for `STALLED_WRITE` ends the bridge. Flow control
+/// keeps a live peer's backlog far below what that takes to drain.
+#[cfg(not(unix))]
+fn bridge(tcp: std::net::TcpStream) -> Result<goatty_client::LocalStream> {
+    use std::io::{Read, Write};
+    const STALLED_WRITE: std::time::Duration = std::time::Duration::from_secs(60);
+    tcp.set_write_timeout(Some(STALLED_WRITE))?;
+    let (ours, theirs) = goatty_client::LocalStream::pair().context("named pipe pair")?;
+    fn pump(mut from: impl Read, mut to: impl Write) {
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            match from.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if to.write_all(&buf[..n]).and_then(|()| to.flush()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let (tcp_r, pipe_w) = (tcp.try_clone()?, ours.try_clone()?);
+    let (tcp_w, pipe_r) = (tcp, ours);
+    std::thread::Builder::new().name("gateway-in".into()).spawn(move || {
+        pump(&tcp_r, &pipe_w);
+        let _ = pipe_w.shutdown(std::net::Shutdown::Both);
+        let _ = tcp_r.shutdown(std::net::Shutdown::Both);
+    })?;
+    std::thread::Builder::new().name("gateway-out".into()).spawn(move || {
+        pump(&pipe_r, &tcp_w);
+        let _ = tcp_w.shutdown(std::net::Shutdown::Both);
+        let _ = pipe_r.shutdown(std::net::Shutdown::Both);
+    })?;
+    Ok(theirs)
 }
 
 /// The host, made now if needed.

@@ -3023,6 +3023,10 @@ impl Render for Workspace {
         // A drag that ended anywhere (even outside the window) is over.
         if !cx.has_active_drag() {
             self.dragging = None;
+            if self.sidebar_drag.is_some() {
+                self.save_sidebar = None;
+                cx.defer_in(window, |this, _, cx| this.save_sidebar_size(false, cx));
+            }
             if self.divider_dragging {
                 // The split's sizes are saved now; changes from other
                 // windows that waited for it apply.
@@ -3040,7 +3044,8 @@ impl Render for Workspace {
         self.moved_unpainted = false;
         let tabs = &cx.global::<AppSettings>().client.tabs;
         // The workspace chip lives in the tab bar: it shows with two workspaces.
-        let show_bar = tabs.show == TabBarShow::Always || self.tabs.len() > 1 || self.shows_workspaces();
+        // Renaming a tab also needs the bar visible so its inline field is shown.
+        let show_bar = tabs.show == TabBarShow::Always || self.tabs.len() > 1 || self.shows_workspaces() || self.rename.is_some();
         let vertical = show_bar && tabs.style == TabStyle::Vertical;
         // goatty draws the title bar, and the tab bar can't be it.
         let header = self.has_custom_title_bar(window) && (vertical || !show_bar);

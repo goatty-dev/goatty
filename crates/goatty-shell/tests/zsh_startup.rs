@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use goatty_config::{Effective, HostSettings, ZshSettings};
+use goatty_config::{Effective, HostSettings, IconsElsewhere, ZshSettings};
 use goatty_shell::{Dirs, Launch, Launcher};
 use goatty_term::TermSize;
 use goatty_term::pty::{Pty, PtyInput, ShellCommand};
@@ -2262,12 +2262,43 @@ fn other_terminals_get_the_prompt_without_nerd_font_icons() {
     assert_eq!(stdout(&o).trim(), "cfg=starship-plain.toml", "stderr: {}", String::from_utf8_lossy(&o.stderr));
     let out = pty_raw(&sb, &["-l", "-i"], &[], b"\x1b]133;B", &[cfg]);
     assert!(out.contains("cfg=starship.toml"), "goatty's pane draws the icons itself: {out:?}");
-    // With prompt.icons_elsewhere, other terminals keep them.
+    let toml = |env: &[(&str, &str)]| {
+        let o = sb.plain(&["-l", "-i", "-c", cfg], env);
+        stdout(&o).trim().trim_start_matches("cfg=").to_owned()
+    };
+    // Automatic (#302): terminals with Nerd Font glyphs built in keep them,
+    // also through SSH (TERM) and tmux (the outer terminal's variables).
+    for env in [
+        &[("TERM_PROGRAM", "ghostty")][..],
+        &[("TERM_PROGRAM", "WezTerm")],
+        &[("TERM", "xterm-kitty")],
+        &[("TERM", "xterm-ghostty"), ("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22")],
+        &[("TERM_PROGRAM", "tmux"), ("TERM", "tmux-256color"), ("KITTY_WINDOW_ID", "1")],
+    ] {
+        assert_eq!(toml(env), "starship.toml", "{env:?}");
+    }
+    for env in [&[("TERM_PROGRAM", "vscode")][..], &[("TERM_PROGRAM", "tmux"), ("TERM", "tmux-256color")]] {
+        assert_eq!(toml(env), "starship-plain.toml", "{env:?}");
+    }
+    // An installed Nerd Font: local terminals fall back to it, SSH logins
+    // come from another machine's terminal.
+    let mut fonts = no_highlighting();
+    fonts.shell.program = Some(sb.zsh.clone());
+    fonts.shell.import.enabled = false;
+    assert!(sb.launcher().assume_nerd_font(true).launch(&Effective::plain(fonts)).managed);
+    assert_eq!(toml(&[]), "starship.toml");
+    assert_eq!(toml(&[("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22")]), "starship-plain.toml");
+    // Always keeps them everywhere, never drops them even where they'd draw.
     let mut keep = no_highlighting();
-    keep.prompt.icons_elsewhere = true;
+    keep.prompt.icons_elsewhere = IconsElsewhere::Always;
     sb.launch_with(keep, None);
-    let o = sb.plain(&["-l", "-i", "-c", cfg], &[]);
-    assert_eq!(stdout(&o).trim(), "cfg=starship.toml");
+    assert_eq!(toml(&[("TERM_PROGRAM", "vscode")]), "starship.toml");
+    let mut never = no_highlighting();
+    never.prompt.icons_elsewhere = IconsElsewhere::Never;
+    sb.launch_with(never, None);
+    assert_eq!(toml(&[("TERM_PROGRAM", "ghostty")]), "starship-plain.toml");
+    let out = pty_raw(&sb, &["-l", "-i"], &[], b"\x1b]133;B", &[cfg]);
+    assert!(out.contains("cfg=starship.toml"), "goatty's pane still draws them: {out:?}");
 }
 
 /// VS Code's shell integration (from an installed VS Code) on top of the

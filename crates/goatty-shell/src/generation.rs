@@ -1,6 +1,6 @@
 //! Generations: built, validated, atomically activated shell configurations.
 //!
-//! Applying host settings is a build-and-activate step (plan §6):
+//! Applying host settings is a build-and-activate step:
 //!
 //! 1. render the startup files from the settings ([`crate::zsh::render`]),
 //! 2. compare with the active generation; identical → nothing to do,

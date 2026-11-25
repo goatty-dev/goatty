@@ -179,8 +179,13 @@ pub const INDEX: &[Entry] = &[
     e(Page::Prompt, "Style", "Separators", "powerline angled round slanted vertical").keys(&["prompt.separator"]),
     e(Page::Prompt, "Style", "Segment heads", "powerline round edges ends caps sharp blurred pill").keys(&["prompt.heads"]),
     e(Page::Prompt, "Style", "Segment tails", "powerline round edges ends caps sharp blurred pill").keys(&["prompt.tails"]),
-    e(Page::Prompt, "Style", "Icons in other terminals", "nerd font icons vscode ide everywhere glyphs boxes")
-        .keys(&["prompt.icons_elsewhere"]),
+    e(
+        Page::Prompt,
+        "Style",
+        "Icons in other terminals",
+        "nerd font icons vscode ide everywhere glyphs boxes ghostty wezterm kitty automatic always never",
+    )
+    .keys(&["prompt.icons_elsewhere"]),
     e(Page::Prompt, "Layout", "Input on its own line", "two line newline").keys(&["prompt.two_line"]),
     e(Page::Prompt, "Layout", "Frame", "box border lines").keys(&["prompt.frame"]),
     e(Page::Prompt, "Layout", "Connection line", "fill dotted solid gap").keys(&["prompt.connection"]),

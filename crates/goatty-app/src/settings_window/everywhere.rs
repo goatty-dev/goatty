@@ -387,13 +387,19 @@ impl SettingsWindow {
             zshrc_note(h.shell.zsh.user_rc, h.shell.import.enabled).0,
             zshrc_note(h.shell.zsh.user_rc, h.shell.import.enabled).1,
         ));
-        if h.prompt.plain_elsewhere() {
-            points = points.child(point(
-                ui,
-                Icon::Palette,
+        let icons = match h.prompt.elsewhere() {
+            goatty_config::IconsElsewhere::Always => None,
+            goatty_config::IconsElsewhere::Auto => Some((
+                "Prompt icons where they draw",
+                "They need a Nerd Font: Ghostty, WezTerm, kitty and terminals on a computer with one installed show them, others show text. Settings → Prompt → Icons in other terminals can keep them everywhere.",
+            )),
+            goatty_config::IconsElsewhere::Never => Some((
                 "Prompt icons stay in goatty",
-                "They need a Nerd Font, so other terminals show text instead. Settings → Prompt can keep them everywhere.",
-            ));
+                "Other terminals show text instead. Settings → Prompt → Icons in other terminals can bring them back.",
+            )),
+        };
+        if let Some((title, desc)) = icons {
+            points = points.child(point(ui, Icon::Palette, title, desc));
         }
         points = points.child(point(
             ui,

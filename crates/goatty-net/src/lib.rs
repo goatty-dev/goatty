@@ -78,6 +78,25 @@ pub fn gateway_socket(socket: &Path) -> PathBuf {
     socket.with_extension("gateway.sock")
 }
 
+/// Keep a `tailscale` child from opening a console window when the GUI (no
+/// console of its own) runs it on Windows: `CREATE_NO_WINDOW` then. A copy
+/// of `goatty_proto::process::hide_console`, as this crate depends on no
+/// other goatty crate.
+pub(crate) fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        // SAFETY: GetConsoleWindow has no preconditions; it returns null when
+        // this process has no console.
+        if unsafe { GetConsoleWindow() }.is_null() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+    cmd
+}
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

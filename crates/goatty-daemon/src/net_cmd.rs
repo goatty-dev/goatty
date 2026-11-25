@@ -76,10 +76,11 @@ fn enable(c: &mut Control, port: Option<u16>) -> Result<NetStatus> {
             if let Ok(s) = request(c, &Request::Status)
                 && let RouteStatus::Permission(p) = &s.route
             {
-                eprintln!("Tailscale doesn't let goatty add its Serve route yet. Run once:");
-                eprintln!("    {}", p.operator);
-                eprintln!("then run this command again (needs sudo rights: Tailscale checks them before it serves a Unix socket).");
-                eprintln!("Or add the route yourself:");
+                eprintln!("Tailscale doesn't let goatty add its Serve route yet. {}", p.advice());
+                if !p.operator.is_empty() {
+                    eprintln!("    {}", p.operator);
+                    eprintln!("Or add the route yourself:");
+                }
                 eprintln!("    {}", p.direct);
                 std::process::exit(1);
             }

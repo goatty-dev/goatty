@@ -552,8 +552,22 @@ builtin source -- "$_goatty_dir/plugins-line-editor.zsh"
 # --- Prompt -----------------------------------------------------------------
 # The Starship plugin (or another prompt plugin); goatty's config for it is
 # generated from the prompt settings. goatty draws Nerd Font icons with its
-# own font; other terminals get the same prompt without them, unless
-# prompt.icons_elsewhere is on (starship-plain.toml).
+# own font; other terminals get the same prompt without them
+# (starship-plain.toml) unless they draw them: prompt.icons_elsewhere
+# (_goatty_prompt_plain: 0 always keeps them, 1 never, 2 automatic).
+# Automatic keeps them in terminals with Nerd Font glyphs built in
+# (Ghostty, WezTerm, kitty; also seen through tmux and SSH by TERM), and in
+# local terminals when an installed font has them (_goatty_nerd_font:
+# fontconfig falls back to it).
+if (( _goatty_prompt_plain == 2 )); then
+  if [[ ${TERM_PROGRAM-} == (ghostty|WezTerm) || ${TERM-} == (xterm-ghostty|xterm-kitty|wezterm) ]] ||
+    { [[ ${TERM_PROGRAM-} == tmux ]] && [[ -n ${KITTY_WINDOW_ID-}${GHOSTTY_RESOURCES_DIR-}${WEZTERM_PANE-} ]] } ||
+    { (( _goatty_nerd_font )) && [[ -z ${SSH_CONNECTION-}${SSH_TTY-} ]] }; then
+    _goatty_prompt_plain=0
+  else
+    _goatty_prompt_plain=1
+  fi
+fi
 typeset -g _goatty_starship_toml=starship.toml
 if (( ! _goatty_inside && _goatty_prompt_plain )); then
   _goatty_starship_toml=starship-plain.toml

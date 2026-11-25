@@ -740,13 +740,16 @@ pub fn net(cmd: NetCmd, top_ssh: Option<String>, top_remote_daemon: Option<Strin
                     }
                     DirectPairOutcome::NeedsPermission { host_name, permission } => {
                         eprintln!(
-                            "Tailscale on {} doesn't let goatty add its Serve route yet. Run once there:",
-                            sanitize_terminal(&host_name)
+                            "Tailscale on {} doesn't let goatty add its Serve route yet. {}",
+                            sanitize_terminal(&host_name),
+                            sanitize_terminal(permission.advice())
                         );
-                        eprintln!("    {}", sanitize_terminal(&permission.operator));
-                        eprintln!("then run `goatty net pair --ssh {}` again.", sanitize_terminal(&ssh_host));
-                        eprintln!("Or add the route directly on {}:", sanitize_terminal(&host_name));
+                        if !permission.operator.is_empty() {
+                            eprintln!("    {}", sanitize_terminal(&permission.operator));
+                            eprintln!("Or add the route directly on {}:", sanitize_terminal(&host_name));
+                        }
                         eprintln!("    {}", sanitize_terminal(&permission.direct));
+                        eprintln!("Then run `goatty net pair --ssh {}` again.", sanitize_terminal(&ssh_host));
                         std::process::exit(1);
                     }
                 }

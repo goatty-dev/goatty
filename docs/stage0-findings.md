@@ -2,18 +2,9 @@
 
 **Date:** 2026-11-07 · **Machine:** CachyOS, niri (Wayland), RTX 4070 Laptop (Vulkan), 28 threads, 144 Hz panel
 
-**Verdict:** GPUI + rio-vt works. It is fast enough and correct enough to continue. The daemon/reattach model is already working too, so part of Stage 2 has been pulled forward.
+**Verdict:** GPUI + rio-vt is fast and correct enough. These are the measurements from the first spike and the reasoning behind the renderer and session model. They are a record of 2026-11-07, not a spec: numbers are from that machine.
 
 ---
-
-## What was built
-
-| Crate | Role |
-|---|---|
-| `goatty-term` | The "TerminalEngine". It is the only crate that touches rio-vt: frame snapshot with RGB-resolved cells, palette, key/mouse/paste encoding, PTY (portable-pty), reattach serialization |
-| `goatty-proto` | Unix-socket protocol (length-prefixed postcard) |
-| `goatty-daemon` (`goattyd`) | Owns the PTYs and an authoritative headless VT per session. Accepts attach/detach. CLI: `list`, `send`, `kill`, `stop` |
-| `goatty-app` (`goatty`) | GPUI client: custom grid `Element`, input, selection, clipboard, scrollback, mouse reporting |
 
 ## Measurements
 
@@ -77,7 +68,7 @@ Automated tests (`cargo test -p goatty-daemon`) and a manual GUI check both pass
 
 ---
 
-## Architecture recommendations (changes vs. the plan)
+## Decisions the spike led to
 
 ### 1. Renderer: use a per-cell glyph cache, not text shaping
 Shaping row text with gpui's `shape_line` works, but every scrolled line misses the cache. That costs 10–17 ms per frame, which is too slow for 120/144 Hz. Instead, resolve each `(char, bold, italic)` to `(font_id, glyph_id)` once (gpui's shaper still handles font fallback) and call `window.paint_glyph` at grid positions. Prepaint then drops to under 0.5 ms.
@@ -85,45 +76,26 @@ Shaping row text with gpui's `shape_line` works, but every scrolled line misses 
 - **Next:** draw box-drawing and block elements (U+2500–259F) procedurally. With font glyphs they misalign at a 1.25 line height (visible in the smoke test). Every serious terminal does this.
 
 ### 2. Session model: authoritative VT in the daemon, mirror VT in the client
-The plan left open whether the daemon or the GUI owns terminal state. Implemented answer: **both run rio-vt**.
+The daemon and the GUI **both run rio-vt**.
 - The **daemon's** VT is authoritative and is the **only one that answers terminal queries** (DA, DSR, OSC 4/10/11). If both answered, the shell would see every reply twice. This is the `answer_queries` flag.
 - On attach, the daemon sends a **VT snapshot**: replayed scrollback, alt-screen switch, screen contents, and input modes (DECCKM, bracketed paste, mouse modes, keypad, title). After that it streams raw bytes, with no gap or overlap: snapshot and subscribe happen under one lock.
 - The client feeds bytes into its own VT and renders from it. So `--local` (in-process PTY) and daemon mode share 100% of the UI code.
 - **Cost:** bytes get parsed twice. At over 175 MB/s per parse, that doesn't matter.
 - **Rejected alternative:** the daemon sends rendered grid diffs (tmux control-mode or zellij style). That means more protocol, client-side scrollback becomes awkward, and nothing is gained locally.
 
-### 3. One socket connection per pane (superseded: see remote-architecture.md D4, connections now multiplex sessions)
-Each pane is its own connection, so flow control and backpressure are per pane for free. Control commands (`list`/`kill`/`send`) use short-lived connections. Multiplexing only becomes worthwhile for the later remote/web API.
+### 3. Survive daemon upgrades (built in #131)
 
-### 4. Survive daemon upgrades: systemd fd store (built in #131)
-The plan says sessions die with the daemon. On Linux, `goattyd` as a systemd **user** service can hand its PTY master fds to systemd's **FDSTORE** before restarting, then pick them up again. Shells then survive daemon upgrades and crashes (the daemon re-creates its VT from a persisted snapshot). Worth designing in early (Stage 2), because it constrains how session state is serialized.
+A systemd fd store could hand the PTYs over (`goatty-daemon/src/restore.rs`, [`remote-architecture.md`](remote-architecture.md) §5c): an upgrade doesn't need systemd at all. `goattyd restart` (protocol `Restart`, v10) re-executes the daemon in the same process with the PTYs and the socket inherited, so the shells stay its children and keep their exit codes. The fd store covers what a re-exec can't: crashes and `systemctl --user restart`. The screens carry over as VT bytes (`Terminal::restore_snapshot`: the attach snapshot, plus the primary screen and its scrollback while a full-screen program shows the alternate one), so up to `MAX_REPLAY_HISTORY` (5000) lines of scrollback.
 
-How it turned out (`goatty-daemon/src/restore.rs`, [`remote-architecture.md`](remote-architecture.md) §5c): an upgrade doesn't need systemd at all. `goattyd restart` (protocol `Restart`, v10) re-executes the daemon in the same process with the PTYs and the socket inherited, so the shells stay its children and keep their exit codes. The fd store covers what a re-exec can't: crashes and `systemctl --user restart`. The screens carry over as VT bytes (`Terminal::restore_snapshot`: the attach snapshot, plus the primary screen and its scrollback while a full-screen program shows the alternate one), so up to `MAX_REPLAY_HISTORY` (5000) lines of scrollback.
-
-### 5. Have a VT fallback ready: `alacritty_terminal` is the better candidate than `wezterm-term`
+### 4. Have a VT fallback ready: `alacritty_terminal` is the better candidate than `wezterm-term`
 Zed's own terminal is GPUI + `alacritty_terminal`, the most battle-tested combination for exactly this stack, and it's published on crates.io. `wezterm-term` is only available as third-party forks on crates.io. rio-vt has been fine so far and its API is very close to alacritty's (Crosswords is derived from it), so swapping behind `goatty-term` would be cheap.
 
-### 6. Threads, not async, for now
+### 5. Threads, not async
 One reader thread per session and one per connection is simple and fast. tokio adds nothing until the remote API arrives.
 
 ---
 
-## Problems found
+## Notes from the spike
 
-| Issue | Status / mitigation |
-|---|---|
-| **Window froze after the first frames** (static "image" while input still reached the shell). Log: `blade_graphics … Acquire failed because the surface is out of date`. Cause: crates.io gpui 0.2.2's blade renderer never recreates the Vulkan swapchain after `VK_ERROR_OUT_OF_DATE_KHR`, which niri triggers when it resizes a new window into its tile | **Fixed** by moving to gpui from Zed git (pinned rev `b5cd310`, 2026-11-07). The Linux renderer there is `gpui_wgpu`; resize and live updates verified |
-| gpui is now a git dependency: `gpui` + `gpui_platform` (the app starts with `gpui_platform::application()`) | Bump on purpose: change the rev in the root `Cargo.toml`, then `cargo update -p gpui`. Zed's toolchain is 1.98.1+ |
-| ~~libc pin~~: needed only for gpui 0.2.2's `xattr` dependency | Removed with the gpui switch |
-| Startup to first window took 2–3 s in my log timestamps (old blade renderer) | The user didn't notice any slowness. Re-measure on wgpu before acting |
-| Unfocused/covered windows render ~1 fps during heavy output | Most likely compositor frame-callback throttling. Expected behavior, but check it's not a gpui_wgpu regression with a focused benchmark |
-| GUI RSS about 220 MB (mostly GPU driver mappings) | Monitor; typical for Vulkan apps on NVIDIA |
-| rio-vt `contents_formatted()` covers only the visible screen and drops combining marks | goatty's snapshot adds scrollback (up to 5,000 lines) and modes. The alt screen's hidden primary screen can't be restored (rio keeps it private) |
-
-## Not done yet (Stage 1 backlog)
-- IME / compose (needs gpui `InputHandler`), cursor blink
-- Procedural box-drawing glyphs; ligature setting
-- Selection auto-scroll, URL/path detection, OSC 133/7 integration
-- Multiline paste confirmation (plan §9)
-- Tabs/splits (one pane per window right now)
-- Not yet checked in a real session: Neovim, tmux-in-goatty, mouse-heavy TUIs (htop rendering confirmed)
+- crates.io gpui 0.2.2 (blade renderer) never recreated the Vulkan swapchain after `VK_ERROR_OUT_OF_DATE_KHR`, so the window froze under niri. That is why gpui comes from Zed's git repo at a pinned rev (`gpui_wgpu` renderer); bump it on purpose (see `CLAUDE.md`).
+- rio-vt's `contents_formatted()` covers only the visible screen and drops combining marks, so goatty's snapshot adds scrollback and modes. The hidden primary screen under the alt screen can't be restored (rio keeps it private).

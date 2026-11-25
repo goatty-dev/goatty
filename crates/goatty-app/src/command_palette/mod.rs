@@ -56,7 +56,7 @@ use crate::session::AttachMode;
 use crate::settings::AppSettings;
 use crate::ui::controls::pretty_keys;
 use crate::ui::icons::Icon;
-use crate::ui::style::Ui;
+use crate::ui::style::{Ui, radius};
 use crate::ui::text_input::{TextInput, TextInputEvent};
 
 pub const CONTEXT: &str = "CommandPalette";
@@ -64,6 +64,10 @@ pub const CONTEXT: &str = "CommandPalette";
 const ROW_HEIGHT: f32 = 32.;
 const MAX_VISIBLE_ROWS: usize = 12;
 const WIDTH: f32 = 620.;
+/// Padding around the input and list; the palette's outer radius adds this
+/// plus its 1 px border to `radius::CONTROL` so the corners stay concentric.
+const PALETTE_PAD: f32 = 8.;
+const PALETTE_RADIUS: f32 = radius::CONTROL + PALETTE_PAD + 1.;
 /// Shortcuts shown per command (some have one per keyboard layout).
 const MAX_SHORTCUTS: usize = 2;
 /// A query word that only matches a keyword ("preferences" → Open settings)
@@ -379,7 +383,6 @@ pub struct Hit {
     pub index: usize,
     /// Matched characters of the label, for highlighting.
     pub positions: Vec<usize>,
-    pub recent: bool,
 }
 
 /// What ranking needs to know about a command.
@@ -415,7 +418,7 @@ fn fits_pane(c: &Command, pane: Option<&(Option<String>, bool)>) -> bool {
 /// session, then the sessions (newest first).
 pub fn rank_in(scope: &Scope, entries: &[Entry<'_>], query: &str) -> Vec<Hit> {
     if matches!(scope, Scope::Sessions(_)) && query.trim().is_empty() {
-        return (0..entries.len()).map(|index| Hit { index, positions: Vec::new(), recent: false }).collect();
+        return (0..entries.len()).map(|index| Hit { index, positions: Vec::new() }).collect();
     }
     rank(entries, query)
 }
@@ -433,7 +436,7 @@ pub fn rank(entries: &[Entry<'_>], query: &str) -> Vec<Hit> {
                 eb.label.to_lowercase(),
             ))
         });
-        return idx.into_iter().map(|index| Hit { index, positions: Vec::new(), recent: entries[index].recent_rank.is_some() }).collect();
+        return idx.into_iter().map(|index| Hit { index, positions: Vec::new() }).collect();
     }
     let mut scored: Vec<(i32, Hit)> = Vec::new();
     'entries: for (index, e) in entries.iter().enumerate() {
@@ -468,7 +471,7 @@ pub fn rank(entries: &[Entry<'_>], query: &str) -> Vec<Hit> {
         }
         positions.sort_unstable();
         positions.dedup();
-        scored.push((score, Hit { index, positions, recent: e.recent_rank.is_some() }));
+        scored.push((score, Hit { index, positions }));
     }
     scored.sort_by(|(sa, a), (sb, b)| sb.cmp(sa).then_with(|| entries[a.index].label.len().cmp(&entries[b.index].label.len())));
     scored.into_iter().map(|(_, h)| h).collect()
@@ -746,7 +749,7 @@ impl CommandPalette {
                 self.labels.push(c.label().into());
                 self.shortcuts.push(Vec::new());
                 self.commands.push(c);
-                let hit = Hit { index: self.commands.len() - 1, positions: Vec::new(), recent: false };
+                let hit = Hit { index: self.commands.len() - 1, positions: Vec::new() };
                 // `user@host` is clearly an address; a bare word may be a
                 // typo of a listed host, which stays first.
                 let first = host.contains('@') || self.hits.iter().all(|h| self.commands[h.index].id == MANAGE_HOSTS);
@@ -1064,7 +1067,7 @@ impl CommandPalette {
             .map(|(label, value)| Entry { label, title_start: 0, keywords: value, recent_rank: None, only_when_searched: false })
             .collect();
         self.hits = if query.trim().is_empty() {
-            (0..entries.len()).map(|index| Hit { index, positions: Vec::new(), recent: false }).collect()
+            (0..entries.len()).map(|index| Hit { index, positions: Vec::new() }).collect()
         } else {
             rank(&entries, query)
         };
@@ -1445,7 +1448,6 @@ impl CommandPalette {
                 }));
                 let keys = self.shortcuts[hit.index].clone();
                 let detail = self.commands[hit.index].detail.clone();
-                let recent = hit.recent && self.query.trim().is_empty();
                 // Sessions can be ended from the list (twice: ask, then end).
                 let endable_at = self.endable_at(ix);
                 let endable = self.conn.is_some() && endable_at.is_some();
@@ -1460,7 +1462,7 @@ impl CommandPalette {
                         .items_center()
                         .justify_between()
                         .gap_4()
-                        .rounded_md()
+                        .rounded(px(radius::CONTROL))
                         .cursor_pointer()
                         .when(selected, |d| d.bg(ui.surface_hover))
                         .when(!selected, |d| d.hover(|s| s.bg(ui.surface)))
@@ -1475,7 +1477,6 @@ impl CommandPalette {
                                 .text_xs()
                                 .text_color(ui.muted)
                                 .when_some(detail, |d, text| d.child(text))
-                                .when(recent, |d| d.child("recently used"))
                                 .children(
                                     keys.into_iter()
                                         .map(|k| div().px_1p5().rounded_sm().border_1().border_color(ui.border).bg(ui.surface).child(k)),
@@ -1529,7 +1530,7 @@ impl Render for CommandPalette {
                     .track_scroll(&self.scroll)
                     .w_full()
                     .h(px(ROW_HEIGHT * rows as f32));
-            div().px_1().child(list).into_any_element()
+            div().px(px(PALETTE_PAD)).pb_1().child(list).into_any_element()
         };
         div()
             .key_context(CONTEXT)
@@ -1557,7 +1558,7 @@ impl Render for CommandPalette {
             .bg(ui.bg)
             .border_1()
             .border_color(ui.border)
-            .rounded_lg()
+            .rounded(px(PALETTE_RADIUS))
             .shadow_lg()
             .overflow_hidden()
             .when_some(self.asking.as_ref(), |d, a| {
@@ -1570,7 +1571,7 @@ impl Render for CommandPalette {
                 };
                 d.child(ask_header(a, &text, ui, mono.into()))
             })
-            .child(div().p_2().when(self.asking.is_some(), |d| d.pt_0()).child(self.input.clone()))
+            .child(div().p(px(PALETTE_PAD)).when(self.asking.is_some(), |d| d.pt_0()).child(self.input.clone()))
             .when_some(self.asking.as_ref().filter(|a| !a.chosen.is_empty()), |d, a| {
                 d.child(div().px_3().flex().flex_wrap().gap_1().children(a.chosen.iter().enumerate().map(|(i, v)| {
                     let value = v.clone();
@@ -1814,7 +1815,6 @@ mod tests {
         let e = entries(&data);
         let hits = rank(&e, "");
         assert_eq!(labels(&e, &hits), ["d", "c", "a", "b"]);
-        assert!(hits[0].recent && !hits[2].recent);
     }
 
     #[test]

@@ -501,10 +501,10 @@ fn pair_ssh_connection_in(conn: Arc<Connection>, existing_toast: Option<toast::T
                 refresh_now(cx);
             }
             Ok(DirectPairOutcome::NeedsPermission { host_name, permission }) => {
-                let cmd = permission.operator.clone();
+                let cmd = if permission.operator.is_empty() { permission.direct.clone() } else { permission.operator.clone() };
                 let retry_conn = conn.clone();
                 let t = Toast::warning(format!("Tailscale on {host_name} needs permission"))
-                    .body(format!("Run `{}` once on {host_name}, then try again.", permission.operator))
+                    .body(format!("On {host_name}, {}, then try again.", permission.summary()))
                     .key(key)
                     .sticky()
                     .action("Copy command", move |_, cx| {

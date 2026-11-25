@@ -2,23 +2,26 @@
 
 A batteries-included terminal for people new to Linux: a GPU-rendered terminal, a managed Zsh setup, and sessions that survive closing the window.
 
-> **Status: early development (Stage 1).** See [`docs/goatty-project-plan.md`](docs/goatty-project-plan.md) for the plan, [`docs/architecture.md`](docs/architecture.md) for the code structure, [`docs/stage0-findings.md`](docs/stage0-findings.md) for what the spike measured, [`docs/remote-architecture.md`](docs/remote-architecture.md) for connecting to goattyd on other machines, and [GitHub issues](https://github.com/goatty-dev/goatty/issues) for open work.
+> **Status: early development.** See [`docs/goatty-project-plan.md`](docs/goatty-project-plan.md) for the vision and decisions, [`docs/architecture.md`](docs/architecture.md) for the code structure, [`docs/remote-architecture.md`](docs/remote-architecture.md) for connecting to goattyd on other machines, and [GitHub issues](https://github.com/goatty-dev/goatty/issues) for open work.
 
 ## Layout
 
 ```
 crates/
-  goatty-term/    terminal engine: rio-vt wrapper, frame snapshots, palette, input encoding, PTY, reattach snapshots
+  goatty-term/    terminal engine: rio-vt wrapper, frame snapshots, input encoding, PTY, reattach snapshots
   goatty-proto/   goatty ⇄ goattyd wire protocol (transport-independent)
-  goatty-client/  connection to a goattyd: local socket, ssh, any stdio command; reconnect; blocking Control client
-  goatty-config/  settings: typed defaults + GOATTY_* overrides (Stage 4 profiles plug in here)
-  goatty-daemon/  goattyd library + binary: owns PTYs and sessions
+  goatty-client/  connection to a goattyd: local socket, ssh, tailnet, any stdio command; reconnect
+  goatty-config/  settings: client and host documents, themes, keys, the prompt model
+  goatty-shell/   the managed zsh, tool installs, plugins on a host, diagnostics
+  goatty-plugin/  plugin format, permissions, signed registry index
+  goatty-net/     the tailnet: device keys, pairing, gateway
+  goatty-daemon/  goattyd library + binary: owns PTYs, sessions and workspaces
   goatty-app/     GPUI desktop client (bin: goatty)
-docs/             plan, architecture, findings, remote design
+docs/             vision, architecture, findings, remote design
 scripts/          smoke.sh (visual test), perf.sh + bench.sh (throughput)
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for how the crates and modules fit together and where upcoming work goes.
+See [`docs/architecture.md`](docs/architecture.md) for how the crates and modules fit together and where new work goes.
 
 ## Run
 

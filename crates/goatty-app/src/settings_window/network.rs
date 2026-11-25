@@ -344,21 +344,21 @@ impl SettingsWindow {
 
     fn route_problem(&self, ui: Ui, s: &NetStatus, cx: &Context<'_, Self>) -> Option<AnyElement> {
         match &s.route {
-            RouteStatus::Permission(p) => Some(
-                card(ui)
-                    .p(px(16.))
-                    .gap(px(10.))
-                    .child(banner(
-                        ui,
-                        Tone::Warning,
-                        "Tailscale doesn't let goatty add its route yet",
-                        vec!["Run this once in a terminal (it needs sudo rights), then turn availability on again:".into()],
-                    ))
-                    .child(copyable("net-copy-operator", p.operator.clone(), "Copied", ui, cx))
-                    .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("Or add the route yourself:"))
-                    .child(copyable("net-copy-direct", p.direct.clone(), "Copied", ui, cx))
-                    .into_any_element(),
-            ),
+            RouteStatus::Permission(p) => {
+                // The advice comes from the host: it may run another OS than this window.
+                let mut body = card(ui).p(px(16.)).gap(px(10.)).child(banner(
+                    ui,
+                    Tone::Warning,
+                    "Tailscale doesn't let goatty add its route yet",
+                    vec![p.advice().to_string()],
+                ));
+                if !p.operator.is_empty() {
+                    body = body
+                        .child(copyable("net-copy-operator", p.operator.clone(), "Copied", ui, cx))
+                        .child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("Or add the route yourself:"));
+                }
+                Some(body.child(copyable("net-copy-direct", p.direct.clone(), "Copied", ui, cx)).into_any_element())
+            }
             RouteStatus::PortTaken { .. } | RouteStatus::Failed { .. } => {
                 Some(banner(ui, Tone::Danger, s.route.describe(s.port), Vec::new()).into_any_element())
             }

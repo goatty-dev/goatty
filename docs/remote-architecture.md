@@ -1,10 +1,10 @@
 # Remote goattyd: architecture and plan
 
-**Date:** 2026-11-07, updated 2026-11-19 · **Status:** R0 implemented (protocol v2, SSH/stdio transports, flow control, reconnect). R1 in progress: version negotiation, goattyd auto-install, plain SSH fallback, SSH prompts in the GUI, the systemd user service, lazy history, compression, size policy, and adaptive flow control (§4, §4a, §4c, §5a, §5b) are done.
+**Status:** R0–R3 implemented (SSH/stdio and tailnet transports, flow control, reconnect, version negotiation and auto-install, askpass, lazy history, compression, size policy, local echo prediction). Open work is in the [R1 milestone](https://github.com/goatty-dev/goatty/milestone/1).
 
 **Goal:** the GUI connects to *any* goattyd: on this machine, on a home server over Tailscale, on a cloud box over SSH, or in a container. Rendering stays local on the GPU. Sessions live on the host and survive the client. Local performance must not regress, and remote must stay usable on poor links.
 
-This turns the ideas in [`archive/remote-goattyd-plan.md`](archive/remote-goattyd-plan.md) into concrete decisions and makes them consistent with what Stage 0 measured ([`stage0-findings.md`](stage0-findings.md)).
+The decisions below are consistent with what Stage 0 measured ([`stage0-findings.md`](stage0-findings.md)).
 
 ---
 
@@ -134,7 +134,7 @@ A session has one size, the PTY's, and one **controlling** client sets it (`Sess
 - **Sizes are bounded** (`WinSize::is_sane`: at most 4096 columns, 2048 rows, 2²¹ cells). goattyd refuses a larger `Create`/`Run`/`Attach` with an `Error` and a larger `Resize` with `Error{req: None}`; a client ignores a larger `SizeControl`. They are refused, not clamped down: a snapshot made for one grid can't be fed into another. Small sizes are rounded up to a 2×1 grid (`to_size`), and `SizeControl` carries the grid the session really has.
 - **The PTY has the size first.** goattyd sets it (`TIOCSWINSZ` on the master fd, without the PTY lock a blocked input write can hold) under the subscriber lock, before the reflow and before any client hears the size. When the ioctls succeed, concurrent resizes leave the PTY at the size decided last. A failed ioctl is logged (the PTY keeps its previous size), and the terminal still takes the new one.
 - **Older clients** (before v14) can't watch at another size or take over, so for them nothing changed: each `Attach` and `Resize` takes control. A v14 daemon tells the v14 clients about it like any other change of control.
-- **Limits.** goattyd has no idle timeout of its own yet: a controller that went silent while its transport stays open keeps control until the daemon sees the connection end (the client's heartbeat doesn't help the daemon). Roadmap R1.10 adds a daemon-side timeout. Control isn't part of the restore state: after a restart, the first client to reattach gets it.
+- **Limits.** A controller that went silent keeps control only until the daemon's liveness check drops its connection (R1.10). Control isn't part of the restore state: after a restart, the first client to reattach gets it.
 
 Covered by `crates/goatty-daemon/tests/size_control.rs`.
 
@@ -150,10 +150,10 @@ ssh's stderr is captured (logged, last 40 lines kept): a failed connect shows ss
 
 `goattyd proxy` connects to the host's daemon socket, starting the daemon if needed, and relays bytes in both directions. It writes stdout through the raw fd, because std's `Stdout` is line-buffered and would hold binary frames back.
 
-**Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. Without SSH, paired tailnet hosts connect through `Endpoint::Tailnet` ([`tailnet.md`](tailnet.md)): still no network socket in goattyd, because tailscaled forwards into a Unix socket.
+**Tailscale:** works out of the box with `--ssh <magicdns-name>`, using normal OpenSSH over the tailnet or Tailscale SSH. Without SSH, paired tailnet hosts connect through `Endpoint::Tailnet` ([`tailnet.md`](tailnet.md)): on Unix still no network socket in goattyd, because tailscaled forwards into a Unix socket. On Windows, where Serve can't forward into a socket or pipe, the gateway listens on `127.0.0.1` only, and every connection must pass the device-key handshake before it reaches the daemon.
 
 ### Any stdio command (implemented: `goatty --via '<cmd>'`)
-E.g. `--via 'docker exec -i devbox goattyd proxy'`. The command line runs under `sh -c`, so shell quoting works for arguments with spaces. The tests use this with the local `goattyd proxy` to exercise the full remote path, including reconnect, without ssh.
+E.g. `--via 'docker exec -i devbox goattyd proxy'`. The command line runs under `sh -c`, so shell quoting works for arguments with spaces. Windows has no `sh`: there the line is split into words (`'…'` and `"…"` group, backslashes stay) and run directly, so `--via 'wsl.exe -d Ubuntu -- goattyd proxy'` works but pipes and variables don't. The tests use this with the local `goattyd proxy` to exercise the full remote path, including reconnect, without ssh.
 
 ### Socket watchdog (implemented)
 If another listener has taken over the path (a second daemon, or a systemd socket installed meanwhile), the watchdog leaves it alone and says so once.
@@ -179,6 +179,15 @@ Connecting to a host always means goattyd on that host, unless the user picks pl
 After an install, the first connection brings this computer's shell setup along (settings, plugins, tools; [`profiles.md`](profiles.md#the-same-shell-on-every-host-159)), unless Settings → Hosts says never.
 
 **Install** (`remote::install`) streams the binary over the same ssh into `~/.local/share/goatty/bin/.goattyd-….$$`, checks the size, runs `--version` there (catches wrong CPU, too-old libc, `noexec` home), then renames it into place and points the symlink `goattyd` in that directory at it (unless a `goattyd` there isn't a symlink), so `goattyd` works in the host's managed zsh, which has that directory on `PATH`; the managed zsh also defines a `goattyd` function for the daemon running it when no `goattyd` is in `PATH` (custom `XDG_DATA_HOME`, `--remote-daemon`). Nothing else on the host changes: no sudo, no PATH or dotfile edits; `rm -r ~/.local/share/goatty` undoes it. Restarting runs that goattyd's `restart --force` (§5c): a daemon from protocol v10 on re-executes itself as the new build and keeps its sessions; an older one is stopped like `stop --force` does, which works on a daemon of *any* version through its socket (`SO_PEERCRED`, only if the process is a `goattyd`; through systemd when it's the service). The binaries come from the release archive: `remote/goattyd-{x86_64,aarch64}-linux`, static musl builds (`release.yml`; measuring them against glibc: #132). Development builds upload their own `goattyd` when the host has the same CPU, with a note that it may not run on an older libc. After a successful install it deletes the other `goattyd-*` builds in that directory unless a running process uses one (`/proc/<pid>/exe`; without `/proc` it keeps them all), so updates don't pile up binaries.
+
+**Windows hosts (#280).** Win32-OpenSSH runs remote commands with cmd.exe (or PowerShell, if the admin made it the default shell), so the POSIX connect script fails there. cmd.exe fails over the script's redirections or doesn't find `sh`, PowerShell doesn't find `sh`, and their messages depend on the host's language. goatty therefore doesn't parse them. It relies on ssh's exit status instead (255 for ssh's own errors, otherwise the remote command's). A connect that fails with a remote status other than 0 and no `goatty-remote:` line, or whose line reports Git Bash/MSYS/Cygwin (`MINGW64_NT-…`), is asked once more with a PowerShell probe. A host that answers it is marked Windows (`SshTarget::windows`, shared by clones, so reconnects go straight there). A POSIX host whose command failed for another reason keeps its original error; it costs one more ssh run, and with password logins one more prompt. On a Windows host:
+
+- goattyd lives in `AppData\Local\goatty\bin` under the directory sessions start in, which is the user's profile (`%USERPROFILE%`), as `goattyd-<version>-p<protocol>.exe` (`remote::WINDOWS_BIN_DIR`). That is `%LOCALAPPDATA%\goatty\bin` unless Local AppData was moved out of the profile. goatty doesn't follow such a move: the connect command must be a path without spaces or quotes that cmd.exe and PowerShell both run, and only a path relative to the start directory guarantees that.
+- The connect command is that relative path plus `proxy`. It has no quotes or special characters, so cmd.exe and PowerShell both run it as is. Only this build's goattyd (or a `--remote-daemon` path without spaces) is used, with no `PATH` search.
+- The probe, install and update are PowerShell scripts sent as `powershell -EncodedCommand <base64>`, so no quoting rule of either shell applies. Install streams the binary on stdin, checks the size and `--version`, moves it into place, and deletes older `goattyd-*.exe` there (Windows won't delete a running one). `rmdir /s /q "%USERPROFILE%\AppData\Local\goatty"` (cmd.exe) undoes it. Stop and restart run the installed goattyd's `stop --force` and `restart --force`.
+- The daemon `goattyd proxy` starts leaves the SSH session's job object when the job allows it (`CREATE_BREAKAWAY_FROM_JOB`), so it survives the disconnect. Where it can't, `goattyd service install` (a Scheduled Task) keeps it running.
+- Links: drive paths (`C:\…`) on such a host go to `StatPath` (`HostInfo::os == "windows"`).
+- Release archives don't carry Windows goattyd builds yet (#281). Until they do, install offers this computer's own goattyd only when this computer runs Windows on the same CPU. Otherwise it explains what to install by hand.
 
 **Plain SSH** (`--plain`, or the button) runs `ssh -- host` in a session of the local goattyd (`Run`, v6), falling back to a window-owned PTY if the local daemon is too old. You get exactly what `ssh` in any terminal gives: the user's ssh config, prompts in the terminal, the host's own shell. Nothing is installed, and nothing of goatty runs there (no managed shell, no host settings or plugins; the settings window configures the local host). The session survives closing the window (the ssh process lives in the local daemon), but not a network drop. Typing `ssh host` inside a goatty shell is the same thing and needs no feature at all.
 
@@ -301,10 +310,10 @@ Compression costs far less than sending the bytes over any remote link (25 KB le
 
 ## 8. Roadmap
 
-### R0: protocol and transports ✅ (this change)
+### R0: protocol and transports ✅
 Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow control with resync, encode-once broadcast, `goattyd proxy`, `--ssh` / `--via`, reconnect with reattach, heartbeat/RTT, socket watchdog, tests for all of it.
 
-### R1: remote MVP polish (next; tracked in the [R1 milestone](https://github.com/goatty-dev/goatty/milestone/1))
+### R1: remote MVP polish ✅
 1. **Host list and switcher UI**: ✅ `~/.ssh/config` `Host` entries plus hosts added in the settings, in the command palette (#115, §5a); the host switcher with OS and RTT, a per-host session picker, and hosts as tabs of one window (#4, #37).
 2. ✅ **Remote goattyd install and version negotiation**, plus the plain SSH fallback (§4, §5a).
 3. ✅ **SSH prompts in the GUI** through goatty as `SSH_ASKPASS` (§5b).
@@ -314,8 +323,8 @@ Protocol v2, `goatty-client` crate, multiplexed connections, ack/window flow con
 7. ✅ **Lazy history**: `FetchHistory` fills the client's scrollback on demand, for the trimmed attach snapshot and for lines skipped by resync, with stable host line numbers (§4a).
 8. ✅ **Compression** for snapshots and history (zstd, negotiated per connection; §4a). Live output stays uncompressed (it's small, and latency matters more).
 9. ✅ **Size policy for multiple clients**: one *controlling* client per session sets the PTY size. Others watch (letterboxed) or take over explicitly (§4c, protocol v14).
-10. **Daemon-side liveness**: drop subscribers whose connection has been silent for >60 s (pings), so the attached count and size control are correct after a client vanished without FIN.
-11. **Client vs host settings split** in the profile model (font/keys/theme are client; shell/plugins/env are host). The plugin manager always acts on the connected host.
+10. ✅ **Daemon-side liveness** (#13): `reap_silent` drops connections that stopped pinging, so the attached count and size control are right after a client vanished without FIN.
+11. ✅ **Client vs host settings split** in the profile model (font/keys/theme are client; shell/plugins/env are host), see [`profiles.md`](profiles.md).
 
 ### R2: hosts on the tailnet ✅ (#15, protocol v12)
 Paired in the app, no SSH setup: see [`tailnet.md`](tailnet.md). goatty uses the user's installed Tailscale. A host that is made available gets one `tailscale serve --tcp` route into a Unix socket of goattyd's, so goattyd still binds no network socket (D5). Each connection authenticates with a device key pinned by pairing (a 6-digit code confirmed on both screens). Outbound, the client uses plain TCP to the peer's tailnet address, or `tailscale nc` in userspace mode. QUIC was dropped: WireGuard already encrypts and authenticates, and Tailscale's stable addresses cover roaming. Per-pane streams without head-of-line blocking would be the only gain, and skip-and-resync bounds that (D7 stays).
@@ -332,13 +341,13 @@ Guesses belong to *epochs*. Input we can't predict (Enter, arrows, control keys,
 | Risk | Mitigation |
 |---|---|
 | Version skew between GUI and remote daemon | Version range negotiation; install/restart from the connect screen (§5a) |
-| Head-of-line blocking across panes on one SSH stream | Bounded by Σ windows; R1 interactive priority; several connections per host if measurements show a need |
+| Head-of-line blocking across panes on one SSH stream | Bounded by Σ windows; interactive priority (done); several connections per host if measurements show a need |
 | Scrollback gaps after resync | Fetched from the daemon's scrollback on scroll-up (§4a); lost after a column resize |
 | Security: proxy access = full control of the daemon | Same trust as an SSH shell on that host; the daemon socket stays 0600 and is never exposed |
 | `$XDG_RUNTIME_DIR` removed on logout | Watchdog re-bind (done); systemd user unit + linger (done, opt-in) |
 | `goattyd` not in PATH for non-interactive SSH | Script searches common dirs; `--remote-daemon`; auto-install (done) |
-| Windows client | `Endpoint::Command` with `ssh.exe` works unchanged; local transport needs named pipes instead of Unix sockets, and process detaching instead of `setsid` |
-| Session size conflicts with two clients | R1 controlling-client policy |
+| Windows client | Named pipes and a detached goattyd locally; Windows's own `ssh.exe` (`ssh_program`: `PATH`, else `%SystemRoot%\System32\OpenSSH`) with askpass (`DISPLAY` for Win32-OpenSSH < 8.4, 8.3 path for a goatty under `Program Files`); `--via` split into words and run without `sh`; helper programs never open a console window (`goatty_proto::process::hide_console`). Windows *as* an SSH host: §5a |
+| Session size conflicts with two clients | Controlling-client policy (§4c) |
 
 ## 10. How to try it
 

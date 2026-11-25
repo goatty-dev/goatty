@@ -39,8 +39,8 @@ use goatty_client::{Connection, Endpoint, RemoteProblem, SshTarget};
 use goatty_shell::HostService;
 use goatty_term::TermSize;
 use gpui::{
-    App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render, SharedString, WeakEntity,
-    Window, div, prelude::*, px,
+    Animation, AnimationExt as _, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render,
+    SharedString, Transformation, WeakEntity, Window, div, percentage, prelude::*, px,
 };
 
 use crate::hosts::pool;
@@ -134,7 +134,9 @@ fn mib(path: &std::path::Path) -> String {
 /// upload for a target (`remote::find_bundled` outside tests).
 pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>) -> Ask {
     let ver = env!("CARGO_PKG_VERSION");
-    let dest = format!("~/{}", remote::BIN_DIR);
+    let dest = |platform: &Platform| {
+        if platform.is_windows() { format!(r"%USERPROFILE%\{}", remote::WINDOWS_BIN_DIR) } else { format!("~/{}", remote::BIN_DIR) }
+    };
     let cancel = (Choice::Cancel, "Cancel".to_string());
     let plain = (Choice::Plain, "Plain SSH".to_string());
     match problem {
@@ -142,7 +144,9 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
             None => Ask {
                 title: format!("goattyd doesn't run on {host}"),
                 body: vec![
-                    format!("{host} is {platform}. goattyd, goatty's session daemon, is available for Linux on x86_64 and aarch64 so far."),
+                    format!(
+                        "{host} is {platform}. goattyd, goatty's session daemon, is available for Linux and Windows on x86_64 and aarch64 so far."
+                    ),
                     PLAIN_NOTE.into(),
                 ],
                 warning: None,
@@ -157,9 +161,10 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                              the window, and get goatty's shell setup. It isn't installed there yet."
                         ),
                         format!(
-                            "goatty can copy goattyd {ver} for {platform} ({}) to {dest} on {host}. Nothing else changes: no sudo, \
+                            "goatty can copy goattyd {ver} for {platform} ({}) to {} on {host}. Nothing else changes: no sudo, \
                              no PATH or dotfile edits.",
-                            mib(&bundled.path)
+                            mib(&bundled.path),
+                            dest(platform)
                         ),
                     ];
                     body.push(SETUP_NOTE.into());
@@ -204,7 +209,9 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     upload: None,
                 };
             }
-            let warning = (!remote_keeps_sessions(mismatch)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
+            let platform = probe.as_ref().map(|p| &p.platform);
+            let warning =
+                (!remote_keeps_sessions(mismatch, platform)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
             if probe.as_ref().is_some_and(Probe::runs_ours) {
                 return Ask {
                     title: format!("Restart goattyd on {host}?"),
@@ -221,8 +228,9 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     body: vec![
                         format!("{mismatch}."),
                         format!(
-                            "goatty can copy goattyd {ver} for {platform} ({}) to {dest} on {host} and restart the daemon with it.",
-                            mib(&bundled.path)
+                            "goatty can copy goattyd {ver} for {platform} ({}) to {} on {host} and restart the daemon with it.",
+                            mib(&bundled.path),
+                            dest(platform)
                         ),
                     ],
                     warning,
@@ -241,17 +249,19 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
     }
 }
 
+/// Whether restarting a remote host's goattyd keeps its sessions. That
+/// depends on the host, not this computer: Windows daemons can't hand their
+/// sessions to a new build. A host of unknown platform gets the warning.
+fn remote_keeps_sessions(mismatch: &goatty_client::VersionMismatch, platform: Option<&Platform>) -> bool {
+    !mismatch.daemon_is_newer
+        && platform.is_some_and(|p| !p.is_windows())
+        && mismatch.daemon_protocol.is_some_and(|v| v >= goatty_proto::RESTART_SINCE)
+}
+
 /// An older local daemon that a restart replaces with its sessions kept
 /// (protocol v10 on Unix; Windows daemons cannot hand off ConPTY handles).
 fn keeps_sessions(mismatch: &goatty_client::VersionMismatch) -> bool {
     !mismatch.daemon_is_newer && mismatch.daemon_protocol.is_some_and(local::can_keep_sessions)
-}
-
-/// An older remote SSH daemon that a restart replaces with its sessions kept.
-/// Remote SSH daemons run on Unix (`goatty_client::remote`), so protocol
-/// support does not depend on the local client OS.
-fn remote_keeps_sessions(mismatch: &goatty_client::VersionMismatch) -> bool {
-    !mismatch.daemon_is_newer && mismatch.daemon_protocol.is_some_and(|p| p >= goatty_proto::RESTART_SINCE)
 }
 
 /// The local daemon speaks no protocol this goatty does but is old enough
@@ -806,7 +816,11 @@ impl Render for ConnectView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Icon::Loader.svg().size(px(18.)).text_color(ui.accent))
+                    .child(Icon::Loader.svg().size(px(18.)).text_color(ui.accent).with_animation(
+                        ("connect-spin", cx.entity_id().as_u64() as usize),
+                        Animation::new(Duration::from_millis(900)).repeat(),
+                        |s, t| s.with_transformation(Transformation::rotate(percentage(t))),
+                    ))
                     .child(div().text_base().child(SharedString::from(label.clone()))),
             ),
             Step::Ask(ask) => {
@@ -899,8 +913,15 @@ mod tests {
         assert_eq!(choices(&describe(&p, bundle(false))), [Choice::Cancel, Choice::Plain]);
         // A daemon from v10 on keeps its sessions over the restart: no warning.
         let v16 = VersionMismatch { daemon_protocol: Some(16), daemon_version: Some("0.3.0".into()), daemon_is_newer: false };
-        let p = RemoteProblem::Incompatible { host: "box".into(), mismatch: v16, probe: probe("/usr/bin/goattyd") };
+        let p = RemoteProblem::Incompatible { host: "box".into(), mismatch: v16.clone(), probe: probe("/usr/bin/goattyd") };
         assert!(describe(&p, bundle(false)).warning.is_none());
+        // Not on a Windows host, whatever this computer runs: its daemon can't hand sessions over.
+        let windows = Some(Probe {
+            platform: Platform { os: "Windows".into(), arch: String::new() },
+            daemon: Some(format!(r"C:\Users\u\{}\{}", remote::WINDOWS_BIN_DIR, remote::windows_binary_name())),
+        });
+        let p = RemoteProblem::Incompatible { host: "win".into(), mismatch: v16, probe: windows };
+        assert!(describe(&p, bundle(false)).warning.is_some());
     }
 
     #[test]

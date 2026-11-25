@@ -59,7 +59,7 @@ pub use host::{
     HistorySettings, HostSettings, ImportFrom, ImportSettings, PluginConfig, PowerShellSettings, ShellSettings, UserAlias, ZshSettings,
     alias_name_problem, is_alias_name, is_snippet_id, normalize_path_entry, path_entry_problem,
 };
-pub use prompt::{PromptSettings, PromptStyle};
+pub use prompt::{IconsElsewhere, PromptSettings, PromptStyle};
 pub use store::{Document, FileStamp, Issue, Loaded};
 pub use theme::{
     Color, ColorSlot, ContrastCheck, DEFAULT_LIGHT_THEME, DEFAULT_THEME, THEMES, Theme, ThemeColors, ThemeOverrides, ThemeSettings,

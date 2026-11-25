@@ -318,7 +318,7 @@ impl Spawner {
 
 /// `ssh host`, for plain SSH sessions.
 pub fn plain_ssh_argv(host: &str) -> Vec<String> {
-    vec!["ssh".to_string(), "--".into(), host.to_string()]
+    vec![goatty_client::ssh_program(), "--".into(), host.to_string()]
 }
 
 /// Input that is an Enter press: a CR, or the kitty protocol's Enter
