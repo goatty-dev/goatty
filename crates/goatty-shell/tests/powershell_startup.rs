@@ -401,9 +401,10 @@ fn native_verb_noun_and_windows_mode_legacy_exes_preserve_json_args() {
     vals.insert("spaced".into(), spaced_val.into());
 
     let path_env = format!("{};{}", tmp.path().display(), std::env::var("PATH").unwrap_or_default());
+    let find_exe_str = find_exe.to_string_lossy();
     for (prog, expected) in [
         ("get-widget", format!("ARG:{json_val}\nARG:{spaced_val}\n")),
-        (&find_exe.to_string_lossy().into_owned(), format!("ARG:{json_val}\nARG:{spaced_val}\n")),
+        (find_exe_str.as_ref(), format!("ARG:{json_val}\nARG:{spaced_val}\n")),
         ("Write-Output", format!("{json_val}\n{spaced_val}\n")),
     ] {
         let line = command_line_powershell(&make_cmd(prog), &vals);

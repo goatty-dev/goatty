@@ -318,11 +318,11 @@ fn format_ps_alias_def(name: &str, body: &str) -> String {
 
 /// Validate rendered PowerShell alias definitions with PowerShell's AST parser
 /// (`[System.Management.Automation.Language.Parser]::ParseInput`) in a single
-/// subprocess call, returning `name -> first parse error message` for any
-/// definition that fails to parse.
-fn parse_check_ps_defs(defs: &[(String, String)], pwsh: &str) -> BTreeMap<String, String> {
+/// subprocess call, returning `Ok(name -> first parse error message)` or `Err`
+/// if the parser subprocess failed to run.
+fn parse_check_ps_defs(defs: &[(String, String)], pwsh: &str) -> Result<BTreeMap<String, String>, String> {
     if defs.is_empty() {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     }
     let mut script = String::new();
     for (name, def) in defs {
@@ -341,16 +341,22 @@ fn parse_check_ps_defs(defs: &[(String, String)], pwsh: &str) -> BTreeMap<String
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
-    let Ok(out) = cmd.output() else {
-        return BTreeMap::new();
-    };
+    let out = cmd.output().map_err(|e| format!("couldn't run PowerShell parser: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("PowerShell parser exited with {}", out.status)
+        } else {
+            format!("PowerShell parser failed: {stderr}")
+        });
+    }
     let mut bad = BTreeMap::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((name, msg)) = line.split_once('\t') {
             bad.entry(name.to_owned()).or_insert_with(|| msg.trim().to_owned());
         }
     }
-    bad
+    Ok(bad)
 }
 
 /// Validate a single alias `(name, command)` for PowerShell, using both the
@@ -364,9 +370,13 @@ pub fn powershell_alias_problem(name: &str, command: &str) -> Option<String> {
         && let Some(pwsh) = crate::launch::find_powershell()
     {
         let def = format_ps_alias_def(name, body);
-        let bad = parse_check_ps_defs(&[(name.to_owned(), def)], &pwsh);
-        if let Some(err) = bad.get(name) {
-            return Some(err.clone());
+        match parse_check_ps_defs(&[(name.to_owned(), def)], &pwsh) {
+            Ok(bad) => {
+                if let Some(err) = bad.get(name) {
+                    return Some(err.clone());
+                }
+            }
+            Err(why) => return Some(why),
         }
     }
     None
@@ -374,6 +384,8 @@ pub fn powershell_alias_problem(name: &str, command: &str) -> Option<String> {
 
 /// Render `aliases.ps1` and collect any skipped-alias issues, validating
 /// candidate definitions against `pwsh`'s AST parser when `pwsh` is `Some`.
+/// If the parser subprocess fails to run, unverified aliases are skipped and
+/// reported rather than silently emitted.
 pub fn render_powershell_checked(settings: &HostSettings, pwsh: Option<&str>) -> (String, Vec<String>) {
     let mut out = String::from(
         "# goatty: your aliases (\"aliases\" in host.json), read after the plugins' aliases so yours win.\n\
@@ -393,7 +405,13 @@ pub fn render_powershell_checked(settings: &HostSettings, pwsh: Option<&str>) ->
             candidates.push((name.clone(), format_ps_alias_def(name, body)));
         }
     }
-    let ast_bad = pwsh.map(|p| parse_check_ps_defs(&candidates, p)).unwrap_or_default();
+    let ast_bad: BTreeMap<String, String> = match pwsh {
+        Some(p) => match parse_check_ps_defs(&candidates, p) {
+            Ok(bad) => bad,
+            Err(why) => candidates.iter().map(|(name, _)| (name.clone(), why.clone())).collect(),
+        },
+        None => BTreeMap::new(),
+    };
 
     let mut groups: BTreeMap<String, (&str, Vec<Named<'_>>)> = BTreeMap::new();
     for (name, a) in &settings.aliases {
@@ -592,5 +610,17 @@ command = "docker"
             assert!(!out.contains(&format!("Function:global:{bad}")), "{out}");
         }
         assert_eq!(issues.len(), 7, "{issues:?}");
+
+        // Parser subprocess failure must skip and report unverified aliases in both forms.
+        let mut s2 = HostSettings::default();
+        s2.aliases.insert("ok".into(), UserAlias::new("git status"));
+        s2.aliases.insert("..".into(), UserAlias::new("cd .."));
+        let (out2, issues2) = render_powershell_checked(&s2, Some("goatty-nonexistent-pwsh-parser"));
+        for name in ["ok", ".."] {
+            assert!(out2.contains(&format!("# skipped: {name} (")), "{name} should be skipped on parser failure:\n{out2}");
+            assert!(!out2.contains(&format!("function global:{name}")), "{out2}");
+            assert!(!out2.contains(&format!("Function:global:{name}")), "{out2}");
+            assert!(issues2.iter().any(|i| i.starts_with(&format!("aliases.{name}:"))), "{issues2:?}");
+        }
     }
 }
