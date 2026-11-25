@@ -185,6 +185,10 @@ pub fn expand(entry: &str, home: Option<&Path>) -> String {
     }
 }
 
+fn norm_win_path(p: &str) -> String {
+    p.trim_end_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase()
+}
+
 fn folder_state(dir: &Path, checked: bool, entries: &[Entry]) -> FolderState {
     if !dir.exists() {
         return FolderState::Missing;
@@ -196,11 +200,7 @@ fn folder_state(dir: &Path, checked: bool, entries: &[Entry]) -> FolderState {
         return FolderState::Unchecked;
     }
     let same = |e: &&Entry| {
-        if cfg!(windows) {
-            e.dir.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(dir.to_string_lossy().trim_end_matches(['\\', '/']))
-        } else {
-            Path::new(&e.dir) == dir
-        }
+        if cfg!(windows) { norm_win_path(&e.dir) == norm_win_path(&dir.to_string_lossy()) } else { Path::new(&e.dir) == dir }
     };
     match entries.iter().find(same) {
         Some(e) if e.origin == Origin::Settings => FolderState::Used,
@@ -226,7 +226,7 @@ pub fn attribute(steps: &[(String, String)]) -> Vec<(String, &str)> {
 pub fn attribute_with(steps: &[(String, String)], sep: char) -> Vec<(String, &str)> {
     let Some((_, last)) = steps.last() else { return Vec::new() };
     let mut seen = std::collections::HashSet::new();
-    let norm = |d: &str| if sep == ';' { d.trim_end_matches(['\\', '/']).to_ascii_lowercase() } else { d.to_owned() };
+    let norm = |d: &str| if sep == ';' { norm_win_path(d) } else { d.to_owned() };
     last.split(sep)
         .filter(|dir| !(sep == ';' && dir.is_empty()) && seen.insert(norm(dir)))
         .map(|dir| {
@@ -325,7 +325,7 @@ mod tests {
             ("tools", r"C:\Windows\System32;C:\Program Files\PowerShell\7;C:\Users\u\bin;C:\Users\u\AppData\Local\goatty\bin"),
             (
                 "final",
-                r"C:\Windows\System32;C:\Program Files\PowerShell\7;C:\Users\u\bin;C:\Users\u\AppData\Local\goatty\bin;c:\windows\system32\",
+                r"C:\Windows\System32;C:\Program Files\PowerShell\7;C:\Users\u\bin;C:\Users\u/bin;C:\Users\u\AppData\Local\goatty\bin;c:\windows\system32\",
             ),
         ]);
         assert_eq!(
@@ -336,8 +336,9 @@ mod tests {
                 (r"C:\Users\u\bin".to_owned(), "settings"),
                 (r"C:\Users\u\AppData\Local\goatty\bin".to_owned(), "tools"),
             ],
-            "case-insensitive dedup with trailing slash normalization"
+            "case-insensitive dedup with slash and trailing slash normalization"
         );
+        assert_eq!(norm_win_path(r"C:\Users\u/bin/"), norm_win_path(r"c:\users\u\bin"));
     }
 
     #[test]

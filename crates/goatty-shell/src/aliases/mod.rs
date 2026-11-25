@@ -198,9 +198,139 @@ pub fn render(settings: &HostSettings) -> String {
     out
 }
 
+/// Check whether `command` can be embedded safely inside `{ <command> @args }`
+/// in both PowerShell 7 and Windows PowerShell 5.1. Returns a short reason when
+/// it would fail to parse.
+pub fn powershell_command_problem(command: &str) -> Option<&'static str> {
+    let body = command.trim();
+    if body.is_empty() {
+        return Some("empty command");
+    }
+    if body.contains(['\n', '\r']) {
+        return Some("multi-line commands aren't supported in PowerShell aliases");
+    }
+    if body.chars().any(|c| c.is_control() && c != '\t') {
+        return Some("contains control characters");
+    }
+    #[derive(PartialEq, Clone, Copy)]
+    enum Q {
+        None,
+        Single,
+        Double,
+    }
+    let is_sq = |c: char| matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}');
+    let is_dq = |c: char| matches!(c, '"' | '\u{201C}' | '\u{201D}' | '\u{201E}');
+
+    let chars: Vec<char> = body.chars().collect();
+    let mut q = Q::None;
+    let mut braces: i32 = 0;
+    let mut parens: i32 = 0;
+    let mut brackets: i32 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match q {
+            Q::None => {
+                if c == '`' {
+                    if next.is_none() {
+                        return Some("ends with a lone backtick");
+                    }
+                    i += 2;
+                    continue;
+                } else if is_sq(c) {
+                    q = Q::Single;
+                } else if is_dq(c) {
+                    q = Q::Double;
+                } else if c == '#' {
+                    return Some("contains a `#` comment");
+                } else if c == '<' && next == Some('#') {
+                    return Some("contains a `<#` block comment");
+                } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
+                    return Some("`&&` and `||` aren't supported by Windows PowerShell 5.1");
+                } else if c == '{' {
+                    braces += 1;
+                } else if c == '}' {
+                    braces -= 1;
+                    if braces < 0 {
+                        return Some("unbalanced `}`");
+                    }
+                } else if c == '(' {
+                    parens += 1;
+                } else if c == ')' {
+                    parens -= 1;
+                    if parens < 0 {
+                        return Some("unbalanced `)`");
+                    }
+                } else if c == '[' {
+                    brackets += 1;
+                } else if c == ']' {
+                    brackets -= 1;
+                    if brackets < 0 {
+                        return Some("unbalanced `]`");
+                    }
+                }
+            }
+            Q::Single => {
+                if is_sq(c) {
+                    if next.is_some_and(is_sq) {
+                        i += 2;
+                        continue;
+                    }
+                    q = Q::None;
+                }
+            }
+            Q::Double => {
+                if c == '`' {
+                    if next.is_none() {
+                        return Some("ends with a lone backtick");
+                    }
+                    i += 2;
+                    continue;
+                } else if is_dq(c) {
+                    if next.is_some_and(is_dq) {
+                        i += 2;
+                        continue;
+                    }
+                    q = Q::None;
+                }
+            }
+        }
+        i += 1;
+    }
+    if q != Q::None {
+        return Some("unclosed quote");
+    }
+    if braces != 0 {
+        return Some("unbalanced `{`");
+    }
+    if parens != 0 {
+        return Some("unbalanced `(`");
+    }
+    if brackets != 0 {
+        return Some("unbalanced `[`");
+    }
+    None
+}
+
+/// Enabled user aliases that cannot be rendered as valid PowerShell.
+pub fn powershell_issues(settings: &HostSettings) -> Vec<String> {
+    settings
+        .aliases
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .filter_map(|(name, a)| powershell_command_problem(&a.command).map(|why| format!("aliases.{name}: skipped for PowerShell ({why})")))
+        .collect()
+}
+
 /// `aliases.ps1`: the user's enabled aliases rendered as PowerShell
 /// `global:` functions (removing any built-in PowerShell alias of the same
 /// name, so aliases with arguments work and override `ls`/`cat`/`curl`) (#278).
+///
+/// Aliases whose command cannot safely sit inside a PowerShell scriptblock on
+/// both PS 7 and Windows PowerShell 5.1 are skipped with a comment (and
+/// reported via [`powershell_issues`]) so a single bad alias never prevents
+/// future generations from building.
 pub fn render_powershell(settings: &HostSettings) -> String {
     let mut out = String::from(
         "# goatty: your aliases (\"aliases\" in host.json), read after the plugins' aliases so yours win.\n\
@@ -217,11 +347,15 @@ pub fn render_powershell(settings: &HostSettings) -> String {
         }
         for (name, a) in aliases {
             if a.enabled {
+                let body = a.command.trim();
+                if let Some(why) = powershell_command_problem(body) {
+                    out.push_str(&format!("# skipped: {name} ({why})\n"));
+                    continue;
+                }
                 let alias_path = goatty_plugin::powershell::quote(&format!("Alias:{name}"));
                 let remove = format!(
                     "if (Test-Path -LiteralPath {alias_path}) {{ Remove-Item -LiteralPath {alias_path} -Force -ErrorAction SilentlyContinue }}"
                 );
-                let body = a.command.trim();
                 let is_ident = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
                 let def = if is_ident {
                     format!("function global:{name} {{ {body} @args }}")
@@ -360,5 +494,28 @@ command = "docker"
         assert!(out.contains("function global:ls { eza --icons=auto @args }"), "{out}");
         assert!(out.contains("Set-Item -LiteralPath 'Function:global:..' -Value { cd .. @args }"), "{out}");
         assert!(out.contains("# off: gl\n"), "{out}");
+    }
+
+    #[test]
+    fn powershell_skips_unparseable_alias_commands_in_both_forms() {
+        let mut s = HostSettings::default();
+        s.aliases.insert("ok".into(), UserAlias::new("git status"));
+        s.aliases.insert("commented".into(), UserAlias::new("git status # trailing"));
+        s.aliases.insert("multiline".into(), UserAlias::new("echo a\necho b"));
+        s.aliases.insert("unbalanced".into(), UserAlias::new("echo }"));
+        s.aliases.insert("chained".into(), UserAlias::new("git add -A && git commit"));
+        s.aliases.insert("g:bad".into(), UserAlias::new("git pull || git status"));
+        s.aliases.insert("quoted-hash".into(), UserAlias::new("Write-Output 'a # b && c'"));
+
+        let out = render_powershell(&s);
+        assert!(out.contains("function global:ok { git status @args }"), "{out}");
+        assert!(out.contains("function global:quoted-hash { Write-Output 'a # b && c' @args }"), "{out}");
+        for bad in ["commented", "multiline", "unbalanced", "chained", "g:bad"] {
+            assert!(out.contains(&format!("# skipped: {bad} (")), "{bad} should be skipped:\n{out}");
+            assert!(!out.contains(&format!("function global:{bad}")), "{out}");
+            assert!(!out.contains(&format!("Function:global:{bad}")), "{out}");
+        }
+        let issues = powershell_issues(&s);
+        assert_eq!(issues.len(), 5, "{issues:?}");
     }
 }

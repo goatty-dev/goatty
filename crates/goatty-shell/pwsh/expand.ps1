@@ -7,9 +7,9 @@
 $global:_goatty_exp_re = @()
 $global:_goatty_exp_to = @()
 $global:_goatty_exp_say = @()
-$global:_goatty_exp_last = @{}
-$global:_goatty_exp_last2 = @{}
-$global:_goatty_exp_enter_bound = $false
+$global:_goatty_exp_last = New-Object System.Collections.Hashtable([System.StringComparer]::Ordinal)
+$global:_goatty_exp_last2 = New-Object System.Collections.Hashtable([System.StringComparer]::Ordinal)
+$global:_goatty_exp_active = $false
 
 $_goatty_exp_data = Join-Path $_goatty_dir 'expansions.ps1'
 if (-not (Test-Path -LiteralPath $_goatty_exp_data)) { return }
@@ -100,15 +100,9 @@ try {
         [Microsoft.PowerShell.PSConsoleReadLine]::Insert(' ')
     } -ErrorAction SilentlyContinue
 
-    Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
-        $line = $null; $cursor = $null
-        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
-        if ($cursor -eq $line.Length -and (_goatty_exp_apply)) {
-            return
-        }
-        _goatty_accept_line
-    } -ErrorAction SilentlyContinue
-    $global:_goatty_exp_enter_bound = $true
+    # Enter is handled by the shared `_goatty_enter_handler` in init.ps1 so
+    # expansions, transient prompt redraw, and OSC 133;C cooperate cleanly.
+    $global:_goatty_exp_active = $true
 
     Set-PSReadLineKeyHandler -Key Backspace -ScriptBlock {
         $line = $null; $cursor = $null

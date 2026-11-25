@@ -133,8 +133,32 @@ pub fn list(dirs: &Dirs) -> Vec<Generation> {
     v
 }
 
+fn write_generated_file(path: &Path, f: &GeneratedFile) -> std::io::Result<()> {
+    // Windows PowerShell 5.1 decodes `.ps1` files without a UTF-8 BOM using the
+    // system ANSI code page, corrupting non-ASCII paths and text. Prepend a
+    // UTF-8 BOM to `.ps1` files only so PS 5.1 and PS 7 decode identically.
+    if f.name.ends_with(".ps1") && !f.contents.starts_with('\u{feff}') {
+        let mut bytes = Vec::with_capacity(3 + f.contents.len());
+        bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        bytes.extend_from_slice(f.contents.as_bytes());
+        std::fs::write(path, bytes)
+    } else {
+        std::fs::write(path, &f.contents)
+    }
+}
+
+pub(crate) fn read_generated_text(path: &Path, name: &str) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    if name.ends_with(".ps1")
+        && let Some(stripped) = text.strip_prefix('\u{feff}')
+    {
+        return Ok(stripped.to_owned());
+    }
+    Ok(text)
+}
+
 fn read_files(dir: &Path, like: &[GeneratedFile]) -> Option<Vec<String>> {
-    like.iter().map(|f| std::fs::read_to_string(dir.join(&f.name)).ok()).collect()
+    like.iter().map(|f| read_generated_text(&dir.join(&f.name), &f.name).ok()).collect()
 }
 
 /// What [`activate`] did.
@@ -174,7 +198,7 @@ pub fn activate(dirs: &Dirs, files: &[GeneratedFile], settings_json: &str) -> Re
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(path, &f.contents)?;
+            write_generated_file(&path, f)?;
         }
         std::fs::write(staging.join("host.json"), settings_json)?;
         let version = env!("CARGO_PKG_VERSION");
@@ -312,7 +336,7 @@ pub fn diff(dirs: &Dirs, files: &[GeneratedFile]) -> Vec<FileDiff> {
     files
         .iter()
         .filter_map(|f| {
-            let old = std::fs::read_to_string(dir.join(&f.name)).unwrap_or_default();
+            let old = read_generated_text(&dir.join(&f.name), &f.name).unwrap_or_default();
             (old != f.contents).then(|| FileDiff {
                 name: f.name.clone(),
                 unified: similar::TextDiff::from_lines(&old, &f.contents)
@@ -348,7 +372,13 @@ mod tests {
 
         assert_eq!(activate(&dirs, &files(one), "{}").unwrap(), Activated { generation: 1, created: true });
         assert_eq!(activate(&dirs, &files(one), "{}").unwrap(), Activated { generation: 1, created: false });
-        assert_eq!(std::fs::read_to_string(dirs.shell_dir().join(entry_name())).unwrap(), one);
+        let entry_path = dirs.shell_dir().join(entry_name());
+        if cfg!(windows) {
+            let raw = std::fs::read(&entry_path).unwrap();
+            assert!(raw.starts_with(&[0xEF, 0xBB, 0xBF]), ".ps1 files must include UTF-8 BOM for PS 5.1");
+            assert!(!std::fs::read(dirs.shell_dir().join("starship.toml")).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]));
+        }
+        assert_eq!(read_generated_text(&entry_path, entry_name()).unwrap(), one);
         assert!(diff(&dirs, &files(one)).is_empty());
 
         let d = diff(&dirs, &files(two));
@@ -362,7 +392,7 @@ mod tests {
         // A settings-only change is a new generation too (rollback target).
         assert_eq!(activate(&dirs, &files(one), "{\"x\":1}").unwrap().generation, 2);
         assert_eq!(activate(&dirs, &files(two), "{\"x\":1}").unwrap().generation, 3);
-        assert_eq!(std::fs::read_to_string(dirs.shell_dir().join(entry_name())).unwrap(), two);
+        assert_eq!(read_generated_text(&dirs.shell_dir().join(entry_name()), entry_name()).unwrap(), two);
         assert_eq!(list(&dirs).iter().filter(|g| g.active).map(|g| g.number).collect::<Vec<_>>(), [3]);
         assert!(list(&dirs)[0].created_unix > 0);
     }
@@ -381,7 +411,7 @@ mod tests {
         assert_eq!(g.number, 1);
         assert_eq!(g.settings_json().as_deref(), Some("one"));
         assert_eq!(current(&dirs), Some(1));
-        assert_eq!(std::fs::read_to_string(dirs.shell_dir().join(entry_name())).unwrap(), one);
+        assert_eq!(read_generated_text(&dirs.shell_dir().join(entry_name()), entry_name()).unwrap(), one);
         assert!(rollback(&dirs, None).is_err(), "nothing older than 1");
         assert_eq!(rollback(&dirs, Some(2)).unwrap().number, 2);
         assert!(rollback(&dirs, Some(9)).is_err());

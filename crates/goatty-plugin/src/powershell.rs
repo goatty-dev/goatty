@@ -21,8 +21,129 @@ use crate::template::{expand_inline, expand_list};
 
 /// Characters that PowerShell's parser treats as single-quote delimiters in
 /// addition to ASCII `'` (Unicode left/right/low/reversed single quotes).
-fn is_ps_single_quote(c: char) -> bool {
+pub(crate) fn is_ps_single_quote(c: char) -> bool {
     matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
+/// Characters that PowerShell's parser treats as double-quote delimiters in
+/// addition to ASCII `"` (Unicode left/right/low double quotes).
+pub(crate) fn is_ps_double_quote(c: char) -> bool {
+    matches!(c, '"' | '\u{201C}' | '\u{201D}' | '\u{201E}')
+}
+
+/// Whether `s` needs legacy native-argument escaping on Windows PowerShell 5.1
+/// (and PowerShell < 7.3 / `Legacy` mode), where embedded double quotes or a
+/// trailing backslash in a whitespace-containing argument are mangled before
+/// reaching Win32 `CommandLineToArgvW`.
+pub(crate) fn needs_legacy_native_escape(s: &str) -> bool {
+    s.contains('"') || (s.ends_with('\\') && s.chars().any(char::is_whitespace))
+}
+
+/// Escape `s` for Win32 `CommandLineToArgvW` when passed through legacy
+/// PowerShell native argument serialization (PowerShell 5.1 / < 7.3).
+pub(crate) fn escape_legacy_native_arg(s: &str) -> String {
+    let has_ws = s.chars().any(char::is_whitespace);
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(c);
+        }
+    }
+    let trailing = if has_ws { backslashes * 2 } else { backslashes };
+    for _ in 0..trailing {
+        out.push('\\');
+    }
+    out
+}
+
+/// PowerShell expression testing whether the active host uses legacy native
+/// command argument passing (Windows PowerShell 5.1, PowerShell 7.0–7.2, or
+/// PowerShell 7.3+ configured with `$PSNativeCommandArgumentPassing = 'Legacy'`).
+pub(crate) const LEGACY_NATIVE_COND: &str = "$PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 3) -or $PSNativeCommandArgumentPassing -eq 'Legacy'";
+
+/// Quote a PowerShell argument for a native executable, preserving embedded
+/// double quotes on both PowerShell 7.3+ and legacy Windows PowerShell 5.1.
+///
+/// Ordinary arguments without embedded `"` (or trailing `\` with whitespace)
+/// are rendered identically to [`word`].
+pub fn native_word(s: &str) -> String {
+    if !needs_legacy_native_escape(s) {
+        return word(s);
+    }
+    let legacy = quote(&escape_legacy_native_arg(s));
+    let modern = quote(s);
+    format!("$(if ({LEGACY_NATIVE_COND}) {{ {legacy} }} else {{ {modern} }})")
+}
+
+/// Whether `prog` looks like a PowerShell `Verb-Noun` cmdlet (e.g.
+/// `Write-Output`, `Set-Location`, `Get-Content`) or built-in cmdlet alias
+/// whose arguments are bound directly as .NET strings without Win32 native
+/// command-line serialization.
+pub(crate) fn is_ps_cmdlet(prog: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "add",
+        "clear",
+        "close",
+        "convertfrom",
+        "convertto",
+        "copy",
+        "disable",
+        "enable",
+        "export",
+        "foreach",
+        "format",
+        "get",
+        "group",
+        "hide",
+        "import",
+        "invoke",
+        "join",
+        "measure",
+        "move",
+        "new",
+        "open",
+        "out",
+        "pop",
+        "push",
+        "read",
+        "register",
+        "remove",
+        "rename",
+        "resolve",
+        "restart",
+        "select",
+        "set",
+        "show",
+        "sort",
+        "split",
+        "start",
+        "stop",
+        "test",
+        "unregister",
+        "update",
+        "where",
+        "write",
+    ];
+    if prog.eq_ignore_ascii_case("echo") {
+        return true;
+    }
+    if let Some((verb, noun)) = prog.split_once('-') {
+        return !noun.is_empty() && noun.bytes().all(|b| b.is_ascii_alphabetic()) && VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb));
+    }
+    false
 }
 
 /// Quote a string as a PowerShell literal expression.

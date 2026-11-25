@@ -50,9 +50,21 @@ if (($null -eq $global:_goatty_inner_prompt_fn) -or ($function:prompt.ToString()
 
 function global:prompt {
     # marker: _goatty_prompt_wrapper
+    if ($global:_goatty_render_transient) {
+        $global:_goatty_render_transient = $false
+        $t = if ($global:_goatty_transient_last_ok) { $global:_goatty_transient_ok } else { $global:_goatty_transient_err }
+        if ($global:_goatty_marks) {
+            $esc = [char]27
+            $bel = [char]7
+            return "$esc]133;A$bel$t$esc]133;B$bel"
+        }
+        return $t
+    }
+
     $lastOk = $?
     $lastExit = $global:LASTEXITCODE
     $exitCode = if ($lastOk) { 0 } elseif ($null -ne $lastExit -and $lastExit -ne 0) { $lastExit } else { 1 }
+    $global:_goatty_transient_last_ok = $lastOk
 
     _goatty_check_reload
 
@@ -87,16 +99,8 @@ function global:prompt {
     return $text
 }
 
-# Bind Enter to emit OSC 133;C when expansions didn't already bind Enter.
-if ($global:_goatty_psreadline) {
-    try {
-        if (-not $global:_goatty_exp_enter_bound) {
-            Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
-                _goatty_accept_line
-            } -ErrorAction SilentlyContinue
-        }
-    } catch {}
-}
+# Enter is bound once at the end of init.ps1 via `_goatty_enter_handler` so
+# expansions, transient prompt redraw, and OSC 133;C cooperate cleanly.
 
 # --- Command-line actions for goatty's right-click menu (OSC 7337) ----------
 $global:_goatty_zle_bound = $false

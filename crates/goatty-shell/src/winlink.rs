@@ -13,15 +13,15 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateDirectoryW, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -125,7 +125,7 @@ fn set_reparse_point(dir: &Path, buf: &[u8]) -> io::Result<()> {
 }
 
 fn is_reparse_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink_dir())
 }
 
 /// Create or atomically retarget an NTFS directory junction at `link` pointing to `target`.
@@ -235,11 +235,13 @@ mod tests {
 
         let link = tmp.path().join("current");
         replace_junction(&d1, &link).unwrap();
+        assert!(is_reparse_dir(&link), "existing junction must take the in-place update path");
         assert_eq!(std::fs::read_to_string(link.join("a.txt")).unwrap(), "one");
         assert_eq!(read_junction(&link).unwrap().file_name().unwrap(), "gen1");
 
         // In-place retargeting.
         replace_junction(&d2, &link).unwrap();
+        assert!(is_reparse_dir(&link));
         assert_eq!(std::fs::read_to_string(link.join("a.txt")).unwrap(), "two");
         assert_eq!(read_junction(&link).unwrap().file_name().unwrap(), "gen2");
 

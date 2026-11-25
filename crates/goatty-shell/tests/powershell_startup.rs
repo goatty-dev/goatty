@@ -135,3 +135,195 @@ fn powershell_quoted_command_line_survives_real_shell() {
     let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
     assert_eq!(stdout, format!("{nasty_a}\npre-{nasty_b}\n"));
 }
+
+/// Find every installed PowerShell binary (`pwsh.exe` and Windows PowerShell 5.1 `powershell.exe`)
+/// so compatibility tests verify both PS 7+ and the 5.1 fallback when present.
+fn all_powershells() -> Vec<String> {
+    let mut out = Vec::new();
+    for name in ["pwsh.exe", "powershell.exe"] {
+        if let Some(p) = goatty_shell::launch::which(name) {
+            let s = p.to_string_lossy().into_owned();
+            if !out.iter().any(|x: &String| x.eq_ignore_ascii_case(&s)) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn native_embedded_quotes_and_snippets_survive_pwsh_and_ps51() {
+    let shells = all_powershells();
+    if shells.is_empty() {
+        eprintln!("PowerShell not installed; skipping");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Helper script invoked via `-File` (native Win32 CommandLineToArgvW argv parsing).
+    let dump_args = tmp.path().join("dump_args.ps1");
+    std::fs::write(&dump_args, "foreach ($a in $args) { Write-Output ('ARG:' + $a) }\n").unwrap();
+    let dump_str = dump_args.to_string_lossy().into_owned();
+
+    let c = PaletteCommand {
+        id: "json-test".into(),
+        title: "JSON test".into(),
+        keywords: Vec::new(),
+        run: vec![
+            shells[0].clone(),
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-File".into(),
+            dump_str.clone(),
+            "{json}".into(),
+            "{spaced}".into(),
+            "plain".into(),
+        ],
+        keys: Vec::new(),
+        pane: None,
+        inputs: vec![
+            CommandInput {
+                id: "json".into(),
+                label: "JSON".into(),
+                placeholder: String::new(),
+                help: String::new(),
+                kind: InputKind::Text,
+                default: None,
+                optional: false,
+                min: None,
+                max: None,
+                pattern: None,
+                pattern_help: None,
+                choices: Vec::new(),
+                must_exist: false,
+                source: None,
+                strict: false,
+            },
+            CommandInput {
+                id: "spaced".into(),
+                label: "Spaced".into(),
+                placeholder: String::new(),
+                help: String::new(),
+                kind: InputKind::Text,
+                default: None,
+                optional: false,
+                min: None,
+                max: None,
+                pattern: None,
+                pattern_help: None,
+                choices: Vec::new(),
+                must_exist: false,
+                source: None,
+                strict: false,
+            },
+        ],
+        when: None,
+        open_in: OpenIn::Current,
+        menu: None,
+    };
+    let json_val = r#"{"name":"value"}"#;
+    let spaced_val = r#"{"msg": "hi \"there\""}"#;
+    let mut vals = BTreeMap::new();
+    vals.insert("json".into(), json_val.into());
+    vals.insert("spaced".into(), spaced_val.into());
+    let line = command_line_powershell(&c, &vals);
+
+    for ps in &shells {
+        let out = Command::new(ps)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &line])
+            .output()
+            .unwrap_or_else(|e| panic!("run {ps}: {e}"));
+        assert!(out.status.success(), "{ps} stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert_eq!(stdout, format!("ARG:{json_val}\nARG:{spaced_val}\nARG:plain\n"), "host={ps}, line={line}");
+    }
+
+    // Embedded snippet placeholders must arrive as single complete arguments.
+    let sn: goatty_plugin::snippets::Snippet = toml::from_str(&format!(
+        "id = \"emb\"\ntitle = \"Emb\"\nline = \"& '{}' -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '{}' --out={{dir}}/file.txt --tag=pre-{{x}}-post {{dir}}\"\n[[input]]\nid = \"dir\"\nlabel = \"Dir\"\ntype = \"folder\"\n[[input]]\nid = \"x\"\nlabel = \"X\"\n",
+        shells[0].replace('\'', "''"),
+        dump_str.replace('\'', "''"),
+    ))
+    .unwrap();
+    let mut sn_vals = BTreeMap::new();
+    sn_vals.insert("dir".into(), "~/src".into());
+    sn_vals.insert("x".into(), "a\u{2019}b".into());
+    let sn_line = sn.render_powershell(&sn_vals);
+    let out = Command::new(&shells[0])
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &sn_line])
+        .output()
+        .expect("run snippet");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "expected 3 args, got: {lines:?}\nline={sn_line}");
+    assert!(lines[0].starts_with("ARG:--out=") && lines[0].ends_with("/src/file.txt"), "{lines:?}");
+    assert_eq!(lines[1], "ARG:--tag=pre-a\u{2019}b-post");
+    assert!(lines[2].starts_with("ARG:") && lines[2].ends_with("src"), "{lines:?}");
+}
+
+#[test]
+fn reload_preserves_user_profile_definitions_and_bom_decodes_non_ascii() {
+    let shells = all_powershells();
+    if shells.is_empty() {
+        eprintln!("PowerShell not installed; skipping");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Include a non-ASCII directory segment so UTF-8 BOM decoding is exercised on PS 5.1.
+    let root = tmp.path().join("caf\u{00e9}-root");
+    let dirs = Dirs::under(&root);
+    std::fs::create_dir_all(dirs.user_ps_profile().parent().unwrap()).unwrap();
+    std::fs::write(
+        dirs.user_ps_profile(),
+        "function my_profile_fn { Write-Output 'fn-survived' }\n\
+         Set-Alias -Name my_profile_al -Value Write-Output\n\
+         $MyProfileVar = 'var-survived'\n",
+    )
+    .unwrap();
+
+    let mut host = HostSettings::default();
+    host.shell.program = Some(shells[0].clone());
+    // Add case-colliding expansion rules to ensure generated expansions.ps1 parses cleanly.
+    host.expansions.insert("exp-lower".into(), serde_json::json!({ "say": "all done", "to": "echo ok" }));
+    host.expansions.insert("exp-upper".into(), serde_json::json!({ "say": "all DONE", "to": "echo OK" }));
+    let eff = Effective::plain(host);
+
+    let launcher = Launcher::new(Some(dirs.clone()), None);
+    let launch = launcher.launch(&eff);
+    assert!(launch.managed);
+
+    let init = dirs.pwsh_dir().join("init.ps1");
+    let prof_path = dirs.user_ps_profile();
+    let prof_q = prof_path.to_string_lossy().replace('\'', "''");
+    // Initial `. init.ps1` loads v1, then we modify `profile.ps1` to define a brand-new
+    // function, alias, and variable (without `global:`) and call `goatty-reload`.
+    // They must survive after `goatty-reload` returns.
+    let script = format!(
+        ". '{}'; \
+         [System.IO.File]::WriteAllText('{}', \"function my_reloaded_fn {{ Write-Output 'fn-reloaded' }}`nSet-Alias -Name my_reloaded_al -Value Write-Output`n`$MyReloadedVar = 'var-reloaded'`n\"); \
+         goatty-reload; \
+         my_reloaded_fn; \
+         my_reloaded_al 'al-reloaded'; \
+         Write-Output $MyReloadedVar; \
+         Write-Output $global:_goatty_dir",
+        init.to_string_lossy().replace('\'', "''"),
+        prof_q,
+    );
+    for ps in &shells {
+        // Reset profile.ps1 to v1 before each shell run.
+        std::fs::write(&prof_path, "function my_profile_fn { Write-Output 'fn-v1' }\n").unwrap();
+        let out = Command::new(ps)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+            .output()
+            .unwrap_or_else(|e| panic!("run {ps}: {e}"));
+        assert!(out.status.success(), "{ps} stderr: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        assert!(stdout.contains("fn-reloaded"), "{ps}: {stdout}");
+        assert!(stdout.contains("al-reloaded"), "{ps}: {stdout}");
+        assert!(stdout.contains("var-reloaded"), "{ps}: {stdout}");
+        assert!(stdout.contains("caf\u{00e9}-root"), "{ps} should decode non-ASCII path via UTF-8 BOM: {stdout}");
+    }
+}

@@ -755,6 +755,9 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
             err("compat.shells".into(), format!("unknown shell {sh:?}"));
         }
     }
+    if !m.powershell.is_empty() && !m.shells().contains(&"powershell") {
+        err("compat.shells".into(), "include \"powershell\" in compat.shells when declaring a [powershell] section".into());
+    }
     for c in &m.requires.commands {
         if !is_plain(c) {
             err("requires.commands".into(), format!("{c:?} is not a command name"));
@@ -1298,6 +1301,11 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
         // Non-.ps1 init is rejected.
         let bad = text.replace("pwsh/init.ps1", "pwsh/init.zsh");
         assert!(problems(&bad).iter().any(|p| p.contains("powershell.init")), "{:?}", problems(&bad));
+        // Declaring [powershell] without "powershell" in compat.shells is rejected at load time.
+        let missing_shell = text.replace("shells = [\"powershell\"]", "shells = [\"zsh\"]");
+        assert!(problems(&missing_shell).iter().any(|p| p.contains("compat.shells")), "{:?}", problems(&missing_shell));
+        let omitted_shells = text.replace("shells = [\"powershell\"]\n", "");
+        assert!(problems(&omitted_shells).iter().any(|p| p.contains("compat.shells")), "{:?}", problems(&omitted_shells));
         // Missing file is rejected when file list is provided.
         let missing = parse(&text, Some(&BTreeSet::new())).unwrap_err().0;
         assert!(missing.iter().any(|p| p.path == "powershell.init"), "{missing:?}");

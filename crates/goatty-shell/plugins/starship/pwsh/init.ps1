@@ -31,11 +31,10 @@ if (-not [string]::IsNullOrEmpty($_goatty_ss_file) -and (Test-Path -LiteralPath 
 }
 
 # Transient prompt: shrink older prompts to a single character once a command runs.
-if ($global:_goatty_prompt_transient -and (Get-Command -Name 'Enable-TransientPrompt' -ErrorAction SilentlyContinue)) {
-    function global:Invoke-Starship-TransientFunction {
-        if ($?) { $global:_goatty_transient_ok } else { $global:_goatty_transient_err }
-    }
-    try { Enable-TransientPrompt } catch {}
+# Handled by goatty's shared Enter handler and prompt wrapper (init.ps1 / integration.ps1)
+# so expansions, transient redraw, and OSC 133;C cooperate without clobbering Enter.
+if ($global:_goatty_prompt_transient) {
+    $global:_goatty_transient_active = $true
 }
 
 Remove-Variable -Name _goatty_ss_cfg, _goatty_ss_key, _goatty_ss_file -ErrorAction SilentlyContinue

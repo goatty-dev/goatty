@@ -47,14 +47,14 @@ $global:_goatty_fzf_cfg = @{
 
 function global:_goatty_ps_quote_arg([string]$s) {
     if ([string]::IsNullOrEmpty($s)) { return "''" }
-    if ($s -match '^[A-Za-z0-9_./=+\\:-]+$' -and (-not $s.StartsWith('.'))) {
+    if ($s -match '^[A-Za-z0-9_./=+\\:-]+$' -and (-not $s.StartsWith('.')) -and (-not $s.StartsWith('-'))) {
         return $s
     }
     return "'" + $s.Replace("'", "''") + "'"
 }
 
 if ($global:_goatty_psreadline) {
-    # Ctrl+R: fuzzy search PSReadLine history (newest first, deduplicated).
+    # Ctrl+R: fuzzy search PSReadLine history (multiline-aware, newest first, deduplicated).
     Set-PSReadLineKeyHandler -Chord 'Ctrl+r' -BriefDescription 'goatty fzf history search' -ScriptBlock {
         param($key, $arg)
         $line = $null
@@ -65,19 +65,47 @@ if ($global:_goatty_psreadline) {
             return
         }
         $raw = [System.IO.File]::ReadAllLines($histPath)
+        # Reconstruct PSReadLine multiline records (physical lines ending with `` ` `` continue onto the next line).
+        $cmds = New-Object System.Collections.Generic.List[string]
+        $buf = New-Object System.Text.StringBuilder
+        foreach ($phys in $raw) {
+            if ($phys.EndsWith('`')) {
+                [void]$buf.Append($phys.Substring(0, $phys.Length - 1))
+                [void]$buf.Append("`n")
+            } else {
+                [void]$buf.Append($phys)
+                $cmds.Add($buf.ToString())
+                [void]$buf.Clear()
+            }
+        }
+        if ($buf.Length -gt 0) {
+            $cmds.Add($buf.ToString().TrimEnd("`n"))
+        }
+
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        $unique = New-Object System.Collections.Generic.List[string]
         $items = New-Object System.Collections.Generic.List[string]
-        for ($i = $raw.Length - 1; $i -ge 0; $i--) {
-            $entry = $raw[$i]
+        for ($i = $cmds.Count - 1; $i -ge 0; $i--) {
+            $entry = $cmds[$i]
             if (-not [string]::IsNullOrWhiteSpace($entry) -and $seen.Add($entry)) {
-                $items.Add($entry)
+                $idx = $unique.Count
+                $unique.Add($entry)
+                $display = $entry.Replace("`r", '').Replace("`n", ' ').Replace("`t", ' ')
+                $items.Add("$idx`t$display")
             }
         }
         if ($items.Count -eq 0) { return }
-        $selected = $items | & fzf --scheme=history --no-sort --query $line
+        $queryArg = _goatty_ps_native_arg "--query=$line"
+        $selected = $items | & fzf --scheme=history --no-sort "--delimiter=`t" --with-nth=2.. $queryArg
         if (-not [string]::IsNullOrEmpty($selected)) {
-            $chosen = ($selected -join "`n")
-            [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $chosen)
+            $first = @($selected)[0]
+            $tabIdx = $first.IndexOf("`t")
+            if ($tabIdx -gt 0) {
+                $idx = 0
+                if ([int]::TryParse($first.Substring(0, $tabIdx), [ref]$idx) -and $idx -ge 0 -and $idx -lt $unique.Count) {
+                    [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $unique[$idx])
+                }
+            }
         }
         [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
     } -ErrorAction SilentlyContinue
@@ -90,7 +118,7 @@ if ($global:_goatty_psreadline) {
         $fzfArgs.Add('-m')
         if ($cfg.previews -and (-not [string]::IsNullOrEmpty($cfg.bat))) {
             $theme = if ([string]::IsNullOrEmpty($env:BAT_THEME)) { 'ansi' } else { $env:BAT_THEME }
-            $fzfArgs.Add("--preview=`"$($cfg.bat)`" --color=always --style=numbers --line-range=:200 --theme=$theme -- {}")
+            $fzfArgs.Add((_goatty_ps_native_arg "--preview=`"$($cfg.bat)`" --color=always --style=numbers --line-range=:200 --theme=$theme -- {}"))
         }
         $selected = $null
         if (-not [string]::IsNullOrEmpty($cfg.fd)) {
@@ -110,7 +138,11 @@ if ($global:_goatty_psreadline) {
             $selected = & fzf @fzfArgs
         }
         if ($selected) {
-            $quoted = @($selected | Where-Object { -not [string]::IsNullOrEmpty($_) } | ForEach-Object { _goatty_ps_quote_arg $_ })
+            $quoted = @($selected | Where-Object { -not [string]::IsNullOrEmpty($_) } | ForEach-Object {
+                $p = [string]$_
+                if ($p.StartsWith('-')) { $p = ".\$p" }
+                _goatty_ps_quote_arg $p
+            })
             if ($quoted.Count -gt 0) {
                 [Microsoft.PowerShell.PSConsoleReadLine]::Insert(($quoted -join ' ') + ' ')
             }
@@ -124,7 +156,7 @@ if ($global:_goatty_psreadline) {
         $cfg = $global:_goatty_fzf_cfg
         $fzfArgs = New-Object System.Collections.Generic.List[string]
         if ($cfg.previews -and (-not [string]::IsNullOrEmpty($cfg.eza))) {
-            $fzfArgs.Add("--preview=`"$($cfg.eza)`" -1 --icons=always --color=always --group-directories-first -- {}")
+            $fzfArgs.Add((_goatty_ps_native_arg "--preview=`"$($cfg.eza)`" -1 --icons=always --color=always --group-directories-first -- {}"))
         }
         $selected = $null
         if (-not [string]::IsNullOrEmpty($cfg.fd)) {

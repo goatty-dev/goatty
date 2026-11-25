@@ -685,6 +685,7 @@ pub fn command_line(c: &PaletteCommand, values: &BTreeMap<String, String>) -> St
 /// quoting arguments with PowerShell single-quote escaping (`''`) and adding
 /// the `&` call operator when the program name requires quoting (#278).
 pub fn command_line_powershell(c: &PaletteCommand, values: &BTreeMap<String, String>) -> String {
+    let is_cmdlet = c.run.first().is_some_and(|p| crate::powershell::is_ps_cmdlet(p));
     let mut words = Vec::new();
     for (i, t) in c.run.iter().enumerate() {
         if i == 0 {
@@ -734,9 +735,17 @@ pub fn command_line_powershell(c: &PaletteCommand, values: &BTreeMap<String, Str
             if !text.is_empty() {
                 exprs.push(crate::powershell::quote(&text));
             }
-            words.push(format!("({})", exprs.join(" + ")));
-        } else {
+            let modern = format!("({})", exprs.join(" + "));
+            if !is_cmdlet && exprs.iter().any(|e| e.contains('"')) {
+                let cond = crate::powershell::LEGACY_NATIVE_COND;
+                words.push(format!("$(if ({cond}) {{ [regex]::Replace({modern}, '(\\\\*)\"', '$1$1\\\"') }} else {{ {modern} }})"));
+            } else {
+                words.push(modern);
+            }
+        } else if is_cmdlet {
             words.push(crate::powershell::word(&text));
+        } else {
+            words.push(crate::powershell::native_word(&text));
         }
     }
     words.join(" ")
@@ -1564,5 +1573,12 @@ optional = true
         v.insert("dir".into(), "~".into());
         v.insert("filter".into(), String::new());
         assert_eq!(command_line_powershell(&c, &v), "eza --level=2 $HOME");
+
+        // Embedded double quotes get a legacy PowerShell 5.1 native-argument
+        // compatibility path, while ordinary literal arguments stay unchanged.
+        v.insert("filter".into(), r#"{"name":"value"}"#.into());
+        let json_line = command_line_powershell(&c, &v);
+        assert!(json_line.contains(r#"'{\"name\":\"value\"}'"#), "{json_line}");
+        assert!(json_line.contains(r#"'{"name":"value"}'"#), "{json_line}");
     }
 }

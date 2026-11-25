@@ -242,7 +242,7 @@ impl HostLink {
     pub fn reload_shells(&self) -> Result<u32> {
         Ok(match self {
             HostLink::Daemon(c) => c.reload_shells()?,
-            HostLink::Local(s) => u32::try_from(s.reload_shells()).unwrap_or(u32::MAX),
+            HostLink::Local(s) => u32::try_from(s.reload_shells()?).unwrap_or(u32::MAX),
         })
     }
 }

@@ -108,6 +108,9 @@ impl HostService {
         if let Some(dirs) = self.launcher.dirs() {
             issues.extend(crate::plugins::active(dirs, value).1);
         }
+        if cfg!(windows) {
+            issues.extend(crate::aliases::powershell_issues(value));
+        }
         issues.extend(crate::launch::program_issue(value.shell.program.as_deref()).map(|i| i.to_string()));
         issues
     }
@@ -280,7 +283,7 @@ impl HostService {
     /// by default, so a process that isn't our zsh (the user ran
     /// `exec bash`, or the pid was reused) is unaffected. Returns how many
     /// shells were signaled.
-    pub fn reload_shells(&self) -> usize {
+    pub fn reload_shells(&self) -> Result<usize> {
         #[cfg(unix)]
         {
             let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
@@ -291,7 +294,7 @@ impl HostService {
                 unsafe { libc::kill(pid, libc::SIGURG) == 0 }
             });
             log::info!("asked {} managed shell(s) to reload", shells.len());
-            shells.len()
+            Ok(shells.len())
         }
         #[cfg(not(unix))]
         {
@@ -300,18 +303,16 @@ impl HostService {
             if let Some(dirs) = self.launcher.dirs() {
                 let sentinel = dirs.reload_sentinel();
                 if let Some(parent) = sentinel.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    std::fs::create_dir_all(parent).with_context(|| format!("create reload sentinel directory {}", parent.display()))?;
                 }
                 let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
                 let seq = SEQ.fetch_add(1, Ordering::Relaxed);
                 let token = format!("{nanos}-{seq}\n");
-                if let Err(e) = std::fs::write(&sentinel, token) {
-                    log::warn!("couldn't write reload sentinel {}: {e}", sentinel.display());
-                }
+                std::fs::write(&sentinel, token).with_context(|| format!("write reload sentinel {}", sentinel.display()))?;
             }
             let count = self.shells.lock().unwrap_or_else(|e| e.into_inner()).len();
             log::info!("updated reload sentinel for {count} tracked managed shell(s)");
-            count
+            Ok(count)
         }
     }
 
@@ -376,13 +377,18 @@ mod tests {
         let dirs = Dirs::under(tmp.path());
         let svc = HostService::new(Launcher::new(Some(dirs.clone()), None), Some(dirs.host_file()));
         svc.track_shell(42);
-        assert_eq!(svc.reload_shells(), 1);
+        assert_eq!(svc.reload_shells().unwrap(), 1);
         let first = std::fs::read_to_string(dirs.reload_sentinel()).unwrap();
-        assert_eq!(svc.reload_shells(), 1);
+        assert_eq!(svc.reload_shells().unwrap(), 1);
         let second = std::fs::read_to_string(dirs.reload_sentinel()).unwrap();
         assert_ne!(first, second, "each reload writes a fresh token");
         svc.untrack_shell(42);
-        assert_eq!(svc.reload_shells(), 0);
+        assert_eq!(svc.reload_shells().unwrap(), 0);
+
+        // Sentinel write failure propagates instead of reporting success.
+        std::fs::remove_file(dirs.reload_sentinel()).unwrap();
+        std::fs::create_dir_all(dirs.reload_sentinel()).unwrap();
+        assert!(svc.reload_shells().is_err());
     }
 
     #[cfg(unix)]

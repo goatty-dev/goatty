@@ -256,7 +256,7 @@ pub(crate) fn tree(dir: &Path) -> Tree {
             let path = e.path();
             if path.is_dir() {
                 go(&path, &rel, out);
-            } else if let Ok(text) = std::fs::read_to_string(&path) {
+            } else if let Ok(text) = crate::generation::read_generated_text(&path, &rel) {
                 out.insert(rel, text);
             }
         }

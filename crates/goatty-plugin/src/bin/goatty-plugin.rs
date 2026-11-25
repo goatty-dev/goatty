@@ -216,9 +216,9 @@ fn render(dir: &Path, set: &[String], shell: &str) -> Result<()> {
     for (k, msg) in issues {
         eprintln!("warning: {k}: {msg}");
     }
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
     match shell {
         "zsh" => {
+            let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
             let r = zsh::render(
                 &m,
                 &values,
@@ -237,6 +237,7 @@ fn render(dir: &Path, set: &[String], shell: &str) -> Result<()> {
             }
         }
         "powershell" | "pwsh" => {
+            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok();
             let r = powershell::render(
                 &m,
                 &values,

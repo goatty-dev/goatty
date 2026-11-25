@@ -42,6 +42,19 @@ function global:_goatty_on([string]$name) {
     return ($global:_goatty_features -contains $name)
 }
 
+# Escape native executable arguments containing embedded double quotes (or
+# whitespace + trailing backslashes) for Windows PowerShell 5.1 / PowerShell < 7.3
+# legacy argument passing while keeping PowerShell 7.3+ arguments untouched.
+function global:_goatty_ps_native_arg([string]$s) {
+    if ($PSVersionTable.PSVersion.Major -lt 7 -or ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 3) -or $PSNativeCommandArgumentPassing -eq 'Legacy') {
+        $s = [regex]::Replace($s, '(\\*)"', '$1$1\"')
+        if ($s -match '\s') {
+            $s = [regex]::Replace($s, '(\\+)$', '$1$1')
+        }
+    }
+    return $s
+}
+
 # Cache a tool's PowerShell init output under $_goatty_cache\init\<name>-<hash>.ps1,
 # keyed on PowerShell version, resolved executable path/size/mtime, extra key, and args.
 # Returns the cache file path, or $null if the command failed.
@@ -103,8 +116,8 @@ function global:_goatty_cached_init {
             New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
         }
         $tmpFile = Join-Path $cacheDir ".tmp-$Name-$tag-$PID.ps1"
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($tmpFile, "$key`n$code`n", $utf8)
+        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        [System.IO.File]::WriteAllText($tmpFile, "$key`n$code`n", $utf8Bom)
         Move-Item -LiteralPath $tmpFile -Destination $cacheFile -Force
         # Prune stale cache entries for the same tool name.
         Get-ChildItem -LiteralPath $cacheDir -Filter "$Name-*.ps1" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -209,11 +222,51 @@ try {
     }
 } catch {}
 
-# Shared AcceptLine helper so integration (OSC 133;C) and expansions cooperate cleanly.
+# Shared AcceptLine and Enter handler so expansions, transient prompt redraw,
+# and shell integration (OSC 133;C) cooperate without clobbering each other.
 $global:_goatty_running = $false
 $global:_goatty_marks = $false
+$global:_goatty_exp_active = $false
+$global:_goatty_transient_active = $false
+$global:_goatty_render_transient = $false
+$global:_goatty_transient_last_ok = $true
+
+function global:_goatty_input_incomplete {
+    try {
+        $ast = $null; $tokens = $null; $parseErrors = $null; $cursor = $null
+        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$ast, [ref]$tokens, [ref]$parseErrors, [ref]$cursor)
+        if ($parseErrors) {
+            foreach ($e in $parseErrors) {
+                if ($e.IncompleteInput) { return $true }
+            }
+        }
+    } catch {}
+    return $false
+}
+
 function global:_goatty_accept_line {
-    if ($global:_goatty_marks) {
+    if ($global:_goatty_marks -and (-not (_goatty_input_incomplete))) {
+        $esc = [char]27
+        $bel = [char]7
+        [Console]::Write("$esc]133;C$bel")
+        $global:_goatty_running = $true
+    }
+    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+}
+
+function global:_goatty_enter_handler {
+    param($key, $arg)
+    $line = $null; $cursor = $null
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+    if ($global:_goatty_exp_active -and $cursor -eq $line.Length -and (_goatty_exp_apply)) {
+        return
+    }
+    $incomplete = _goatty_input_incomplete
+    if ($global:_goatty_transient_active -and $global:_goatty_prompt_transient -and (-not $incomplete)) {
+        $global:_goatty_render_transient = $true
+        [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+    }
+    if ($global:_goatty_marks -and (-not $incomplete)) {
         $esc = [char]27
         $bel = [char]7
         [Console]::Write("$esc]133;C$bel")
@@ -260,8 +313,16 @@ if (Test-Path -LiteralPath $_goatty_pr) { . $_goatty_pr }
 
 # Fallback prompt when no prompt plugin loaded.
 if (-not $global:_goatty_prompt) {
+    if ($global:_goatty_prompt_transient) {
+        $global:_goatty_transient_active = $true
+    }
     function global:prompt {
+        if ($global:_goatty_render_transient) {
+            $global:_goatty_render_transient = $false
+            return $(if ($global:_goatty_transient_last_ok) { $global:_goatty_transient_ok } else { $global:_goatty_transient_err })
+        }
         $ok = $?
+        $global:_goatty_transient_last_ok = $ok
         $esc = [char]27
         $cwd = $executionContext.SessionState.Path.CurrentLocation.Path
         if ($HOME -and $cwd.StartsWith($HOME, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -289,6 +350,31 @@ if ((_goatty_on 'integration') -and (Test-Path -LiteralPath (Join-Path $_goatty_
     _goatty_ok 'integration' (Join-Path $_goatty_dir 'integration.ps1')
 } else {
     $global:_goatty_state['integration'] = 'off'
+    # When integration is off but a prompt plugin (e.g. Starship) has transient
+    # prompt enabled, wrap `prompt` lightly so `_goatty_render_transient` works.
+    if ($global:_goatty_transient_active -and $global:_goatty_prompt_transient -and $global:_goatty_prompt) {
+        if (($null -eq $global:_goatty_inner_prompt_fn) -or ($function:prompt.ToString() -notlike '*_goatty_transient_wrapper*')) {
+            $global:_goatty_inner_prompt_fn = $function:prompt
+        }
+        function global:prompt {
+            # marker: _goatty_transient_wrapper
+            if ($global:_goatty_render_transient) {
+                $global:_goatty_render_transient = $false
+                return $(if ($global:_goatty_transient_last_ok) { $global:_goatty_transient_ok } else { $global:_goatty_transient_err })
+            }
+            $lastOk = $?
+            $lastExit = $global:LASTEXITCODE
+            $global:_goatty_transient_last_ok = $lastOk
+            $inner = $global:_goatty_inner_prompt_fn
+            if ($inner) {
+                if ($lastOk) { $null = $true } else { $global:LASTEXITCODE = if ($null -ne $lastExit -and $lastExit -ne 0) { $lastExit } else { 1 } }
+                $out = & $inner
+                $global:LASTEXITCODE = $lastExit
+                return $out
+            }
+            return "PS $($executionContext.SessionState.Path.CurrentLocation)> "
+        }
+    }
 }
 
 # --- User's goatty-only additions (%APPDATA%\goatty\profile.ps1) ------------
@@ -300,6 +386,17 @@ $global:_goatty_path_marks.Add("additions`t$env:PATH")
 # --- Plugins: last slot (syntax highlighting) -------------------------------
 $_goatty_last = Join-Path $_goatty_dir 'plugins-last.ps1'
 if (Test-Path -LiteralPath $_goatty_last) { . $_goatty_last }
+
+# Bind Enter once after expansions, prompt, integration, and plugins have all
+# loaded so nothing clobbers the shared handler.
+if ($global:_goatty_psreadline -and ($global:_goatty_exp_active -or $global:_goatty_marks -or ($global:_goatty_transient_active -and $global:_goatty_prompt_transient))) {
+    try {
+        Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+            param($key, $arg)
+            _goatty_enter_handler $key $arg
+        } -ErrorAction SilentlyContinue
+    } catch {}
+}
 
 # Record reload sentinel timestamp at startup so prompt detects `goattyd shell reload`.
 $global:_goatty_reload_seen = ''
@@ -335,9 +432,44 @@ function global:_goatty_outdated_tools {
 }
 
 function global:goatty-reload {
-    $entry = Join-Path $global:_goatty_dir 'init.ps1'
-    if (Test-Path -LiteralPath $entry) {
-        . $entry
+    $_gr_entry = Join-Path $global:_goatty_dir 'init.ps1'
+    if (-not (Test-Path -LiteralPath $_gr_entry)) {
+        return
+    }
+    # Snapshot visible functions and local variables before dot-sourcing so any
+    # non-global functions, aliases, or variables defined by the user's $PROFILE,
+    # profile.ps1, or plugin init scripts are promoted to global scope instead of
+    # disappearing when goatty-reload returns.
+    $_gr_pre_fns = New-Object System.Collections.Hashtable([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($_gr_f in (Get-ChildItem -Path 'Function:' -ErrorAction SilentlyContinue)) {
+        $_gr_pre_fns[$_gr_f.Name] = $_gr_f.ScriptBlock
+    }
+    $_gr_skip_vars = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($_gr_v in (Get-Variable -Scope Local -ErrorAction SilentlyContinue)) {
+        [void]$_gr_skip_vars.Add($_gr_v.Name)
+    }
+    foreach ($_gr_auto in @('?', '^', '$', '_', 'LASTEXITCODE', 'Matches', 'foreach', 'switch', 'input', 'args', 'this', 'MyInvocation', 'PSBoundParameters', 'PSCmdlet', 'PSScriptRoot', 'PSCommandPath', 'Error', 'null', 'true', 'false', 'PWD', 'HOME', 'PID', 'Host', 'PROFILE', 'PSVersionTable', 'ExecutionContext')) {
+        [void]$_gr_skip_vars.Add($_gr_auto)
+    }
+
+    . $_gr_entry
+
+    foreach ($_gr_f in (Get-ChildItem -Path 'Function:' -ErrorAction SilentlyContinue)) {
+        if ((-not $_gr_pre_fns.ContainsKey($_gr_f.Name)) -or (-not [object]::ReferenceEquals($_gr_pre_fns[$_gr_f.Name], $_gr_f.ScriptBlock))) {
+            Set-Item -LiteralPath ("Function:global:" + $_gr_f.Name) -Value $_gr_f.ScriptBlock -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($_gr_a in (Get-Alias -Scope Local -ErrorAction SilentlyContinue)) {
+        Set-Alias -Name $_gr_a.Name -Value $_gr_a.Definition -Scope Global -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($_gr_v in (Get-Variable -Scope Local -ErrorAction SilentlyContinue)) {
+        if ($_gr_skip_vars.Contains($_gr_v.Name) -or $_gr_v.Name.StartsWith('_goatty_') -or $_gr_v.Name.StartsWith('_gr_')) {
+            continue
+        }
+        if (($_gr_v.Options -band [System.Management.Automation.ScopedItemOptions]::Constant) -ne 0) {
+            continue
+        }
+        Set-Variable -Name $_gr_v.Name -Value $_gr_v.Value -Scope Global -Force -ErrorAction SilentlyContinue
     }
 }
 

@@ -75,10 +75,10 @@ if ($global:_goatty_psreadline) {
         $fzfArgs.Add('--with-nth=2')
         if ($cfg.previews) {
             if ($allDirs -and (-not [string]::IsNullOrEmpty($cfg.eza))) {
-                $fzfArgs.Add("--preview=`"$($cfg.eza)`" -1 --icons=always --color=always --group-directories-first -- {3}")
+                $fzfArgs.Add((_goatty_ps_native_arg "--preview=`"$($cfg.eza)`" -1 --icons=always --color=always --group-directories-first -- {3}"))
             } elseif ($allFiles -and (-not [string]::IsNullOrEmpty($cfg.bat))) {
                 $theme = if ([string]::IsNullOrEmpty($env:BAT_THEME)) { 'ansi' } else { $env:BAT_THEME }
-                $fzfArgs.Add("--preview=`"$($cfg.bat)`" --color=always --style=numbers --line-range=:200 --theme=$theme -- {3}")
+                $fzfArgs.Add((_goatty_ps_native_arg "--preview=`"$($cfg.bat)`" --color=always --style=numbers --line-range=:200 --theme=$theme -- {3}"))
             }
         }
 
