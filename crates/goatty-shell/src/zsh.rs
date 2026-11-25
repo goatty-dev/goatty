@@ -127,7 +127,7 @@ fn render_plugins(cfg: &ZshConfig<'_>) -> Vec<GeneratedFile> {
         let id = &a.manifest.id;
         // Shipped files first: a plugin whose files don't check out is left out entirely.
         let mut shipped = Vec::new();
-        let checked: Result<(), String> = a.shell_files().into_iter().try_for_each(|rel| {
+        let checked: Result<(), String> = a.shell_files_for("zsh").into_iter().try_for_each(|rel| {
             let bytes = a.read(cfg.dirs, &rel).map_err(|e| format!("{e:#}"))?;
             let text = String::from_utf8(bytes).map_err(|_| format!("{id}: {rel} isn't text"))?;
             shipped.push(GeneratedFile::new(format!("plugins/{id}/{rel}"), text));
@@ -243,7 +243,7 @@ pub fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

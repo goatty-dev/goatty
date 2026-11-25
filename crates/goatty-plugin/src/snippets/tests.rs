@@ -416,3 +416,33 @@ fn the_table_is_quoted_data() {
     let out = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out, format!("{}\n$'| y \\'$(rm -rf ~)\\' \\C-A2\\C-A'\n1 2\n", rules[1].re), "zsh's (q+) shows \\x01 as \\C-A");
 }
+
+#[test]
+fn powershell_snippet_and_expansion_table() {
+    let s = snippet(
+        r#"
+id = "find-name"
+title = "Find by name"
+line = "find {dir} -iname {pattern}"
+[[input]]
+id = "dir"
+label = "Dir"
+type = "folder"
+[[input]]
+id = "pattern"
+label = "Pattern"
+"#,
+    );
+    let rendered = s.render_powershell(&values(&[("dir", "~/my dir"), ("pattern", "it's $(bad)")]));
+    assert_eq!(rendered, "find (Join-Path $HOME 'my dir') -iname 'it''s $(bad)'");
+
+    let e =
+        |say: &str, to: &str| compile(&Expansion { say: say.into(), to: to.into(), description: String::new(), inputs: BTreeMap::new() });
+    let rules = vec![e("| sorted nicely", "| sort").unwrap(), e("| x {w} nicely", "| y '$(rm -rf ~)' {w}").unwrap()];
+    let t = render_table_powershell(&rules);
+    assert!(t.contains("$global:_goatty_exp_re = @("), "{t}");
+    assert!(t.contains(r"\s+"), "POSIX [[:space:]] converted to .NET \\s: {t}");
+    assert!(!t.contains("[[:space:]]"), "{t}");
+    assert!(t.contains("$global:_goatty_exp_last = @{"), "{t}");
+    assert!(t.contains("'nicely' = @(0, 1)"), "0-based indices for PowerShell: {t}");
+}

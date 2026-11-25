@@ -488,17 +488,24 @@ impl Snippet {
     /// quoted word (several for a `multiple` input), `~/` kept expandable,
     /// empty optional values left out with their space.
     pub fn render(&self, values: &Answers) -> String {
-        let segs = self.segments(values, None, true);
+        let segs = self.segments(values, None, true, false);
+        tidy(&segs.iter().map(Seg::text).collect::<String>())
+    }
+
+    /// Like [`render`](Self::render), quoting placeholder values for
+    /// PowerShell (single-quote escaping `''`, `$HOME` for `~/` paths) (#278).
+    pub fn render_powershell(&self, values: &Answers) -> String {
+        let segs = self.segments(values, None, true, true);
         tidy(&segs.iter().map(Seg::text).collect::<String>())
     }
 
     /// The line for showing while values are asked: filled values, blanks
     /// as `‹label›` (`current` marks the one being asked).
     pub fn preview(&self, values: &Answers, current: Option<&str>) -> Vec<Seg> {
-        self.segments(values, current, false)
+        self.segments(values, current, false, false)
     }
 
-    fn segments(&self, values: &Answers, current: Option<&str>, done: bool) -> Vec<Seg> {
+    fn segments(&self, values: &Answers, current: Option<&str>, done: bool, powershell: bool) -> Vec<Seg> {
         let Ok(pieces) = self.pieces() else { return vec![Seg::Text(self.line.clone())] };
         let mut out: Vec<Seg> = Vec::new();
         for p in pieces {
@@ -507,7 +514,7 @@ impl Snippet {
                 Piece::Var { name, start, end } => {
                     let Some(input) = self.input(&name) else { continue };
                     let value = values.get(&name);
-                    let text = value.map(|v| render_value(input, v, start)).unwrap_or_default();
+                    let text = value.map(|v| render_value(input, v, start, powershell)).unwrap_or_default();
                     if text.is_empty() {
                         let answered = value.is_some() && (done || input.optional || input.kind == InputKind::Flag);
                         if answered || done {
@@ -566,7 +573,7 @@ impl Snippet {
 }
 
 /// One value as it goes into the line.
-fn render_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
+fn render_value(input: &SnippetInput, value: &str, word_start: bool, powershell: bool) -> String {
     match input.kind {
         InputKind::Flag => {
             if value == "yes" {
@@ -575,17 +582,32 @@ fn render_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
                 String::new()
             }
         }
-        _ if input.multiple => value.split('\n').filter(|v| !v.is_empty()).map(|v| one_value(input, v, true)).collect::<Vec<_>>().join(" "),
+        _ if input.multiple => {
+            value.split('\n').filter(|v| !v.is_empty()).map(|v| one_value(input, v, true, powershell)).collect::<Vec<_>>().join(" ")
+        }
         _ if value.is_empty() => String::new(),
-        _ => one_value(input, value, word_start),
+        _ => one_value(input, value, word_start, powershell),
     }
 }
 
-fn one_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
+fn one_value(input: &SnippetInput, value: &str, word_start: bool, powershell: bool) -> String {
     if input.raw() {
         return value.to_string();
     }
     let path = matches!(input.kind, InputKind::Path | InputKind::Folder);
+    if powershell {
+        if let Some(rest) = value.strip_prefix('~').filter(|r| path && (r.is_empty() || r.starts_with('/') || r.starts_with('\\'))) {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            return if rest.is_empty() {
+                "$HOME".to_string()
+            } else if word_start {
+                format!("(Join-Path $HOME {})", crate::powershell::quote(rest))
+            } else {
+                format!("($HOME + {})", crate::powershell::quote(&format!("/{rest}")))
+            };
+        }
+        return crate::powershell::word(value);
+    }
     if let Some(rest) = value.strip_prefix('~').filter(|r| path && (r.is_empty() || r.starts_with('/'))) {
         let rest = rest.trim_start_matches('/');
         // A tilde only expands at the start of a word.
@@ -1369,6 +1391,34 @@ pub fn render_table(rules: &[Compiled]) -> String {
         }
         let pairs: Vec<String> = by.iter().map(|(k, v)| format!("{} {}", crate::zsh::quote(k), crate::zsh::quote(&v.join(" ")))).collect();
         out.push_str(&format!("typeset -gA {name}=({})\n", pairs.join(" ")));
+    }
+    out
+}
+
+/// Convert a [`Compiled::re`] POSIX ERE into an equivalent .NET regex for PowerShell.
+fn dotnet_regex(re: &str) -> String {
+    re.replace("[^[:space:]]", r"\S").replace("[[:space:]]", r"\s")
+}
+
+/// `expansions.ps1`: the table goatty's PowerShell expansion handlers
+/// (`goatty-shell/pwsh/expand.ps1`) read, in priority order. Data only:
+/// every string is quoted with [`crate::powershell::quote`].
+pub fn render_table_powershell(rules: &[Compiled]) -> String {
+    let mut out = String::from(
+        "# goatty expansions: generated from the plugins' [[expansion]] and host.json's expansions.\n# Change them in goatty's settings window (Snippets).\n",
+    );
+    let list = |f: &dyn Fn(&Compiled) -> String| rules.iter().map(f).collect::<Vec<_>>().join(", ");
+    out.push_str(&format!("$global:_goatty_exp_re = @({})\n", list(&|r| crate::powershell::quote(&dotnet_regex(&r.re)))));
+    out.push_str(&format!("$global:_goatty_exp_to = @({})\n", list(&|r| crate::powershell::quote(&r.to))));
+    out.push_str(&format!("$global:_goatty_exp_say = @({})\n", list(&|r| crate::powershell::quote(&r.say))));
+    // 0-based indices for PowerShell arrays.
+    for (name, trailing) in [("_goatty_exp_last", false), ("_goatty_exp_last2", true)] {
+        let mut by: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (i, r) in rules.iter().enumerate().filter(|(_, r)| r.trailing == trailing) {
+            by.entry(r.last.as_str()).or_default().push(i.to_string());
+        }
+        let pairs: Vec<String> = by.iter().map(|(k, v)| format!("{} = @({})", crate::powershell::quote(k), v.join(", "))).collect();
+        out.push_str(&format!("$global:{name} = @{{ {} }}\n", pairs.join("; ")));
     }
     out
 }

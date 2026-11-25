@@ -12,6 +12,10 @@ publisher = "goatty"
 license = "MIT"
 keywords = ["snippets", "beginner", "cheatsheet", "expansions", "help"]
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [requires]
 # The process list for "Stop a running program".
 commands = ["ps"]

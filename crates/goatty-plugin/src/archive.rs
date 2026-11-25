@@ -42,8 +42,12 @@ pub fn executables(format: AssetFormat, bytes: &[u8], limit: usize) -> Result<Ve
             let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).context("read the .zip")?;
             for i in 0..zip.len() {
                 let f = zip.by_index_raw(i)?;
-                if out.len() < limit && f.is_file() && f.unix_mode().is_some_and(|m| m & 0o111 != 0) {
-                    out.push(f.name()?.into_owned());
+                if out.len() < limit && f.is_file() {
+                    let name = f.name()?;
+                    let is_exec = f.unix_mode().is_some_and(|m| m & 0o111 != 0) || name.to_ascii_lowercase().ends_with(".exe");
+                    if is_exec {
+                        out.push(name.into_owned());
+                    }
                 }
             }
         }
@@ -144,6 +148,18 @@ pub(crate) mod tests {
         }
         assert!(unpack(AssetFormat::Zip, &pack(AssetFormat::TarGz, &[("a", b"a", 0o644)]), dir.path()).is_err());
         assert!(unpack(AssetFormat::Binary, b"x", dir.path()).is_err());
+    }
+
+    #[test]
+    fn detects_windows_exe_in_zip_without_unix_mode() {
+        let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        z.start_file("starship.exe", opts).unwrap();
+        z.write_all(b"MZ").unwrap();
+        z.start_file("README.md", opts).unwrap();
+        z.write_all(b"docs").unwrap();
+        let bytes = z.finish().unwrap().into_inner();
+        assert_eq!(executables(AssetFormat::Zip, &bytes, 10).unwrap(), ["starship.exe"]);
     }
 
     #[test]

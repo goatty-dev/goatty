@@ -41,19 +41,26 @@ macro_rules! plugin {
 
 /// In the order the old `.zshrc` listed them.
 pub static BUILTINS: &[Builtin] = &[
-    plugin!("fzf", true, ["plugin.toml", "zsh/init.zsh"]),
-    plugin!("fzf-tab", true, ["plugin.toml", "zsh/init.zsh"]),
-    plugin!("autosuggestions", true, ["plugin.toml", "zsh/init.zsh"]),
-    plugin!("starship", true, ["plugin.toml", "zsh/init.zsh"]),
-    plugin!("syntax-highlighting", true, ["plugin.toml", "zsh/init.zsh"]),
+    plugin!("fzf", true, ["plugin.toml", "zsh/init.zsh", "pwsh/init.ps1"]),
+    plugin!("fzf-tab", true, ["plugin.toml", "zsh/init.zsh", "pwsh/init.ps1"]),
+    plugin!("autosuggestions", true, ["plugin.toml", "zsh/init.zsh", "pwsh/init.ps1"]),
+    plugin!("starship", true, ["plugin.toml", "zsh/init.zsh", "pwsh/init.ps1"]),
+    plugin!("syntax-highlighting", true, ["plugin.toml", "zsh/init.zsh", "pwsh/init.ps1"]),
     // Snippets and expansions only: no tool, nothing to install (#89).
     plugin!("basics", false, ["plugin.toml"]),
 ];
 
-/// The built-in plugins that bring a tool (a package to install): what
-/// `goattyd shell install`, the welcome window and the diagnostics list.
+/// The managed shell used on the current host (`"powershell"` on Windows, `"zsh"` on Unix).
+pub const fn host_managed_shell() -> &'static str {
+    if cfg!(windows) { "powershell" } else { "zsh" }
+}
+
+/// The built-in plugins that bring a tool (a package to install on this host's
+/// managed shell): what `goattyd shell install`, the welcome window and the
+/// diagnostics list.
 pub fn tools() -> impl Iterator<Item = &'static Builtin> {
-    BUILTINS.iter().filter(|b| !b.manifest().packages.is_empty())
+    let shell = host_managed_shell();
+    BUILTINS.iter().filter(move |b| b.manifest().packages.iter().any(|p| p.applies_to_shell(shell)))
 }
 
 /// Packages of plugins that used to come with goatty: (package id, its
@@ -138,9 +145,12 @@ mod tests {
             assert_eq!(m.id, b.id);
             assert_eq!(m.publisher, "goatty");
             assert_eq!(b.checksums().len(), b.files.len());
-            for f in m.zsh.init.iter() {
+            for f in m.zsh.init.iter().chain(m.powershell.init.iter()) {
                 assert!(b.read(f).is_some(), "{}: {f}", b.id);
             }
+            assert!(m.compatible(goatty_plugin::GOATTY_VERSION, "x86_64-linux").is_ok(), "{}: linux compat", b.id);
+            assert!(m.compatible(goatty_plugin::GOATTY_VERSION, "x86_64-windows").is_ok(), "{}: windows compat", b.id);
+            assert!(m.compatible(goatty_plugin::GOATTY_VERSION, "aarch64-windows").is_ok(), "{}: aarch64 windows compat", b.id);
             for p in &m.packages {
                 assert!(!p.assets.is_empty(), "{}", b.id);
                 for a in &p.assets {

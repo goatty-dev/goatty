@@ -32,6 +32,7 @@ pub mod fetch;
 pub mod index;
 pub mod manifest;
 pub mod permissions;
+pub mod powershell;
 pub mod schema;
 pub mod sign;
 pub mod snippets;

@@ -209,6 +209,21 @@ pub fn transient_prompt(p: &PromptSettings, failed: bool) -> String {
     format!("%B%F{{{color}}}{}%f%b ", sym.replace('%', "%%"))
 }
 
+/// An ANSI SGR prompt string for the prompt character, used by PowerShell's
+/// Starship transient prompt (`\x1b[1;32m❯\x1b[0m `).
+pub fn transient_prompt_ansi(p: &PromptSettings, failed: bool) -> String {
+    let [ok, err, _] = p.character_symbols();
+    let (sym, color) = if failed { (err, &p.character.error_color) } else { (ok, &p.character.success_color) };
+    let sgr = match PromptColor::parse(color) {
+        Some(PromptColor::Ansi(i)) if i < 8 => format!("1;{}", 30 + i),
+        Some(PromptColor::Ansi(i)) => format!("1;{}", 90 + (i - 8)),
+        Some(PromptColor::Indexed(i)) => format!("1;38;5;{i}"),
+        Some(PromptColor::Rgb(r, g, b)) => format!("1;38;2;{r};{g};{b}"),
+        None => "1;32".into(),
+    };
+    format!("\x1b[{sgr}m{sym}\x1b[0m ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

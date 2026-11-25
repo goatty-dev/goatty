@@ -38,8 +38,16 @@ help = "Gives each pair of brackets its own color and marks one that isn't close
 type = "bool"
 default = false
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [zsh]
 init = "zsh/init.zsh"
+load = "last"
+
+[powershell]
+init = "pwsh/init.ps1"
 load = "last"
 
 [permissions]

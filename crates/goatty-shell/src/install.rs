@@ -45,6 +45,59 @@ pub struct PackageInstall<'a> {
     pub completions: &'a [String],
 }
 
+/// Executable file name placed in `bin/` for a manifest `bin` entry.
+/// On Windows, appends `.exe` when the name doesn't already have an extension.
+pub fn bin_file_name(bin: &str) -> String {
+    let name = goatty_plugin::manifest::bin_name(bin);
+    #[cfg(windows)]
+    {
+        if Path::new(name).extension().is_none() {
+            return format!("{name}.exe");
+        }
+    }
+    name.to_owned()
+}
+
+/// Resolve an extracted executable inside `root` for manifest entry `b`.
+/// On Windows, falls back to `{b}.exe` when `b` omits the extension.
+fn locate_extracted_bin(root: &Path, b: &str) -> PathBuf {
+    let direct = root.join(b);
+    #[cfg(windows)]
+    {
+        if !direct.exists() && Path::new(b).extension().is_none() {
+            let with_exe = root.join(format!("{b}.exe"));
+            if with_exe.exists() {
+                return with_exe;
+            }
+        }
+    }
+    direct
+}
+
+#[cfg(windows)]
+fn owner_file(dirs: &Dirs, file_name: &str) -> PathBuf {
+    dirs.bin_dir().join(format!(".{file_name}.goatty"))
+}
+
+#[cfg(windows)]
+fn write_owner(dirs: &Dirs, file_name: &str, id: &str, version: &str) -> Result<()> {
+    let path = owner_file(dirs, file_name);
+    let tmp = dirs.bin_dir().join(format!(".{file_name}.goatty.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, format!("{id}\n{version}\n")).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Read `(package_id, version)` from the Windows ownership sidecar for `bin/<file_name>`.
+#[cfg(windows)]
+pub(crate) fn read_bin_owner(dirs: &Dirs, file_name: &str) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(owner_file(dirs, file_name)).ok()?;
+    let mut lines = text.lines();
+    let id = lines.next()?.trim();
+    let version = lines.next()?.trim();
+    (!id.is_empty() && !version.is_empty()).then(|| (id.to_owned(), version.to_owned()))
+}
+
 /// Verify and unpack a plugin package into `tools/<id>/<version>/`, link
 /// its executables into `bin/` and its directory as `plugins/<id>` when it
 /// has a script to source. A `bin/` link that belongs to something else
@@ -57,7 +110,7 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
     if !got.eq_ignore_ascii_case(p.sha256) {
         bail!("checksum mismatch for {} {}: expected {}, got {got}; not installing", p.id, p.version, p.sha256);
     }
-    let names: Vec<&str> = p.bins.iter().map(|b| goatty_plugin::manifest::bin_name(b)).collect();
+    let names: Vec<String> = p.bins.iter().map(|b| bin_file_name(b)).collect();
     let tool_dir = dirs.tools_dir().join(p.id);
     for name in &names {
         if let Some(owner) = link_owner(dirs, name)
@@ -71,26 +124,28 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
     let staging = tool_dir.join(format!(".{}.partial-{}", p.version, std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
+    let mut extracted_rel: Vec<PathBuf> = Vec::with_capacity(p.bins.len());
     let result = (|| -> Result<()> {
+        let base = staging.join(p.root);
         if p.format == AssetFormat::Binary {
-            let dest = staging.join(p.root).join(&p.bins[0]);
+            let dest = base.join(&names[0]);
             std::fs::create_dir_all(dest.parent().context("no parent")?)?;
             std::fs::write(&dest, archive)?;
         } else {
             goatty_plugin::archive::unpack(p.format, archive, &staging).context("unpack the download")?;
         }
         for b in p.bins {
-            let exe = staging.join(p.root).join(b);
+            let exe = locate_extracted_bin(&base, b);
             let meta = std::fs::symlink_metadata(&exe).with_context(|| format!("the download has no {}/{b}", p.root))?;
             if !meta.is_file() {
                 bail!("{}/{b} in the download is not a regular file", p.root);
             }
             #[cfg(unix)]
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
+            extracted_rel.push(exe.strip_prefix(&staging).unwrap_or(&exe).to_path_buf());
         }
         if let Some(src) = p.source {
-            let meta = std::fs::symlink_metadata(staging.join(p.root).join(src))
-                .with_context(|| format!("the download has no {}/{src}", p.root))?;
+            let meta = std::fs::symlink_metadata(base.join(src)).with_context(|| format!("the download has no {}/{src}", p.root))?;
             if !meta.is_file() {
                 bail!("{}/{src} in the download is not a regular file", p.root);
             }
@@ -107,14 +162,21 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
     }
     std::fs::rename(&staging, &version_dir)?;
     let mut links = Vec::new();
-    for (b, name) in p.bins.iter().zip(&names) {
+    for (rel, name) in extracted_rel.iter().zip(&names) {
         let link = dirs.bin_dir().join(name);
-        replace_symlink(&version_dir.join(p.root).join(b), &link)?;
+        let target = version_dir.join(rel);
+        #[cfg(unix)]
+        replace_symlink(&target, &link)?;
+        #[cfg(windows)]
+        {
+            crate::winlink::replace_bin(&target, &link)?;
+            write_owner(dirs, name, p.id, p.version)?;
+        }
         links.push(link);
     }
     if p.source.is_some() {
         let link = dirs.plugins_dir().join(p.id);
-        replace_symlink(&version_dir.join(p.root), &link)?;
+        replace_dir_link(&version_dir.join(p.root), &link)?;
         links.push(link);
     }
     for entry in std::fs::read_dir(&tool_dir)?.flatten() {
@@ -123,13 +185,14 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
         }
     }
     if let Some((name, args)) = p.completions.split_first() {
-        let exe = dirs.bin_dir().join(name);
-        if let Err(e) = crate::completions::for_package(dirs, name, &exe, args) {
-            log::warn!("no zsh completions for {}: {e:#}", p.id);
+        let cmd_name = goatty_plugin::manifest::command_name(name);
+        let exe = dirs.bin_dir().join(bin_file_name(name));
+        if let Err(e) = crate::completions::for_package(dirs, cmd_name, &exe, args) {
+            log::warn!("no completions for {}: {e:#}", p.id);
         }
     }
     for name in &names {
-        invalidate_init_cache(dirs, name);
+        invalidate_init_cache(dirs, goatty_plugin::manifest::command_name(name));
     }
     Ok(links)
 }
@@ -140,6 +203,7 @@ fn invalidate_init_cache(dirs: &Dirs, name: &str) {
     let init_dir = dirs.init_cache_dir();
     let _ = std::fs::remove_file(init_dir.join(format!("{name}.zsh.zwc")));
     let _ = std::fs::remove_file(init_dir.join(format!("{name}.zsh")));
+    let _ = std::fs::remove_file(init_dir.join(format!("{name}.ps1")));
     if let Ok(entries) = std::fs::read_dir(&init_dir) {
         let prefix = format!("{name}-");
         let mut variants: Vec<PathBuf> = entries
@@ -147,7 +211,7 @@ fn invalidate_init_cache(dirs: &Dirs, name: &str) {
             .filter_map(|e| {
                 let name = e.file_name();
                 let s = name.to_string_lossy();
-                (s.starts_with(&prefix) && (s.ends_with(".zsh") || s.ends_with(".zsh.zwc"))).then(|| e.path())
+                (s.starts_with(&prefix) && (s.ends_with(".zsh") || s.ends_with(".zsh.zwc") || s.ends_with(".ps1"))).then(|| e.path())
             })
             .collect();
         // Remove `.zsh.zwc` before `.zsh` so a concurrent reader never sees a stale `.zwc`.
@@ -161,15 +225,23 @@ fn invalidate_init_cache(dirs: &Dirs, name: &str) {
 /// Which managed tool or package `bin/<name>` belongs to: the `<id>` of
 /// `tools/<id>/...` it points into, `"?"` for anything else that exists.
 pub fn link_owner(dirs: &Dirs, name: &str) -> Option<String> {
-    let link = dirs.bin_dir().join(name);
+    let file_name = bin_file_name(name);
+    let link = dirs.bin_dir().join(&file_name);
     link.symlink_metadata().ok()?;
-    let target = std::fs::read_link(&link).ok();
-    let owner = target
-        .as_deref()
-        .and_then(|t| t.strip_prefix(dirs.tools_dir()).ok())
-        .and_then(|rel| rel.components().next())
-        .map(|c| c.as_os_str().to_string_lossy().into_owned());
-    Some(owner.unwrap_or_else(|| "?".into()))
+    #[cfg(unix)]
+    {
+        let target = std::fs::read_link(&link).ok();
+        let owner = target
+            .as_deref()
+            .and_then(|t| t.strip_prefix(dirs.tools_dir()).ok())
+            .and_then(|rel| rel.components().next())
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        Some(owner.unwrap_or_else(|| "?".into()))
+    }
+    #[cfg(windows)]
+    {
+        Some(read_bin_owner(dirs, &file_name).map(|(id, _)| id).unwrap_or_else(|| "?".into()))
+    }
 }
 
 /// Remove a plugin package: its `bin/` links and their completion functions,
@@ -180,8 +252,15 @@ pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool>
     let mut had = remove_links(id, bins, dirs)?;
     let tool_dir = dirs.tools_dir().join(id);
     let plugin_link = dirs.plugins_dir().join(id);
-    if std::fs::read_link(&plugin_link).is_ok_and(|t| t.starts_with(&tool_dir)) {
+    #[cfg(unix)]
+    let points_here = std::fs::read_link(&plugin_link).is_ok_and(|t| t.starts_with(&tool_dir));
+    #[cfg(windows)]
+    let points_here = crate::winlink::read_junction(&plugin_link).is_ok_and(|t| t.starts_with(crate::winlink::strip_verbatim(&tool_dir)));
+    if points_here {
+        #[cfg(unix)]
         std::fs::remove_file(&plugin_link).with_context(|| format!("remove {}", plugin_link.display()))?;
+        #[cfg(windows)]
+        crate::winlink::remove_junction(&plugin_link).with_context(|| format!("remove {}", plugin_link.display()))?;
         had = true;
     }
     if tool_dir.exists() {
@@ -196,15 +275,30 @@ pub fn uninstall_package(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool>
 pub fn remove_links(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool> {
     let mut had = false;
     for b in bins {
-        let name = goatty_plugin::manifest::bin_name(b);
-        if link_owner(dirs, name).as_deref() == Some(id) {
-            std::fs::remove_file(dirs.bin_dir().join(name)).with_context(|| format!("remove bin/{name}"))?;
-            crate::completions::remove(dirs, name)?;
-            invalidate_init_cache(dirs, name);
+        let file_name = bin_file_name(b);
+        let cmd_name = goatty_plugin::manifest::command_name(b);
+        if link_owner(dirs, &file_name).as_deref() == Some(id) {
+            std::fs::remove_file(dirs.bin_dir().join(&file_name)).with_context(|| format!("remove bin/{file_name}"))?;
+            #[cfg(windows)]
+            let _ = std::fs::remove_file(owner_file(dirs, &file_name));
+            crate::completions::remove(dirs, cmd_name)?;
+            invalidate_init_cache(dirs, cmd_name);
             had = true;
         }
     }
     Ok(had)
+}
+
+/// Point directory `link` at `target`, atomically (symlink on Unix, NTFS junction on Windows).
+fn replace_dir_link(target: &Path, link: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        replace_symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        crate::winlink::replace_junction(target, link)
+    }
 }
 
 /// Point `link` at `target`, atomically (symlink beside it, then rename).
@@ -218,12 +312,6 @@ fn replace_symlink(target: &Path, link: &Path) -> Result<()> {
     std::os::unix::fs::symlink(target, &tmp).with_context(|| format!("symlink {}", tmp.display()))?;
     std::fs::rename(&tmp, link).with_context(|| format!("activate {}", link.display()))?;
     Ok(())
-}
-
-/// Windows fallback until NTFS junctions / hardlinks land (#278).
-#[cfg(not(unix))]
-fn replace_symlink(_target: &Path, _link: &Path) -> Result<()> {
-    bail!("managed tool linking isn't supported on Windows yet (tracked in #278)")
 }
 
 #[cfg(all(test, unix))]
@@ -444,5 +532,57 @@ mod tests {
         assert!(!init_dir.join("tool-dumb.zsh").exists());
         assert!(!init_dir.join("tool-dumb.zsh.zwc").exists());
         assert!(init_dir.join("other.zsh").exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn installs_windows_zip_exe_with_owner_sidecar_and_invalidates_ps1_cache() {
+        use std::io::Write;
+
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        z.start_file("fzf.exe", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(b"MZfake-exe-payload").unwrap();
+        let archive = z.finish().unwrap().into_inner();
+        let sha = sha256_hex(&archive);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let init_dir = dirs.init_cache_dir();
+        std::fs::create_dir_all(&init_dir).unwrap();
+        std::fs::write(init_dir.join("fzf-abc123.ps1"), "# cached\n").unwrap();
+        std::fs::write(init_dir.join("other-abc123.ps1"), "# keep\n").unwrap();
+
+        let bins = vec!["fzf".to_string()];
+        let p = PackageInstall {
+            id: "fzf",
+            version: "0.74.5",
+            sha256: &sha,
+            format: AssetFormat::Zip,
+            root: "",
+            bins: &bins,
+            source: None,
+            completions: &[],
+        };
+        let installed = install_package(&p, &archive, &dirs).unwrap();
+        assert_eq!(installed, [dirs.bin_dir().join("fzf.exe")]);
+        assert_eq!(std::fs::read(dirs.bin_dir().join("fzf.exe")).unwrap(), b"MZfake-exe-payload");
+        assert_eq!(link_owner(&dirs, "fzf").as_deref(), Some("fzf"));
+        assert_eq!(read_bin_owner(&dirs, "fzf.exe"), Some(("fzf".into(), "0.74.5".into())));
+        assert!(!init_dir.join("fzf-abc123.ps1").exists());
+        assert!(init_dir.join("other-abc123.ps1").exists());
+
+        // Another package cannot take over bin/fzf.exe.
+        let other = PackageInstall { id: "other", ..p };
+        assert!(install_package(&other, &archive, &dirs).unwrap_err().to_string().contains("already provided by fzf"));
+
+        // Uninstall removes exe, sidecar, and tools dir.
+        assert!(uninstall_package("fzf", &bins, &dirs).unwrap());
+        assert!(!dirs.bin_dir().join("fzf.exe").exists());
+        assert!(!owner_file(&dirs, "fzf.exe").exists());
+        assert!(!dirs.tools_dir().join("fzf").exists());
     }
 }

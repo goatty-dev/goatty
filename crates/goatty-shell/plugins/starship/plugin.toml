@@ -42,6 +42,20 @@ url = "https://github.com/starship/starship/releases/download/v1.27.0/starship-a
 sha256 = "5362da8cb2928f98f3ce0ffda697cf0f8de70081db000dae316d6d3a404f6cf0"
 size = 4039405
 
+[[package.asset]]
+target = "x86_64-windows"
+url = "https://github.com/starship/starship/releases/download/v1.27.0/starship-x86_64-pc-windows-msvc.zip"
+sha256 = "7764f861805376af2812dd78c84fadc16b714cf3f346baed9b597bfda8484403"
+size = 4818893
+format = "zip"
+
+[[package.asset]]
+target = "aarch64-windows"
+url = "https://github.com/starship/starship/releases/download/v1.27.0/starship-aarch64-pc-windows-msvc.zip"
+sha256 = "1822b6cf1af28071b056976d3f445359d61df324918ffe76c6d0f851eef9366f"
+size = 4449874
+format = "zip"
+
 [[setting]]
 id = "prefer_user_config"
 label = "Use my own starship.toml"
@@ -49,8 +63,16 @@ help = "Use ~/.config/starship.toml (or $STARSHIP_CONFIG) when it exists, instea
 type = "bool"
 default = false
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [zsh]
 init = "zsh/init.zsh"
+load = "prompt"
+
+[powershell]
+init = "pwsh/init.ps1"
 load = "prompt"
 
 [permissions]

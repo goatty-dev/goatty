@@ -88,7 +88,8 @@ jobs:
         run: cargo test --locked --no-fail-fast -p goatty-plugin -p goatty-shell -p goatty-term -p goatty-client -p goatty-daemon
 
   windows:
-    # Core platform, ConPTY, Named Pipes IPC, and local goattyd.exe (#277).
+    # Core platform, ConPTY, Named Pipes IPC, local goattyd.exe (#277), and
+    # managed PowerShell + Windows plugin framework (#278).
     # Expanded to goatty-app once the Windows GUI issue (#279) lands.
     name: clippy + tests (windows)
     runs-on: windows-latest
@@ -101,9 +102,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --locked --workspace --exclude goatty-app --all-targets -- -D warnings
-      - name: Tests (core crates & daemon)
-        run: cargo test --locked --no-fail-fast -p goatty-proto -p goatty-config -p goatty-plugin -p goatty-term -p goatty-net -p goatty-client -p goatty-daemon -- -q
-      - name: Tests (goatty-shell dirs)
-        run: cargo test --locked -p goatty-shell --lib dirs::tests -- -q
-      - name: Tests (goatty-shell snippets)
-        run: cargo test --locked -p goatty-shell --lib snippets::tests -- -q
+      - name: Tests (core crates, shell & daemon)
+        run: cargo test --locked --no-fail-fast -p goatty-proto -p goatty-config -p goatty-plugin -p goatty-shell -p goatty-term -p goatty-net -p goatty-client -p goatty-daemon -- -q

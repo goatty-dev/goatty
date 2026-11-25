@@ -20,8 +20,11 @@ use crate::setup::tilde;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Prints `step<TAB>PATH` per startup step, then `final<TAB>PATH`.
+/// Prints `step<TAB>PATH` per startup step, then `final<TAB>PATH` (zsh).
 pub const COMMAND: &str = r#"builtin print -rl -- "${_goatty_path_marks[@]}" "final"$'\t'"$PATH""#;
+
+/// Prints `step<TAB>PATH` per startup step, then `final<TAB>PATH` (PowerShell).
+pub const PS_COMMAND: &str = "foreach ($m in $_goatty_path_marks) { Write-Output $m }; Write-Output \"final`t$env:PATH\"";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Report {
@@ -120,11 +123,12 @@ impl HostService {
         let launch = self.launcher.launch(&host);
         let inherited = launch.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).or_else(|| std::env::var("PATH").ok());
         let inherited = inherited.unwrap_or_default();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::dirs::Dirs::home_dir();
         let mut report = Report { home: home.as_ref().map(|h| h.display().to_string()), managed: launch.managed, ..Report::default() };
 
         let steps = if launch.managed {
-            match doctor::run(&launch, COMMAND, PROBE_TIMEOUT) {
+            let cmd = if crate::launch::is_powershell(&launch.program) { PS_COMMAND } else { COMMAND };
+            match doctor::run(&launch, cmd, PROBE_TIMEOUT) {
                 Ok(ran) => match parse_marks(&ran.report) {
                     Some(marks) => Some(marks),
                     None => {
@@ -138,7 +142,8 @@ impl HostService {
                 }
             }
         } else {
-            report.problem = Some("goatty's managed zsh isn't used here, so this is goattyd's own PATH".into());
+            let shell_name = if cfg!(windows) { "PowerShell" } else { "zsh" };
+            report.problem = Some(format!("goatty's managed {shell_name} isn't used here, so this is goattyd's own PATH"));
             None
         };
         report.probed = steps.is_some();
@@ -170,10 +175,12 @@ impl HostService {
     }
 }
 
-/// `~` and `~/…` under `home`, like the managed zsh expands `shell.path`.
+/// `~`, `~/…`, and `~\…` under `home`, like the managed shell expands `shell.path`.
 pub fn expand(entry: &str, home: Option<&Path>) -> String {
     match (entry.strip_prefix('~'), home) {
-        (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with('/') => format!("{}{rest}", h.display()),
+        (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => {
+            format!("{}{rest}", h.display())
+        }
         _ => entry.to_owned(),
     }
 }
@@ -188,7 +195,13 @@ fn folder_state(dir: &Path, checked: bool, entries: &[Entry]) -> FolderState {
     if !checked {
         return FolderState::Unchecked;
     }
-    let same = |e: &&Entry| Path::new(&e.dir) == dir;
+    let same = |e: &&Entry| {
+        if cfg!(windows) {
+            e.dir.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(dir.to_string_lossy().trim_end_matches(['\\', '/']))
+        } else {
+            Path::new(&e.dir) == dir
+        }
+    };
     match entries.iter().find(same) {
         Some(e) if e.origin == Origin::Settings => FolderState::Used,
         Some(e) => FolderState::Earlier { origin: e.origin.clone() },
@@ -206,12 +219,19 @@ pub fn parse_marks(text: &str) -> Option<Vec<(String, String)>> {
 
 /// The final PATH's folders, each with the first step whose PATH has it.
 pub fn attribute(steps: &[(String, String)]) -> Vec<(String, &str)> {
+    attribute_with(steps, if cfg!(windows) { ';' } else { ':' })
+}
+
+/// [`attribute`] with an explicit PATH separator (`:` on Unix, `;` on Windows).
+pub fn attribute_with(steps: &[(String, String)], sep: char) -> Vec<(String, &str)> {
     let Some((_, last)) = steps.last() else { return Vec::new() };
     let mut seen = std::collections::HashSet::new();
-    last.split(':')
-        .filter(|dir| seen.insert(*dir))
+    let norm = |d: &str| if sep == ';' { d.trim_end_matches(['\\', '/']).to_ascii_lowercase() } else { d.to_owned() };
+    last.split(sep)
+        .filter(|dir| !(sep == ';' && dir.is_empty()) && seen.insert(norm(dir)))
         .map(|dir| {
-            let step = steps.iter().find(|(_, p)| p.split(':').any(|d| d == dir)).map_or("final", |(s, _)| s.as_str());
+            let key = norm(dir);
+            let step = steps.iter().find(|(_, p)| p.split(sep).any(|d| norm(d) == key)).map_or("final", |(s, _)| s.as_str());
             (dir.to_owned(), step)
         })
         .collect()
@@ -227,8 +247,12 @@ struct Files {
 
 impl Files {
     fn find(svc: &HostService) -> Self {
-        let zdotdir = std::env::var_os("ZDOTDIR").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).unwrap_or_default();
-        let additions = svc.launcher.dirs().map_or_else(|| "~/.config/goatty/zshrc".into(), |d| tilde(&d.user_zshrc()));
+        let zdotdir = std::env::var_os("ZDOTDIR").map(PathBuf::from).or_else(crate::dirs::Dirs::home_dir).unwrap_or_default();
+        let additions = if cfg!(windows) {
+            svc.launcher.dirs().map_or_else(|| r"~\AppData\Roaming\goatty\profile.ps1".into(), |d| tilde(&d.user_ps_profile()))
+        } else {
+            svc.launcher.dirs().map_or_else(|| "~/.config/goatty/zshrc".into(), |d| tilde(&d.user_zshrc()))
+        };
         let imported = svc.launcher.dirs().map_or_else(|| "your shell's startup files (imported)".into(), crate::import::path_origin);
         Files { zdotdir, additions, imported }
     }
@@ -243,6 +267,7 @@ impl Files {
             "zshenv" => user(".zshenv"),
             "zprofile" => user(".zprofile"),
             "zshrc" => user(".zshrc"),
+            "profile" => Origin::User { file: "$PROFILE".into() },
             // A User origin (not a new kind), so older windows can read it.
             "imported" => Origin::User { file: self.imported.clone() },
             "settings" => Origin::Settings,
@@ -280,7 +305,7 @@ mod tests {
             ("final", "/home/u/.cargo/bin:/usr/local/bin:/usr/bin:/opt/x/bin:/late:/usr/bin"),
         ]);
         assert_eq!(
-            attribute(&s),
+            attribute_with(&s, ':'),
             [
                 ("/home/u/.cargo/bin".to_owned(), "zprofile"),
                 ("/usr/local/bin".to_owned(), "etc-zprofile"),
@@ -289,6 +314,29 @@ mod tests {
                 ("/late".to_owned(), "final"),
             ],
             "duplicates show once"
+        );
+    }
+
+    #[test]
+    fn windows_semicolon_path_attribution() {
+        let s = steps(&[
+            ("inherited", r"C:\Windows\System32;C:\Program Files\PowerShell\7"),
+            ("settings", r"C:\Windows\System32;C:\Program Files\PowerShell\7;C:\Users\u\bin"),
+            ("tools", r"C:\Windows\System32;C:\Program Files\PowerShell\7;C:\Users\u\bin;C:\Users\u\AppData\Local\goatty\bin"),
+            (
+                "final",
+                r"C:\Windows\System32;C:\Program Files\PowerShell\7;C:\Users\u\bin;C:\Users\u\AppData\Local\goatty\bin;c:\windows\system32\",
+            ),
+        ]);
+        assert_eq!(
+            attribute_with(&s, ';'),
+            [
+                (r"C:\Windows\System32".to_owned(), "inherited"),
+                (r"C:\Program Files\PowerShell\7".to_owned(), "inherited"),
+                (r"C:\Users\u\bin".to_owned(), "settings"),
+                (r"C:\Users\u\AppData\Local\goatty\bin".to_owned(), "tools"),
+            ],
+            "case-insensitive dedup with trailing slash normalization"
         );
     }
 
@@ -307,6 +355,7 @@ mod tests {
         let home = Path::new("/home/u");
         assert_eq!(expand("~", Some(home)), "/home/u");
         assert_eq!(expand("~/bin", Some(home)), "/home/u/bin");
+        assert_eq!(expand(r"~\bin", Some(Path::new(r"C:\Users\u"))), r"C:\Users\u\bin");
         assert_eq!(expand("~bin", Some(home)), "~bin");
         assert_eq!(expand("/opt/bin", Some(home)), "/opt/bin");
         assert_eq!(expand("~/bin", None), "~/bin");

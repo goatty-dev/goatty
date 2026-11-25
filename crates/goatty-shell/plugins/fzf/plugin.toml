@@ -41,6 +41,20 @@ url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-darw
 sha256 = "ada808c7401b9949ce8842274ac16a6b6193fd32dcada396884a6a9a89e5985a"
 size = 2154490
 
+[[package.asset]]
+target = "x86_64-windows"
+url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-windows_amd64.zip"
+sha256 = "01f854ec8b9b47c99a7d78023638f7d2056cfb0af56b72dabd112032eed3993e"
+size = 2544236
+format = "zip"
+
+[[package.asset]]
+target = "aarch64-windows"
+url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-windows_arm64.zip"
+sha256 = "45d8f69b7660ac0c59118c9ccaccdea305d56fdd74a3599aa357cbb374ebd61e"
+size = 2292730
+format = "zip"
+
 [[setting]]
 id = "hidden_files"
 label = "Hidden files too"
@@ -78,8 +92,16 @@ lines = [
   "--bind='ctrl-/:change-preview-window(down,50%,border-top|hidden|)'",
 ]
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [zsh]
 init = "zsh/init.zsh"
+load = "line-editor"
+
+[powershell]
+init = "pwsh/init.ps1"
 load = "line-editor"
 
 [permissions]

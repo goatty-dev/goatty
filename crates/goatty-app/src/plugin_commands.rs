@@ -29,7 +29,8 @@ use std::rc::Rc;
 use goatty_config::CommandOpenIn;
 use goatty_plugin::api::{Installed, Reply, Request};
 use goatty_plugin::commands::{
-    CommandInput, MenuWhen, OpenIn as PluginOpenIn, PaletteCommand, command_argv, command_line, needs_home_expansion, strokes,
+    CommandInput, MenuWhen, OpenIn as PluginOpenIn, PaletteCommand, command_argv, command_line, command_line_powershell,
+    needs_home_expansion, strokes,
 };
 use gpui::{App, AsyncApp, Global, Window};
 
@@ -570,19 +571,26 @@ fn run(id: &str, c: &PaletteCommand, origin: &HostLink, answers: &Answers, windo
     }
     let open_in = effective_open_in(id, c, cx);
     let line = command_line(c, answers);
+    let ps_line = command_line_powershell(c, answers);
     let pane = c.pane.clone();
     let title = c.title.clone();
     if open_in == CommandOpenIn::Current {
         let origin = origin.clone();
         // Deferred: the palette runs commands from inside the workspace.
         window.defer(cx, move |window, cx| {
-            if let Some(view) = crate::typing::target(&origin, &line, crate::typing::What::Command, window, cx) {
+            let is_ps =
+                window.root::<crate::workspace::Workspace>().flatten().and_then(|ws| ws.read(cx).focused_terminal()).is_some_and(|v| {
+                    let proc = v.read(cx).process();
+                    proc.is_some_and(goatty_shell::launch::is_powershell) || (cfg!(windows) && origin.is_local() && proc.is_none())
+                });
+            let chosen = if is_ps { ps_line } else { line };
+            if let Some(view) = crate::typing::target(&origin, &chosen, crate::typing::What::Command, window, cx) {
                 if let Some(pane) = pane.as_ref()
                     && !pane_fits_or_warn(pane, &title, Some(&view), window, cx)
                 {
                     return;
                 }
-                view.update(cx, |v, cx| v.run_line(&line, cx));
+                view.update(cx, |v, cx| v.run_line(&chosen, cx));
             }
         });
         return;

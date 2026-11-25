@@ -554,6 +554,7 @@ mod tests {
                 compat: Default::default(),
                 packages: Vec::new(),
                 zsh: Default::default(),
+                powershell: Default::default(),
                 env: Vec::new(),
                 aliases: Vec::new(),
                 files: Vec::new(),

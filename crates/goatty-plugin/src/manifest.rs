@@ -22,7 +22,7 @@ pub const SCHEMA: u32 = 1;
 pub const FILE: &str = "plugin.toml";
 
 /// Download targets goatty knows (`"<arch>-<os>"`).
-pub const TARGETS: &[&str] = &["x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos"];
+pub const TARGETS: &[&str] = &["x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos", "x86_64-windows", "aarch64-windows"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +68,9 @@ pub struct Manifest {
     pub files: Vec<ConfigFile>,
     #[serde(default)]
     pub zsh: ZshIntegration,
+    /// PowerShell integration for Windows managed PowerShell (#278).
+    #[serde(default, skip_serializing_if = "PowerShellIntegration::is_empty")]
+    pub powershell: PowerShellIntegration,
     /// Entries in goatty's command palette (see [`crate::commands`]).
     #[serde(default, rename = "command", skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<crate::commands::PaletteCommand>,
@@ -420,7 +423,36 @@ pub struct ZshIntegration {
     pub after: Vec<String>,
 }
 
-/// The slots of the managed `.zshrc` a plugin can load in, in order. The
+/// PowerShell code shipped with the plugin (#278). Like [`ZshIntegration`],
+/// `init` is the one place a plugin runs code of its own (`shell-code` permission).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerShellIntegration {
+    /// A `.ps1` file in the plugin directory, dot-sourced at the plugin's
+    /// load slot. `$goatty_settings` holds each setting's value while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    /// Where in the managed PowerShell startup the plugin loads ([`Load`]).
+    #[serde(default, skip_serializing_if = "is_default_load")]
+    pub load: Load,
+    /// Plugins this one loads after when they're there (same `load` slot).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+}
+
+fn is_default_load(l: &Load) -> bool {
+    *l == Load::Normal
+}
+
+impl PowerShellIntegration {
+    pub fn is_empty(&self) -> bool {
+        self.init.is_none() && self.when.is_none() && self.load == Load::Normal && self.after.is_empty()
+    }
+}
+
+/// The slots of the managed `.zshrc` (and PowerShell `init.ps1`) a plugin can load in, in order. The
 /// plugin's environment and `fpath` always go in before `compinit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -460,6 +492,17 @@ impl Load {
             Load::Last => "plugins-last.zsh",
         }
     }
+
+    /// The PowerShell file of the shell configuration generation this slot is
+    /// rendered into (dot-sourced by the managed `init.ps1` at its place).
+    pub fn ps_file(self) -> &'static str {
+        match self {
+            Load::LineEditor => "plugins-line-editor.ps1",
+            Load::Prompt => "plugins-prompt.ps1",
+            Load::Normal => "plugins.ps1",
+            Load::Last => "plugins-last.ps1",
+        }
+    }
 }
 
 impl Manifest {
@@ -486,6 +529,14 @@ impl Manifest {
         if self.compat.shells.is_empty() { vec!["zsh"] } else { self.compat.shells.iter().map(String::as_str).collect() }
     }
 
+    /// The managed shell goatty uses on the OS of `target`.
+    pub fn managed_shell_for(target: &str) -> &'static str {
+        match target.rsplit('-').next().unwrap_or("") {
+            "windows" => "powershell",
+            _ => "zsh",
+        }
+    }
+
     /// Whether this goatty version, OS and target can use the plugin; the
     /// reason when not.
     pub fn compatible(&self, goatty_version: &str, target: &str) -> Result<(), String> {
@@ -499,10 +550,11 @@ impl Manifest {
         if !self.compat.os.is_empty() && !self.compat.os.iter().any(|o| o == os) {
             return Err(format!("supports {} only", self.compat.os.join(", ")));
         }
-        if !self.shells().contains(&"zsh") {
-            return Err(format!("integrates with {} only; goatty's managed shell is zsh", self.shells().join(", ")));
+        let managed_shell = Self::managed_shell_for(target);
+        if !self.shells().contains(&managed_shell) {
+            return Err(format!("integrates with {} only; goatty's managed shell is {managed_shell}", self.shells().join(", ")));
         }
-        for p in &self.packages {
+        for p in self.packages.iter().filter(|p| p.applies_to_shell(managed_shell)) {
             if p.asset_for(target).is_none() {
                 return Err(format!("{} has no build for {target}", p.id));
             }
@@ -515,11 +567,24 @@ impl Package {
     pub fn asset_for(&self, target: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.target == target).or_else(|| self.assets.iter().find(|a| a.target == "any"))
     }
+
+    /// Whether this package is used by `shell` (`"zsh"` or `"powershell"`).
+    /// Packages that only ship a `.zsh` `source` script (no `bin`) are zsh-only.
+    pub fn applies_to_shell(&self, shell: &str) -> bool {
+        if self.bin.is_empty() && self.source.is_some() { shell == "zsh" } else { true }
+    }
 }
 
-/// `bin/eza` → `eza`.
+/// `bin/eza` → `eza`, `bin/tool.exe` → `tool.exe`.
 pub fn bin_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Logical command name for a `Package.bin` entry: strips directory prefix and
+/// any trailing `.exe` suffix (`bin/tool.exe` → `tool`, `starship` → `starship`).
+pub fn command_name(path: &str) -> &str {
+    let name = bin_name(path);
+    if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") { &name[..name.len() - 4] } else { name }
 }
 
 /// A problem in a manifest: where (`setting.icons.default`) and what.
@@ -681,12 +746,12 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
         err("compat.goatty".into(), format!("{:?} is not a version requirement (like \">=0.1\")", m.compat.goatty));
     }
     for os in &m.compat.os {
-        if !["linux", "macos"].contains(&os.as_str()) {
-            err("compat.os".into(), format!("unknown OS {os:?} (linux, macos)"));
+        if !["linux", "macos", "windows"].contains(&os.as_str()) {
+            err("compat.os".into(), format!("unknown OS {os:?} (linux, macos, windows)"));
         }
     }
     for sh in &m.compat.shells {
-        if !["zsh", "bash", "fish"].contains(&sh.as_str()) {
+        if !["zsh", "bash", "fish", "powershell"].contains(&sh.as_str()) {
             err("compat.shells".into(), format!("unknown shell {sh:?}"));
         }
     }
@@ -737,12 +802,12 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
         for b in &p.bin {
             if !is_bundle_path(b) {
                 err(format!("{at}.bin"), format!("{b:?}: a relative path inside the archive"));
-            } else if !exes.insert(bin_name(b).to_string()) {
+            } else if !exes.insert(command_name(b).to_string()) {
                 err(format!("{at}.bin"), format!("{:?} is provided twice", bin_name(b)));
             }
         }
         if let Some(first) = p.completions.first() {
-            if !p.bin.iter().any(|b| bin_name(b) == first) {
+            if !p.bin.iter().any(|b| bin_name(b) == first || command_name(b) == first) {
                 err(format!("{at}.completions"), format!("{first:?} is not one of the package's executables"));
             }
             if p.completions.iter().any(|a| a.is_empty() || a.contains('\0')) {
@@ -810,7 +875,12 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
     }
 
     // Effects.
-    let commands: BTreeSet<&str> = exes.iter().map(String::as_str).chain(m.requires.commands.iter().map(String::as_str)).collect();
+    let commands: BTreeSet<&str> = exes
+        .iter()
+        .map(String::as_str)
+        .chain(m.packages.iter().flat_map(|p| p.bin.iter().map(|b| bin_name(b))))
+        .chain(m.requires.commands.iter().map(String::as_str))
+        .collect();
     let cond = |path: String, when: &Option<String>, out: &mut Vec<Problem>| {
         if let Some(w) = when
             && let Err(e) = Condition::parse(w).and_then(|c| c.check(m))
@@ -861,11 +931,12 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
         if !file_names.insert(&f.name) {
             out.push(Problem { path: format!("{at}.name"), message: "appears twice".into() });
         }
-        let shipped = m.zsh.init.iter().chain(&m.zsh.fpath).any(|p| *p == f.name || p.starts_with(&format!("{}/", f.name)));
+        let shipped =
+            m.zsh.init.iter().chain(&m.zsh.fpath).chain(&m.powershell.init).any(|p| *p == f.name || p.starts_with(&format!("{}/", f.name)));
         if shipped {
             out.push(Problem {
                 path: format!("{at}.name"),
-                message: "collides with a file the plugin ships (zsh.init / zsh.fpath)".into(),
+                message: "collides with a file the plugin ships (zsh.init / zsh.fpath / powershell.init)".into(),
             });
         }
         match f.format {
@@ -917,6 +988,21 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>) -> Vec<Problem> {
     for a in &m.zsh.after {
         if !is_id(a) || *a == m.id {
             out.push(Problem { path: "zsh.after".into(), message: format!("{a:?} is not another plugin's id") });
+        }
+    }
+    if let Some(init) = &m.powershell.init {
+        if !is_bundle_path(init) || !init.ends_with(".ps1") {
+            out.push(Problem { path: "powershell.init".into(), message: format!("{init:?}: a .ps1 file inside the plugin directory") });
+        } else if let Some(files) = files
+            && !files.contains(init)
+        {
+            out.push(Problem { path: "powershell.init".into(), message: format!("{init} doesn't exist") });
+        }
+    }
+    cond("powershell.when".into(), &m.powershell.when, &mut out);
+    for a in &m.powershell.after {
+        if !is_id(a) || *a == m.id {
+            out.push(Problem { path: "powershell.after".into(), message: format!("{a:?} is not another plugin's id") });
         }
     }
 
@@ -1186,6 +1272,38 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
         assert!(applies(&Some("icons != never".into()), &values));
         assert!(Condition::parse("icons=nope").unwrap().check(&m).is_err());
         assert!(Condition::parse("missing").unwrap().check(&m).is_err());
+    }
+
+    #[test]
+    fn windows_and_powershell_manifest_support() {
+        let text = EXAMPLE.replace(
+            "target = \"x86_64-linux\"\nurl = \"https://example.com/eza.tar.gz\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsize = 100",
+            "target = \"x86_64-windows\"\nurl = \"https://example.com/eza.zip\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsize = 100\nformat = \"zip\"",
+        )
+        .replace("bin = [\"eza\"]", "bin = [\"eza.exe\"]")
+        .replace(
+            "[permissions]",
+            "[compat]\nos = [\"windows\"]\nshells = [\"powershell\"]\n\n\
+             [powershell]\ninit = \"pwsh/init.ps1\"\nload = \"prompt\"\nafter = [\"fzf\"]\n\n\
+             [permissions]\nshell-code = \"sets up the eza PowerShell helper\"",
+        );
+        let files: BTreeSet<String> = ["plugin.toml", "pwsh/init.ps1"].map(String::from).into();
+        let m = parse(&text, Some(&files)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(m.powershell.load, Load::Prompt);
+        assert_eq!(m.powershell.init.as_deref(), Some("pwsh/init.ps1"));
+        assert!(m.compatible("0.1.0", "x86_64-windows").is_ok());
+        assert!(m.compatible("0.1.0", "x86_64-linux").unwrap_err().contains("supports windows only"));
+        assert!(m.compatible("0.1.0", "aarch64-windows").unwrap_err().contains("no build"));
+
+        // Non-.ps1 init is rejected.
+        let bad = text.replace("pwsh/init.ps1", "pwsh/init.zsh");
+        assert!(problems(&bad).iter().any(|p| p.contains("powershell.init")), "{:?}", problems(&bad));
+        // Missing file is rejected when file list is provided.
+        let missing = parse(&text, Some(&BTreeSet::new())).unwrap_err().0;
+        assert!(missing.iter().any(|p| p.path == "powershell.init"), "{missing:?}");
+        assert_eq!(command_name("bin/eza.exe"), "eza");
+        assert_eq!(command_name("bin/EZA.EXE"), "EZA");
+        assert_eq!(command_name("starship"), "starship");
     }
 
     #[test]

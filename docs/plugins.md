@@ -16,7 +16,7 @@ Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatt
 | Environment | `[[env]]` (value template, `when`) | `export NAME='value'` before compinit | `env` |
 | Config files | `[[file]]` (`lines` or `text`, optional `env` pointing at it) | a file in the generation, e.g. bat's `BAT_CONFIG_PATH` | `config-files` |
 | Completions | `zsh.fpath` (directories in the plugin) | `fpath` entries before compinit | – |
-| Shell code | `zsh.init` (a `.zsh` file in the plugin) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
+| Shell code | `zsh.init` (`.zsh`), `powershell.init` (`.ps1`) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
 | Palette commands | `[[command]]` + `[[command.input]]` (typed inputs: label, placeholder, checks; a list to pick from with `[command.input.source]` + `strict`), `[command.menu]`, `keys` + `[command.pane]` | an entry in goatty's command palette (and, with `menu`, the terminal's right-click menu) that asks for its inputs, then types its quoted `run` line into the focused terminal, or sends `keys` to the program running there (only where `pane` says it applies) | `commands` |
 | Snippets | `[[snippet]]` + `[[snippet.input]]` (a command line with `{input}` blanks; typed inputs, flags, several values) | entries in the snippet picker (Ctrl+Shift+S) that ask for their blanks and put the quoted line on the prompt ([`snippets.md`](snippets.md)) | `snippets` |
 | Suggestions (lists to pick from) | `[snippet.input.source]`, `[command.input.source]` (`run`: argv of a package executable or required command; `split`, `column`, `label`, `detail`, `skip`, `on_fail`, `timeout`) | the host runs it when the field opens, in the pane's directory, without a shell | `snippet-sources` (reason required) |
@@ -47,8 +47,8 @@ category = "environment"
 
 [compat]
 goatty = ">=0.0.1"              # semver requirement
-os = ["linux"]
-shells = ["zsh"]                # default
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]  # default: ["zsh"]
 
 [requires]
 commands = ["docker"]           # must exist on the host; goatty won't install them
@@ -71,7 +71,7 @@ completions = ["eza", "--completions", "zsh"]   # optional: prints the zsh compl
 #                                       # /opt/local/, /run/current-system/sw/, /nix/var/nix/profiles/
 
 [[package.asset]]
-target = "x86_64-linux"         # x86_64/aarch64 × linux/macos, or "any"
+target = "x86_64-linux"         # x86_64/aarch64 × linux/macos/windows, or "any"
 url = "https://github.com/…/eza_x86_64-unknown-linux-musl.tar.gz"   # https only
 sha256 = "e06eeb…"              # checked before anything is unpacked
 size = 1412332
@@ -118,6 +118,12 @@ fpath = ["zsh/completions"]
 when = "completion"
 load = "normal"                 # line-editor | prompt | normal (default) | last
 after = ["fzf"]                 # in the same slot, load after these plugins when they're there
+
+[powershell]                    # optional: Windows managed PowerShell integration (#278)
+init = "pwsh/init.ps1"          # a .ps1 file in the plugin (same `shell-code` permission)
+when = "completion"
+load = "normal"                 # line-editor | prompt | normal (default) | last
+after = ["fzf"]
 
 [[command]]                     # an entry in the command palette (#91)
 id = "tree"                     # palette id: plugin.eza.tree

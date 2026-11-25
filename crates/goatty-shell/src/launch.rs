@@ -92,7 +92,16 @@ impl Launcher {
 
     fn render(&self, dirs: &Dirs, settings: &HostSettings) -> Vec<GeneratedFile> {
         let (plugins, _) = crate::plugins::active(dirs, settings);
-        zsh::render(&ZshConfig { settings, dirs, daemon_exe: self.daemon_exe.as_deref(), plugins: &plugins })
+        if cfg!(windows) {
+            crate::powershell::render(&crate::powershell::PowerShellConfig {
+                settings,
+                dirs,
+                daemon_exe: self.daemon_exe.as_deref(),
+                plugins: &plugins,
+            })
+        } else {
+            zsh::render(&ZshConfig { settings, dirs, daemon_exe: self.daemon_exe.as_deref(), plugins: &plugins })
+        }
     }
 
     /// Build and activate the generation for `host` (a no-op when the
@@ -113,42 +122,77 @@ impl Launcher {
         }
     }
 
-    /// The login shell for a new session. zsh gets goatty's managed
-    /// configuration when `shell.managed` is on: the generation for these
-    /// settings is built if needed. If that fails (say, validation), the
-    /// last good generation is used, and with none, plain zsh. Other shells
-    /// start as they are.
+    /// The login shell for a new session. zsh (on Unix) or PowerShell (on
+    /// Windows) gets goatty's managed configuration when `shell.managed` is on:
+    /// the generation for these settings is built if needed. If that fails
+    /// (say, validation), the last good generation is used, and with none, a
+    /// plain shell. Other shells start as they are.
     pub fn launch(&self, host: &Effective<HostSettings>) -> Launch {
         let shell = &host.value.shell;
         let program = resolve_program(shell.program.as_deref());
         let args = if cfg!(windows) && !is_zsh(&program) { Vec::new() } else { vec!["-l".into()] };
         let mut launch = Launch { program, args, env: Vec::new(), managed: false };
-        if !(shell.managed && is_zsh(&launch.program)) {
-            return launch;
+        #[cfg(windows)]
+        {
+            if !(shell.managed && is_powershell(&launch.program)) {
+                return launch;
+            }
+            let Some(dirs) = &self.dirs else {
+                log::warn!("no user profile directory: starting plain PowerShell");
+                return launch;
+            };
+            let started = SystemTime::now();
+            if let Err(e) = self.apply(host) {
+                log::warn!("couldn't build the PowerShell configuration: {e:#}");
+            }
+            touch_stamp(dirs, started);
+            let init = dirs.pwsh_dir().join("init.ps1");
+            if !init.is_file() {
+                log::warn!("no usable PowerShell configuration generation: starting plain PowerShell");
+                return launch;
+            }
+            let dot_cmd = format!(". {}", goatty_plugin::powershell::quote(&init.to_string_lossy()));
+            launch.args = vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-NoExit".into(),
+                "-Command".into(),
+                dot_cmd,
+            ];
+            launch.managed = true;
+            launch
         }
-        let Some(dirs) = &self.dirs else {
-            log::warn!("no $HOME: starting plain zsh");
-            return launch;
-        };
-        let started = SystemTime::now();
-        if let Err(e) = self.apply(host) {
-            log::warn!("couldn't build the shell configuration: {e:#}");
+        #[cfg(not(windows))]
+        {
+            if !(shell.managed && is_zsh(&launch.program)) {
+                return launch;
+            }
+            let Some(dirs) = &self.dirs else {
+                log::warn!("no $HOME: starting plain zsh");
+                return launch;
+            };
+            let started = SystemTime::now();
+            if let Err(e) = self.apply(host) {
+                log::warn!("couldn't build the shell configuration: {e:#}");
+            }
+            self.prepare_import(&host.value);
+            touch_stamp(dirs, started);
+            if !dirs.zsh_dir().join(".zshrc").is_file() {
+                log::warn!("no usable shell configuration generation: starting plain zsh");
+                return launch;
+            }
+            let zdotdir = dirs.zsh_dir();
+            launch.env.push(("ZDOTDIR".to_owned(), zdotdir.to_string_lossy().into_owned()));
+            // The user's own ZDOTDIR, for .zshenv to put back. Ignore our own
+            // (a daemon started from inside a goatty shell mid-startup).
+            if let Some(orig) = std::env::var_os("ZDOTDIR").filter(|o| Path::new(o) != zdotdir) {
+                launch.env.push(("GOATTY_ORIG_ZDOTDIR".to_owned(), orig.to_string_lossy().into_owned()));
+            }
+            launch.managed = true;
+            launch
         }
-        self.prepare_import(&host.value);
-        touch_stamp(dirs, started);
-        if !dirs.zsh_dir().join(".zshrc").is_file() {
-            log::warn!("no usable shell configuration generation: starting plain zsh");
-            return launch;
-        }
-        let zdotdir = dirs.zsh_dir();
-        launch.env.push(("ZDOTDIR".to_owned(), zdotdir.to_string_lossy().into_owned()));
-        // The user's own ZDOTDIR, for .zshenv to put back. Ignore our own
-        // (a daemon started from inside a goatty shell mid-startup).
-        if let Some(orig) = std::env::var_os("ZDOTDIR").filter(|o| Path::new(o) != zdotdir) {
-            launch.env.push(("GOATTY_ORIG_ZDOTDIR".to_owned(), orig.to_string_lossy().into_owned()));
-        }
-        launch.managed = true;
-        launch
     }
 
     /// Bring the configuration and the import of the user's shell setup up
@@ -195,13 +239,18 @@ impl Launcher {
                 }
                 let (plugins, _) = crate::plugins::active(dirs, settings);
                 let needs_gen = plugins.iter().any(|a| a.manifest.files.iter().any(|f| f.env.is_some()));
-                if needs_gen && !dirs.zsh_dir().join(".zshrc").is_file() {
+                let entry_file = if cfg!(windows) { dirs.pwsh_dir().join("init.ps1") } else { dirs.zsh_dir().join(".zshrc") };
+                if needs_gen && !entry_file.is_file() {
                     let _ = self.apply(host);
                 }
-                let home = std::env::var("HOME").ok();
+                let home = Dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
                 for a in &plugins {
                     let mut values = a.values.clone();
-                    goatty_plugin::zsh::expand_home(&a.manifest, &mut values, home.as_deref());
+                    if cfg!(windows) {
+                        goatty_plugin::powershell::expand_home(&a.manifest, &mut values, home.as_deref());
+                    } else {
+                        goatty_plugin::zsh::expand_home(&a.manifest, &mut values, home.as_deref());
+                    }
                     for e in a.manifest.env.iter().filter(|e| goatty_plugin::manifest::applies(&e.when, &values)) {
                         let v = goatty_plugin::template::expand_inline(&e.value, &a.manifest, &values, None);
                         if !v.is_empty() {
@@ -210,7 +259,7 @@ impl Launcher {
                     }
                     for f in a.manifest.files.iter().filter(|f| goatty_plugin::manifest::applies(&f.when, &values)) {
                         if let Some(var) = &f.env {
-                            let file_path = dirs.zsh_dir().join("plugins").join(&a.manifest.id).join(&f.name);
+                            let file_path = dirs.shell_dir().join("plugins").join(&a.manifest.id).join(&f.name);
                             if file_path.is_file() {
                                 env_map.insert(var.clone(), file_path.to_string_lossy().into_owned());
                             }
@@ -244,6 +293,40 @@ pub(crate) fn touch_stamp(dirs: &Dirs, at: SystemTime) {
     }
 }
 
+/// Find PowerShell on this host: PowerShell 7 (`pwsh.exe`) first, then
+/// Windows PowerShell 5.1 (`powershell.exe`). On non-Windows hosts checks
+/// `pwsh` on PATH.
+pub fn find_powershell() -> Option<String> {
+    #[cfg(windows)]
+    {
+        if let Some(p) = which("pwsh.exe") {
+            return Some(p);
+        }
+        for env_var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(pf) = std::env::var_os(env_var) {
+                let candidate = PathBuf::from(pf).join("PowerShell").join("7").join("pwsh.exe");
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if let Some(p) = which("powershell.exe") {
+            return Some(p);
+        }
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let candidate = PathBuf::from(root).join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        which("pwsh")
+    }
+}
+
 /// `program` if given; on Unix, else zsh if installed, else `$SHELL`, else `/bin/sh`;
 /// on Windows, else `pwsh.exe`, else `powershell.exe`, else `%COMSPEC%` / `cmd.exe`.
 pub fn resolve_program(program: Option<&str>) -> String {
@@ -252,10 +335,7 @@ pub fn resolve_program(program: Option<&str>) -> String {
     }
     #[cfg(windows)]
     {
-        which("pwsh.exe")
-            .or_else(|| which("powershell.exe"))
-            .or_else(|| std::env::var("COMSPEC").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "cmd.exe".into())
+        find_powershell().or_else(|| std::env::var("COMSPEC").ok().filter(|s| !s.is_empty())).unwrap_or_else(|| "cmd.exe".into())
     }
     #[cfg(not(windows))]
     {
@@ -267,7 +347,8 @@ pub fn resolve_program(program: Option<&str>) -> String {
 /// would fail to start. `None` (the default shell) is always fine.
 pub fn program_issue(program: Option<&str>) -> Option<goatty_config::Issue> {
     let p = program.map(str::trim).filter(|p| !p.is_empty())?;
-    let found = if p.contains('/') { Path::new(p).is_file() } else { which(p).is_some() };
+    let is_path = p.contains('/') || (cfg!(windows) && p.contains('\\'));
+    let found = if is_path { Path::new(p).is_file() } else { which(p).is_some() };
     (!found).then(|| goatty_config::Issue::new("shell.program", format!("{p:?} isn't installed on this host; new sessions won't start")))
 }
 
@@ -275,10 +356,59 @@ pub fn is_zsh(program: &str) -> bool {
     Path::new(program).file_name().is_some_and(|n| n == "zsh")
 }
 
+/// Whether `program` is PowerShell (`pwsh`, `pwsh.exe`, `powershell`, or
+/// `powershell.exe`, matched case-insensitively on the basename).
+pub fn is_powershell(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    matches!(name.to_ascii_lowercase().as_str(), "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe")
+}
+
+/// Whether `program` is legacy Windows PowerShell 5.1 (`powershell` / `powershell.exe`).
+pub fn is_windows_powershell(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    matches!(name.to_ascii_lowercase().as_str(), "powershell" | "powershell.exe")
+}
+
+/// Whether `program` is the shell managed by goatty on this host (`zsh` on
+/// Unix, PowerShell on Windows).
+pub fn is_managed_shell(program: &str) -> bool {
+    if cfg!(windows) { is_powershell(program) } else { is_zsh(program) }
+}
+
 /// First `bin` in `$PATH`.
 pub fn which(bin: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+    #[cfg(windows)]
+    {
+        let has_ext = Path::new(bin).extension().is_some();
+        let exts: Vec<String> = if has_ext {
+            Vec::new()
+        } else {
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        for dir in std::env::split_paths(&path) {
+            let direct = dir.join(bin);
+            if direct.is_file() {
+                return Some(direct.to_string_lossy().into_owned());
+            }
+            for ext in &exts {
+                let candidate = dir.join(format!("{bin}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::split_paths(&path).map(|d| d.join(bin)).find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
+    }
 }
 
 #[cfg(test)]
@@ -295,29 +425,49 @@ mod tests {
     fn missing_programs_are_reported() {
         assert!(program_issue(None).is_none());
         assert!(program_issue(Some(" ")).is_none());
-        assert!(program_issue(Some("/bin/sh")).is_none());
-        assert!(program_issue(Some("sh")).is_none(), "found on PATH");
-        assert_eq!(program_issue(Some("/nonexistent/fish")).unwrap().path, "shell.program");
+        if cfg!(windows) {
+            assert!(program_issue(Some("cmd.exe")).is_none(), "found on PATH");
+            assert_eq!(program_issue(Some(r"C:\nonexistent\fish.exe")).unwrap().path, "shell.program");
+        } else {
+            assert!(program_issue(Some("/bin/sh")).is_none());
+            assert!(program_issue(Some("sh")).is_none(), "found on PATH");
+            assert_eq!(program_issue(Some("/nonexistent/fish")).unwrap().path, "shell.program");
+        }
         assert!(program_issue(Some("goatty-no-such-shell")).is_some());
     }
 
     #[test]
-    fn zsh_detection() {
+    fn zsh_and_powershell_detection() {
         assert!(is_zsh("/usr/bin/zsh"));
         assert!(is_zsh("zsh"));
         assert!(!is_zsh("/bin/zsh5"));
         assert!(!is_zsh("/bin/bash"));
+
+        assert!(is_powershell("pwsh"));
+        assert!(is_powershell("pwsh.exe"));
+        assert!(is_powershell(r"C:\Program Files\PowerShell\7\PWSH.EXE"));
+        assert!(is_powershell(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(is_windows_powershell("powershell.exe"));
+        assert!(!is_windows_powershell("pwsh.exe"));
+        assert!(!is_powershell("cmd.exe"));
+        assert!(!is_powershell("/bin/bash"));
     }
 
     #[test]
-    fn non_zsh_starts_plain() {
+    fn unmanaged_shells_start_plain() {
         let tmp = tempfile::tempdir().unwrap();
         let l = Launcher::new(Some(Dirs::under(tmp.path())), None);
-        let launch = l.launch(&Effective::plain(host("/bin/sh")));
-        assert_eq!(launch, Launch { program: "/bin/sh".into(), args: vec!["-l".into()], env: vec![], managed: false });
+        if cfg!(windows) {
+            let launch = l.launch(&Effective::plain(host("cmd.exe")));
+            assert_eq!(launch, Launch { program: "cmd.exe".into(), args: vec![], env: vec![], managed: false });
+        } else {
+            let launch = l.launch(&Effective::plain(host("/bin/sh")));
+            assert_eq!(launch, Launch { program: "/bin/sh".into(), args: vec!["-l".into()], env: vec![], managed: false });
+        }
         assert!(!tmp.path().join("data").exists(), "nothing written for other shells");
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_zsh_uses_the_current_generation() {
         let tmp = tempfile::tempdir().unwrap();
@@ -346,6 +496,36 @@ mod tests {
         off.value.shell.managed = false;
         assert!(!l.launch(&off).managed);
         assert!(!Launcher::new(None, None).launch(&h).managed, "no HOME: plain zsh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_powershell_uses_the_current_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let l = Launcher::new(Some(dirs.clone()), None);
+        let mut h = Effective::plain(host("pwsh.exe"));
+        let launch = l.launch(&h);
+        assert!(launch.managed);
+        assert!(launch.args.iter().any(|a| a == "-NoProfile"));
+        assert!(launch.args.iter().any(|a| a == "-NoExit"));
+        assert!(launch.args.iter().any(|a| a.contains("init.ps1")));
+        assert!(dirs.pwsh_dir().join("init.ps1").is_file());
+        assert_eq!(generation::current(&dirs), Some(1));
+
+        l.launch(&h);
+        assert_eq!(generation::current(&dirs), Some(1));
+        h.value.history.size = 777;
+        h.file.value.history.size = 777;
+        let diff = l.preview(&h.value);
+        assert_eq!(diff.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["settings.ps1"]);
+        l.launch(&h);
+        assert_eq!(generation::current(&dirs), Some(2));
+
+        let mut off = h.clone();
+        off.value.shell.managed = false;
+        assert!(!l.launch(&off).managed);
+        assert!(!Launcher::new(None, None).launch(&h).managed);
     }
 
     #[cfg(unix)]

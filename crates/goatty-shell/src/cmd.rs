@@ -202,9 +202,12 @@ fn probe_shell(host: &Effective<HostSettings>, launcher: &Launcher) -> Option<do
 }
 
 fn is_missing(b: &Builtin, dirs: &Dirs, path: Option<&str>, probe: Option<&doctor::Probe>) -> bool {
+    let shell = builtins::host_managed_shell();
     match probe {
         Some(p) => p.get(b.id) == Some(&doctor::State::Missing),
-        None => b.manifest().packages.iter().any(|p| packages::locate(dirs, p, path) == Location::Missing),
+        None => {
+            b.manifest().packages.iter().filter(|p| p.applies_to_shell(shell)).any(|p| packages::locate(dirs, p, path) == Location::Missing)
+        }
     }
 }
 
@@ -222,7 +225,8 @@ fn outdated_managed_manifest(
     {
         return None;
     }
-    m.packages.iter().find_map(|p| match packages::locate(dirs, p, path) {
+    let shell = builtins::host_managed_shell();
+    m.packages.iter().filter(|p| p.applies_to_shell(shell)).find_map(|p| match packages::locate(dirs, p, path) {
         Location::Managed { version, .. } if version != p.version => Some(version),
         _ => None,
     })
@@ -320,7 +324,8 @@ fn update_explicit_candidates(
             out.push(c);
             continue;
         }
-        for p in &c.manifest.packages {
+        let shell = builtins::host_managed_shell();
+        for p in c.manifest.packages.iter().filter(|p| p.applies_to_shell(shell)) {
             match packages::locate(dirs, p, path) {
                 Location::System(sys) => println!("{} is already installed at {}; goatty uses that.", c.manifest.name, tilde(&sys)),
                 Location::Managed { version, .. } => println!("{} {version} is already up to date.", c.manifest.name),

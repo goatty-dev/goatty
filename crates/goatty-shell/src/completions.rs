@@ -26,22 +26,28 @@ use crate::dirs::Dirs;
 /// How long a tool may take to print its completions.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The file holding command `name`'s completion function.
+/// The file holding command `name`'s completion script (`_<name>` in
+/// `share/zsh/site-functions/` on Unix; `<name>.ps1` in
+/// `share/pwsh/completions/` on Windows).
 pub fn file(dirs: &Dirs, name: &str) -> PathBuf {
-    dirs.site_functions_dir().join(format!("_{name}"))
+    if cfg!(windows) { dirs.pwsh_completions_dir().join(format!("{name}.ps1")) } else { dirs.site_functions_dir().join(format!("_{name}")) }
 }
 
-/// Make `_name` hold `script` (atomically). Returns whether anything
-/// changed; the completion dump is dropped when it did.
+fn completions_dir(dirs: &Dirs) -> PathBuf {
+    if cfg!(windows) { dirs.pwsh_completions_dir() } else { dirs.site_functions_dir() }
+}
+
+/// Make the completion file for `name` hold `script` (atomically). Returns
+/// whether anything changed; the zsh completion dump is dropped when it did.
 pub fn write(dirs: &Dirs, name: &str, script: &str) -> Result<bool> {
     check(name, script)?;
     let path = file(dirs, name);
     if std::fs::read(&path).is_ok_and(|old| old == script.as_bytes()) {
         return Ok(false);
     }
-    let dir = dirs.site_functions_dir();
+    let dir = completions_dir(dirs);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let tmp = dir.join(format!("._{name}.tmp-{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
     std::fs::write(&tmp, script).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))?;
     invalidate_dump(dirs);
@@ -66,16 +72,23 @@ pub fn remove(dirs: &Dirs, name: &str) -> Result<bool> {
 pub fn write_own(dirs: Option<&Dirs>, name: &str, script: &str) {
     let Some(dirs) = dirs else { return };
     match write(dirs, name, script) {
-        Ok(true) => log::info!("updated the zsh completions of {name} in {}", dirs.site_functions_dir().display()),
+        Ok(true) => log::info!("updated the completions of {name} in {}", completions_dir(dirs).display()),
         Ok(false) => {}
-        Err(e) => log::warn!("couldn't write the zsh completions of {name}: {e:#}"),
+        Err(e) => log::warn!("couldn't write the completions of {name}: {e:#}"),
     }
 }
 
 /// Run `exe` with `args` (a package's `completions` command, `exe` being
-/// goatty's copy of the program) and keep what it prints as `_<name>`.
+/// goatty's copy of the program) and keep what it prints. On Windows, any
+/// `"zsh"` shell argument (as in `starship completions zsh`) is rewritten to
+/// `"powershell"`.
 pub fn for_package(dirs: &Dirs, name: &str, exe: &Path, args: &[String]) -> Result<bool> {
-    let script = generate(exe, args).with_context(|| format!("{} {}", exe.display(), args.join(" ")))?;
+    let adapted: Vec<String> = if cfg!(windows) {
+        args.iter().map(|a| if a == "zsh" { "powershell".to_owned() } else { a.clone() }).collect()
+    } else {
+        args.to_vec()
+    };
+    let script = generate(exe, &adapted).with_context(|| format!("{} {}", exe.display(), adapted.join(" ")))?;
     write(dirs, name, &script)
 }
 
@@ -94,12 +107,14 @@ pub fn backfill(dirs: &Dirs) {
     }
     for p in &packages {
         let Some((name, args)) = p.completions.split_first() else { continue };
-        if crate::install::link_owner(dirs, name).as_deref() != Some(p.id.as_str()) || file(dirs, name).exists() {
+        let cmd_name = goatty_plugin::manifest::command_name(name);
+        let file_name = crate::install::bin_file_name(name);
+        if crate::install::link_owner(dirs, &file_name).as_deref() != Some(p.id.as_str()) || file(dirs, cmd_name).exists() {
             continue;
         }
-        match for_package(dirs, name, &dirs.bin_dir().join(name), args) {
-            Ok(_) => log::info!("added the zsh completions of goatty's {name}"),
-            Err(e) => log::warn!("no zsh completions for {name}: {e:#}"),
+        match for_package(dirs, cmd_name, &dirs.bin_dir().join(&file_name), args) {
+            Ok(_) => log::info!("added the completions of goatty's {cmd_name}"),
+            Err(e) => log::warn!("no completions for {cmd_name}: {e:#}"),
         }
     }
 }
@@ -110,7 +125,14 @@ fn generate(exe: &Path, args: &[String]) -> Result<String> {
     // Another thread forking while `exe` was just written holds that writable
     // fd until its exec; retry ETXTBSY ("text file busy").
     let mut child = loop {
-        match Command::new(exe).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+        let mut cmd = Command::new(exe);
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        }
+        match cmd.spawn() {
             Ok(child) => break child,
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
@@ -141,13 +163,17 @@ fn generate(exe: &Path, args: &[String]) -> Result<String> {
     String::from_utf8(out).context("printed something that isn't text")
 }
 
-/// A zsh completion function starts with `#compdef`; `compinit` ignores
-/// anything else.
+/// A zsh completion function starts with `#compdef`; on Windows a PowerShell
+/// completion script must be non-empty text without NUL bytes.
 fn check(name: &str, script: &str) -> Result<()> {
-    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
         bail!("{name:?} is not a command name");
     }
-    if !script.starts_with("#compdef") {
+    if cfg!(windows) {
+        if script.trim().is_empty() || script.contains('\0') {
+            bail!("not a PowerShell completion script");
+        }
+    } else if !script.starts_with("#compdef") {
         bail!("not a zsh completion function (no #compdef line)");
     }
     Ok(())
@@ -176,22 +202,33 @@ mod tests {
         let dump = dirs.cache.join("zcompdump-5.9");
         std::fs::write(&dump, "").unwrap();
 
-        assert!(write(&dirs, "goattyd", "#compdef goattyd\n_goattyd() {}\n").unwrap());
+        let script = if cfg!(windows) {
+            "Register-ArgumentCompleter -CommandName 'goattyd' -ScriptBlock {}\n"
+        } else {
+            "#compdef goattyd\n_goattyd() {}\n"
+        };
+        assert!(write(&dirs, "goattyd", script).unwrap());
         assert!(!dump.exists(), "a new function rebuilds the dump");
-        assert_eq!(std::fs::read_to_string(file(&dirs, "goattyd")).unwrap(), "#compdef goattyd\n_goattyd() {}\n");
+        assert_eq!(std::fs::read_to_string(file(&dirs, "goattyd")).unwrap(), script);
 
         std::fs::write(&dump, "").unwrap();
-        assert!(!write(&dirs, "goattyd", "#compdef goattyd\n_goattyd() {}\n").unwrap());
+        assert!(!write(&dirs, "goattyd", script).unwrap());
         assert!(dump.exists(), "nothing changed: the dump stays");
 
-        assert!(write(&dirs, "x", "echo hi").is_err(), "not a completion function");
-        assert!(write(&dirs, "../x", "#compdef x").is_err());
+        if cfg!(windows) {
+            assert!(write(&dirs, "x", "   \n").is_err(), "empty completion script");
+            assert!(write(&dirs, "x", "bad\0script").is_err(), "NUL byte rejected");
+        } else {
+            assert!(write(&dirs, "x", "echo hi").is_err(), "not a completion function");
+        }
+        assert!(write(&dirs, "../x", script).is_err());
 
         assert!(remove(&dirs, "goattyd").unwrap());
         assert!(!dump.exists());
         assert!(!remove(&dirs, "goattyd").unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn generates_from_a_command() {
         let tmp = tempfile::tempdir().unwrap();

@@ -71,17 +71,30 @@ pub fn run(launch: &Launch, command: &str, timeout: Duration) -> Result<Ran> {
     if !launch.managed {
         bail!("{} doesn't run goatty's managed configuration", launch.program);
     }
-    let script = format!("builtin print -r -- '{SENTINEL}'; {command}");
     let start = Instant::now();
-    let mut child = Command::new(&launch.program)
-        .args(["-l", "-i", "-c", &script])
-        .envs(launch.env.iter().map(|(k, v)| (k, v)))
-        .current_dir(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start {}", launch.program))?;
+    let mut cmd = Command::new(&launch.program);
+    if crate::launch::is_powershell(&launch.program) {
+        let init_cmd = launch
+            .args
+            .windows(2)
+            .find(|w| w[0].eq_ignore_ascii_case("-Command"))
+            .map(|w| w[1].as_str())
+            .context("managed PowerShell launch is missing -Command init")?;
+        let script = format!("{init_cmd}; Write-Output '{SENTINEL}'; {command}");
+        cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+    } else {
+        let script = format!("builtin print -r -- '{SENTINEL}'; {command}");
+        cmd.args(["-l", "-i", "-c", &script]);
+    }
+    let cwd = crate::dirs::Dirs::home_dir().unwrap_or_else(|| if cfg!(windows) { ".".into() } else { "/".into() });
+    cmd.envs(launch.env.iter().map(|(k, v)| (k, v))).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().with_context(|| format!("start {}", launch.program))?;
     let read_all = |mut r: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut s = Vec::new();

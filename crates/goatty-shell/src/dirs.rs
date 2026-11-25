@@ -57,6 +57,12 @@ fn home_dir_for(windows: bool, var: &impl Fn(&str) -> Option<String>) -> Option<
 }
 
 impl Dirs {
+    /// The user's home directory (`USERPROFILE` / `HOMEDRIVE`+`HOMEPATH` / `HOME`
+    /// on Windows; `HOME` on Unix).
+    pub fn home_dir() -> Option<PathBuf> {
+        home_dir_for(cfg!(windows), &|k| std::env::var(k).ok())
+    }
+
     /// From the process environment. `None` without a home directory (or Windows AppData dirs).
     pub fn from_env() -> Option<Self> {
         Self::from_vars(|k| std::env::var(k).ok())
@@ -106,10 +112,18 @@ impl Dirs {
     pub fn zsh_dir(&self) -> PathBuf {
         self.current_link().join("zsh")
     }
+    /// The active generation's PowerShell directory (through the `current` junction).
+    pub fn pwsh_dir(&self) -> PathBuf {
+        self.current_link().join("pwsh")
+    }
+    /// The active generation's shell directory (`pwsh` on Windows, `zsh` on Unix).
+    pub fn shell_dir(&self) -> PathBuf {
+        if cfg!(windows) { self.pwsh_dir() } else { self.zsh_dir() }
+    }
     pub fn generations_dir(&self) -> PathBuf {
         self.data.join("generations")
     }
-    /// Symlink to the active generation.
+    /// Symlink (Unix) or NTFS junction (Windows) to the active generation.
     pub fn current_link(&self) -> PathBuf {
         self.data.join("current")
     }
@@ -129,6 +143,15 @@ impl Dirs {
     /// Zsh completion functions goatty provides ([`crate::completions`]).
     pub fn site_functions_dir(&self) -> PathBuf {
         self.data.join("share/zsh/site-functions")
+    }
+    /// PowerShell completion scripts goatty provides ([`crate::completions`]).
+    pub fn pwsh_completions_dir(&self) -> PathBuf {
+        self.data.join("share/pwsh/completions")
+    }
+    /// Sentinel file bumped by `reload_shells()` on Windows so running
+    /// PowerShell prompts pick up configuration reloads without `SIGURG`.
+    pub fn reload_sentinel(&self) -> PathBuf {
+        self.state.join("shell-reload")
     }
     /// Installed goatty plugins (Stage 5): `installed/<id>/` + `lock.json`.
     pub fn installed_dir(&self) -> PathBuf {
@@ -165,6 +188,11 @@ impl Dirs {
     /// The user's own zsh additions, sourced late by the managed `.zshrc`.
     pub fn user_zshrc(&self) -> PathBuf {
         self.config.join("zshrc")
+    }
+    /// The user's own PowerShell additions (`%APPDATA%\goatty\profile.ps1`),
+    /// dot-sourced late by the managed `init.ps1`.
+    pub fn user_ps_profile(&self) -> PathBuf {
+        self.config.join("profile.ps1")
     }
     /// goatty over the tailnet (`goatty_net::Paths`): the device key, paired
     /// devices, pinned hosts, whether this host is available.

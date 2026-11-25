@@ -278,7 +278,7 @@ fn plugin_ids(t: &Tree, settings: &str) -> BTreeSet<String> {
 /// Compare a generation (`settings`, `files`, built by goatty `version`)
 /// with its base.
 pub(crate) fn compare(base: &Generation, settings: &str, files: &Tree, version: &str) -> Changes {
-    let old_files = tree(&base.zsh_dir());
+    let old_files = tree(&base.shell_dir());
     let changed =
         old_files.keys().chain(files.keys()).collect::<BTreeSet<_>>().into_iter().filter(|k| old_files.get(*k) != files.get(*k)).count();
     let old_settings = base.settings_json().unwrap_or_default();
@@ -309,7 +309,7 @@ pub fn list(dirs: &Dirs) -> Vec<Entry> {
             let changes = info.changes.clone().or_else(|| match base_of(g, &all) {
                 Some(base) => {
                     let settings = g.settings_json().unwrap_or_default();
-                    Some(compare(base, &settings, &tree(&g.zsh_dir()), &info.goatty))
+                    Some(compare(base, &settings, &tree(&g.shell_dir()), &info.goatty))
                 }
                 None if g.number == 1 => Some(Changes::default()),
                 None => None,
@@ -337,9 +337,9 @@ pub fn set_name(dirs: &Dirs, number: u32, name: Option<&str>) -> Result<()> {
 pub fn file_diff(dirs: &Dirs, number: u32) -> Result<Vec<FileDiff>> {
     let all = generation::list(dirs);
     let g = all.iter().find(|g| g.number == number).with_context(|| format!("no generation {number}"))?;
-    let new = tree(&g.zsh_dir());
+    let new = tree(&g.shell_dir());
     let (base_name, old) = match base_of(g, &all) {
-        Some(b) => (b.number.to_string(), tree(&b.zsh_dir())),
+        Some(b) => (b.number.to_string(), tree(&b.shell_dir())),
         None if number == 1 => ("none".to_string(), Tree::new()),
         None => bail!("the generation {number} was built on isn't kept any more"),
     };
@@ -432,8 +432,12 @@ mod tests {
     }
 
     fn files(rc: &str, plugin: Option<&str>) -> Vec<GeneratedFile> {
-        let mut v = vec![GeneratedFile::new(".zshrc", rc)];
-        v.extend(plugin.map(|p| GeneratedFile::new(format!("plugins/{p}/init.zsh"), "true\n")));
+        let entry = if cfg!(windows) { "init.ps1" } else { ".zshrc" };
+        let body = if cfg!(windows) { format!("# {rc}") } else { rc.to_owned() };
+        let mut v = vec![GeneratedFile::new(entry, body)];
+        let plugin_file = if cfg!(windows) { "init.ps1" } else { "init.zsh" };
+        let plugin_body = if cfg!(windows) { "$true\n" } else { "true\n" };
+        v.extend(plugin.map(|p| GeneratedFile::new(format!("plugins/{p}/{plugin_file}"), plugin_body)));
         v
     }
 
@@ -464,7 +468,8 @@ mod tests {
         let d = file_diff(&dirs, 3).unwrap();
         assert_eq!(d.len(), 1, "against 1, its base, not 2");
         assert!(d[0].unified.contains("-a") && d[0].unified.contains("+b"), "{}", d[0].unified);
-        assert_eq!(file_diff(&dirs, 2).unwrap().iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["plugins/demo/init.zsh"]);
+        let expected_plugin = if cfg!(windows) { "plugins/demo/init.ps1" } else { "plugins/demo/init.zsh" };
+        assert_eq!(file_diff(&dirs, 2).unwrap().iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), [expected_plugin]);
         assert_eq!(file_diff(&dirs, 1).unwrap().len(), 1, "everything is new in the first");
     }
 

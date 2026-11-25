@@ -681,6 +681,67 @@ pub fn command_line(c: &PaletteCommand, values: &BTreeMap<String, String>) -> St
     words.join(" ")
 }
 
+/// The line `c` types into a PowerShell terminal for `values` (by input id),
+/// quoting arguments with PowerShell single-quote escaping (`''`) and adding
+/// the `&` call operator when the program name requires quoting (#278).
+pub fn command_line_powershell(c: &PaletteCommand, values: &BTreeMap<String, String>) -> String {
+    let mut words = Vec::new();
+    for (i, t) in c.run.iter().enumerate() {
+        if i == 0 {
+            words.push(crate::powershell::command_word(t));
+            continue;
+        }
+        let Ok(ps) = parts(t) else { continue };
+        if let [Part::Var(v)] = ps.as_slice() {
+            let value = values.get(*v).map(String::as_str).unwrap_or_default();
+            if value.is_empty() {
+                continue;
+            }
+            let is_path = c.inputs.iter().any(|i| i.id == *v && matches!(i.kind, InputKind::Path | InputKind::Folder));
+            if is_path && (value == "~" || value.starts_with("~/") || value.starts_with(r"~\")) {
+                let rest = value[1..].trim_start_matches(['/', '\\']);
+                words.push(if rest.is_empty() { "$HOME".into() } else { format!("(Join-Path $HOME {})", crate::powershell::quote(rest)) });
+                continue;
+            }
+        }
+        let mut exprs: Vec<String> = Vec::new();
+        let mut text = String::new();
+        let mut has_home = false;
+        for p in &ps {
+            match p {
+                Part::Text(s) => text.push_str(s),
+                Part::Var(v) => {
+                    let value = values.get(*v).map(String::as_str).unwrap_or_default();
+                    let is_path = c.inputs.iter().any(|i| i.id == *v && matches!(i.kind, InputKind::Path | InputKind::Folder));
+                    match value
+                        .strip_prefix('~')
+                        .filter(|rest| is_path && (rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')))
+                    {
+                        Some(rest) => {
+                            has_home = true;
+                            if !text.is_empty() {
+                                exprs.push(crate::powershell::quote(&std::mem::take(&mut text)));
+                            }
+                            exprs.push("$HOME".into());
+                            text.push_str(rest);
+                        }
+                        None => text.push_str(value),
+                    }
+                }
+            }
+        }
+        if has_home {
+            if !text.is_empty() {
+                exprs.push(crate::powershell::quote(&text));
+            }
+            words.push(format!("({})", exprs.join(" + ")));
+        } else {
+            words.push(crate::powershell::word(&text));
+        }
+    }
+    words.join(" ")
+}
+
 /// The direct `argv` `c` spawns (without a shell) for `values` (by input id)
 /// when opening in a split or new tab (#241). Whole-word `{input}` with an
 /// empty optional value is omitted. Leading `~` / `~/` in `path` and `folder`
@@ -1425,5 +1486,83 @@ optional = true
         // Invalid open_in value is rejected.
         let bad = with_commands("[[command]]\nid = \"x\"\ntitle = \"X\"\nrun = [\"eza\"]\nopen_in = \"floating\"\n");
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn command_line_powershell_quotes_and_expands_home() {
+        let c = PaletteCommand {
+            id: "x".into(),
+            title: "x".into(),
+            keywords: Vec::new(),
+            run: vec!["eza".into(), "--level={depth}".into(), "{dir}".into(), "{filter}".into()],
+            keys: Vec::new(),
+            pane: None,
+            inputs: vec![
+                CommandInput {
+                    id: "dir".into(),
+                    label: "Folder".into(),
+                    placeholder: String::new(),
+                    help: String::new(),
+                    kind: InputKind::Folder,
+                    default: None,
+                    optional: false,
+                    min: None,
+                    max: None,
+                    pattern: None,
+                    pattern_help: None,
+                    choices: Vec::new(),
+                    must_exist: false,
+                    source: None,
+                    strict: false,
+                },
+                CommandInput {
+                    id: "depth".into(),
+                    label: "Depth".into(),
+                    placeholder: String::new(),
+                    help: String::new(),
+                    kind: InputKind::Integer,
+                    default: None,
+                    optional: false,
+                    min: None,
+                    max: None,
+                    pattern: None,
+                    pattern_help: None,
+                    choices: Vec::new(),
+                    must_exist: false,
+                    source: None,
+                    strict: false,
+                },
+                CommandInput {
+                    id: "filter".into(),
+                    label: "Filter".into(),
+                    placeholder: String::new(),
+                    help: String::new(),
+                    kind: InputKind::Text,
+                    default: None,
+                    optional: true,
+                    min: None,
+                    max: None,
+                    pattern: None,
+                    pattern_help: None,
+                    choices: Vec::new(),
+                    must_exist: false,
+                    source: None,
+                    strict: false,
+                },
+            ],
+            when: None,
+            open_in: OpenIn::Current,
+            menu: None,
+        };
+        let mut v = BTreeMap::new();
+        v.insert("depth".into(), "2".into());
+        v.insert("dir".into(), "~/my repo".into());
+        v.insert("filter".into(), "$(rm -rf ~); 'it''s'".into());
+        let line = command_line_powershell(&c, &v);
+        assert_eq!(line, "eza --level=2 (Join-Path $HOME 'my repo') '$(rm -rf ~); ''it''''s'''");
+
+        v.insert("dir".into(), "~".into());
+        v.insert("filter".into(), String::new());
+        assert_eq!(command_line_powershell(&c, &v), "eza --level=2 $HOME");
     }
 }

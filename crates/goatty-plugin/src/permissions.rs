@@ -134,7 +134,7 @@ pub fn derived(m: &Manifest) -> Vec<Permission> {
     if !m.packages.is_empty() {
         v.push(Permission::Binaries);
     }
-    if m.zsh.init.is_some() {
+    if m.zsh.init.is_some() || m.powershell.init.is_some() {
         v.push(Permission::ShellCode);
     }
     if !m.aliases.is_empty() {
@@ -208,7 +208,7 @@ pub(crate) fn check(m: &Manifest) -> Vec<Problem> {
 fn what_uses(p: Permission) -> &'static str {
     match p {
         Permission::Binaries => "installs programs ([[package]])",
-        Permission::ShellCode => "runs shell code (zsh.init)",
+        Permission::ShellCode => "runs shell code (zsh.init / powershell.init)",
         Permission::SnippetSources => "runs programs for suggestions ([snippet.input.source] or [command.input.source])",
         _ => "uses it",
     }
@@ -244,7 +244,7 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                         format!("{} {}: {}", pk.id, pk.version, what.join(", "))
                     })
                     .collect(),
-                Permission::ShellCode => m.zsh.init.iter().cloned().collect(),
+                Permission::ShellCode => m.zsh.init.iter().chain(&m.powershell.init).cloned().collect(),
                 Permission::Network => Vec::new(),
                 Permission::Aliases => {
                     let mut names: Vec<String> = m.aliases.iter().map(|a| format!("{} → {}", a.name, a.command)).collect();

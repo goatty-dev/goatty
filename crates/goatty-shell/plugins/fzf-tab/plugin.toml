@@ -40,11 +40,20 @@ help = "Shows what's selected next to the list: directories (needs eza), files (
 type = "bool"
 default = true
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [zsh]
 init = "zsh/init.zsh"
 load = "line-editor"
 # After fzf's bindings (which wrap Tab for `**` completion); before
 # autosuggestions, which wraps the widgets defined before it.
+after = ["fzf"]
+
+[powershell]
+init = "pwsh/init.ps1"
+load = "line-editor"
 after = ["fzf"]
 
 [permissions]
