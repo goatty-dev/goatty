@@ -3023,6 +3023,10 @@ impl Render for Workspace {
         // A drag that ended anywhere (even outside the window) is over.
         if !cx.has_active_drag() {
             self.dragging = None;
+            if self.sidebar_drag.is_some() {
+                self.save_sidebar = None;
+                cx.defer_in(window, |this, _, cx| this.save_sidebar_size(false, cx));
+            }
             if self.divider_dragging {
                 // The split's sizes are saved now; changes from other
                 // windows that waited for it apply.

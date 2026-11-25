@@ -94,12 +94,15 @@ impl Workspace {
     /// The window's root in the vertical style: a row in the sidebar's
     /// color that follows a drag of the sidebar's edge.
     pub(super) fn sidebar_frame(&self, root: gpui::Stateful<gpui::Div>, cx: &mut Context<'_, Self>) -> gpui::Stateful<gpui::Div> {
-        root.flex_row().bg(Colors::get(cx).bar).on_drag_move(cx.listener(Self::on_sidebar_drag)).on_drop(cx.listener(
-            |this, _: &SidebarDrag, _, cx| {
-                this.save_sidebar = None;
-                this.save_sidebar_size(true, cx);
-            },
-        ))
+        root.flex_row()
+            .bg(Colors::get(cx).bar)
+            .on_drag_move(cx.listener(Self::on_sidebar_drag))
+            .on_drop(cx.listener(|this, _: &SidebarDrag, _, cx| this.finish_sidebar_drag(cx)))
+    }
+
+    fn finish_sidebar_drag(&mut self, cx: &mut Context<'_, Self>) {
+        self.save_sidebar = None;
+        self.save_sidebar_size(true, cx);
     }
 
     fn on_sidebar_drag(&mut self, ev: &DragMoveEvent<SidebarDrag>, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -118,7 +121,7 @@ impl Workspace {
     }
 
     /// Save the dragged size to the settings. `done`: the drag ended.
-    fn save_sidebar_size(&mut self, done: bool, cx: &mut Context<'_, Self>) {
+    pub(super) fn save_sidebar_size(&mut self, done: bool, cx: &mut Context<'_, Self>) {
         let Some((_, s)) = self.sidebar_drag else { return };
         let tabs = &cx.global::<AppSettings>().client.tabs;
         if tabs.sidebar_width != s.width || tabs.sidebar_collapsed != s.folded {
@@ -567,7 +570,7 @@ impl Workspace {
     pub(super) fn render_sidebar_handle(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
         let c = Colors::get(cx);
         let x = self.sidebar_width(window, cx);
-        let dragging = self.sidebar_drag.is_some();
+        let dragging = self.sidebar_drag.is_some() && cx.has_active_drag();
         let line = div().w(px(2.)).h_full().rounded_full().when(dragging, |d| d.bg(c.ui.accent.opacity(0.7)));
         div()
             .id("tab-sidebar-edge")
@@ -584,6 +587,7 @@ impl Workspace {
             .group("tab-sidebar-edge")
             .child(line.group_hover("tab-sidebar-edge", |s| s.bg(c.ui.accent.opacity(0.5))))
             .on_drag(SidebarDrag, |_, _, _, cx| cx.new(|_| gpui::EmptyView))
+            .on_drop(cx.listener(|this, _: &SidebarDrag, _, cx| this.finish_sidebar_drag(cx)))
             .on_click(|ev, window, cx| {
                 if ev.click_count() == 2 {
                     window.dispatch_action(Box::new(ToggleTabSidebar), cx);
