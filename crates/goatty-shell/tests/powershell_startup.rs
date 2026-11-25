@@ -141,11 +141,10 @@ fn powershell_quoted_command_line_survives_real_shell() {
 fn all_powershells() -> Vec<String> {
     let mut out = Vec::new();
     for name in ["pwsh.exe", "powershell.exe"] {
-        if let Some(p) = goatty_shell::launch::which(name) {
-            let s = p.to_string_lossy().into_owned();
-            if !out.iter().any(|x: &String| x.eq_ignore_ascii_case(&s)) {
-                out.push(s);
-            }
+        if let Some(s) = goatty_shell::launch::which(name)
+            && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(&s))
+        {
+            out.push(s);
         }
     }
     out
