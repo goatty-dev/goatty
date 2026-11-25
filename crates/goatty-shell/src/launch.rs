@@ -28,6 +28,18 @@ pub struct Launcher {
     daemon_exe: Option<PathBuf>,
     /// Where imports of the user's shell setup come from.
     import: ImportFrom,
+    /// Whether a Nerd Font is installed ([`crate::fonts`]).
+    nerd_font: NerdFont,
+}
+
+/// How [`Launcher`] knows whether a Nerd Font is installed.
+#[derive(Debug, Clone, Copy)]
+enum NerdFont {
+    /// Given: [`Launcher::new`] assumes none, so tests don't depend on the
+    /// machine's fonts ([`Launcher::assume_nerd_font`]).
+    Given(bool),
+    /// Ask fontconfig (goattyd).
+    Probe,
 }
 
 /// Whose shell [`Launcher`] imports from.
@@ -47,13 +59,20 @@ impl Launcher {
     /// It imports nobody's shell setup ([`Self::from_env`] and
     /// [`Self::with_import_context`] do).
     pub fn new(dirs: Option<Dirs>, daemon_exe: Option<PathBuf>) -> Self {
-        Self { dirs, daemon_exe, import: ImportFrom::Nobody }
+        Self { dirs, daemon_exe, import: ImportFrom::Nobody, nerd_font: NerdFont::Given(false) }
     }
 
     /// Import the user's shell setup from `ctx` instead of this process's
     /// home and environment (tests, sandboxes).
     pub fn with_import_context(mut self, ctx: crate::import::Context) -> Self {
         self.import = ImportFrom::Given(ctx);
+        self
+    }
+
+    /// Whether a Nerd Font is installed, instead of asking fontconfig
+    /// (tests, sandboxes).
+    pub fn assume_nerd_font(mut self, installed: bool) -> Self {
+        self.nerd_font = NerdFont::Given(installed);
         self
     }
 
@@ -83,7 +102,7 @@ impl Launcher {
     /// The user's dirs, importing their shell setup from this process's
     /// environment.
     pub fn from_env(daemon_exe: Option<PathBuf>) -> Self {
-        Self { import: ImportFrom::Env, ..Self::new(Dirs::from_env(), daemon_exe) }
+        Self { import: ImportFrom::Env, nerd_font: NerdFont::Probe, ..Self::new(Dirs::from_env(), daemon_exe) }
     }
 
     pub fn dirs(&self) -> Option<&Dirs> {
@@ -100,7 +119,12 @@ impl Launcher {
                 plugins: &plugins,
             })
         } else {
-            zsh::render(&ZshConfig { settings, dirs, daemon_exe: self.daemon_exe.as_deref(), plugins: &plugins })
+            let nerd_font = settings.prompt.elsewhere() == goatty_config::IconsElsewhere::Auto
+                && match self.nerd_font {
+                    NerdFont::Given(b) => b,
+                    NerdFont::Probe => crate::fonts::installed_for(&crate::starship::render(settings)),
+                };
+            zsh::render(&ZshConfig { settings, dirs, daemon_exe: self.daemon_exe.as_deref(), plugins: &plugins, nerd_font })
         }
     }
 

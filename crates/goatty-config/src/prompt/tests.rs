@@ -218,7 +218,7 @@ fn plain_prompt_needs_no_nerd_font() {
     p.edit_module("rust", |c| c.symbol = Some("R ".into()));
     p.directory.substitutions =
         vec![Substitution { from: "goatty".into(), to: "\u{f418}".into() }, Substitution { from: "work".into(), to: "w".into() }];
-    assert!(p.needs_nerd_font() && p.plain_elsewhere());
+    assert!(p.needs_nerd_font() && p.elsewhere() == IconsElsewhere::Auto);
     let plain = p.plain();
     assert_eq!(plain.symbols, Symbols::Text);
     assert_eq!((plain.separator, plain.heads, plain.tails), (Separator::Angled, Edge::Flat, Edge::Blurred), "Rainbow draws no separators");
@@ -243,6 +243,17 @@ fn plain_prompt_needs_no_nerd_font() {
     assert!(!rainbow.needs_nerd_font(), "Rainbow has no separators");
     let classic = PromptSettings { style: PromptStyle::Classic, symbols: Symbols::Text, heads: Edge::Flat, ..Default::default() };
     assert!(classic.needs_nerd_font(), "Classic draws the Angled separator");
-    let kept = PromptSettings { icons_elsewhere: true, ..Default::default() };
-    assert!(kept.needs_nerd_font() && !kept.plain_elsewhere());
+    let kept = PromptSettings { icons_elsewhere: IconsElsewhere::Never, ..Default::default() };
+    assert_eq!(kept.elsewhere(), IconsElsewhere::Never);
+    assert_eq!(PromptSettings { icons_elsewhere: IconsElsewhere::Never, ..plain }.elsewhere(), IconsElsewhere::Always, "nothing to drop");
+}
+
+#[test]
+fn icons_elsewhere_reads_the_old_toggle() {
+    let read = |v: serde_json::Value| serde_json::from_value::<IconsElsewhere>(v).unwrap();
+    assert_eq!(read(serde_json::json!(true)), IconsElsewhere::Always);
+    assert_eq!(read(serde_json::json!(false)), IconsElsewhere::Auto);
+    assert_eq!(read(serde_json::json!("never")), IconsElsewhere::Never);
+    assert!(serde_json::from_value::<IconsElsewhere>(serde_json::json!("nope")).is_err());
+    assert_eq!(serde_json::to_value(IconsElsewhere::Always).unwrap(), "always");
 }

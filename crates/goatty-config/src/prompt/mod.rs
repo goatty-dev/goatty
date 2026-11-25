@@ -525,10 +525,61 @@ pub struct PromptSettings {
     pub colors: PromptColors,
     /// Per-module settings by Starship module name.
     pub modules: BTreeMap<String, ModuleConfig>,
-    /// Keep Nerd Font icons in other terminals too (goatty's shell in every
+    /// Nerd Font icons in other terminals (goatty's shell in every
     /// terminal, #283). goatty draws them with its own font; elsewhere they
-    /// need a Nerd Font, so by default other terminals get [`Self::plain`].
-    pub icons_elsewhere: bool,
+    /// need a Nerd Font, and terminals without one get [`Self::plain`].
+    pub icons_elsewhere: IconsElsewhere,
+}
+
+/// Whether other terminals (outside goatty's panes) get the prompt's Nerd
+/// Font icons and Powerline shapes, or [`PromptSettings::plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IconsElsewhere {
+    /// Where they draw: terminals with Nerd Font glyphs built in (Ghostty,
+    /// WezTerm, kitty), and local terminals when an installed font has
+    /// them (fontconfig falls back to it).
+    #[default]
+    Auto,
+    /// Always: every terminal the user runs has a Nerd Font.
+    Always,
+    /// Never: text and flat edges outside goatty.
+    Never,
+}
+
+impl IconsElsewhere {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Always, Self::Never];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Always => "Always",
+            Self::Never => "Never",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IconsElsewhere {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            /// Before #302 it was a toggle: on kept the icons, off (the
+            /// default, so never saved) is now automatic.
+            Bool(bool),
+            Named(String),
+        }
+        match Stored::deserialize(d)? {
+            Stored::Bool(true) => Ok(Self::Always),
+            Stored::Bool(false) => Ok(Self::Auto),
+            Stored::Named(n) => match n.as_str() {
+                "auto" => Ok(Self::Auto),
+                "always" => Ok(Self::Always),
+                "never" => Ok(Self::Never),
+                other => Err(serde::de::Error::unknown_variant(other, &["auto", "always", "never"])),
+            },
+        }
+    }
 }
 
 impl Default for PromptSettings {
@@ -550,7 +601,7 @@ impl Default for PromptSettings {
             character: CharacterPrompt::default(),
             colors: PromptColors::default(),
             modules: BTreeMap::new(),
-            icons_elsewhere: false,
+            icons_elsewhere: IconsElsewhere::Auto,
         }
     }
 }
@@ -572,10 +623,11 @@ impl PromptSettings {
         self.symbols == Symbols::Nerd || self != &self.plain()
     }
 
-    /// Other terminals (outside goatty) get [`Self::plain`] instead of this
-    /// prompt: it needs a Nerd Font and [`Self::icons_elsewhere`] is off.
-    pub fn plain_elsewhere(&self) -> bool {
-        !self.icons_elsewhere && self.needs_nerd_font()
+    /// What other terminals (outside goatty) get: [`IconsElsewhere::Always`]
+    /// when this prompt draws in any font, else [`Self::icons_elsewhere`]
+    /// (where they don't keep the icons, [`Self::plain`]).
+    pub fn elsewhere(&self) -> IconsElsewhere {
+        if self.needs_nerd_font() { self.icons_elsewhere } else { IconsElsewhere::Always }
     }
 
     /// The same prompt, drawable in any font: text symbols instead of Nerd
