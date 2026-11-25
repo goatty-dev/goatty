@@ -622,14 +622,16 @@ fn windows_force_stop(path: &Path, why: String) -> Result<Stopped> {
     // termination.
     // SAFETY: plain Win32 call; returned handle is validated and closed on drop.
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid) };
+    // Capture `GetLastError` immediately before `drop(stream)` calls `CloseHandle`,
+    // which could overwrite the thread's last-error code.
+    // SAFETY: `GetLastError` has no preconditions.
+    let open_err = if raw.is_null() { unsafe { GetLastError() } } else { 0 };
     drop(stream);
     if raw.is_null() {
-        // SAFETY: `GetLastError` has no preconditions.
-        let err = unsafe { GetLastError() };
-        if err == ERROR_INVALID_PARAMETER {
+        if open_err == ERROR_INVALID_PARAMETER {
             return Ok(Stopped::NotRunning);
         }
-        anyhow::bail!("OpenProcess(pid {pid}): {}", std::io::Error::from_raw_os_error(err as i32));
+        anyhow::bail!("OpenProcess(pid {pid}): {}", std::io::Error::from_raw_os_error(open_err as i32));
     }
     let proc = OwnedProcess(raw);
 

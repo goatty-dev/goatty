@@ -83,23 +83,31 @@ mod win_acl {
     use std::ffi::OsStr;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
     use std::path::Path;
 
     use anyhow::{Context, Result, bail};
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, GENERIC_ALL, GENERIC_READ, HANDLE, LocalFree};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_SUCCESS, FALSE, GENERIC_ALL, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
-        SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetAclInformation, GetSecurityDescriptorDacl, GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        GetAclInformation, GetTokenInformation, OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_QUERY,
+        TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_READ_DATA};
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_READ_DATA};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 6;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+    const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
+    const ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE: u8 = 12;
 
     struct OwnedHandle(HANDLE);
     impl Drop for OwnedHandle {
@@ -176,23 +184,29 @@ mod win_acl {
         Ok(buf)
     }
 
-    pub(crate) fn set_owner_only_dacl(path: &Path) -> Result<()> {
+    pub(super) fn current_user_sid_string() -> Result<String> {
         let me = TokenUserBuf::current_user().context("read current user SID")?;
         let mut sid_wide: *mut u16 = std::ptr::null_mut();
         // SAFETY: `me.sid()` lives for the duration of `me`.
         if unsafe { ConvertSidToStringSidW(me.sid(), &raw mut sid_wide) } == 0 || sid_wide.is_null() {
             return Err(io::Error::last_os_error()).context("ConvertSidToStringSidW");
         }
-        let sid_str = {
-            let _guard = LocalMem(sid_wide.cast());
-            let mut len = 0usize;
-            // SAFETY: `ConvertSidToStringSidW` returns a NUL-terminated UTF-16 string.
-            while unsafe { *sid_wide.add(len) } != 0 {
-                len += 1;
-            }
-            // SAFETY: `len` stops before the terminating NUL.
-            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_wide, len) })
-        };
+        let _guard = LocalMem(sid_wide.cast());
+        let mut len = 0usize;
+        // SAFETY: `ConvertSidToStringSidW` returns a NUL-terminated UTF-16 string.
+        while unsafe { *sid_wide.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` stops before the terminating NUL.
+        Ok(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_wide, len) }))
+    }
+
+    /// Create a brand-new file exclusively (`dwShareMode = 0`) with a protected
+    /// owner-only DACL (`D:P(A;;GA;;;<USER_SID>)`) applied atomically at
+    /// creation time so no other account can ever open the file during a
+    /// create-then-chmod window.
+    pub(crate) fn create_private_file(path: &Path) -> Result<std::fs::File> {
+        let sid_str = current_user_sid_string()?;
         let sddl: Vec<u16> = OsStr::new(&format!("D:P(A;;GA;;;{sid_str})")).encode_wide().chain(std::iter::once(0)).collect();
         let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated UTF-16 and `sd` is a valid out-pointer.
@@ -204,33 +218,22 @@ mod win_acl {
             return Err(io::Error::last_os_error()).context("ConvertStringSecurityDescriptorToSecurityDescriptorW");
         }
         let _sd_guard = LocalMem(sd);
-        let mut dacl_present = 0;
-        let mut dacl_defaulted = 0;
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: `sd` is a valid security descriptor owned by `_sd_guard`.
-        if unsafe { GetSecurityDescriptorDacl(sd, &raw mut dacl_present, &raw mut dacl, &raw mut dacl_defaulted) } == 0
-            || dacl_present == 0
-            || dacl.is_null()
-        {
-            return Err(io::Error::last_os_error()).context("GetSecurityDescriptorDacl");
-        }
-        let wide_path = to_wide_nul(path);
-        // SAFETY: `wide_path` is NUL-terminated UTF-16 and `dacl` lives inside `_sd_guard`.
-        let status = unsafe {
-            SetNamedSecurityInfoW(
-                wide_path.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                dacl,
-                std::ptr::null(),
-            )
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: FALSE,
         };
-        if status != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(status as i32)).with_context(|| format!("set private ACL on {}", path.display()));
+        let wide_path = to_wide_nul(path);
+        // SAFETY: `wide_path` is NUL-terminated UTF-16 and `sa.lpSecurityDescriptor`
+        // stays alive for the duration of `CreateFileW`.
+        let handle = unsafe {
+            CreateFileW(wide_path.as_ptr(), GENERIC_WRITE, 0, &raw const sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err(io::Error::last_os_error()).with_context(|| format!("create private file {}", path.display()));
         }
-        Ok(())
+        // SAFETY: `handle` is a newly created, valid Win32 file handle owned exclusively by us.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
     }
 
     pub(crate) fn check_private(path: &Path) -> Result<()> {
@@ -296,16 +299,29 @@ mod win_acl {
             if unsafe { GetAce(dacl, i, &raw mut ace_ptr) } == 0 || ace_ptr.is_null() {
                 return Err(io::Error::last_os_error()).with_context(|| format!("read ACE {i} of {}", path.display()));
             }
-            // SAFETY: every ACE starts with `ACE_HEADER`; when `AceType == ACCESS_ALLOWED_ACE_TYPE`,
-            // it is an `ACCESS_ALLOWED_ACE` whose `SidStart` field is the start of the trustee SID.
+            // SAFETY: every ACE starts with `ACE_HEADER`; both `ACCESS_ALLOWED_ACE`
+            // and `ACCESS_ALLOWED_CALLBACK_ACE` share the exact leading layout
+            // (`ACE_HEADER`, `Mask: u32`, `SidStart: u32`).
             unsafe {
                 let header = *(ace_ptr.cast::<windows_sys::Win32::Security::ACE_HEADER>());
-                if header.AceType == ACCESS_ALLOWED_ACE_TYPE {
-                    let allowed = ace_ptr.cast::<ACCESS_ALLOWED_ACE>();
-                    let mask = (*allowed).Mask;
-                    let sid = (&raw mut (*allowed).SidStart).cast::<std::ffi::c_void>();
-                    if (mask & read_mask) != 0 && !is_allowed_sid(sid) {
-                        bail!("{} is readable by other users: refusing to use it as this computer's goatty key", path.display());
+                match header.AceType {
+                    ACCESS_DENIED_ACE_TYPE
+                    | ACCESS_DENIED_OBJECT_ACE_TYPE
+                    | ACCESS_DENIED_CALLBACK_ACE_TYPE
+                    | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE => {}
+                    ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {
+                        let allowed = ace_ptr.cast::<ACCESS_ALLOWED_ACE>();
+                        let mask = (*allowed).Mask;
+                        let sid = (&raw mut (*allowed).SidStart).cast::<std::ffi::c_void>();
+                        if (mask & read_mask) != 0 && !is_allowed_sid(sid) {
+                            bail!("{} is readable by other users: refusing to use it as this computer's goatty key", path.display());
+                        }
+                    }
+                    other => {
+                        bail!(
+                            "{} has unsupported access-control entry (type {other}): refusing to use it as this computer's goatty key",
+                            path.display()
+                        );
                     }
                 }
             }
@@ -315,7 +331,7 @@ mod win_acl {
 }
 
 #[cfg(windows)]
-pub(crate) use win_acl::set_owner_only_dacl;
+pub(crate) use win_acl::create_private_file;
 
 #[cfg(windows)]
 fn check_private(path: &Path) -> Result<()> {
@@ -373,10 +389,77 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // Grant Everyone (S-1-1-0) read access and verify load rejects it.
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            };
+            use windows_sys::Win32::Security::{
+                ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+            };
+
+            // 1. Creation-time DACL isolation: even inside a directory where
+            // Everyone has inheritable full control, `load_or_create` creates
+            // the key with a protected owner-only DACL at `CreateFileW` time.
+            let shared_dir = dir.path().join("shared-parent");
+            std::fs::create_dir_all(&shared_dir).unwrap();
+            let out = std::process::Command::new("icacls.exe")
+                .arg(&shared_dir)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+                .output()
+                .expect("run icacls.exe");
+            assert!(out.status.success(), "icacls shared dir failed: {}", String::from_utf8_lossy(&out.stderr));
+            let shared_key = shared_dir.join("device.key");
+            let created = Identity::load_or_create(&shared_key).unwrap();
+            let reloaded = Identity::load_or_create(&shared_key).unwrap();
+            assert_eq!(created.public(), reloaded.public());
+
+            // 2. Standard allow ACE: granting Everyone (S-1-1-0) read access is rejected.
             let out = std::process::Command::new("icacls.exe").arg(&path).args(["/grant", "*S-1-1-0:R"]).output().expect("run icacls.exe");
             assert!(out.status.success(), "icacls failed: {}", String::from_utf8_lossy(&out.stderr));
             let err = Identity::load_or_create(&path).unwrap_err();
+            assert!(err.to_string().contains("readable by other users"), "{err:#}");
+
+            // 3. Conditional allow ACE (`ACCESS_ALLOWED_CALLBACK_ACE_TYPE`, SDDL `XA`)
+            // granting Everyone read access is also rejected.
+            let me_sid = win_acl::current_user_sid_string().unwrap();
+            let cond_sddl: Vec<u16> = OsStr::new(&format!("D:P(A;;GA;;;{me_sid})(XA;;FR;;;WD;(Member_of {{SID(WD)}}))"))
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `cond_sddl` is NUL-terminated UTF-16 and `sd` is freed via `LocalFree` below.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(cond_sddl.as_ptr(), SDDL_REVISION_1, &raw mut sd, std::ptr::null_mut())
+            };
+            assert_ne!(ok, 0, "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}", std::io::Error::last_os_error());
+            let mut dacl_present = 0;
+            let mut dacl_defaulted = 0;
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            // SAFETY: `sd` is a valid security descriptor allocated above.
+            let got_dacl = unsafe { GetSecurityDescriptorDacl(sd, &raw mut dacl_present, &raw mut dacl, &raw mut dacl_defaulted) };
+            assert_ne!(got_dacl, 0);
+            assert!(dacl_present != 0 && !dacl.is_null());
+            let wide_path: Vec<u16> = OsStr::new(shared_key.as_os_str()).encode_wide().chain(std::iter::once(0)).collect();
+            // SAFETY: `wide_path` is NUL-terminated UTF-16 and `dacl` lives inside `sd`.
+            let status = unsafe {
+                SetNamedSecurityInfoW(
+                    wide_path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null(),
+                )
+            };
+            // SAFETY: `sd` was allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+            unsafe {
+                LocalFree(sd);
+            }
+            assert_eq!(status, ERROR_SUCCESS, "SetNamedSecurityInfoW failed: {status}");
+            let err = Identity::load_or_create(&shared_key).unwrap_err();
             assert!(err.to_string().contains("readable by other users"), "{err:#}");
         }
     }

@@ -421,6 +421,10 @@ pub(crate) struct Session {
     /// gets control even when another client attached in between. `None`
     /// for restored sessions. Changed while `subs` is held.
     pub(crate) creator: Mutex<Option<u64>>,
+    /// Exit code once the session has finished (`Some(code)`). Read and written
+    /// only while `subs` is held so a subscriber racing with `finish` never
+    /// misses `ServerMsg::Exited`.
+    pub(crate) exited: Mutex<Option<Option<u32>>>,
 }
 
 #[cfg(unix)]
@@ -817,7 +821,14 @@ impl Session {
                 sub.push(f, 0);
             }
         }
-        subs.push(sub.clone());
+        if let Some(code) = *self.exited.lock() {
+            if let Ok(f) = encode(&ServerMsg::Exited { session: self.id, code }) {
+                let _ = sub.tx.send(Outbound::session(f, self.id));
+            }
+            sub.release_flow();
+        } else {
+            subs.push(sub.clone());
+        }
         sub
     }
 
@@ -888,7 +899,9 @@ impl Session {
     /// `Exited`. Called once by the reader thread.
     pub(crate) fn finish(&self, code: Option<u32>) {
         let exited = encode(&ServerMsg::Exited { session: self.id, code }).ok();
-        for sub in self.subs.lock().drain(..) {
+        let mut subs = self.subs.lock();
+        *self.exited.lock() = Some(code);
+        for sub in subs.drain(..) {
             // Let lagging clients see the final screen before the end.
             if sub.lagging.load(Ordering::Acquire) {
                 self.resync(&sub);

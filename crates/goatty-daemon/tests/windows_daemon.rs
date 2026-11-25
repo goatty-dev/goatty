@@ -147,8 +147,18 @@ fn windows_daemon_named_pipes_conpty_and_proxy_end_to_end() {
         conn.run(SIZE, None, vec!["cmd.exe".into(), "/C".into(), "echo".into(), "WIN_RUN_EXIT_OK".into()], run_sink.clone()).unwrap();
     assert!(run_sink.wait_for("WIN_RUN_EXIT_OK", Duration::from_secs(10)), "run screen:\n{}", run_sink.text());
     let deadline = Instant::now() + Duration::from_secs(10);
+    while !run_sink.events.lock().iter().any(|e| e.starts_with("Exited(")) {
+        assert!(
+            Instant::now() < deadline,
+            "short-lived Run session did not deliver PaneEvent::Exited (events: {:?})",
+            *run_sink.events.lock()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(run_sink.events.lock().iter().any(|e| e == "Exited(Some(0))"), "expected Exited(Some(0)), got {:?}", *run_sink.events.lock());
+    let deadline = Instant::now() + Duration::from_secs(10);
     while ctl.list_sessions().unwrap().len() != 1 {
-        assert!(Instant::now() < deadline, "short-lived Run session did not exit cleanly");
+        assert!(Instant::now() < deadline, "short-lived Run session did not leave list_sessions");
         std::thread::sleep(Duration::from_millis(25));
     }
 

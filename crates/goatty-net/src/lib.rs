@@ -119,24 +119,29 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
     let tmp = dir.join(format!(".{name}.{}.{n}.{}", std::process::id(), hex(&random::<4>()?)));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut f = opts.open(&tmp).with_context(|| format!("write {}", tmp.display()))?;
-    #[cfg(windows)]
-    if mode & 0o077 == 0
-        && let Err(e) = identity::set_owner_only_dacl(&tmp)
-    {
-        drop(f);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let mut f = {
+        #[cfg(windows)]
+        {
+            if mode & 0o077 == 0 {
+                identity::create_private_file(&tmp).with_context(|| format!("write {}", tmp.display()))?
+            } else {
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).with_context(|| format!("write {}", tmp.display()))?
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(mode);
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            opts.open(&tmp).with_context(|| format!("write {}", tmp.display()))?
+        }
+    };
     let written = f.write_all(data).and_then(|()| f.sync_all()).and_then(|()| {
         drop(f);
         std::fs::rename(&tmp, path)

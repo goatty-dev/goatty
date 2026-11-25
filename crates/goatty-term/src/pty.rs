@@ -11,6 +11,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use portable_pty::PtySize;
 
+#[cfg(unix)]
 use crate::TermSize;
 
 /// The terminal (`/dev/pts/N`) of a goatty pane, set in its shell's

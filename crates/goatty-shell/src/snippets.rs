@@ -12,10 +12,14 @@
 //! managed PATH, with a time limit and an output cap.
 
 use std::collections::BTreeSet;
+#[cfg(not(windows))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(windows))]
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use goatty_config::HostSettings;
@@ -327,21 +331,54 @@ struct Output {
 }
 
 #[cfg(windows)]
-mod win_job {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+mod win_proc {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+    use std::io::{self, Read};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result, bail};
+    use goatty_config::snippets;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, FALSE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, TRUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     };
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
+        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
 
-    pub(super) struct JobObject(HANDLE);
+    use super::Output;
 
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: `self.0` is a valid Win32 handle owned exclusively by `self`.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct JobObject(HANDLE);
     impl JobObject {
-        pub(super) fn new() -> std::io::Result<Self> {
+        fn new() -> io::Result<Self> {
             // SAFETY: null attributes and unnamed job object are valid.
             let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if h.is_null() {
-                return Err(std::io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
             }
             let job = Self(h);
             // SAFETY: plain C struct; zeroed initialization is valid.
@@ -357,20 +394,20 @@ mod win_job {
                 )
             } == 0
             {
-                return Err(std::io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
             }
             Ok(job)
         }
 
-        pub(super) fn assign(&self, proc_handle: HANDLE) -> std::io::Result<()> {
+        fn assign(&self, proc_handle: HANDLE) -> io::Result<()> {
             // SAFETY: both `self.0` and `proc_handle` are valid open handles.
             if unsafe { AssignProcessToJobObject(self.0, proc_handle) } == 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         }
 
-        pub(super) fn terminate(&self) {
+        fn terminate(&self) {
             // SAFETY: `self.0` is a valid job handle owned by `self`.
             unsafe {
                 TerminateJobObject(self.0, 1);
@@ -386,136 +423,380 @@ mod win_job {
             }
         }
     }
+
+    fn to_wide_nul(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn quote_windows_arg(arg: &str) -> String {
+        if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '"')) {
+            return arg.to_string();
+        }
+        let mut out = String::with_capacity(arg.len() + 2);
+        out.push('"');
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    for _ in 0..(backslashes * 2 + 1) {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                    out.push('"');
+                }
+                c => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                    out.push(c);
+                }
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            out.push('\\');
+        }
+        out.push('"');
+        out
+    }
+
+    fn build_cmdline(program: &Path, args: &[String]) -> Vec<u16> {
+        let mut line = quote_windows_arg(&program.to_string_lossy());
+        for arg in args {
+            line.push(' ');
+            line.push_str(&quote_windows_arg(arg));
+        }
+        to_wide_nul(OsStr::new(&line))
+    }
+
+    fn build_env_block(path_env: &str) -> Vec<u16> {
+        let mut map: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for (k, v) in std::env::vars_os() {
+            let ks = k.to_string_lossy().into_owned();
+            let vs = v.to_string_lossy().into_owned();
+            map.insert(ks.to_ascii_lowercase(), (ks, vs));
+        }
+        map.remove("goatty_socket");
+        for (k, v) in [("PATH", path_env), ("GIT_TERMINAL_PROMPT", "0"), ("GIT_PAGER", "cat"), ("PAGER", "cat")] {
+            map.insert(k.to_ascii_lowercase(), (k.to_string(), v.to_string()));
+        }
+        let mut block = Vec::new();
+        for (_, (k, v)) in map {
+            block.extend(OsStr::new(&k).encode_wide());
+            block.push(b'=' as u16);
+            block.extend(OsStr::new(&v).encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    fn create_output_pipe() -> io::Result<(std::fs::File, OwnedHandle)> {
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: TRUE,
+        };
+        let mut read_h: HANDLE = std::ptr::null_mut();
+        let mut write_h: HANDLE = std::ptr::null_mut();
+        // SAFETY: `read_h`, `write_h`, and `sa` are valid pointers.
+        if unsafe { CreatePipe(&raw mut read_h, &raw mut write_h, &raw mut sa, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read = OwnedHandle(read_h);
+        let write = OwnedHandle(write_h);
+        // Prevent the child from inheriting the parent's read end of the pipe.
+        // SAFETY: `read.0` is a valid pipe handle.
+        if unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let raw_read = read.0;
+        std::mem::forget(read);
+        // SAFETY: `raw_read` is a valid, exclusively owned pipe read handle.
+        let file = unsafe { std::fs::File::from_raw_handle(raw_read) };
+        Ok((file, write))
+    }
+
+    fn open_nul_stdin() -> io::Result<OwnedHandle> {
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: TRUE,
+        };
+        let nul = to_wide_nul(OsStr::new("NUL"));
+        // SAFETY: `nul` is NUL-terminated UTF-16 and `sa` stays alive across the call.
+        let h = unsafe {
+            CreateFileW(
+                nul.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &raw const sa,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE || h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedHandle(h))
+    }
+
+    /// Spawn `program` with `CREATE_SUSPENDED`, assign it to a
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object before calling
+    /// `ResumeThread` (so no descendant can escape job membership), and
+    /// terminate the entire job tree on both normal exit and timeout before
+    /// joining the stdout/stderr reader threads.
+    pub(super) fn run_in_job(program: &Path, args: &[String], dir: &Path, path_env: &str, timeout: Duration) -> Result<Output> {
+        let job = JobObject::new().context("create Windows job object")?;
+        let (mut stdout, stdout_write) = create_output_pipe().context("create stdout pipe")?;
+        let (mut stderr, stderr_write) = create_output_pipe().context("create stderr pipe")?;
+        let stdin_nul = open_nul_stdin().context("open NUL for stdin")?;
+
+        // SAFETY: `STARTUPINFOW` is plain C data; zero-init + `cb` is required.
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = stdin_nul.0;
+        si.hStdOutput = stdout_write.0;
+        si.hStdError = stderr_write.0;
+
+        let app_wide = to_wide_nul(program.as_os_str());
+        let mut cmdline = build_cmdline(program, args);
+        let env_block = build_env_block(path_env);
+        let cwd_wide = to_wide_nul(dir.as_os_str());
+        // SAFETY: `PROCESS_INFORMATION` is plain C data.
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // SAFETY: all wide strings, env block, and structs live across `CreateProcessW`.
+        let ok = unsafe {
+            CreateProcessW(
+                app_wide.as_ptr(),
+                cmdline.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                TRUE,
+                CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                env_block.as_ptr().cast(),
+                cwd_wide.as_ptr(),
+                &raw const si,
+                &raw mut pi,
+            )
+        };
+        // Close our copies of the child's stdio handles immediately so pipes hit
+        // EOF as soon as the job's process tree exits.
+        drop(stdin_nul);
+        drop(stdout_write);
+        drop(stderr_write);
+        if ok == 0 {
+            return Err(io::Error::last_os_error()).context("couldn't start it");
+        }
+        let proc_handle = OwnedHandle(pi.hProcess);
+        let thread_handle = OwnedHandle(pi.hThread);
+
+        // Assign while suspended so every descendant inherits job membership.
+        if let Err(e) = job.assign(proc_handle.0) {
+            // SAFETY: `proc_handle.0` is a valid suspended process owned by us.
+            unsafe {
+                TerminateProcess(proc_handle.0, 1);
+            }
+            return Err(e).context("assign snippet subprocess to Windows job object");
+        }
+        // SAFETY: `thread_handle.0` is the primary thread of the newly created process.
+        if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
+            let err = io::Error::last_os_error();
+            // SAFETY: terminate process we failed to resume.
+            unsafe {
+                TerminateProcess(proc_handle.0, 1);
+            }
+            return Err(err).context("resume snippet subprocess");
+        }
+        drop(thread_handle);
+
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut stdout).take(snippets::MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
+            buf
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut stderr).take(4096).read_to_end(&mut buf);
+            buf
+        });
+
+        let deadline = Instant::now() + timeout;
+        let timed_out = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX - 1);
+            // SAFETY: `proc_handle.0` is a valid waitable process handle.
+            match unsafe { WaitForSingleObject(proc_handle.0, wait_ms) } {
+                WAIT_OBJECT_0 => break false,
+                WAIT_TIMEOUT => break true,
+                _ => {
+                    job.terminate();
+                    let _ = out_thread.join();
+                    let _ = err_thread.join();
+                    return Err(io::Error::last_os_error()).context("wait for snippet subprocess");
+                }
+            }
+        };
+
+        if timed_out {
+            job.terminate();
+            // SAFETY: wait briefly for process teardown before joining pipe readers.
+            unsafe {
+                WaitForSingleObject(proc_handle.0, 5_000);
+            }
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            bail!("it took longer than {} s", timeout.as_secs_f64());
+        }
+
+        let mut exit_code = 1u32;
+        // SAFETY: `proc_handle.0` has exited and `exit_code` is a valid out-pointer.
+        let success = unsafe { GetExitCodeProcess(proc_handle.0, &raw mut exit_code) } != 0 && exit_code == 0;
+        // Terminate any lingering descendants that inherited stdout/stderr pipes
+        // before joining the reader threads.
+        job.terminate();
+        let mut out = out_thread.join().unwrap_or_default();
+        let capped = out.len() > snippets::MAX_OUTPUT;
+        if capped {
+            out.truncate(snippets::MAX_OUTPUT);
+            if let Some(i) = out.iter().rposition(|&b| b == b'\n') {
+                out.truncate(i + 1);
+            }
+        }
+        let err = err_thread.join().unwrap_or_default();
+        Ok(Output {
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            stderr: String::from_utf8_lossy(&err).into_owned(),
+            success,
+            capped,
+        })
+    }
 }
 
 /// Run `cmd` in its own process group: no stdin, output capped, killed
 /// (with everything it started) at `timeout`.
 fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Output> {
-    let mut c = match cmd {
-        Command::Argv(argv) => {
-            let first = argv.first().context("nothing to run")?;
-            let program = find_in(path, first).with_context(|| format!("{first} isn't installed here"))?;
-            let mut c = std::process::Command::new(program);
-            c.args(&argv[1..]);
-            c
-        }
-        Command::Shell(text) => {
-            #[cfg(unix)]
-            {
-                let mut c = std::process::Command::new("/bin/sh");
-                c.arg("-c").arg(text);
-                c
+    #[cfg(windows)]
+    {
+        match cmd {
+            Command::Argv(argv) => {
+                let first = argv.first().context("nothing to run")?;
+                let program = find_in(path, first).with_context(|| format!("{first} isn't installed here"))?;
+                win_proc::run_in_job(&program, &argv[1..], dir, path, timeout)
             }
-            #[cfg(not(unix))]
-            {
+            Command::Shell(_) => {
                 // Snippet shell templates are rendered with POSIX single-quoting,
                 // which `cmd.exe` does not treat as quoting (command injection risk).
-                let _ = text;
                 bail!("shell snippet sources aren't supported on Windows yet (tracked in #278)")
             }
         }
-    };
-    c.current_dir(dir)
-        .env("PATH", path)
-        // Never wait for a password or a pager.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .env_remove("GOATTY_SOCKET")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        c.process_group(0);
     }
-    #[cfg(windows)]
+    #[cfg(not(windows))]
     {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
-        c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
-    #[cfg(windows)]
-    let job = win_job::JobObject::new().context("create Windows job object")?;
-    let mut child = c.spawn().context("couldn't start it")?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        if let Err(e) = job.assign(child.as_raw_handle())
-            && child.try_wait().ok().flatten().is_none()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e).context("assign snippet subprocess to Windows job object");
-        }
-    }
-    #[cfg(unix)]
-    let pid = child.id();
-    let mut stdout = child.stdout.take().context("no stdout")?;
-    let mut stderr = child.stderr.take().context("no stderr")?;
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut stdout).take(snippets::MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
-        buf
-    });
-    let err_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut stderr).take(4096).read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + timeout;
-    let kill = |child: &mut std::process::Child| {
+        let mut c = match cmd {
+            Command::Argv(argv) => {
+                let first = argv.first().context("nothing to run")?;
+                let program = find_in(path, first).with_context(|| format!("{first} isn't installed here"))?;
+                let mut c = std::process::Command::new(program);
+                c.args(&argv[1..]);
+                c
+            }
+            Command::Shell(text) => {
+                #[cfg(unix)]
+                {
+                    let mut c = std::process::Command::new("/bin/sh");
+                    c.arg("-c").arg(text);
+                    c
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = text;
+                    bail!("shell snippet sources aren't supported on this platform")
+                }
+            }
+        };
+        c.current_dir(dir)
+            .env("PATH", path)
+            // Never wait for a password or a pager.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env_remove("GOATTY_SOCKET")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         #[cfg(unix)]
         {
-            let _ = child;
-            // SAFETY: kill(2) with a negative pid signals the process group the
-            // child leads (`process_group(0)`); no memory is involved.
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
+        let mut child = c.spawn().context("couldn't start it")?;
+        #[cfg(unix)]
+        let pid = child.id();
+        let mut stdout = child.stdout.take().context("no stdout")?;
+        let mut stderr = child.stderr.take().context("no stderr")?;
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut stdout).take(snippets::MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
+            buf
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut stderr).take(4096).read_to_end(&mut buf);
+            buf
+        });
+        let deadline = Instant::now() + timeout;
+        let kill = |child: &mut std::process::Child| {
+            #[cfg(unix)]
+            {
+                let _ = child;
+                // SAFETY: kill(2) with a negative pid signals the process group the
+                // child leads (`process_group(0)`); no memory is involved.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+        };
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if Instant::now() >= deadline {
+                kill(&mut child);
+                let _ = child.wait();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
+                bail!("it took longer than {} s", timeout.as_secs_f64());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Whatever it left running in its group (a pager, a subshell) goes too.
+        kill(&mut child);
+        let mut out = out_thread.join().unwrap_or_default();
+        let capped = out.len() > snippets::MAX_OUTPUT;
+        if capped {
+            out.truncate(snippets::MAX_OUTPUT);
+            // Up to the last whole line.
+            if let Some(i) = out.iter().rposition(|&b| b == b'\n') {
+                out.truncate(i + 1);
             }
         }
-        #[cfg(windows)]
-        {
-            job.terminate();
-            let _ = child.kill();
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child.kill();
-        }
-    };
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
-        }
-        if Instant::now() >= deadline {
-            kill(&mut child);
-            let _ = child.wait();
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            bail!("it took longer than {} s", timeout.as_secs_f64());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    // Whatever it left running in its group / job (a pager, a subshell) goes too.
-    kill(&mut child);
-    let mut out = out_thread.join().unwrap_or_default();
-    let capped = out.len() > snippets::MAX_OUTPUT;
-    if capped {
-        out.truncate(snippets::MAX_OUTPUT);
-        // Up to the last whole line.
-        if let Some(i) = out.iter().rposition(|&b| b == b'\n') {
-            out.truncate(i + 1);
-        }
+        let err = err_thread.join().unwrap_or_default();
+        Ok(Output {
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            stderr: String::from_utf8_lossy(&err).into_owned(),
+            success: status.success(),
+            capped,
+        })
     }
-    let err = err_thread.join().unwrap_or_default();
-    Ok(Output {
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stderr: String::from_utf8_lossy(&err).into_owned(),
-        success: status.success(),
-        capped,
-    })
 }
 
 #[cfg(test)]
@@ -617,5 +898,35 @@ mod tests {
         h.shell.expansions = false;
         let (table, _) = render_expansions(&h, &active);
         assert!(table.contains("_goatty_exp_re=()"), "{table}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_descendant_holding_inherited_pipe_does_not_hang_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        // Spawn a background descendant (`start /B ping -n 30`) that inherits
+        // stdout/stderr handles while the parent `cmd.exe` prints a marker and
+        // exits immediately. Because the child is assigned to the Job Object
+        // while `CREATE_SUSPENDED` before `ResumeThread`, the descendant joins
+        // the job automatically and `job.terminate()` closes its inherited pipe
+        // handles so `run` does not hang for 30 seconds.
+        let cmd = Command::Argv(vec![
+            "cmd.exe".into(),
+            "/C".into(),
+            "start /B cmd.exe /C \"ping -n 30 127.0.0.1 >nul\" & echo SNIPPET_DESCENDANT_OK".into(),
+        ]);
+        let start = std::time::Instant::now();
+        let out = run(&cmd, tmp.path(), &path_env, Duration::from_secs(10)).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "run hung waiting for descendant pipe: {:?}", start.elapsed());
+        assert!(out.success, "stderr: {}", out.stderr);
+        assert!(out.stdout.contains("SNIPPET_DESCENDANT_OK"), "stdout: {:?}", out.stdout);
+
+        // Also verify timeout terminates the entire process tree promptly.
+        let slow = Command::Argv(vec!["cmd.exe".into(), "/C".into(), "ping -n 30 127.0.0.1 >nul".into()]);
+        let start = std::time::Instant::now();
+        let err = run(&slow, tmp.path(), &path_env, Duration::from_millis(300)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5), "timeout cleanup hung: {:?}", start.elapsed());
+        assert!(err.to_string().contains("longer than"), "{err:#}");
     }
 }

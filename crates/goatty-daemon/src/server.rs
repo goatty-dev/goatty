@@ -208,6 +208,7 @@ impl Daemon {
             replies_written: AtomicU64::new(0),
             controller: Mutex::new(None),
             creator: Mutex::new(creator),
+            exited: Mutex::new(None),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");
@@ -218,23 +219,38 @@ impl Daemon {
             self.host.track_shell(pid);
         }
 
+        // Register before spawning the reader/exit threads so a fast-exiting
+        // command cannot run `sessions.remove(&id)` before `insert(id, ...)`
+        // and leave a finished session stranded in `ListSessions`.
+        self.sessions.lock().insert(id, session.clone());
+        let rollback = || {
+            self.sessions.lock().remove(&id);
+            if let Some(pid) = managed_pid {
+                self.host.untrack_shell(pid);
+            }
+            session.pty.lock().kill();
+        };
+
         // Query replies → PTY.
         {
             let s = Arc::downgrade(&session);
-            std::thread::Builder::new().name(format!("s{id}-replies")).spawn(move || {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-replies")).spawn(move || {
                 while let Ok(bytes) = chans.replies.recv() {
                     let Some(s) = s.upgrade() else { break };
                     s.replies_taken.fetch_add(1, Ordering::SeqCst);
                     let _ = s.input.lock().write(&bytes);
                     s.replies_written.fetch_add(1, Ordering::SeqCst);
                 }
-            })?;
+            }) {
+                rollback();
+                return Err(e.into());
+            }
         }
         // PTY → terminal + subscribers.
         {
             let s = session.clone();
             let daemon = self.clone();
-            std::thread::Builder::new().name(format!("s{id}-reader")).spawn(move || {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-reader")).spawn(move || {
                 pump_output(&s, reader);
                 // The PTY master can hit EOF/EIO slightly before the child is
                 // reapable via WNOHANG; retry briefly so short-lived `Run`
@@ -260,7 +276,10 @@ impl Daemon {
                 }
                 s.finish(code);
                 daemon.session_ended(s.id);
-            })?;
+            }) {
+                rollback();
+                return Err(e.into());
+            }
         }
         // Windows ConPTY keeps the output pipe open until `ClosePseudoConsole` is
         // called. Watch the child process handle on its own thread (without holding
@@ -268,11 +287,13 @@ impl Daemon {
         // `s{id}-reader` drains remaining output until EOF.
         #[cfg(windows)]
         {
-            std::thread::Builder::new().name(format!("s{id}-exit")).spawn(move || {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-exit")).spawn(move || {
                 exit_watch.wait_and_close_console();
-            })?;
+            }) {
+                rollback();
+                return Err(e.into());
+            }
         }
-        self.sessions.lock().insert(id, session.clone());
         Ok(session)
     }
 
@@ -564,4 +585,109 @@ pub(crate) fn listener_from_fd(fd: RawFd) -> Result<LocalListener> {
     // SAFETY: the previous goattyd passed this fd for exactly this, and
     // nothing in this process has adopted it before.
     Ok(LocalListener::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use goatty_proto::{ServerMsg, StreamOpts, WinSize, read_msg};
+
+    use super::Daemon;
+    use crate::flow::FlowControl;
+    use crate::session::{SubConn, SubFeatures};
+
+    const SIZE: WinSize = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
+
+    fn exit_cmd(code: u32) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd.exe".into(), "/C".into(), format!("exit {code}")]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["/bin/sh".into(), "-c".into(), format!("exit {code}")]
+        }
+    }
+
+    #[test]
+    fn subscribe_after_finish_still_delivers_exited_and_clears_session_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(dir.path().join("d.sock")));
+        let session = daemon.run(1, SIZE, None, exit_cmd(42)).unwrap();
+
+        // Wait until the fast-exiting child has been removed from `sessions`
+        // AND `Session::finish` has run BEFORE subscribing, deterministically
+        // exercising both ordering races (registration vs removal and finish vs subscribe).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.get(session.id).is_some() || session.exited.lock().is_none() {
+            assert!(Instant::now() < deadline, "session did not finish and leave sessions map");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(daemon.list().is_empty(), "finished session must not remain in list()");
+
+        // Subscribe AFTER `finish` has already completed: must still receive
+        // `Attached` followed by `Exited { code: Some(42) }`, and must not
+        // leave a dangling subscriber behind.
+        let (tx, rx) = flume::unbounded();
+        let flow = Arc::new(FlowControl::new());
+        let _sub = session.subscribe(SubConn { id: 1, features: SubFeatures::default(), flow: &flow, tx: &tx }, 7, SIZE, StreamOpts::LOCAL);
+        assert!(session.subs.lock().is_empty(), "late subscriber on finished session must not stay registered");
+
+        let mut saw_attached = false;
+        let mut exit_code = None;
+        for out in rx.try_iter() {
+            if out.stop {
+                continue;
+            }
+            let mut slice: &[u8] = &out.frame;
+            match read_msg::<_, ServerMsg>(&mut slice).unwrap() {
+                ServerMsg::Attached { req, session: sid, .. } => {
+                    assert_eq!(req, 7);
+                    assert_eq!(sid, session.id);
+                    saw_attached = true;
+                }
+                ServerMsg::Exited { session: sid, code } => {
+                    assert_eq!(sid, session.id);
+                    exit_code = Some(code);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_attached, "late subscriber must receive Attached snapshot");
+        assert_eq!(exit_code, Some(Some(42)), "late subscriber must receive Exited with the child exit code");
+    }
+
+    #[test]
+    fn subscribe_before_finish_delivers_exited_once_and_clears_session_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(dir.path().join("d.sock")));
+        let session = daemon.run(1, SIZE, None, exit_cmd(7)).unwrap();
+
+        let (tx, rx) = flume::unbounded();
+        let flow = Arc::new(FlowControl::new());
+        let _sub = session.subscribe(SubConn { id: 1, features: SubFeatures::default(), flow: &flow, tx: &tx }, 9, SIZE, StreamOpts::LOCAL);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited = Vec::new();
+        while exited.is_empty() {
+            assert!(Instant::now() < deadline, "subscriber never received Exited");
+            if let Ok(out) = rx.recv_timeout(Duration::from_millis(50))
+                && !out.stop
+            {
+                let mut slice: &[u8] = &out.frame;
+                if let ServerMsg::Exited { session: sid, code } = read_msg::<_, ServerMsg>(&mut slice).unwrap() {
+                    assert_eq!(sid, session.id);
+                    exited.push(code);
+                }
+            }
+        }
+        assert_eq!(exited, vec![Some(7)]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !daemon.list().is_empty() {
+            assert!(Instant::now() < deadline, "finished session remained in list()");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }

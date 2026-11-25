@@ -377,7 +377,13 @@ mod tests {
         let xml = render_task_xml(exe, log, Some(r"DESKTOP\alice"));
 
         assert!(is_goatty_task(&xml));
-        assert!(xml.contains("<LogonTrigger>"));
+        assert!(xml.contains(r#"<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">"#));
+
+        // Verify top-level Task Scheduler 1.2 <xs:sequence> element order.
+        let sections = ["<RegistrationInfo>", "<Triggers>", "<Principals>", "<Settings>", "<Actions Context=\"Author\">"];
+        let positions: Vec<usize> = sections.iter().map(|s| xml.find(s).unwrap_or_else(|| panic!("missing {s}"))).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "top-level section order invalid: {positions:?}");
+
         let trigger = xml.split("<LogonTrigger>").nth(1).unwrap().split("</LogonTrigger>").next().unwrap();
         let enabled_pos = trigger.find("<Enabled>true</Enabled>").expect("LogonTrigger missing Enabled");
         let trigger_user_pos = trigger.find(r"<UserId>DESKTOP\alice</UserId>").expect("LogonTrigger missing UserId");
@@ -387,6 +393,8 @@ mod tests {
         let logon_type_pos = principal.find("<LogonType>InteractiveToken</LogonType>").expect("Principal missing LogonType");
         let run_level_pos = principal.find("<RunLevel>LeastPrivilege</RunLevel>").expect("Principal missing RunLevel");
         assert!(principal_user_pos < logon_type_pos && logon_type_pos < run_level_pos, "invalid Principal element order: {principal}");
+        let exec = xml.split("<Exec>").nth(1).unwrap().split("</Exec>").next().unwrap();
+        assert!(exec.find("<Command>").unwrap() < exec.find("<Arguments>").unwrap(), "invalid Exec element order: {exec}");
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
         assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
@@ -396,6 +404,66 @@ mod tests {
         assert_eq!(
             task_exec_display(&xml).unwrap(),
             r#""C:\Program Files\goatty & co\goattyd.exe" serve --log C:\Users\alice\AppData\Local\goatty\goattyd.log"#
+        );
+
+        // Also verify rendering without an explicit UserId remains valid.
+        let anon_xml = render_task_xml(exe, log, None);
+        assert!(!anon_xml.contains("<UserId>"));
+        assert!(anon_xml.contains("<LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn task_xml_validates_against_windows_task_scheduler_schema() {
+        fn validate_with_task_scheduler(xml: &str) -> Result<()> {
+            let dir = tempfile::tempdir().context("create tempdir")?;
+            let path = dir.path().join("task.xml");
+            std::fs::write(&path, encode_utf16le_with_bom(xml)).context("write temp task xml")?;
+            let script = r#"
+$ErrorActionPreference = 'Stop'
+$xml = Get-Content -LiteralPath $env:GOATTY_TASK_XML -Raw -Encoding Unicode
+$svc = New-Object -ComObject Schedule.Service
+$svc.Connect()
+$td = $svc.NewTask(0)
+$td.XmlText = $xml
+"#;
+            let out = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .env("GOATTY_TASK_XML", &path)
+                .stdin(Stdio::null())
+                .output()
+                .context("run powershell.exe")?;
+            if !out.status.success() {
+                bail!(
+                    "Task Scheduler rejected XML:\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Ok(())
+        }
+
+        let exe = Path::new(r"C:\Program Files\goatty & co\goattyd.exe");
+        let log = Path::new(r"C:\Users\alice\AppData\Local\goatty\goattyd.log");
+
+        // Both user-scoped and unscoped task definitions must pass Windows' real
+        // Task Scheduler 1.2 XSD validator (`ITaskDefinition::put_XmlText`).
+        let with_user = render_task_xml(exe, log, Some(r"DESKTOP\alice"));
+        validate_with_task_scheduler(&with_user).expect("user-scoped task XML must pass Task Scheduler schema validation");
+
+        let without_user = render_task_xml(exe, log, None);
+        validate_with_task_scheduler(&without_user).expect("unscoped task XML must pass Task Scheduler schema validation");
+
+        // Negative control: swapping <UserId> before <Enabled> in <LogonTrigger>
+        // must be rejected by the schema validator.
+        let invalid = with_user.replace(
+            "<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>DESKTOP\\alice</UserId>",
+            "<LogonTrigger>\n      <UserId>DESKTOP\\alice</UserId>\n      <Enabled>true</Enabled>",
+        );
+        assert_ne!(invalid, with_user);
+        assert!(
+            validate_with_task_scheduler(&invalid).is_err(),
+            "Task Scheduler schema validator must reject out-of-order LogonTrigger elements"
         );
     }
 

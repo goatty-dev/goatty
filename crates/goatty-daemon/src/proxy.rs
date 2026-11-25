@@ -11,26 +11,17 @@ pub fn proxy() -> Result<()> {
     let exe = std::env::current_exe().ok();
     let sock = goatty_client::connect_or_spawn_daemon(exe)?;
     let mut to_daemon = sock.try_clone()?;
-    #[cfg(windows)]
-    let from_daemon_ctl = sock.try_clone()?;
     let mut from_daemon = sock;
     let (mut stdin, mut stdout) = raw_stdio()?;
     let up = std::thread::spawn(move || {
         relay(&mut *stdin, &mut to_daemon);
+        // Signals write-EOF to the daemon on both Unix sockets (`SHUT_WR`) and
+        // Windows message-mode Named Pipes (zero-length EOF message), so the
+        // daemon finishes any in-flight replies and closes its end cleanly.
         let _ = to_daemon.shutdown(std::net::Shutdown::Write);
-        #[cfg(windows)]
-        {
-            // Windows Named Pipes have no half-close primitive: once stdin hits
-            // EOF, bound how long `from_daemon` waits while idle so any final
-            // replies still flush to stdout before closing the pipe and exiting.
-            let _ = from_daemon_ctl.set_read_timeout(Some(std::time::Duration::from_millis(250)));
-        }
     });
     relay(&mut from_daemon, &mut *stdout);
-    #[cfg(windows)]
-    let _ = from_daemon.shutdown(std::net::Shutdown::Both);
-    // Daemon closed the connection (or went idle after stdin EOF on Windows):
-    // we're done, whatever stdin is doing.
+    // Daemon closed the connection: we're done, whatever stdin is doing.
     drop(up);
     Ok(())
 }
