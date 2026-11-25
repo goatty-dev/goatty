@@ -6,14 +6,38 @@ Another computer on the user's tailnet that runs goatty can be paired in the app
 
 ## Using it
 
-On the computer to reach (it runs goatty already):
+### Headless server or VPS (fastest — one-time pairing code)
 
-1. Settings → Network → **Make this computer available** (or `goattyd net enable`). goatty adds one `tailscale serve` TCP route.
-2. **Allow a new device** (or `goattyd net pair`): the pairing window opens for 5 minutes.
+On the headless server (no GUI required):
 
-On the other computer: Ctrl+Shift+H lists the tailnet's computers that answer on goatty's port. Pick one, choose **Pair**, compare the 6-digit code with the first screen, and confirm on both. From then on it is a host like any other (sessions, tabs, reconnect, shell setup sync) under its Tailscale name.
+```sh
+goattyd net pair
+```
 
-Settings → Network also shows Tailscale's state, the port, the paired devices (revoke), and the hosts this computer paired with (forget). `goattyd net status|enable [--port N]|disable|pair|devices|revoke KEY|leave` does the host side from a shell.
+`goattyd net pair` starts `goattyd` if needed, adds the `tailscale serve` TCP route if it isn't enabled yet (or prints the exact `sudo tailscale set --operator=$USER` command once), opens a 5-minute pairing window, and prints a single-use `goatty-pair:…` pairing code (carrying the host's MagicDNS/IP, exact port, pinned public key, and a 128-bit single-use secret).
+
+On your laptop/desktop:
+- Paste the `goatty-pair:…` code into **Settings → Network → Pair with a host or pairing code**, or **Ctrl+Shift+P → Tailnet: Pair with a host or code…**, or
+- Run `goatty net pair <code…>` from a terminal.
+
+Non-interactive / scripted form: `goatty net pair "$(ssh vps goattyd net pair --token-only)"`.
+
+### Host currently reachable over SSH (one click)
+
+If the headless server is reachable over SSH right now (for example on your local LAN before you leave home, or while SSH is open):
+
+- From an active SSH tab in goatty: **Ctrl+Shift+P → Tailnet: Pair this SSH host over Tailscale**, right-click the host's tab group → **Pair over Tailscale**, or open **Settings → Network** → **Pair over Tailscale**.
+- From anywhere: **Ctrl+Shift+P → Tailnet: Pair an SSH host over Tailscale…** or `goatty net pair --ssh HOST`.
+
+goatty enables Tailscale Serve on the remote host over the already-authenticated SSH link, authorizes this computer's device key there, pins the host locally, and verifies Tailscale reachability. From then on it connects directly over Tailscale without SSH (`Ctrl+Shift+H` or `goatty --tailnet HOST`).
+
+### Two computers with screens (6-digit code)
+
+On the host: Settings → Network → **Make this computer available** and **Allow a new device** (or `goattyd net pair`). On the other computer: pick it in **Ctrl+Shift+H** or **Settings → Network** (or enter its Tailscale name/IP with optional `:port`), compare the 6-digit code, and confirm on both.
+
+Settings → Network also shows Tailscale's state, the port, discovered tailnet peers, the paired devices (revoke), and the hosts this computer paired with (connect / forget).
+- Host CLI: `goattyd net status|enable [--port N]|disable|pair [--port N] [--no-wait] [--token-only]|authorize KEY [NAME]|devices|revoke KEY|leave`.
+- Client CLI: `goatty net list|pair <code|host[:port]|--ssh HOST>|forget HOST`, and `goatty --tailnet HOST`.
 
 ## How it works
 
@@ -35,7 +59,7 @@ Settings → Network also shows Tailscale's state, the port, the paired devices 
 It is per node and shared with whatever else the user publishes.
 
 - goatty adds **one route on one port** and removes **only that route** (`serve --tcp=<port> off`). It never runs `serve reset`.
-- A route is goatty's if it forwards to goatty's gateway socket. A port serving anything else is left alone. The settings page says so, and the port can be changed there. **Limit:** discovery probes only the default port (7422), and pairing starts from a discovered host, so a host must be on 7422 while it pairs. After pairing it can move to another port, but then the client needs its new port, and nothing tells it yet. Pair first, then change the port only if 7422 is taken.
+- A route is goatty's if it forwards to goatty's gateway socket. A port serving anything else is left alone. The settings page says so, and the port can be changed there. Discovery probes the default port (7422), while pairing by one-time code (`goatty-pair:…`), direct address (`host:port`), or SSH (`--ssh`) carries the host's actual port automatically.
 - Changing the port adds the new route first, then removes the old one. If the new port is taken, nothing changes.
 - On start, goattyd serves again if the host was available (the route still points at the same socket path). Otherwise it removes a leftover route of its own. A route that disappeared from outside (`serve reset`) shows as a problem on the page.
 - **Permission.** Tailscale lets a non-root user serve a *Unix socket* only if they are the operator **and** may run `sudo tailscale` (tailscaled checks `sudo -U <user> -l tailscale` itself). Without that, goatty shows `sudo tailscale set --operator=$USER`, plus the exact `sudo tailscale serve …` line as an alternative, and waits. While goatty's Unix route exists, any Serve change on that node needs the same permission, because Tailscale checks the whole config.

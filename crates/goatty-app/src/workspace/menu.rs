@@ -397,6 +397,16 @@ impl Workspace {
                 || matches!(host.and_then(super::host_ref_of), Some(crate::hosts::HostRef::Ssh(_))))
                 && crate::hosts::current(cx).iter().any(|e| e.host == *g.label);
             entries.push(Self::group_color_menu(&g.label, ssh, cx).into());
+            if let Some(crate::session::Spawner::Daemon(conn)) = host
+                && matches!(conn.endpoint(), goatty_client::Endpoint::Ssh(_))
+            {
+                let conn = conn.clone();
+                entries.push(
+                    Item::new("Pair over Tailscale", move |_, cx| crate::tailnet::pair_ssh_connection(conn.clone(), cx))
+                        .icon(Icon::Globe)
+                        .into(),
+                );
+            }
         }
         entries.push(
             Item::new(

@@ -235,3 +235,66 @@ fn availability_comes_back_after_the_daemon_restarts() {
     }
     assert!(gateway.exists());
 }
+
+#[test]
+fn headless_token_pairing_and_direct_remote_pairing() {
+    if !has_python() {
+        eprintln!("skipped: the fake `tailscale nc` needs python3");
+        return;
+    }
+    let d = start_daemon();
+    let gateway = goatty_net::gateway_socket(&d.sock);
+    let bin = d.dir.path().join("fakebin");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+
+    // 1. `goattyd net pair --token-only --port 7510` auto-enables on a custom
+    //    port, opens pairing, and prints a single-use `goatty-pair:…` token.
+    let out = Command::new(env!("CARGO_BIN_EXE_goattyd"))
+        .args(["net", "pair", "--token-only", "--port", "7510"])
+        .env("GOATTY_SOCKET", &d.sock)
+        .env("PATH", &path)
+        .env("HOME", d.dir.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let token = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert!(goatty_net::pairing::PairToken::looks_like(&token), "{token}");
+
+    // Client pairs in one step with the token — no confirmation needed on host,
+    // and custom port 7510 is carried automatically.
+    let client = tempfile::tempdir().unwrap();
+    let ts = Tailscale::with_program(fake(&client.path().join("bin"), CLIENT_STATUS));
+    std::fs::write(client.path().join("bin/nc-socket"), gateway.to_str().unwrap()).unwrap();
+    let paths = Paths::new(client.path().join("tailnet"));
+    let host = tailnet::pair_with_token(&ts, &paths, &token, "laptop").unwrap();
+    assert_eq!(host.dns, "desk.tail1.ts.net");
+    assert_eq!(host.port, 7510);
+
+    // Connecting works immediately over Endpoint::Tailnet on the custom port.
+    let target = TailnetTarget { dns: host.dns.clone(), name: host.name.clone(), paths: Some(paths.clone()), tailscale: ts.clone() };
+    let conn = Connection::open(Endpoint::Tailnet(target), "test-token").unwrap();
+    assert_eq!(conn.protocol_version(), goatty_proto::PROTOCOL_VERSION);
+    drop(conn);
+
+    // Reusing the same token fails (single-use).
+    let client2 = tempfile::tempdir().unwrap();
+    let paths2 = Paths::new(client2.path().join("tailnet"));
+    assert!(tailnet::pair_with_token(&ts, &paths2, &token, "other").is_err());
+
+    // 2. Direct remote pairing over an authenticated control link (as over SSH):
+    //    disable first, then `pair_via_remote` re-enables, authorizes, pins, and probes.
+    let mut c = Control::connect(&d.sock, "test-ssh").unwrap();
+    net(&mut c, &Request::Disable).unwrap();
+    let outcome = tailnet::pair_via_remote(|req| net(&mut c, req), &ts, &paths2, "workstation").unwrap();
+    let tailnet::DirectPairOutcome::Paired { host: h2, reachability } = outcome else {
+        panic!("expected Paired, got {outcome:?}");
+    };
+    assert_eq!(h2.dns, "desk.tail1.ts.net");
+    assert_eq!(h2.port, 7510);
+    assert!(reachability.is_ok(), "reachability: {reachability:?}");
+    let target2 = TailnetTarget { dns: h2.dns, name: h2.name, paths: Some(paths2), tailscale: ts };
+    let conn2 = Connection::open(Endpoint::Tailnet(target2), "test-direct").unwrap();
+    assert_eq!(conn2.protocol_version(), goatty_proto::PROTOCOL_VERSION);
+}

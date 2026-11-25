@@ -69,6 +69,14 @@ impl HostLink {
         }
     }
 
+    /// The underlying SSH daemon connection, if this link reaches a host over SSH.
+    pub fn ssh_connection(&self) -> Option<Arc<Connection>> {
+        match self {
+            HostLink::Daemon(c) if matches!(c.endpoint(), goatty_client::Endpoint::Ssh(_)) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
     /// Another host's name as goatty reaches it (the ssh destination, or
     /// the `--via` command's label): what per-host choices and the shell
     /// sync state are keyed by. `None` for this computer.

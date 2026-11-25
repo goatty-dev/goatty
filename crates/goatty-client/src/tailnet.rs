@@ -9,11 +9,12 @@ use std::io::{BufReader, Read, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use goatty_net::api::{NetStatus, Request, RouteStatus};
 use goatty_net::gateway::{self, GatewayError, Refusal};
 use goatty_net::identity::Identity;
 use goatty_net::link::{self, Deadline, Mode};
-use goatty_net::pairing::{KnownHost, KnownHosts};
-use goatty_net::tailscale::{Node, State, Status, Tailscale};
+use goatty_net::pairing::{KnownHost, KnownHosts, PairToken};
+use goatty_net::tailscale::{Node, Permission, State, Status, Tailscale, parse_host_port};
 use goatty_net::{DEFAULT_PORT, Paths};
 use parking_lot::Mutex;
 
@@ -27,12 +28,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 fn route(ts: &Tailscale, dns: &str, fallback: Option<&KnownHost>, name: &str) -> Result<(Mode, String)> {
     match ts.detect() {
         State::Running(status) => {
-            let peer = status.peer(dns);
+            let peer = status.peer(dns).or_else(|| status.find_peer(dns));
             if let Some(p) = peer.filter(|p| !p.online) {
                 bail!("{} is offline on your tailnet", p.name);
             }
             let addr = peer.and_then(Node::addr).map(String::from).or_else(|| fallback.map(|h| h.addr.clone()));
-            let addr = addr.with_context(|| format!("{name} isn't on your tailnet any more"))?;
+            let addr = addr.filter(|a| !a.is_empty()).with_context(|| format!("{name} isn't on your tailnet any more"))?;
             Ok((Mode::for_tun(status.tun), addr))
         }
         other => bail!("{}", other.describe()),
@@ -45,7 +46,7 @@ fn route(ts: &Tailscale, dns: &str, fallback: Option<&KnownHost>, name: &str) ->
 pub(crate) fn connect(t: &TailnetTarget) -> Result<Transport> {
     let paths = t.paths.as_ref().context("no $HOME: goatty keeps this computer's tailnet key there")?;
     let hosts = KnownHosts::load(&paths.hosts())?;
-    let Some(host) = hosts.get(&t.dns).cloned() else {
+    let Some(host) = hosts.get(&t.dns).or_else(|| hosts.find(&t.dns)).cloned() else {
         bail!(GatewayError::Refused {
             code: Refusal::NotPaired,
             reason: format!("this computer isn't paired with {}: pair it first", t.name),
@@ -81,11 +82,17 @@ pub fn known_hosts(paths: &Paths) -> Vec<KnownHost> {
     KnownHosts::load(&paths.hosts()).map(|h| h.hosts).unwrap_or_default()
 }
 
+/// Look up a paired host by MagicDNS name, friendly host name, or Tailscale IP.
+pub fn find_known_host(paths: &Paths, query: &str) -> Option<KnownHost> {
+    KnownHosts::load(&paths.hosts()).ok()?.find(query).cloned()
+}
+
 /// Forget a paired host on this computer (the host keeps this device until
-/// it's revoked there).
-pub fn forget(paths: &Paths, dns: &str) -> Result<bool> {
+/// it's revoked there). Accepts MagicDNS name, friendly name, or Tailscale IP.
+pub fn forget(paths: &Paths, target: &str) -> Result<bool> {
     let mut hosts = KnownHosts::load(&paths.hosts())?;
-    let removed = hosts.remove(dns);
+    let key = hosts.find(target).map(|h| h.dns.clone()).unwrap_or_else(|| target.to_string());
+    let removed = hosts.remove(&key);
     if removed {
         hosts.save(&paths.hosts())?;
     }
@@ -187,6 +194,36 @@ impl Pairing {
         })
     }
 
+    /// Start interactive 6-digit code pairing with `target` — a Tailscale host
+    /// name, MagicDNS name, or Tailscale IP, with optional `:port`. Works even
+    /// when discovery didn't find the host (tagged VPS, custom port, discovery off).
+    pub fn start_target(ts: &Tailscale, paths: &Paths, target: &str, my_name: &str) -> Result<Self> {
+        let (host, port_override) = parse_host_port(target);
+        if host.is_empty() {
+            bail!("enter a Tailscale host name, IP, or pairing code");
+        }
+        let state = ts.detect();
+        let status = state.running().ok_or_else(|| anyhow::anyhow!("{}", state.describe()))?;
+        let node = match status.find_peer(&host) {
+            Some(p) if !p.online => bail!("{} is offline on your tailnet", p.name),
+            Some(p) => p.clone(),
+            None => Node {
+                name: host.split('.').next().unwrap_or(&host).to_string(),
+                dns: host.clone(),
+                addrs: vec![host.clone()],
+                os: String::new(),
+                user_id: 0,
+                user: None,
+                online: true,
+                tagged: false,
+                direct: false,
+                relay: String::new(),
+            },
+        };
+        let port = port_override.unwrap_or_else(|| port_of(paths, node.host_id()));
+        Self::start(ts, paths, status, &node, port, my_name)
+    }
+
     /// Until the host's user confirms the code (`Ok`) or rejects it, or the
     /// host's pairing window closes.
     pub fn wait(&mut self) -> Result<()> {
@@ -201,24 +238,244 @@ impl Pairing {
 
     /// Remember the host and its key (after both users confirmed).
     pub fn pin(&self) -> Result<KnownHost> {
-        let host = KnownHost {
-            dns: self.node.dns.clone(),
-            name: self.node.name.clone(),
-            addr: self.node.addr().unwrap_or_default().to_string(),
-            port: self.port,
-            key: self.key.clone(),
-            paired_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-        };
-        let mut hosts = KnownHosts::load(&self.paths.hosts())?;
-        hosts.add(host.clone());
-        hosts.save(&self.paths.hosts())?;
-        Ok(host)
+        let dns = self.node.host_id().to_string();
+        let name =
+            if self.node.name.is_empty() || (self.node.addrs.first().is_some_and(|a| *a == self.node.name) && !self.host_name.is_empty()) {
+                self.host_name.clone()
+            } else {
+                self.node.name.clone()
+            };
+        pin_host(
+            &self.paths,
+            KnownHost {
+                dns,
+                name,
+                addr: self.node.addr().unwrap_or_default().to_string(),
+                port: self.port,
+                key: self.key.clone(),
+                paired_unix: now_unix(),
+            },
+        )
     }
 }
 
 impl Drop for Pairing {
     fn drop(&mut self) {
         self.closer.close();
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn pin_host(paths: &Paths, host: KnownHost) -> Result<KnownHost> {
+    let mut hosts = KnownHosts::load(&paths.hosts())?;
+    hosts.add(host.clone());
+    hosts.save(&paths.hosts())?;
+    Ok(host)
+}
+
+/// Pair with a host in one step using a one-time pairing code (`goatty-pair:…`)
+/// printed by `goattyd net pair` or Settings → Network on that host.
+pub fn pair_with_token(ts: &Tailscale, paths: &Paths, token_str: &str, my_name: &str) -> Result<KnownHost> {
+    let token = PairToken::decode(token_str)?;
+    let state = ts.detect();
+    let status = state.running().ok_or_else(|| anyhow::anyhow!("{}", state.describe()))?;
+    let peer = if !token.dns.is_empty() { status.find_peer(&token.dns) } else { None }
+        .or_else(|| (!token.addr.is_empty()).then(|| status.find_peer(&token.addr)).flatten());
+    if let Some(p) = peer.filter(|p| !p.online) {
+        bail!("{} is offline on your tailnet", p.name);
+    }
+    let addr = peer
+        .and_then(Node::addr)
+        .map(String::from)
+        .or_else(|| (!token.addr.is_empty()).then(|| token.addr.clone()))
+        .or_else(|| (!token.dns.is_empty()).then(|| token.dns.clone()))
+        .context("pairing code has no reachable tailnet address")?;
+    let identity = Identity::load_or_create(&paths.key())?;
+    let l = link::open(ts, Mode::for_tun(status.tun), &addr, token.port, CONNECT_TIMEOUT)?;
+    let stderr = l.stderr.clone();
+    let mut reader = BufReader::new(l.reader);
+    let mut writer = l.writer;
+    let greeting = {
+        let _deadline = Deadline::start(&l.closer, CONNECT_TIMEOUT);
+        gateway::pair_with_token(&mut reader, &mut writer, &identity, my_name, &token)
+    };
+    l.closer.close();
+    let greeting = greeting.map_err(|e| {
+        let said = stderr.lock().last().cloned();
+        match said {
+            Some(line) if e.downcast_ref::<GatewayError>().is_none() => e.context(format!("tailscale nc: {line}")),
+            _ => e,
+        }
+    })?;
+    let dns = peer.map(|p| p.host_id().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| token.host_id().to_string());
+    let name = peer
+        .map(|p| p.name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if !greeting.name.is_empty() { greeting.name.clone() } else { token.display_name().to_string() });
+    pin_host(paths, KnownHost { dns, name, addr, port: token.port, key: greeting.key, paired_unix: now_unix() })
+}
+
+/// Outcome of pairing a remote host through an already-authenticated control
+/// channel (such as an SSH connection to its `goattyd`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectPairOutcome {
+    /// Tailscale Serve is active on the remote host, this computer's device
+    /// key is authorized there, and the host is pinned locally.
+    Paired {
+        host: KnownHost,
+        /// `Ok(summary)` when this computer reached the host over Tailscale
+        /// right now (e.g. `"direct"` or `"relay fra"`), or `Err(note)` when
+        /// pairing succeeded but the tailnet link couldn't be verified yet.
+        reachability: std::result::Result<String, String>,
+    },
+    /// Tailscale on the remote host denied adding the Serve route until the
+    /// user grants operator permission (or adds the route manually).
+    NeedsPermission { host_name: String, permission: Permission },
+}
+
+/// Pair a remote host over an already-authenticated `Net` RPC channel (for
+/// example, an existing SSH connection to its `goattyd`):
+///
+/// 1. Check Tailscale on the remote host and enable its Serve route if off.
+/// 2. Authorize this computer's device key on the remote host (falling back
+///    to an SSH-verified pairing window for older remote `goattyd` builds).
+/// 3. Pin the host locally in `hosts.json` and check tailnet reachability.
+pub fn pair_via_remote(
+    mut net_rpc: impl FnMut(&Request) -> Result<NetStatus>,
+    ts: &Tailscale,
+    paths: &Paths,
+    my_name: &str,
+) -> Result<DirectPairOutcome> {
+    let mut status = net_rpc(&Request::Status)?;
+    let Some(remote_ts) = status.tailscale.running().cloned() else {
+        let extra = if matches!(status.tailscale, State::NotInstalled) {
+            " (install Tailscale and log in on that host first: https://tailscale.com/download)"
+        } else {
+            ""
+        };
+        bail!("{} on the remote host{extra}", status.tailscale.describe());
+    };
+    let remote_name = if remote_ts.me.name.is_empty() { remote_ts.me.host_id().to_string() } else { remote_ts.me.name.clone() };
+    if !status.available || status.route != RouteStatus::Active {
+        match net_rpc(&Request::Enable { port: None }) {
+            Ok(s) => status = s,
+            Err(e) => {
+                if let Ok(after) = net_rpc(&Request::Status)
+                    && let RouteStatus::Permission(permission) = after.route
+                {
+                    return Ok(DirectPairOutcome::NeedsPermission { host_name: remote_name, permission });
+                }
+                return Err(e);
+            }
+        }
+    }
+    let remote_ts = status.tailscale.running().context("Tailscale stopped on the remote host")?;
+    let remote_dns = remote_ts.me.host_id().to_string();
+    let remote_addr = remote_ts.me.addr().unwrap_or_default().to_string();
+    let remote_name = if remote_ts.me.name.is_empty() { remote_dns.clone() } else { remote_ts.me.name.clone() };
+    let remote_port = status.port;
+    let remote_key = status.key.clone();
+    if remote_dns.is_empty() && remote_addr.is_empty() {
+        bail!("{remote_name} has no Tailscale address yet");
+    }
+
+    let identity = Identity::load_or_create(&paths.key())?;
+    let my_key = identity.public();
+    if let Err(e) = net_rpc(&Request::AuthorizeDevice { key: my_key.clone(), name: my_name.to_string() }) {
+        if format!("{e:#}").contains("bad tailnet request") {
+            // Older remote goattyd without `AuthorizeDevice`: verify the key
+            // and 6-digit code across the authenticated SSH channel instead.
+            pair_via_window_fallback(&mut net_rpc, ts, paths, my_name, &remote_dns, &remote_addr, &remote_name, remote_port, &remote_key)?;
+        } else {
+            return Err(e);
+        }
+    }
+
+    let host = pin_host(
+        paths,
+        KnownHost {
+            dns: remote_dns.clone(),
+            name: remote_name.clone(),
+            addr: remote_addr.clone(),
+            port: remote_port,
+            key: remote_key.clone(),
+            paired_unix: now_unix(),
+        },
+    )?;
+
+    let reachability = check_reachability(ts, &remote_dns, &remote_addr, remote_port, &remote_key);
+    Ok(DirectPairOutcome::Paired { host, reachability })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pair_via_window_fallback(
+    net_rpc: &mut impl FnMut(&Request) -> Result<NetStatus>,
+    ts: &Tailscale,
+    paths: &Paths,
+    my_name: &str,
+    remote_dns: &str,
+    remote_addr: &str,
+    remote_name: &str,
+    remote_port: u16,
+    remote_key: &str,
+) -> Result<()> {
+    let local_state = ts.detect();
+    let local_ts = local_state.running().ok_or_else(|| {
+        anyhow::anyhow!("the remote goattyd is older and needs Tailscale running here to complete pairing ({})", local_state.describe())
+    })?;
+    let node = local_ts.find_peer(remote_dns).or_else(|| local_ts.find_peer(remote_addr)).cloned().unwrap_or_else(|| Node {
+        name: remote_name.to_string(),
+        dns: remote_dns.to_string(),
+        addrs: if remote_addr.is_empty() { Vec::new() } else { vec![remote_addr.to_string()] },
+        os: String::new(),
+        user_id: 0,
+        user: None,
+        online: true,
+        tagged: false,
+        direct: false,
+        relay: String::new(),
+    });
+    net_rpc(&Request::OpenPairing { secs: Some(60) })?;
+    let result = (|| -> Result<()> {
+        let mut pairing = Pairing::start(ts, paths, local_ts, &node, remote_port, my_name)?;
+        if pairing.key != remote_key {
+            bail!(GatewayError::HostKeyChanged { name: remote_name.to_string() });
+        }
+        let my_key = Identity::load_or_create(&paths.key())?.public();
+        let pending = net_rpc(&Request::Status)?
+            .pairing
+            .and_then(|w| w.pending.into_iter().find(|p| p.key == my_key && p.code == pairing.code))
+            .context("pairing request didn't appear on the remote host")?;
+        net_rpc(&Request::Decide { id: pending.id, accept: true })?;
+        pairing.wait()
+    })();
+    let _ = net_rpc(&Request::ClosePairing);
+    result
+}
+
+fn check_reachability(ts: &Tailscale, dns: &str, addr: &str, port: u16, expected_key: &str) -> std::result::Result<String, String> {
+    let state = ts.detect();
+    let Some(status) = state.running() else {
+        return Err(format!("paired, ready once Tailscale runs here ({})", state.describe()));
+    };
+    let peer = status.find_peer(dns).or_else(|| status.find_peer(addr));
+    let Some(connect_addr) = peer.and_then(Node::addr).or((!addr.is_empty()).then_some(addr)) else {
+        return Err("paired, but no tailnet address was found for it here".into());
+    };
+    match goatty_net::discovery::probe(ts, Mode::for_tun(status.tun), connect_addr, port) {
+        Ok(p) if p.greeting.key == expected_key => {
+            let via = match peer {
+                Some(n) if n.direct => "direct".to_string(),
+                Some(n) if !n.relay.is_empty() => format!("relay {}", n.relay),
+                _ => "tailnet".to_string(),
+            };
+            Ok(via)
+        }
+        Ok(_) => Err("a different goatty key answered on that tailnet address".into()),
+        Err(e) => Err(format!("paired, but couldn't reach it over Tailscale right now ({e:#})")),
     }
 }
 

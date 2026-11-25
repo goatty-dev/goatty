@@ -18,7 +18,7 @@ use goatty_config::{ClientSettings, Document, HostSettings, Loaded, ThemeLibrary
 use goatty_plugin::api;
 use goatty_shell::HostService;
 
-use crate::cli::{SettingsCmd, ThemeCmd, ThemeFor};
+use crate::cli::{NetCmd, SettingsCmd, ThemeCmd, ThemeFor};
 
 const CLIENT: &str = concat!("goatty-cli ", env!("CARGO_PKG_VERSION"));
 const VIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -638,6 +638,153 @@ pub fn theme(cmd: ThemeCmd) -> Result<()> {
             let e = lib.get(&id).filter(|e| e.user).with_context(|| format!("{id:?} isn't one of your themes"))?;
             lib.delete(&id)?;
             println!("Deleted {:?}.", e.name);
+            Ok(())
+        }
+    }
+}
+
+pub fn net(cmd: NetCmd, top_ssh: Option<String>, top_remote_daemon: Option<String>) -> Result<()> {
+    use goatty_client::tailnet::{self, DirectPairOutcome, Pairing};
+    use goatty_net::identity::short;
+    use goatty_net::pairing::{PairToken, spaced};
+    use goatty_net::tailscale::Tailscale;
+
+    let paths = crate::tailnet::paths().context("no $HOME: goatty keeps this computer's tailnet key there")?;
+    let ts = Tailscale::system();
+
+    match cmd {
+        NetCmd::List { all, no_discover } => {
+            let state = ts.detect();
+            println!("{}", state.describe());
+            let known = tailnet::known_hosts(&paths);
+            if known.is_empty() {
+                println!("No paired hosts yet.");
+            } else {
+                println!("Paired hosts:");
+                for h in &known {
+                    let port = if h.port == goatty_net::DEFAULT_PORT { String::new() } else { format!(":{}", h.port) };
+                    println!("  {:<20} {}{port}  key {}", sanitize_terminal(&h.name), sanitize_terminal(&h.dns), short(&h.key));
+                }
+            }
+            if !no_discover && state.running().is_some() {
+                let all_devices = all || goatty_config::load_client().value.tailnet.all_devices;
+                let disc = tailnet::discover(&ts, &paths, goatty_net::DEFAULT_PORT, all_devices);
+                let unpaired: Vec<_> = disc.found.into_iter().filter(|f| !f.paired).collect();
+                if !unpaired.is_empty() {
+                    println!("Available to pair:");
+                    for f in unpaired {
+                        let status = if f.probe.pairing { "ready to pair" } else { "not paired" };
+                        println!("  {:<20} {}  ({status})", sanitize_terminal(&f.node.name), sanitize_terminal(f.node.host_id()));
+                    }
+                }
+            }
+            println!(
+                "\nHeadless host: run `goattyd net pair` there, then `goatty net pair <code|host>` here (or `goatty net pair --ssh HOST`)."
+            );
+            Ok(())
+        }
+        NetCmd::Pair { target, ssh, remote_daemon } => {
+            let ssh = match (top_ssh, ssh) {
+                (Some(_), Some(_)) => bail!("--ssh cannot be used more than once"),
+                (Some(v), None) | (None, Some(v)) => Some(v),
+                (None, None) => None,
+            };
+            let remote_daemon = match (top_remote_daemon, remote_daemon) {
+                (Some(_), Some(_)) => bail!("--remote-daemon cannot be used more than once"),
+                (Some(v), None) | (None, Some(v)) => Some(v),
+                (None, None) => None,
+            };
+            if remote_daemon.is_some() && ssh.is_none() {
+                bail!("--remote-daemon requires --ssh");
+            }
+            if ssh.is_some() && target.is_some() {
+                bail!("pass either a pairing code/host or `--ssh HOST`, not both");
+            }
+            let my_name = tailnet::my_name();
+            if let Some(ssh_host) = ssh {
+                let endpoint = Endpoint::ssh(&ssh_host, remote_daemon.as_deref());
+                let conn = Connection::open_once(endpoint, CLIENT, None).map_err(|e| {
+                    let hint = match e.downcast_ref::<RemoteProblem>() {
+                        Some(RemoteProblem::NotInstalled { host, platform }) if platform.target().is_some() => {
+                            Some(format!("run `goatty --ssh {host}` once to install goattyd there"))
+                        }
+                        Some(RemoteProblem::Incompatible { host, mismatch, .. }) if !mismatch.daemon_is_newer => {
+                            Some(format!("run `goatty --ssh {host}` to update goattyd there"))
+                        }
+                        _ => None,
+                    };
+                    let sanitized = anyhow::anyhow!("{}", sanitize_terminal(&format!("{e:#}")));
+                    match hint {
+                        Some(msg) => sanitized.context(sanitize_terminal(&msg)),
+                        None => sanitized,
+                    }
+                })?;
+                let outcome = tailnet::pair_via_remote(
+                    |req| {
+                        let reply = conn.net(serde_json::to_string(req)?)?;
+                        serde_json::from_str::<goatty_net::api::Reply>(&reply)?.into_result()
+                    },
+                    &ts,
+                    &paths,
+                    &my_name,
+                )?;
+                match outcome {
+                    DirectPairOutcome::Paired { host, reachability } => {
+                        println!("Paired with {} ({}, port {}).", sanitize_terminal(&host.name), sanitize_terminal(&host.dns), host.port);
+                        match reachability {
+                            Ok(via) => println!("Reachable over Tailscale ({}).", sanitize_terminal(&via)),
+                            Err(note) => eprintln!("Note: {}", sanitize_terminal(&note)),
+                        }
+                        println!("Connect with: goatty --tailnet {}", sanitize_terminal(&host.name));
+                        Ok(())
+                    }
+                    DirectPairOutcome::NeedsPermission { host_name, permission } => {
+                        eprintln!(
+                            "Tailscale on {} doesn't let goatty add its Serve route yet. Run once there:",
+                            sanitize_terminal(&host_name)
+                        );
+                        eprintln!("    {}", sanitize_terminal(&permission.operator));
+                        eprintln!("then run `goatty net pair --ssh {}` again.", sanitize_terminal(&ssh_host));
+                        eprintln!("Or add the route directly on {}:", sanitize_terminal(&host_name));
+                        eprintln!("    {}", sanitize_terminal(&permission.direct));
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(target) = target {
+                if PairToken::looks_like(&target) {
+                    let host = tailnet::pair_with_token(&ts, &paths, &target, &my_name)?;
+                    println!("Paired with {} ({}, port {}).", sanitize_terminal(&host.name), sanitize_terminal(&host.dns), host.port);
+                    println!("Connect with: goatty --tailnet {}", sanitize_terminal(&host.name));
+                    Ok(())
+                } else {
+                    if !std::io::stdin().is_terminal() {
+                        bail!("interactive 6-digit pairing needs a terminal; pass a `goatty-pair:…` code from `goattyd net pair` instead");
+                    }
+                    let mut pairing = Pairing::start_target(&ts, &paths, &target, &my_name)?;
+                    let host_name = sanitize_terminal(&pairing.host_name);
+                    let code = spaced(&pairing.code);
+                    println!("Pairing with {host_name}. Confirm the same code on {host_name} (`goattyd net pair` or Settings → Network).");
+                    if !confirm(&format!("Does {host_name} show {code}?"), false)? {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                    println!("Waiting for {host_name} to confirm…");
+                    pairing.wait()?;
+                    let host = pairing.pin()?;
+                    println!("Paired with {} ({}, port {}).", sanitize_terminal(&host.name), sanitize_terminal(&host.dns), host.port);
+                    println!("Connect with: goatty --tailnet {}", sanitize_terminal(&host.name));
+                    Ok(())
+                }
+            } else {
+                bail!("pass a `goatty-pair:…` code, a Tailscale host, or `--ssh HOST`");
+            }
+        }
+        NetCmd::Forget { host } => {
+            if tailnet::forget(&paths, &host)? {
+                println!("Forgot {}.", sanitize_terminal(&host));
+            } else {
+                bail!("{} isn't a paired host (see `goatty net list`)", sanitize_terminal(&host));
+            }
             Ok(())
         }
     }
