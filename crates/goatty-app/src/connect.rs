@@ -204,7 +204,7 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     upload: None,
                 };
             }
-            let warning = (!keeps_sessions(mismatch)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
+            let warning = (!remote_keeps_sessions(mismatch)).then(|| format!("Restarting goattyd ends the sessions running on {host}."));
             if probe.as_ref().is_some_and(Probe::runs_ours) {
                 return Ask {
                     title: format!("Restart goattyd on {host}?"),
@@ -241,10 +241,17 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
     }
 }
 
-/// An older daemon that a restart replaces with its sessions kept
-/// (protocol v10 on; `Control::connect_admin` still speaks to it).
+/// An older local daemon that a restart replaces with its sessions kept
+/// (protocol v10 on Unix; Windows daemons cannot hand off ConPTY handles).
 fn keeps_sessions(mismatch: &goatty_client::VersionMismatch) -> bool {
     !mismatch.daemon_is_newer && mismatch.daemon_protocol.is_some_and(local::can_keep_sessions)
+}
+
+/// An older remote SSH daemon that a restart replaces with its sessions kept.
+/// Remote SSH daemons run on Unix (`goatty_client::remote`), so protocol
+/// support does not depend on the local client OS.
+fn remote_keeps_sessions(mismatch: &goatty_client::VersionMismatch) -> bool {
+    !mismatch.daemon_is_newer && mismatch.daemon_protocol.is_some_and(|p| p >= goatty_proto::RESTART_SINCE)
 }
 
 /// The local daemon speaks no protocol this goatty does but is old enough
@@ -770,7 +777,8 @@ pub fn plain_ssh(host: &str, join: Option<&saved::Join>) -> Result<Ready> {
         Err(e) => log::warn!("no local goattyd ({e:#}); running ssh in this window"),
     }
     let session = Session::local_command(initial_size(), None, argv, None).context("couldn't start ssh")?;
-    let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
+    let daemon =
+        std::env::current_exe().ok().map(|e| e.with_file_name(format!("goattyd{}", std::env::consts::EXE_SUFFIX))).filter(|d| d.exists());
     let base = Spawner::Local(Arc::new(HostService::from_env(daemon)));
     Ok((Startup::Session(session), Spawner::Plain { host: host.to_string(), base: Box::new(base) }))
 }
@@ -903,6 +911,10 @@ mod tests {
         assert!(a.body[0].contains("older") && a.body[0].contains("/x/goattyd"), "{:?}", a.body);
         assert!(a.warning.unwrap().contains("ends the sessions"));
         let v16 = VersionMismatch { daemon_protocol: Some(16), daemon_version: Some("0.3.0".into()), daemon_is_newer: false };
-        assert!(describe_local(&LocalProblem::Incompatible(v16), None).warning.is_none());
+        if cfg!(windows) {
+            assert!(describe_local(&LocalProblem::Incompatible(v16), None).warning.unwrap().contains("ends the sessions"));
+        } else {
+            assert!(describe_local(&LocalProblem::Incompatible(v16), None).warning.is_none());
+        }
     }
 }

@@ -669,6 +669,10 @@ version = "0.1.0"
 summary = "Defines a greet function"
 publisher = "tests"
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [[setting]]
 id = "name"
 label = "Name"
@@ -677,6 +681,9 @@ default = "world"
 
 [zsh]
 init = "zsh/init.zsh"
+
+[powershell]
+init = "pwsh/init.ps1"
 
 [permissions]
 shell-code = "defines the greet function in every shell"
@@ -689,11 +696,18 @@ version = "0.2.0"
 summary = "Depends on greet"
 publisher = "tests"
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [requires]
 plugins = ["greet"]
 
 [zsh]
 init = "zsh/init.zsh"
+
+[powershell]
+init = "pwsh/init.ps1"
 
 [permissions]
 shell-code = "uses greet"
@@ -703,13 +717,16 @@ shell-code = "uses greet"
         let key = sign::load_secret(&key_path).unwrap();
         std::fs::create_dir_all(&reg).unwrap();
         std::fs::write(reg.join(index::META), format!("name = \"test\"\nkeys = [\"{public}\"]\n")).unwrap();
-        for (id, v, manifest, init) in
-            [("greet", "0.1.0", greet, "greet() { echo hi }\n"), ("addon", "0.2.0", addon, "addon() { greet }\n")]
-        {
+        for (id, v, manifest, zsh_init, pwsh_init) in [
+            ("greet", "0.1.0", greet, "greet() { echo hi }\n", "function global:greet { Write-Output 'hi' }\n"),
+            ("addon", "0.2.0", addon, "addon() { greet }\n", "function global:addon { greet }\n"),
+        ] {
             let p = reg.join("plugins").join(id).join(v);
             std::fs::create_dir_all(p.join("zsh")).unwrap();
+            std::fs::create_dir_all(p.join("pwsh")).unwrap();
             std::fs::write(p.join("plugin.toml"), manifest).unwrap();
-            std::fs::write(p.join("zsh/init.zsh"), init).unwrap();
+            std::fs::write(p.join("zsh/init.zsh"), zsh_init).unwrap();
+            std::fs::write(p.join("pwsh/init.ps1"), pwsh_init).unwrap();
         }
         let idx = index::build(&reg).unwrap();
         std::fs::write(reg.join(index::INDEX), idx.to_bytes()).unwrap();

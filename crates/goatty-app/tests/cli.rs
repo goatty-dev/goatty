@@ -33,11 +33,11 @@ fn goatty_with_path(home: &Path, extra_path: Option<&Path>, args: &[&str]) -> Ou
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("APPDATA", home.join(".config"))
-        .env("LOCALAPPDATA", home.join(".local/share"))
+        .env("LOCALAPPDATA", home.join(".local").join("share"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_DATA_HOME", home.join(".local").join("share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
-        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_STATE_HOME", home.join(".local").join("state"))
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY")
         .env_remove("GOATTY_THEME")
@@ -74,7 +74,7 @@ fn ok(o: Output) -> Output {
 fn settings_set_show_validate() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
-    let file = home.join(".config/goatty/settings.json");
+    let file = home.join(".config").join("goatty").join("settings.json");
     assert!(out(&ok(goatty(home, &["settings", "path"]))).contains(&file.display().to_string()));
 
     ok(goatty(home, &["settings", "set", "font.size", "16"]));
