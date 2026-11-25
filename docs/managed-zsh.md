@@ -328,4 +328,4 @@ Installed plugins (Stage 5, [`plugins.md`](plugins.md)) render into `plugins-ear
 
 ## Not done yet
 
-Installs for other architectures and a distro-specific hint when zsh is missing (#42), an interactive GUI smoke test (#47), and the terminal side of shell integration (#28).
+Installs for other architectures and a distro-specific hint when zsh is missing (#42).
