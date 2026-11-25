@@ -39,8 +39,8 @@ use goatty_client::{Connection, Endpoint, RemoteProblem, SshTarget};
 use goatty_shell::HostService;
 use goatty_term::TermSize;
 use gpui::{
-    App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render, SharedString, WeakEntity,
-    Window, div, prelude::*, px,
+    Animation, AnimationExt as _, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render,
+    SharedString, Transformation, WeakEntity, Window, div, percentage, prelude::*, px,
 };
 
 use crate::hosts::pool;
@@ -816,7 +816,11 @@ impl Render for ConnectView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Icon::Loader.svg().size(px(18.)).text_color(ui.accent))
+                    .child(Icon::Loader.svg().size(px(18.)).text_color(ui.accent).with_animation(
+                        ("connect-spin", cx.entity_id().as_u64() as usize),
+                        Animation::new(Duration::from_millis(900)).repeat(),
+                        |s, t| s.with_transformation(Transformation::rotate(percentage(t))),
+                    ))
                     .child(div().text_base().child(SharedString::from(label.clone()))),
             ),
             Step::Ask(ask) => {
