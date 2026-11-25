@@ -200,6 +200,8 @@ fn windows_proxy_exits_cleanly_after_stdin_eof_and_delivers_replies() {
     let mut stdin = proxy.stdin.take().unwrap();
     let mut stdout = proxy.stdout.take().unwrap();
 
+    // Supervise reply reads, EOF, and process exit under one bounded deadline.
+    let deadline = Instant::now() + Duration::from_secs(5);
     write_msg(&mut stdin, &ClientMsg::Hello { version: PROTOCOL_VERSION, client: "win-proxy-eof".into() }).unwrap();
     write_msg(&mut stdin, &ClientMsg::ListSessions { req: 1 }).unwrap();
     stdin.flush().unwrap();
@@ -207,21 +209,55 @@ fn windows_proxy_exits_cleanly_after_stdin_eof_and_delivers_replies() {
     // still flush both replies to stdout, and exit cleanly without hanging.
     drop(stdin);
 
-    let hello: ServerMsg = read_msg(&mut stdout).unwrap();
+    let progress = Arc::new(Mutex::new(Vec::<String>::new()));
+    let progress_w = progress.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let res = (|| -> Result<(ServerMsg, ServerMsg, Vec<u8>), String> {
+            let hello: ServerMsg = read_msg(&mut stdout).map_err(|e| format!("read Hello: {e}"))?;
+            progress_w.lock().push(format!("hello={hello:?}"));
+            let sessions: ServerMsg = read_msg(&mut stdout).map_err(|e| format!("read Sessions: {e}"))?;
+            progress_w.lock().push(format!("sessions={sessions:?}"));
+            let mut tail = Vec::new();
+            stdout.read_to_end(&mut tail).map_err(|e| format!("read EOF: {e}"))?;
+            progress_w.lock().push(format!("eof(tail_len={})", tail.len()));
+            Ok((hello, sessions, tail))
+        })();
+        let _ = done_tx.send(res);
+    });
+
+    let left = deadline.saturating_duration_since(Instant::now());
+    let (hello, sessions, tail) = match done_rx.recv_timeout(left) {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(e)) => {
+            let _ = proxy.kill();
+            let _ = proxy.wait();
+            let _ = reader_thread.join();
+            panic!("proxy stdout read failed ({e}); received so far: {:?}", *progress.lock());
+        }
+        Err(_) => {
+            let _ = proxy.kill();
+            let _ = proxy.wait();
+            let _ = reader_thread.join();
+            panic!("timed out waiting for proxy replies/EOF; received so far: {:?}", *progress.lock());
+        }
+    };
+    reader_thread.join().unwrap();
+
     assert!(matches!(hello, ServerMsg::Hello { .. }), "expected Hello, got {hello:?}");
-    let sessions: ServerMsg = read_msg(&mut stdout).unwrap();
     assert!(matches!(sessions, ServerMsg::Sessions { req: 1, .. }), "expected Sessions, got {sessions:?}");
-    let mut tail = Vec::new();
-    stdout.read_to_end(&mut tail).unwrap();
     assert!(tail.is_empty(), "unexpected trailing bytes: {tail:?}");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = proxy.try_wait().unwrap() {
             assert!(status.success(), "proxy exited with {status}");
             break;
         }
-        assert!(Instant::now() < deadline, "goattyd.exe proxy hung after stdin EOF");
+        if Instant::now() >= deadline {
+            let _ = proxy.kill();
+            let _ = proxy.wait();
+            panic!("goattyd.exe proxy hung after stdout EOF");
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }

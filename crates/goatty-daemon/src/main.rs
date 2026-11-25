@@ -386,11 +386,19 @@ fn main() -> Result<()> {
     };
     let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level));
     if let Cmd::Serve { log: Some(ref path), .. } = cmd {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("goattyd: warning: couldn't create log directory {}: {e}", parent.display());
         }
-        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            logger.target(env_logger::Target::Pipe(Box::new(file)));
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                logger.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                eprintln!("goattyd: warning: couldn't open --log {}: {e}; logging to stderr", path.display());
+            }
         }
     }
     logger.init();

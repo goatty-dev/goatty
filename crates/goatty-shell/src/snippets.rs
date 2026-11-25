@@ -386,8 +386,10 @@ mod win_proc {
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess,
-        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     use super::Output;
@@ -575,6 +577,69 @@ mod win_proc {
         Ok(OwnedHandle(h))
     }
 
+    struct ProcThreadAttrList {
+        _buf: Vec<usize>,
+        _handles: Box<[HANDLE]>,
+        ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
+    }
+
+    impl ProcThreadAttrList {
+        fn with_handle_list(handles: Vec<HANDLE>) -> io::Result<Self> {
+            let mut bytes = 0usize;
+            // SAFETY: probing the required buffer size with a null attribute list is documented.
+            unsafe {
+                InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &raw mut bytes);
+            }
+            if bytes == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let words = bytes.div_ceil(std::mem::size_of::<usize>()).max(1);
+            let mut buf = vec![0usize; words];
+            let ptr: LPPROC_THREAD_ATTRIBUTE_LIST = buf.as_mut_ptr().cast();
+            // SAFETY: `buf` is pointer-aligned and holds at least `bytes` writable bytes.
+            if unsafe { InitializeProcThreadAttributeList(ptr, 1, 0, &raw mut bytes) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let handles = handles.into_boxed_slice();
+            let handles_ptr = handles.as_ptr().cast();
+            let handles_bytes = std::mem::size_of_val(handles.as_ref());
+            // Moving `handles` (a `Box<[HANDLE]>`) into `Self` preserves its heap address
+            // until after `Drop::drop` deletes the attribute list.
+            let list = Self { _buf: buf, _handles: handles, ptr };
+            // SAFETY: `list.ptr` is initialized and `list._handles` stays alive at the same
+            // heap address until after `DeleteProcThreadAttributeList` runs in `Drop`.
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    list.ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    handles_ptr,
+                    handles_bytes,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(list)
+        }
+
+        fn as_mut_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+            self.ptr
+        }
+    }
+
+    impl Drop for ProcThreadAttrList {
+        fn drop(&mut self) {
+            // SAFETY: `self.ptr` was initialized by `InitializeProcThreadAttributeList`;
+            // `_buf` and `_handles` are dropped only after `Drop::drop` returns.
+            unsafe {
+                DeleteProcThreadAttributeList(self.ptr);
+            }
+        }
+    }
+
     /// Spawn `program` with `CREATE_SUSPENDED`, assign it to a
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object before calling
     /// `ResumeThread` (so no descendant can escape job membership), and
@@ -586,13 +651,19 @@ mod win_proc {
         let (mut stderr, stderr_write) = create_output_pipe().context("create stderr pipe")?;
         let stdin_nul = open_nul_stdin().context("open NUL for stdin")?;
 
-        // SAFETY: `STARTUPINFOW` is plain C data; zero-init + `cb` is required.
-        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = stdin_nul.0;
-        si.hStdOutput = stdout_write.0;
-        si.hStdError = stderr_write.0;
+        // Restrict inheritance strictly to this child's three standard handles so
+        // concurrent snippet spawns never inherit another run's pipe write ends.
+        let attrs = ProcThreadAttrList::with_handle_list(vec![stdin_nul.0, stdout_write.0, stderr_write.0])
+            .context("init PROC_THREAD_ATTRIBUTE_HANDLE_LIST")?;
+
+        // SAFETY: `STARTUPINFOEXW` is plain C data; zero-init + `cb` is required.
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = stdin_nul.0;
+        si.StartupInfo.hStdOutput = stdout_write.0;
+        si.StartupInfo.hStdError = stderr_write.0;
+        si.lpAttributeList = attrs.as_mut_ptr();
 
         let app_wide = to_wide_nul(program.as_os_str());
         let mut cmdline = build_cmdline(program, args);
@@ -601,7 +672,7 @@ mod win_proc {
         // SAFETY: `PROCESS_INFORMATION` is plain C data.
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-        // SAFETY: all wide strings, env block, and structs live across `CreateProcessW`.
+        // SAFETY: all wide strings, env block, attribute list, and handles live across `CreateProcessW`.
         let ok = unsafe {
             CreateProcessW(
                 app_wide.as_ptr(),
@@ -609,15 +680,17 @@ mod win_proc {
                 std::ptr::null(),
                 std::ptr::null(),
                 TRUE,
-                CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
                 env_block.as_ptr().cast(),
                 cwd_wide.as_ptr(),
-                &raw const si,
+                &raw const si.StartupInfo,
                 &raw mut pi,
             )
         };
-        // Close our copies of the child's stdio handles immediately so pipes hit
-        // EOF as soon as the job's process tree exits.
+        // Delete the attribute list before closing the handles it referenced,
+        // and close our copies of the child's stdio handles immediately so pipes
+        // hit EOF as soon as the job's process tree exits.
+        drop(attrs);
         drop(stdin_nul);
         drop(stdout_write);
         drop(stderr_write);

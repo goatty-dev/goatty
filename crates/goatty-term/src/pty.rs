@@ -367,7 +367,7 @@ mod windows {
     use std::io::{Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use anyhow::{Context, Result, bail};
@@ -383,8 +383,7 @@ mod windows {
     use windows_sys::Win32::System::Threading::{
         CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject,
+        PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     use super::ShellCommand;
@@ -442,6 +441,60 @@ mod windows {
             line.push_str(&quote_windows_arg(arg));
         }
         to_wide_nul(OsStr::new(&line))
+    }
+
+    fn is_batch_script(program: &str) -> bool {
+        let trimmed = program.trim_end_matches([' ', '.']);
+        Path::new(trimmed)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+    }
+
+    fn comspec() -> String {
+        if let Some(p) = std::env::var_os("COMSPEC").filter(|v| !v.is_empty()) {
+            return p.to_string_lossy().into_owned();
+        }
+        if let Some(root) = std::env::var_os("SystemRoot").filter(|v| !v.is_empty()) {
+            return PathBuf::from(root).join("System32").join("cmd.exe").to_string_lossy().into_owned();
+        }
+        r"C:\Windows\System32\cmd.exe".into()
+    }
+
+    /// Build `(lpApplicationName, lpCommandLine)` for `CreateProcessW`.
+    ///
+    /// Batch scripts (`.cmd`/`.bat`) are dispatched explicitly through
+    /// `%COMSPEC% /D /S /C` instead of relying on `CreateProcessW`'s implicit
+    /// `cmd.exe` shim, and arguments containing `cmd.exe` metacharacters
+    /// (`&`, `|`, `<`, `>`, `^`, `%`, `"`, `\r`, `\n`) are rejected so an
+    /// argument can never split into a second command.
+    pub(super) fn build_spawn_command(program: &str, args: &[String]) -> Result<(Option<Vec<u16>>, Vec<u16>)> {
+        if is_batch_script(program) {
+            if let Some(bad) = program.chars().find(|c| matches!(c, '"' | '%' | '\r' | '\n')) {
+                bail!("refusing to run batch script {program:?} containing unsupported character {bad:?}");
+            }
+            for arg in args {
+                if let Some(bad) = arg.chars().find(|c| matches!(c, '&' | '|' | '<' | '>' | '^' | '%' | '"' | '\r' | '\n')) {
+                    bail!("refusing to pass argument containing cmd.exe metacharacter {bad:?} to batch script {program:?}");
+                }
+            }
+            let mut inner = format!("\"{program}\"");
+            for arg in args {
+                inner.push(' ');
+                if arg.is_empty() || arg.chars().any(|c| matches!(c, ' ' | '\t')) {
+                    inner.push('"');
+                    inner.push_str(arg);
+                    inner.push('"');
+                } else {
+                    inner.push_str(arg);
+                }
+            }
+            let cmd_exe = comspec();
+            let full = format!("{} /D /S /C \"{inner}\"", quote_windows_arg(&cmd_exe));
+            return Ok((Some(to_wide_nul(OsStr::new(&cmd_exe))), to_wide_nul(OsStr::new(&full))));
+        }
+        let app = Path::new(program).is_absolute().then(|| to_wide_nul(OsStr::new(program)));
+        Ok((app, build_cmdline(program, args)))
     }
 
     /// Build a sorted UTF-16 `CREATE_UNICODE_ENVIRONMENT` block inheriting the
@@ -756,17 +809,14 @@ mod windows {
             let attrs = ProcThreadAttrList::with_pseudoconsole(hpcon).context("init PROC_THREAD_ATTRIBUTE_LIST")?;
 
             // SAFETY: `STARTUPINFOEXW` is plain C data; zeroed with `cb` set is required.
+            // Leaving `STARTF_USESTDHANDLES` unset and standard handle fields zeroed lets
+            // the child attach directly to the ConPTY's console handles.
             let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            // Prevent the child from inheriting redirected stdio handles (e.g.
-            // `goattyd.log`) instead of attaching to the ConPTY.
-            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-            si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-            si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-            si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
             si.lpAttributeList = attrs.as_mut_ptr();
 
-            let mut cmdline = build_cmdline(&cmd.program, &cmd.args);
+            let (app_wide, mut cmdline) = build_spawn_command(&cmd.program, &cmd.args)?;
+            let app_ptr = app_wide.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
             let env_block = build_env_block(&cmd.env);
             let cwd_wide = cmd.cwd.as_ref().map(|p| to_wide_nul(p.as_os_str()));
             let cwd_ptr = cwd_wide.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
@@ -777,10 +827,10 @@ mod windows {
             let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
             // Start suspended so we assign the child to the Job Object BEFORE it
             // executes a single instruction or spawns any grandchildren.
-            // SAFETY: `cmdline`, `env_block`, `cwd_ptr`, `si`, and `attrs` all stay alive across the call.
+            // SAFETY: `app_wide`, `cmdline`, `env_block`, `cwd_ptr`, `si`, and `attrs` all stay alive across the call.
             let ok = unsafe {
                 CreateProcessW(
-                    std::ptr::null(),
+                    app_ptr,
                     cmdline.as_mut_ptr(),
                     std::ptr::null(),
                     std::ptr::null(),
@@ -1056,5 +1106,105 @@ mod tests {
         }
         exit_thread.join().unwrap();
         reader_thread.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_rejects_metacharacters_and_exe_preserves_literal_ampersand() {
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = TempDir(std::env::temp_dir().join(format!("goatty-pty-batch-test-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+
+        let run_to_exit = |cmd: &ShellCommand| -> String {
+            let (mut pty, mut reader) = Pty::spawn(cmd, TermSize::new(120, 24)).unwrap();
+            let exit_watch = pty.exit_watcher();
+            let reader_thread = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                String::from_utf8_lossy(&out).into_owned()
+            });
+            let exit_thread = std::thread::spawn(move || exit_watch.wait_and_close_console());
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while pty.try_wait().is_none() {
+                if Instant::now() >= deadline {
+                    pty.kill();
+                    pty.close_console();
+                    let _ = exit_thread.join();
+                    let partial = reader_thread.join().unwrap_or_default();
+                    panic!("timed out waiting for {} to exit; output so far:\n{partial}", cmd.program);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            exit_thread.join().unwrap();
+            reader_thread.join().unwrap()
+        };
+
+        // 1. Control case: `.exe` target receives an argument containing `&` literally.
+        let ps1 = dir.0.join("echo-arg.ps1");
+        std::fs::write(&ps1, "Write-Output \"EXE_ARG=$($args[0])\"\r\n").unwrap();
+        let exe_cmd = ShellCommand {
+            program: "powershell.exe".into(),
+            args: vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                ps1.to_string_lossy().into_owned(),
+                "a&echo_literal".into(),
+            ],
+            cwd: Some(dir.0.clone()),
+            env: Vec::new(),
+        };
+        let exe_out = run_to_exit(&exe_cmd);
+        assert!(exe_out.contains("EXE_ARG=a&echo_literal"), "expected literal ampersand from .exe; got:\n{exe_out}");
+
+        // 2. Batch script fixture: safe arguments run explicitly through COMSPEC /D /S /C.
+        let batch = dir.0.join("echo-arg.cmd");
+        std::fs::write(&batch, "@echo off\r\necho BATCH_ARG=%~1\r\n").unwrap();
+        let safe_batch = ShellCommand {
+            program: batch.to_string_lossy().into_owned(),
+            args: vec!["safe value".into()],
+            cwd: Some(dir.0.clone()),
+            env: Vec::new(),
+        };
+        let batch_out = run_to_exit(&safe_batch);
+        assert!(batch_out.contains("BATCH_ARG=safe value"), "expected batch output; got:\n{batch_out}");
+
+        // 3. Batch script rejects cmd.exe metacharacters (including `&`) instead of
+        // letting implicit or explicit cmd.exe split the command.
+        let injected_batch = ShellCommand {
+            program: batch.to_string_lossy().into_owned(),
+            args: vec!["a&echo INJECTED".into()],
+            cwd: Some(dir.0.clone()),
+            env: Vec::new(),
+        };
+        let err = match Pty::spawn(&injected_batch, TermSize::new(80, 24)) {
+            Ok((mut pty, _)) => {
+                pty.kill();
+                pty.close_console();
+                panic!("expected batch spawn with '&' argument to be rejected");
+            }
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("metacharacter"), "{err:#}");
+
+        for bad in ["a&b", "a|b", "a<b", "a>b", "a^b", "%TEMP%", "a\"b", "a\nb", "a\rb"] {
+            let err = windows::build_spawn_command(&batch.to_string_lossy(), &[bad.into()]).unwrap_err();
+            assert!(err.to_string().contains("metacharacter"), "expected rejection for {bad:?}, got {err:#}");
+        }
     }
 }
