@@ -31,10 +31,13 @@ fn goatty_with_path(home: &Path, extra_path: Option<&Path>, args: &[&str]) -> Ou
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_goatty"));
     cmd.args(args)
         .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("XDG_STATE_HOME")
+        .env("USERPROFILE", home)
+        .env("APPDATA", home.join(".config"))
+        .env("LOCALAPPDATA", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("DISPLAY")
         .env_remove("GOATTY_THEME")
@@ -173,7 +176,12 @@ fn profile_export_import_without_daemon() {
     ok(goatty(other.path(), &["settings", "import", "--yes", profile.to_str().unwrap()]));
     assert!(std::fs::read_to_string(other.path().join(".config/goatty/settings.json")).unwrap().contains("dracula"));
     assert!(std::fs::read_to_string(other.path().join(".config/goatty/host.json")).unwrap().contains("4321"));
-    assert!(other.path().join(".local/share/goatty/current/zsh/.zshrc").is_file(), "host settings were applied as a generation");
+    let generated = if cfg!(windows) {
+        other.path().join(".local/share/goatty/current/pwsh/init.ps1")
+    } else {
+        other.path().join(".local/share/goatty/current/zsh/.zshrc")
+    };
+    assert!(generated.is_file(), "host settings were applied as a generation ({})", generated.display());
 }
 
 fn build_greet_registry(reg: &Path, key_path: &Path) -> String {
@@ -181,13 +189,15 @@ fn build_greet_registry(reg: &Path, key_path: &Path) -> String {
     let key = goatty_plugin::sign::load_secret(key_path).unwrap();
     let plugin_dir = reg.join("plugins/greet/0.1.0");
     std::fs::create_dir_all(plugin_dir.join("zsh")).unwrap();
+    std::fs::create_dir_all(plugin_dir.join("pwsh")).unwrap();
     std::fs::write(reg.join(goatty_plugin::index::META), format!("name = \"test\"\nkeys = [\"{public}\"]\n")).unwrap();
     std::fs::write(
         plugin_dir.join("plugin.toml"),
-        "schema = 1\nid = \"greet\"\nname = \"Greet\"\nversion = \"0.1.0\"\nsummary = \"Says hi\"\npublisher = \"tests\"\n[zsh]\ninit = \"zsh/init.zsh\"\n[permissions]\nshell-code = \"defines greet\"\n",
+        "schema = 1\nid = \"greet\"\nname = \"Greet\"\nversion = \"0.1.0\"\nsummary = \"Says hi\"\npublisher = \"tests\"\n[compat]\nos = [\"linux\", \"macos\", \"windows\"]\nshells = [\"zsh\", \"powershell\"]\n[zsh]\ninit = \"zsh/init.zsh\"\n[powershell]\ninit = \"pwsh/init.ps1\"\n[permissions]\nshell-code = \"defines greet\"\n",
     )
     .unwrap();
     std::fs::write(plugin_dir.join("zsh/init.zsh"), "greet() { echo hi }\n").unwrap();
+    std::fs::write(plugin_dir.join("pwsh/init.ps1"), "function global:greet { Write-Output 'hi' }\n").unwrap();
     let idx = goatty_plugin::index::build(reg).unwrap();
     std::fs::write(reg.join(goatty_plugin::index::INDEX), idx.to_bytes()).unwrap();
     goatty_plugin::index::sign_dir(reg, &key).unwrap();
@@ -290,6 +300,7 @@ fn remote_flags_reject_unsupported_subcommands() {
     assert!(!o.status.success());
 }
 
+#[cfg(unix)]
 fn spawn_fake_remote_daemon(
     in_fifo: &Path,
     out_fifo: &Path,
@@ -370,19 +381,23 @@ fn spawn_fake_remote_daemon(
     })
 }
 
+#[cfg(unix)]
 fn make_fifo(path: &Path) {
     let status = Command::new("mkfifo").arg(path).status().unwrap();
     assert!(status.success(), "mkfifo failed for {}", path.display());
 }
 
+#[cfg(unix)]
 fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+#[cfg(unix)]
 fn via_bridge(in_fifo: &Path, out_fifo: &Path) -> String {
     format!("exec 3<&0; cat <&3 > {} & p=$!; exec 3<&-; cat < {}; wait $p 2>/dev/null", sh_quote(in_fifo), sh_quote(out_fifo))
 }
 
+#[cfg(unix)]
 #[test]
 fn profile_export_import_via_remote_connection() {
     use std::io::Write;

@@ -12,20 +12,23 @@
 //! When goatty draws them:
 //! - The horizontal tab bar is the title bar: the window buttons sit at its
 //!   ends (the desktop's `button-layout`, only the ones the compositor
-//!   supports). Dragging its empty space moves the window, double-clicking
-//!   it maximizes, and right-clicking it opens the window menu.
+//!   supports; on Windows, native top-right caption buttons wired to
+//!   `WindowControlArea` for Aero Snap and Windows 11 Snap Layouts).
+//!   Dragging its empty space moves the window, double-clicking it maximizes,
+//!   and right-clicking it opens the window menu.
 //! - Vertical tabs and a hidden tab bar get a slim header that does that
 //!   ([`Workspace::render_title_header`]).
-//! - A window that isn't tiled gets a shadow, a hairline border, rounded
-//!   top corners and resize edges ([`Workspace::window_frame`]).
-//!
-//! macOS and Windows aren't built yet; there the desktop's title bar stays.
+//! - On Linux, a window that isn't tiled gets a shadow, a hairline border,
+//!   rounded top corners and resize edges ([`Workspace::window_frame`]).
+//!   On Windows, DWM provides the native frame, shadow, Windows 11 rounded
+//!   corners, and resize borders automatically when `appears_transparent` is
+//!   set on `TitlebarOptions`.
 
 use goatty_config::TitleBar;
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, Context, CursorStyle, Decorations, Hitbox, HitboxBehavior, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, ResizeEdge, Size, StatefulInteractiveElement, Styled, Tiling, Window, WindowButton,
-    WindowButtonLayout, WindowDecorations, canvas, div, point, prelude::*, px,
+    MouseButton, ParentElement, Pixels, Point, ResizeEdge, Size, StatefulInteractiveElement, Styled, Tiling, TitlebarOptions, Window,
+    WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations, canvas, div, point, prelude::*, px, rgb,
 };
 
 use super::Workspace;
@@ -43,17 +46,29 @@ const BORDER: Pixels = px(1.);
 const HEADER_HEIGHT: f32 = 34.;
 const BUTTON_GAP: f32 = 8.;
 const BUTTON_PAD: f32 = 8.;
+/// Native Windows 10/11 caption button width (Minimize, Maximize, Close).
+const WIN_BUTTON_WIDTH: f32 = 46.;
 
 /// When the desktop doesn't say where the window buttons go.
 const DEFAULT_LAYOUT: WindowButtonLayout =
     WindowButtonLayout { left: [None; 3], right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)] };
 
-/// The decorations to ask the desktop for.
+/// The decorations to ask the desktop for (Linux Wayland/X11).
 pub fn requested(title_bar: TitleBar) -> WindowDecorations {
     match title_bar {
         TitleBar::System => WindowDecorations::Server,
         TitleBar::Goatty => WindowDecorations::Client,
     }
+}
+
+/// Titlebar options passed to `WindowOptions` (Windows uses
+/// `appears_transparent` to extend the DWM client area into the title bar).
+pub fn titlebar_options(title_bar: TitleBar) -> TitlebarOptions {
+    titlebar_options_for(title_bar, cfg!(target_os = "windows"))
+}
+
+fn titlebar_options_for(title_bar: TitleBar, windows: bool) -> TitlebarOptions {
+    TitlebarOptions { title: Some("goatty".into()), appears_transparent: windows && title_bar == TitleBar::Goatty, ..Default::default() }
 }
 
 /// How the window is tiled, when goatty draws its decorations; `None` when
@@ -95,7 +110,10 @@ fn side_buttons(side: Side, window: &Window, cx: &App) -> Vec<WindowButton> {
 }
 
 /// How wide [`window_buttons`] are at both ends, `size` px buttons.
-pub(super) fn buttons_width(size: f32, window: &Window, cx: &App) -> f32 {
+pub(super) fn buttons_width(size: f32, windows_bar: bool, window: &Window, cx: &App) -> f32 {
+    if windows_bar {
+        return 3.0 * WIN_BUTTON_WIDTH;
+    }
     [Side::Left, Side::Right]
         .into_iter()
         .map(|side| match side_buttons(side, window, cx).len() {
@@ -107,7 +125,10 @@ pub(super) fn buttons_width(size: f32, window: &Window, cx: &App) -> f32 {
 
 /// The window buttons for one end of the title bar, `size` px each, when
 /// goatty draws the decorations and the desktop puts some there.
-pub(super) fn window_buttons(side: Side, size: f32, c: Colors, window: &Window, cx: &App) -> Option<AnyElement> {
+pub(super) fn window_buttons(side: Side, size: f32, windows_bar: bool, c: Colors, window: &Window, cx: &App) -> Option<AnyElement> {
+    if windows_bar {
+        return matches!(side, Side::Right).then(|| windows_caption_buttons(c, window));
+    }
     let maximized = window.is_maximized();
     let buttons: Vec<AnyElement> = side_buttons(side, window, cx).into_iter().map(|b| window_button(b, maximized, size, c)).collect();
     if buttons.is_empty() {
@@ -126,6 +147,69 @@ pub(super) fn window_buttons(side: Side, size: f32, c: Colors, window: &Window, 
             .children(buttons)
             .into_any_element(),
     )
+}
+
+/// Native-style Windows 10/11 top-right caption buttons wired to GPUI's
+/// `WindowControlArea` (`WM_NCHITTEST` -> `HTMINBUTTON` / `HTMAXBUTTON` /
+/// `HTCLOSE`), enabling native minimize, maximize/restore toggle, Windows 11
+/// Snap Layouts on maximize hover, and close without stopping propagation.
+fn windows_caption_buttons(c: Colors, window: &Window) -> AnyElement {
+    let maximized = window.is_maximized();
+    let min_ok = window.is_minimizable();
+    let max_ok = window.is_resizable();
+    div()
+        .id("windows-window-controls")
+        .flex_none()
+        .h_full()
+        .flex()
+        .items_stretch()
+        .child(windows_caption_button("win-minimize", Icon::WindowMinimize, 11., WindowControlArea::Min, min_ok, false, c))
+        .child(windows_caption_button(
+            "win-maximize",
+            if maximized { Icon::WindowRestore } else { Icon::WindowMaximize },
+            11.,
+            WindowControlArea::Max,
+            max_ok,
+            false,
+            c,
+        ))
+        .child(windows_caption_button("win-close", Icon::Close, 13., WindowControlArea::Close, true, true, c))
+        .into_any_element()
+}
+
+fn windows_caption_button(
+    id: &'static str,
+    icon: Icon,
+    icon_size: f32,
+    area: WindowControlArea,
+    enabled: bool,
+    is_close: bool,
+    c: Colors,
+) -> AnyElement {
+    let icon_color = if enabled { c.ui.text } else { c.ui.muted };
+    let mut el = div()
+        .id(id)
+        .group(id)
+        .flex_none()
+        .w(px(WIN_BUTTON_WIDTH))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .occlude()
+        .window_control_area(area);
+    if enabled {
+        if is_close {
+            el = el.hover(|s| s.bg(rgb(0xc42b1c))).active(|s| s.bg(rgb(0xb22719)));
+        } else {
+            el = el.hover(|s| s.bg(c.ui.text.opacity(0.08))).active(|s| s.bg(c.ui.text.opacity(0.14)));
+        }
+    }
+    let mut glyph = icon.svg().size(px(icon_size)).text_color(icon_color);
+    if is_close && enabled {
+        glyph = glyph.group_hover(id, |s| s.text_color(gpui::white()));
+    }
+    el.child(glyph).into_any_element()
 }
 
 fn window_button(button: WindowButton, maximized: bool, size: f32, c: Colors) -> AnyElement {
@@ -185,6 +269,12 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        if self.windows_custom_title_bar {
+            // On Windows, `WindowControlArea::Drag` returns `HTCAPTION` from
+            // `WM_NCHITTEST`, so Windows natively handles dragging, Aero Snap,
+            // double-click maximize/restore, and right-click system menu.
+            return el.window_control_area(WindowControlArea::Drag);
+        }
         let controls = window.window_controls();
         let zoom = controls.maximize && window.is_resizable();
         el.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = true))
@@ -215,6 +305,7 @@ impl Workspace {
     pub(super) fn render_title_header(&self, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
         let c = Colors::get(cx);
         let title = self.active_tab().map(|t| self.tab_label(t, cx)).unwrap_or_default();
+        let win_bar = self.windows_custom_title_bar;
         let area = div()
             .id("title-header-drag")
             .flex_1()
@@ -222,8 +313,8 @@ impl Workspace {
             .h_full()
             .flex()
             .items_center()
-            .justify_center()
-            .px(px(8.))
+            .when(win_bar, |d| d.pl(px(12.)).pr(px(8.)))
+            .when(!win_bar, |d| d.justify_center().px(px(8.)))
             .text_size(px(text::SMALL))
             .text_color(c.ui.muted)
             .child(div().min_w_0().truncate().child(title));
@@ -236,9 +327,9 @@ impl Workspace {
             .flex()
             .bg(c.bar)
             .font_family(cx.global::<AppSettings>().ui_font.clone())
-            .children(window_buttons(Side::Left, 22., c, window, cx))
+            .children(window_buttons(Side::Left, 22., win_bar, c, window, cx))
             .child(area)
-            .children(window_buttons(Side::Right, 22., c, window, cx));
+            .children(window_buttons(Side::Right, 22., win_bar, c, window, cx));
         round_top(header, window).into_any_element()
     }
 
@@ -387,5 +478,8 @@ mod tests {
         assert_eq!(at(797., 3., left), Some(ResizeEdge::Right));
         assert_eq!(requested(TitleBar::System), WindowDecorations::Server);
         assert_eq!(requested(TitleBar::Goatty), WindowDecorations::Client);
+        assert!(!titlebar_options_for(TitleBar::System, true).appears_transparent);
+        assert!(titlebar_options_for(TitleBar::Goatty, true).appears_transparent);
+        assert!(!titlebar_options_for(TitleBar::Goatty, false).appears_transparent);
     }
 }

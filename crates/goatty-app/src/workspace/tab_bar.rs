@@ -223,13 +223,14 @@ impl Workspace {
             StripItem::Tab(_) => (l, t + 1),
         });
         let active_at = strip.iter().position(|i| matches!(i, StripItem::Tab(t) if t.active));
-        let csd = chrome::csd(window).is_some();
+        let win_bar = self.windows_custom_title_bar;
+        let csd = self.has_custom_title_bar(window);
         let control = if modern { 24.0 } else { 18.0 };
-        let left = chrome::window_buttons(chrome::Side::Left, control, c, window, cx);
-        let right = chrome::window_buttons(chrome::Side::Right, control, c, window, cx);
+        let left = chrome::window_buttons(chrome::Side::Left, control, win_bar, c, window, cx);
+        let right = chrome::window_buttons(chrome::Side::Right, control, win_bar, c, window, cx);
         // The settings button, the new-tab menu's chevron, and the window
         // buttons when goatty draws them.
-        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, window, cx) + self.chip_width();
+        let chrome_room = 32.0 + 12.0 + chrome::buttons_width(control, win_bar, window, cx) + self.chip_width();
         let room = f32::from(window.viewport_size().width) - chrome::frame_width(window) - labels - chrome_room;
         let width = modern_tab_width(room, tabs);
         let height = if modern { MODERN_HEIGHT } else { COMPACT_HEIGHT };
@@ -318,7 +319,12 @@ impl Workspace {
             .tooltip(tooltip("Settings"))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenSettings), cx));
         let settings = if modern {
-            settings.size(px(28.)).mb(px(MODERN_LIFT)).rounded_md().child(Icon::Sliders.svg().size(px(15.)).text_color(c.ui.muted))
+            settings
+                .size(px(28.))
+                .mb(px(MODERN_LIFT))
+                .when(win_bar, |d| d.mr(px(4.)))
+                .rounded_md()
+                .child(Icon::Sliders.svg().size(px(15.)).text_color(c.ui.muted))
         } else {
             settings.h_full().px(px(8.)).child(Icon::Sliders.svg().size(px(13.)).text_color(c.ui.muted))
         };
@@ -336,7 +342,7 @@ impl Workspace {
             .bg(c.bar)
             .font_family(cx.global::<AppSettings>().ui_font.clone())
             .on_scroll(cx.listener(Self::on_tabs_scroll))
-            .when(modern, |d| d.items_end().px(px(6.)).gap(px(2.)))
+            .when(modern, |d| d.items_end().pl(px(6.)).when(!win_bar, |d| d.pr(px(6.))).gap(px(2.)))
             .when(!modern, |d| d.items_stretch().text_size(px(12.)))
             // The seam to the panes, which the active tab opens.
             .child(div().absolute().bottom_0().left_0().right_0().h(px(1.)).bg(seam(c)))

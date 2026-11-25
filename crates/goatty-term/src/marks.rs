@@ -57,6 +57,8 @@ pub(crate) enum Mark {
     /// `CSI ? 1049` (or `1047`, `47`) before its `h` or `l`: the screen is
     /// about to switch (or stay).
     ScreenSwitch,
+    /// `CSI ? 9001 h` / `l`: ConPTY / Windows win32-input-mode.
+    Win32InputMode(bool),
     /// `OSC 7501 ; …`: a program's status report, or the probe.
     Status(Report),
     /// `ESC c` (RIS): a full reset.
@@ -135,8 +137,12 @@ enum State {
     OscEsc,
     /// After `ESC [`.
     Csi,
-    /// Inside `ESC [ ?`, with the parameter read so far.
-    DecPrivate(u16),
+    /// Inside `ESC [ ?`, with the parameter read so far and whether `9001`
+    /// appeared in the parameter list.
+    DecPrivate {
+        n: u16,
+        win32: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -192,22 +198,30 @@ impl MarkScanner {
                 State::Csi => {
                     // Anything but a DEC private mode: back to looking for ESC.
                     if bytes[i] == b'?' {
-                        self.state = State::DecPrivate(0);
+                        self.state = State::DecPrivate { n: 0, win32: false };
                         i += 1;
                     } else {
                         self.state = State::Ground;
                     }
                 }
-                State::DecPrivate(n) => match bytes[i] {
+                State::DecPrivate { n, win32 } => match bytes[i] {
                     d @ b'0'..=b'9' => {
-                        self.state = State::DecPrivate(n.saturating_mul(10).saturating_add(u16::from(d - b'0')));
+                        self.state = State::DecPrivate { n: n.saturating_mul(10).saturating_add(u16::from(d - b'0')), win32 };
                         i += 1;
                     }
                     b @ (b';' | 0x40..=0x7e) => {
                         if matches!(n, 47 | 1047 | 1049) {
                             on(i, Mark::ScreenSwitch);
                         }
-                        self.state = if b == b';' { State::DecPrivate(0) } else { State::Ground };
+                        let win32 = win32 || n == 9001;
+                        if b == b';' {
+                            self.state = State::DecPrivate { n: 0, win32 };
+                        } else {
+                            if win32 && matches!(b, b'h' | b'l') {
+                                on(i + 1, Mark::Win32InputMode(b == b'h'));
+                            }
+                            self.state = State::Ground;
+                        }
                         i += 1;
                     }
                     _ => self.state = State::Ground,

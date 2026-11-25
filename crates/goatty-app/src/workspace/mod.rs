@@ -66,6 +66,7 @@ mod notices;
 pub mod reopen;
 pub mod saved;
 pub use chrome::requested as requested_decorations;
+pub use chrome::titlebar_options;
 mod sidebar;
 mod switcher;
 mod sync;
@@ -283,6 +284,9 @@ pub struct Workspace {
     /// The left button went down on the title bar's empty space: the next
     /// move starts moving the window (`chrome`).
     title_drag: bool,
+    /// On Windows, `gpui_windows` decides whether to hide the system title bar
+    /// when the window is created (`TitlebarOptions::appears_transparent`).
+    windows_custom_title_bar: bool,
     /// The window edge under the pointer, when goatty draws the frame.
     resize_edge: Option<gpui::ResizeEdge>,
     /// The frame last told to the platform: goatty's (with the tiling) or none.
@@ -344,6 +348,7 @@ impl Workspace {
         });
         let button_layout = cx.observe_button_layout_changed(window, |_, _, cx| cx.notify());
         let mut title_bar = cx.global::<AppSettings>().client.window.title_bar;
+        let windows_custom_title_bar = cfg!(target_os = "windows") && title_bar == goatty_config::TitleBar::Goatty;
         // `terminal.opacity` / `terminal.blur`, live.
         let mut background = background_appearance(&cx.global::<AppSettings>().client.terminal);
         window.set_background_appearance(background);
@@ -356,7 +361,14 @@ impl Workspace {
             let wanted = cx.global::<AppSettings>().client.window.title_bar;
             if wanted != title_bar {
                 title_bar = wanted;
-                window.request_decorations(chrome::requested(wanted));
+                if cfg!(target_os = "windows") {
+                    toast::show(
+                        cx,
+                        Toast::info("Title bar style updated").body("Open a new window to use the new title bar.").key("window.title_bar"),
+                    );
+                } else {
+                    window.request_decorations(chrome::requested(wanted));
+                }
             }
             cx.notify();
         });
@@ -406,6 +418,7 @@ impl Workspace {
             dragging: None,
             moved_unpainted: false,
             title_drag: false,
+            windows_custom_title_bar,
             resize_edge: None,
             frame_applied: None,
             sidebar_drag: None,
@@ -441,6 +454,10 @@ impl Workspace {
             Initial::Reopen(record, open_settings) => this.reopen(record, open_settings, window, cx),
         }
         this
+    }
+
+    pub(super) fn has_custom_title_bar(&self, window: &Window) -> bool {
+        self.windows_custom_title_bar || chrome::csd(window).is_some()
     }
 
     /// The window went away with its tabs (closed while goatty runs on, or
@@ -2947,16 +2964,36 @@ fn dir_label(dir: &Path, home: Option<&Path>) -> String {
 /// A directory for the vertical tabs' second line: `~/…` under the home
 /// directory, and only the last two components when it's deeper than three.
 fn short_dir(dir: &Path, home: Option<&Path>) -> String {
-    let (prefix, rest) = match home.and_then(|h| dir.strip_prefix(h).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => return "~".into(),
-        Some(rest) => ("~/", rest),
-        None => ("/", dir.strip_prefix("/").unwrap_or(dir)),
-    };
+    if let Some(rest) = home.and_then(|h| dir.strip_prefix(h).ok()) {
+        if rest.as_os_str().is_empty() {
+            return "~".into();
+        }
+        let parts: Vec<_> = rest.iter().map(|p| p.to_string_lossy()).collect();
+        if parts.len() > 3 {
+            return format!("…/{}", parts[parts.len() - 2..].join("/"));
+        }
+        return format!("~/{}", parts.join("/"));
+    }
+    let raw = dir.to_string_lossy();
+    let is_win_drive = raw.as_bytes().get(1) == Some(&b':') && raw.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    if is_win_drive {
+        let normalized = raw.replace('\\', "/");
+        let (drive, rest) = normalized.split_at(2);
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return format!("{drive}/");
+        }
+        if parts.len() > 3 {
+            return format!("…/{}", parts[parts.len() - 2..].join("/"));
+        }
+        return format!("{drive}/{}", parts.join("/"));
+    }
+    let rest = dir.strip_prefix("/").unwrap_or(dir);
     let parts: Vec<_> = rest.iter().map(|p| p.to_string_lossy()).collect();
     if parts.len() > 3 {
         return format!("…/{}", parts[parts.len() - 2..].join("/"));
     }
-    format!("{prefix}{}", parts.join("/"))
+    format!("/{}", parts.join("/"))
 }
 
 /// Opaque unless the terminal background is see-through.
@@ -3006,7 +3043,7 @@ impl Render for Workspace {
         let show_bar = tabs.show == TabBarShow::Always || self.tabs.len() > 1 || self.shows_workspaces();
         let vertical = show_bar && tabs.style == TabStyle::Vertical;
         // goatty draws the title bar, and the tab bar can't be it.
-        let header = chrome::csd(window).is_some() && (vertical || !show_bar);
+        let header = self.has_custom_title_bar(window) && (vertical || !show_bar);
         // Where the panes start: the palette centers over them.
         let panes_left = if vertical { self.sidebar_width(window, cx) } else { 0.0 };
         let root = div().id("workspace").size_full().relative().flex();
@@ -3173,5 +3210,8 @@ mod tests {
         assert_eq!(short_dir(Path::new("/etc/nginx"), home), "/etc/nginx");
         assert_eq!(short_dir(Path::new("/var/lib/docker/volumes"), None), "…/docker/volumes");
         assert_eq!(short_dir(Path::new("/home/meow"), home), "/home/meow");
+        assert_eq!(short_dir(Path::new(r"C:\Users\me"), None), "C:/Users/me");
+        assert_eq!(short_dir(Path::new(r"C:\"), None), "C:/");
+        assert_eq!(short_dir(Path::new(r"C:\Users\me\coding\rust\goatty"), None), "…/rust/goatty");
     }
 }

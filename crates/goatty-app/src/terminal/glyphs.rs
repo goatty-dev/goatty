@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use goatty_config::FontSettings;
 use goatty_term::CellFlags;
 use gpui::{Font, FontId, FontStyle, FontWeight, GlyphId, Hsla, Pixels, TextRun, WindowTextSystem, px};
 
@@ -22,6 +23,16 @@ pub struct Glyph {
 /// Style bits that select a font face.
 fn face_bits(flags: CellFlags) -> u8 {
     (flags.contains(CellFlags::BOLD) as u8) | (flags.contains(CellFlags::ITALIC) as u8) << 1
+}
+
+fn style_font(mut f: Font, bits: u8) -> Font {
+    if bits & 1 != 0 {
+        f.weight = FontWeight::BOLD;
+    }
+    if bits & 2 != 0 {
+        f.style = FontStyle::Italic;
+    }
+    f
 }
 
 pub struct GlyphCache {
@@ -67,31 +78,36 @@ impl GlyphCache {
     }
 
     fn face(&self, bits: u8) -> Font {
-        let mut f = self.font.clone();
-        if bits & 1 != 0 {
-            f.weight = FontWeight::BOLD;
-        }
-        if bits & 2 != 0 {
-            f.style = FontStyle::Italic;
-        }
-        f
+        style_font(self.font.clone(), bits)
     }
 
-    fn shape(&self, ts: &WindowTextSystem, text: &str, bits: u8) -> Vec<Glyph> {
-        let run = TextRun {
-            len: text.len(),
-            font: self.face(bits),
-            color: Hsla::default(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
+    fn bundled_face(&self, bits: u8) -> Font {
+        style_font(gpui::font(FontSettings::BUNDLED), bits)
+    }
+
+    fn shape_with(&self, ts: &WindowTextSystem, font: Font, text: &str) -> Vec<Glyph> {
+        let run = TextRun { len: text.len(), font, color: Hsla::default(), background_color: None, underline: None, strikethrough: None };
         let layout = ts.layout_line(text, self.font_size, &[run], None);
         layout
             .runs
             .iter()
             .flat_map(|r| r.glyphs.iter().map(move |g| Glyph { font_id: r.font_id, id: g.id, x: g.position.x, emoji: g.is_emoji }))
             .collect()
+    }
+
+    fn shape(&self, ts: &WindowTextSystem, text: &str, bits: u8) -> Vec<Glyph> {
+        let glyphs = self.shape_with(ts, self.face(bits), text);
+        // On Windows DirectWrite, `Font::fallbacks` only searches the system
+        // font collection, not in-memory fonts registered via `add_fonts()`.
+        // When a user selects a non-Nerd-Font (e.g. Consolas), explicitly fall
+        // back to the bundled JetBrainsMono Nerd Font for missing glyphs.
+        if self.font.family.as_ref() != FontSettings::BUNDLED && (glyphs.is_empty() || glyphs.iter().all(|g| g.id.0 == 0)) {
+            let fallback = self.shape_with(ts, self.bundled_face(bits), text);
+            if fallback.iter().any(|g| g.id.0 != 0) {
+                return fallback;
+            }
+        }
+        glyphs
     }
 
     pub fn simple(&mut self, ts: &WindowTextSystem, ch: char, flags: CellFlags) -> Option<Glyph> {

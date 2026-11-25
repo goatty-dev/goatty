@@ -112,6 +112,11 @@ impl Askpass {
                     self.secret.push_str(text.lines().next().unwrap_or(""));
                 }
             }
+            _ if crate::terminal::keys::is_windows_altgr(ks) => {
+                if let Some(c) = &ks.key_char {
+                    self.secret.push_str(c);
+                }
+            }
             _ if m.control || m.alt || m.platform => return,
             _ => match &ks.key_char {
                 Some(c) if !c.chars().any(char::is_control) => self.secret.push_str(c),

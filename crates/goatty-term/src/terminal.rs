@@ -77,6 +77,9 @@ pub(crate) struct Inner {
     /// the alternate screen: what a snapshot taken in the alternate screen
     /// restores for it (rio-vt keeps the inactive screen's flags private).
     pub(crate) primary_kitty: AtomicU8,
+    /// ConPTY / Windows win32-input-mode (`CSI ? 9001 h` / `l`), tracked
+    /// alongside rio-vt because rio-vt does not implement mode 9001.
+    pub(crate) win32_input: AtomicBool,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -142,6 +145,7 @@ impl Terminal {
             prompts: AtomicU64::new(0),
             lines: Mutex::new(Default::default()),
             primary_kitty: AtomicU8::new(0),
+            win32_input: AtomicBool::new(false),
         };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
@@ -263,6 +267,9 @@ impl Terminal {
                     self.inner.primary_kitty.store(mode.kitty_flags(), Ordering::Relaxed);
                 }
             }
+            Mark::Win32InputMode(on) => {
+                self.inner.win32_input.store(on, Ordering::Relaxed);
+            }
             Mark::Status(Report::Probe) => {
                 if self.inner.answer_queries {
                     let _ = self.inner.replies.send(status::PROBE_REPLY.to_vec());
@@ -277,6 +284,7 @@ impl Terminal {
                 let _ = self.inner.ui.send(UiEvent::Status { news });
             }
             Mark::Reset => {
+                self.inner.win32_input.store(false, Ordering::Relaxed);
                 if self.inner.status.lock().reset() {
                     let _ = self.inner.ui.send(UiEvent::Status { news: None });
                 }
@@ -346,7 +354,15 @@ impl Terminal {
     }
 
     pub fn mode(&self) -> TermMode {
-        TermMode::of(&self.inner.term.lock())
+        let mut mode = TermMode::of(&self.inner.term.lock());
+        if self.inner.win32_input.load(Ordering::Relaxed) {
+            mode |= TermMode::WIN32_INPUT_MODE;
+        }
+        mode
+    }
+
+    pub(crate) fn win32_input(&self) -> bool {
+        self.inner.win32_input.load(Ordering::Relaxed)
     }
 
     /// Scrollback lines currently held (primary screen).

@@ -151,7 +151,7 @@ impl UserCommand {
         let Some(prog) = program.map(str::trim).filter(|p| !p.is_empty()) else {
             return false;
         };
-        let base = prog.rsplit('/').next().unwrap_or(prog);
+        let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
         self.when_program.iter().any(|w| w.eq_ignore_ascii_case(prog) || w.eq_ignore_ascii_case(base))
     }
 }
@@ -271,7 +271,11 @@ impl Default for FontSettings {
             "FiraCode Nerd Font Mono",
             "FiraCode Nerd Font",
             "CommitMono Nerd Font Mono",
+            "CaskaydiaCove Nerd Font",
             "Fira Code",
+            "Cascadia Mono",
+            "Cascadia Code",
+            "Consolas",
             "DejaVu Sans Mono",
             "Adwaita Mono",
             "Noto Sans Mono",
@@ -300,7 +304,7 @@ impl FontSettings {
 
     /// Default proportional families for goatty's own windows.
     pub const DEFAULT_UI_FALLBACKS: &'static [&'static str] =
-        &["Inter", "Cantarell", "Noto Sans", "Ubuntu", "Open Sans", "DejaVu Sans", "Liberation Sans"];
+        &["Inter", "Segoe UI Variable", "Segoe UI", "Cantarell", "Noto Sans", "Ubuntu", "Open Sans", "DejaVu Sans", "Liberation Sans"];
 
     /// The family to use, given the fonts installed on the system (without
     /// the bundled one):
