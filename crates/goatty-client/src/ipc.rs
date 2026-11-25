@@ -1003,6 +1003,11 @@ mod imp {
             PipeInner::new(server).map(LocalStream)
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn stream_from_raw_for_test(raw: HANDLE) -> io::Result<LocalStream> {
+        PipeInner::new(OwnedHandle(raw)).map(LocalStream)
+    }
 }
 
 #[cfg(windows)]
@@ -1178,26 +1183,38 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn shutdown_write_propagates_timeout_when_peer_stalls() {
-        let (_stalled_peer, mut client) = LocalStream::pair().unwrap();
-        client.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
-        // Fill the pipe's 64 KiB buffer without reading from `_stalled_peer`
-        // until writes backpressure and time out.
-        let chunk = vec![0xAAu8; 64 * 1024];
-        let mut filled = false;
-        for _ in 0..16 {
-            match client.write(&chunk) {
-                Ok(_) => continue,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                    filled = true;
-                    break;
-                }
-                Err(e) => panic!("unexpected write error while filling pipe: {e:?}"),
-            }
-        }
-        assert!(filled, "pipe never backpressured");
-        let err = client.shutdown(Shutdown::Write).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "expected TimedOut from stalled write-EOF, got {err:?}");
+    fn shutdown_write_propagates_os_error_when_eof_marker_fails() {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly-eof.sock");
+        let _listener = LocalListener::bind(&path).unwrap();
+        let pipe_name = goatty_proto::windows_pipe_name(&path);
+        let wide: Vec<u16> = OsStr::new(&pipe_name).encode_wide().chain(std::iter::once(0)).collect();
+        // Open the client end read-only (`GENERIC_READ` without `GENERIC_WRITE`)
+        // so `send_write_eof`'s zero-length `WriteFile` deterministically fails
+        // with `ERROR_ACCESS_DENIED`.
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(raw != INVALID_HANDLE_VALUE && !raw.is_null(), "CreateFileW failed: {}", io::Error::last_os_error());
+        let stream = imp::stream_from_raw_for_test(raw).unwrap();
+        let err = stream.shutdown(Shutdown::Write).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "expected PermissionDenied from read-only write-EOF, got {err:?}");
     }
 
     #[cfg(windows)]

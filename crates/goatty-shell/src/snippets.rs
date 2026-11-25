@@ -124,13 +124,16 @@ pub(crate) fn managed_path_with(dirs: &Dirs, settings: &HostSettings, env_path: 
             folders.extend(h.added_path().into_iter().map(str::to_string));
         }
     }
-    folders.extend(env_path.unwrap_or_default().split(':').filter(|d| !d.is_empty()).map(str::to_string));
+    folders.extend(
+        std::env::split_paths(env_path.unwrap_or_default()).filter(|d| !d.as_os_str().is_empty()).map(|d| d.to_string_lossy().into_owned()),
+    );
     let home = std::env::var_os("HOME").map(PathBuf::from);
     folders.extend(settings.shell.path.iter().map(|p| crate::path_report::expand(p, home.as_deref())));
     folders.push(dirs.bin_dir().to_string_lossy().into_owned());
     let mut seen = BTreeSet::new();
     folders.retain(|f| seen.insert(f.clone()));
-    folders.join(":")
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    folders.join(sep)
 }
 
 fn is_executable(p: &Path) -> bool {

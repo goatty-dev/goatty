@@ -445,10 +445,11 @@ $td.XmlText = $xml
 
         let exe = Path::new(r"C:\Program Files\goatty & co\goattyd.exe");
         let log = Path::new(r"C:\Users\alice\AppData\Local\goatty\goattyd.log");
+        let user = current_user_id().unwrap_or_else(|| r"DESKTOP\alice".into());
 
         // Both user-scoped and unscoped task definitions must pass Windows' real
         // Task Scheduler 1.2 XSD validator (`ITaskDefinition::put_XmlText`).
-        let with_user = render_task_xml(exe, log, Some(r"DESKTOP\alice"));
+        let with_user = render_task_xml(exe, log, Some(&user));
         validate_with_task_scheduler(&with_user).expect("user-scoped task XML must pass Task Scheduler schema validation");
 
         let without_user = render_task_xml(exe, log, None);
@@ -456,9 +457,10 @@ $td.XmlText = $xml
 
         // Negative control: swapping <UserId> before <Enabled> in <LogonTrigger>
         // must be rejected by the schema validator.
+        let escaped_user = xml_escape(&user);
         let invalid = with_user.replace(
-            "<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>DESKTOP\\alice</UserId>",
-            "<LogonTrigger>\n      <UserId>DESKTOP\\alice</UserId>\n      <Enabled>true</Enabled>",
+            &format!("<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>{escaped_user}</UserId>"),
+            &format!("<LogonTrigger>\n      <UserId>{escaped_user}</UserId>\n      <Enabled>true</Enabled>"),
         );
         assert_ne!(invalid, with_user);
         assert!(

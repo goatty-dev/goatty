@@ -168,6 +168,11 @@ fn notify(_state: &str, _fds: &[RawFd]) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn notify(state: &str, fds: &[RawFd]) -> std::io::Result<()> {
     let Some(path) = notify_socket() else { return Ok(()) };
+    notify_to(path, state, fds)
+}
+
+#[cfg(target_os = "linux")]
+fn notify_to(path: &str, state: &str, fds: &[RawFd]) -> std::io::Result<()> {
     // SAFETY: plain syscall; the result is checked and owned right away.
     let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
@@ -276,11 +281,10 @@ mod tests {
         assert_eq!(fds, 1);
     }
 
-    /// [`notify`] against an explicit socket path.
+    /// [`notify`] against an explicit socket path without relying on the
+    /// process-wide `ENV` `OnceLock` being uninitialized when other tests run.
     #[cfg(target_os = "linux")]
     fn send_to(path: &str, state: &str, fds: &[RawFd]) {
-        let _ = ENV.set(Env { listen: Vec::new(), notify: Some(path.to_string()) });
-        assert_eq!(notify_socket(), Some(path), "no other test sets the env");
-        notify(state, fds).unwrap();
+        notify_to(path, state, fds).unwrap();
     }
 }

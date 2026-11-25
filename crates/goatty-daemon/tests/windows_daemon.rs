@@ -119,10 +119,17 @@ fn windows_daemon_named_pipes_conpty_and_proxy_end_to_end() {
 
     // 2. Connect via `goattyd.exe proxy` over stdio (exercises binary mode +
     //    `GetStdHandle` + Named Pipe relay + ConPTY session lifecycle).
+    // Write a tiny batch wrapper instead of embedding escaped quotes in `cmd /C`.
+    let proxy_cmd = d._dir.path().join("proxy.cmd");
+    std::fs::write(
+        &proxy_cmd,
+        format!("@echo off\r\nset \"GOATTY_SOCKET={}\"\r\n\"{}\" proxy\r\n", d.sock.display(), env!("CARGO_BIN_EXE_goattyd")),
+    )
+    .unwrap();
     let proxy_ep = Endpoint::Command {
         label: "win-proxy".into(),
         program: "cmd.exe".into(),
-        args: vec!["/C".into(), format!("set GOATTY_SOCKET={}&& \"{}\" proxy", d.sock.display(), env!("CARGO_BIN_EXE_goattyd"))],
+        args: vec!["/C".into(), proxy_cmd.to_string_lossy().into_owned()],
     };
     let conn = Connection::open(proxy_ep, "win-e2e-conn").unwrap();
     let sink = MirrorSink::new();
