@@ -687,8 +687,12 @@ mod tests {
         #[cfg(not(windows))]
         let (osc, expected) = (b"\x1b]7;file://localhost/tmp/some%20dir\x1b\\".as_slice(), PathBuf::from("/tmp/some dir"));
         t.feed(osc);
-        assert_eq!(t.current_directory(), Some(expected.clone()));
-        t.feed(b"\x1b]7;file://elsewhere.example/srv\x1b\\");
-        assert_eq!(t.current_directory(), Some(expected), "another host's directory");
+        assert_eq!(t.current_directory().as_ref(), Some(&expected));
+        // `rio-vt` only queries the local hostname to reject foreign OSC 7 hosts on Unix.
+        #[cfg(unix)]
+        {
+            t.feed(b"\x1b]7;file://elsewhere.example/srv\x1b\\");
+            assert_eq!(t.current_directory().as_ref(), Some(&expected), "another host's directory");
+        }
     }
 }

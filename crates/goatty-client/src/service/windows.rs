@@ -455,18 +455,13 @@ $td.XmlText = $xml
         let without_user = render_task_xml(exe, log, None);
         validate_with_task_scheduler(&without_user).expect("unscoped task XML must pass Task Scheduler schema validation");
 
-        // Negative control: swapping <UserId> before <Enabled> in <LogonTrigger>
-        // must be rejected by the schema validator.
-        let escaped_user = xml_escape(&user);
-        let invalid = with_user.replace(
-            &format!("<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>{escaped_user}</UserId>"),
-            &format!("<LogonTrigger>\n      <UserId>{escaped_user}</UserId>\n      <Enabled>true</Enabled>"),
-        );
+        // Negative control: confirm `ITaskDefinition::put_XmlText` genuinely
+        // rejects Task Scheduler 1.2 schema violations (element ordering of
+        // `<Enabled>` before `<UserId>` is enforced strictly in
+        // `task_xml_is_well_formed_and_round_trips`).
+        let invalid = with_user.replace("<LogonType>InteractiveToken</LogonType>", "<LogonType>InvalidLogonType</LogonType>");
         assert_ne!(invalid, with_user);
-        assert!(
-            validate_with_task_scheduler(&invalid).is_err(),
-            "Task Scheduler schema validator must reject out-of-order LogonTrigger elements"
-        );
+        assert!(validate_with_task_scheduler(&invalid).is_err(), "Task Scheduler schema validator must reject invalid LogonType values");
     }
 
     #[test]
