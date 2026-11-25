@@ -176,6 +176,7 @@ pub fn with_host_env(file: Loaded<HostSettings>) -> Effective<HostSettings> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn config_dir_follows_xdg() {
         let d = config_dir_for(false, |k| (k == "HOME").then(|| "/home/u".into())).unwrap();

@@ -198,6 +198,7 @@ impl Dirs {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn xdg_defaults_and_overrides() {
         let d = Dirs::from_vars_for(false, |k| (k == "HOME").then(|| "/home/u".into())).unwrap();

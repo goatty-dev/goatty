@@ -545,8 +545,10 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-/// The name of process `pid` (`/proc/<pid>/comm` on Linux, `proc_name` on
-/// macOS, `QueryFullProcessImageNameW` leaf on Windows); empty when unavailable.
+/// The name of process `pid` (`/proc/<pid>/comm` on Linux, `proc_name` on macOS);
+/// empty when unavailable. Windows verifies the basename directly on the retained
+/// process handle inside [`windows_force_stop`].
+#[cfg(unix)]
 fn process_name(pid: u32) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -559,11 +561,7 @@ fn process_name(pid: u32) -> String {
     {
         std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
     }
-    #[cfg(windows)]
-    {
-        windows_process_info(pid).and_then(|(p, _)| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         String::new()
@@ -581,8 +579,104 @@ fn wait_gone(pid: u32, timeout: Duration) -> bool {
     true
 }
 
+fn is_goattyd_process_name_for(name: &str, windows: bool) -> bool {
+    let trimmed = name.trim();
+    if windows { trimmed.eq_ignore_ascii_case("goattyd.exe") } else { trimmed.starts_with("goattyd") }
+}
+
 fn is_goattyd_process_name(name: &str) -> bool {
-    name.trim().to_ascii_lowercase().starts_with("goattyd")
+    is_goattyd_process_name_for(name, cfg!(windows))
+}
+
+#[cfg(windows)]
+fn windows_force_stop(path: &Path, why: String) -> Result<Stopped> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    use anyhow::Context;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FALSE, GetLastError, HANDLE, STILL_ACTIVE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Security::EqualSid;
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    };
+
+    struct OwnedProcess(HANDLE);
+    impl Drop for OwnedProcess {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid process handle owned exclusively by `self`.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let Ok(stream) = LocalStream::connect(path) else {
+        return Ok(Stopped::NotRunning);
+    };
+    let pid = stream.server_pid()?;
+
+    // Open a single handle with query + terminate + wait rights while `stream`
+    // is still connected so the PID cannot be reused between verification and
+    // termination.
+    // SAFETY: plain Win32 call; returned handle is validated and closed on drop.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid) };
+    drop(stream);
+    if raw.is_null() {
+        // SAFETY: `GetLastError` has no preconditions.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_INVALID_PARAMETER {
+            return Ok(Stopped::NotRunning);
+        }
+        anyhow::bail!("OpenProcess(pid {pid}): {}", std::io::Error::from_raw_os_error(err as i32));
+    }
+    let proc = OwnedProcess(raw);
+
+    let mut exit_code = 0u32;
+    // SAFETY: `proc.0` is open and `exit_code` is a valid out-pointer.
+    if unsafe { GetExitCodeProcess(proc.0, &raw mut exit_code) } != 0 && exit_code != STILL_ACTIVE as u32 {
+        return Ok(Stopped::NotRunning);
+    }
+
+    // Verify the retained handle belongs to the current user SID.
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle.
+    let my_sid = crate::ipc::TokenUserBuf::for_process(unsafe { GetCurrentProcess() }).context("read current user SID")?;
+    let peer_sid = crate::ipc::TokenUserBuf::for_process(proc.0)
+        .with_context(|| format!("{} belongs to another user or inaccessible process (pid {pid})", path.display()))?;
+    // SAFETY: both `TokenUserBuf`s live across `EqualSid`.
+    let same_user = unsafe { EqualSid(my_sid.sid(), peer_sid.sid()) != 0 };
+    anyhow::ensure!(same_user, "{} belongs to another user (pid {pid})", path.display());
+
+    // Verify the retained handle's exact executable basename is `goattyd.exe`.
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `proc.0` is open and `buf` has space for `len` UTF-16 code units.
+    let ok = unsafe { QueryFullProcessImageNameW(proc.0, 0, buf.as_mut_ptr(), &raw mut len) };
+    anyhow::ensure!(ok != 0 && len > 0, "QueryFullProcessImageNameW(pid {pid}): {}", std::io::Error::last_os_error());
+    let exe_path = PathBuf::from(OsString::from_wide(&buf[..len as usize]));
+    let comm = exe_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    anyhow::ensure!(is_goattyd_process_name(&comm), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
+
+    log::info!("stopping goattyd (pid {pid}): {why}");
+    // SAFETY: `proc.0` was opened with `PROCESS_TERMINATE` and just verified above.
+    if unsafe { TerminateProcess(proc.0, 1) } == 0 {
+        // SAFETY: `GetLastError` has no preconditions.
+        let err = unsafe { GetLastError() };
+        // If the process exited between our check and `TerminateProcess`, report it gone.
+        let mut code = 0u32;
+        // SAFETY: `proc.0` is open and `code` is a valid out-pointer.
+        if unsafe { GetExitCodeProcess(proc.0, &raw mut code) } != 0 && code != STILL_ACTIVE as u32 {
+            return Ok(Stopped::NotRunning);
+        }
+        anyhow::bail!("TerminateProcess(pid {pid}): {}", std::io::Error::from_raw_os_error(err as i32));
+    }
+
+    // Confirm exit on the same handle before reporting `Stopped::Killed`.
+    // SAFETY: `proc.0` was opened with `SYNCHRONIZE`.
+    let wait = unsafe { WaitForSingleObject(proc.0, 5_000) };
+    anyhow::ensure!(wait == WAIT_OBJECT_0, "goattyd (pid {pid}) did not exit within 5 s after TerminateProcess");
+    Ok(Stopped::Killed { pid, why })
 }
 
 /// Stop the local daemon and wait until it's gone. This ends its sessions:
@@ -650,20 +744,23 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
         return Ok(Stopped::Service { why });
     }
     // Nothing listening: nothing to stop (remote updates run this blindly).
-    if LocalStream::connect(&path).is_err() {
-        #[cfg(unix)]
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        return Ok(Stopped::NotRunning);
+    #[cfg(windows)]
+    {
+        windows_force_stop(&path, why)
     }
-    let pid = crate::control::socket_owner(&path)?;
-    // Under socket activation the listener belongs to systemd/launchd, never kill that.
-    let comm = process_name(pid);
-    anyhow::ensure!(is_goattyd_process_name(&comm), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
-    log::info!("stopping goattyd (pid {pid}): {why}");
     #[cfg(unix)]
     {
+        if LocalStream::connect(&path).is_err() {
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            return Ok(Stopped::NotRunning);
+        }
+        let pid = crate::control::socket_owner(&path)?;
+        // Under socket activation the listener belongs to systemd/launchd, never kill that.
+        let comm = process_name(pid);
+        anyhow::ensure!(is_goattyd_process_name(&comm), "{} belongs to pid {pid} ({}), not a goattyd", path.display(), comm.trim());
+        log::info!("stopping goattyd (pid {pid}): {why}");
         // SAFETY: plain syscall on a pid we just checked is our goattyd.
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if !wait_gone(pid, Duration::from_secs(5)) {
@@ -675,24 +772,13 @@ pub fn stop_daemon(force: bool) -> Result<Stopped> {
         if crate::control::socket_owner(&path).is_err() {
             let _ = std::fs::remove_file(&path);
         }
+        Ok(Stopped::Killed { pid, why })
     }
-    #[cfg(windows)]
+    #[cfg(not(any(unix, windows)))]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-
-        // SAFETY: plain Win32 call on a pid we just verified belongs to our user's goattyd.
-        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) };
-        if !handle.is_null() {
-            // SAFETY: `handle` is open with `PROCESS_TERMINATE`.
-            unsafe {
-                TerminateProcess(handle, 1);
-                CloseHandle(handle);
-            }
-            wait_gone(pid, Duration::from_secs(5));
-        }
+        let _ = (path, why);
+        Ok(Stopped::NotRunning)
     }
-    Ok(Stopped::Killed { pid, why })
 }
 
 #[cfg(test)]
@@ -715,12 +801,16 @@ mod tests {
 
     #[test]
     fn goattyd_process_name_check_handles_unix_and_windows() {
-        assert!(is_goattyd_process_name("goattyd"));
-        assert!(is_goattyd_process_name("goattyd\n"));
-        assert!(is_goattyd_process_name("goattyd.exe"));
-        assert!(is_goattyd_process_name("GOATTYD.EXE"));
-        assert!(!is_goattyd_process_name("systemd"));
-        assert!(!is_goattyd_process_name("launchd"));
+        assert!(is_goattyd_process_name_for("goattyd", false));
+        assert!(is_goattyd_process_name_for("goattyd\n", false));
+        assert!(is_goattyd_process_name_for("goattyd-0.3.0-p", false));
+        assert!(!is_goattyd_process_name_for("systemd", false));
+        assert!(!is_goattyd_process_name_for("launchd", false));
+
+        assert!(is_goattyd_process_name_for("goattyd.exe", true));
+        assert!(is_goattyd_process_name_for("GOATTYD.EXE", true));
+        assert!(!is_goattyd_process_name_for("goattyd-diagnostics.exe", true));
+        assert!(!is_goattyd_process_name_for("goattyd", true));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]

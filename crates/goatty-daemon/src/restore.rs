@@ -306,7 +306,17 @@ mod unix {
         // Answers to anything in the replay would go to the shell, which
         // didn't ask.
         for _ in chans.replies.try_iter() {}
-        let n = NewSession { id: s.id, pty, reader, term, chans, created_unix: s.created_unix, managed: s.managed, creator: None };
+        let n = NewSession {
+            id: s.id,
+            pty,
+            reader,
+            term,
+            chans,
+            created_unix: s.created_unix,
+            managed: s.managed,
+            creator: None,
+            initial_cwd: None,
+        };
         let session = daemon.start(n)?;
         log::info!("session {}: taken over (pid {}{})", s.id, s.pid, if snapshot.is_some() { "" } else { ", no saved screen" });
         Ok(session)

@@ -221,6 +221,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn runtime_dir_uses_library_caches_on_macos() {
         let env = env_of(&[("HOME", "/Users/alice"), ("USER", "alice")]);
@@ -262,6 +263,7 @@ mod tests {
         assert_eq!(socket_path_from(false, true, &with_override, PathBuf::from(r"C:\Temp")), PathBuf::from(r"C:\Temp\test\d.sock"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn legacy_socket_path_only_applies_to_default_macos_path() {
         let env = env_of(&[("HOME", "/Users/alice"), ("USER", "alice")]);

@@ -201,7 +201,8 @@ mod imp {
     };
     use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
     };
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
@@ -209,7 +210,7 @@ mod imp {
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, SetEvent,
+        CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, ResetEvent, SetEvent,
         WaitForMultipleObjects, WaitForSingleObject,
     };
 
@@ -260,28 +261,46 @@ mod imp {
         Ok(OwnedHandle(h))
     }
 
-    /// Query the `TOKEN_USER` buffer for `process`.
-    fn process_token_user(process: HANDLE) -> io::Result<Vec<u8>> {
-        let mut token: HANDLE = std::ptr::null_mut();
-        // SAFETY: `process` is a valid process handle and `token` is a writable out-pointer.
-        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
-            return Err(io::Error::last_os_error());
+    /// Aligned storage holding a `TOKEN_USER` struct plus its trailing variable-length SID.
+    pub(crate) struct TokenUserBuf(Vec<TOKEN_USER>);
+
+    impl TokenUserBuf {
+        /// Query the `TOKEN_USER` buffer for `process`.
+        pub(crate) fn for_process(process: HANDLE) -> io::Result<Self> {
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: `process` is a valid process handle and `token` is a writable out-pointer.
+            if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token = OwnedHandle(token);
+            let mut needed = 0u32;
+            // SAFETY: first call probes the required buffer length in bytes.
+            unsafe {
+                GetTokenInformation(token.raw(), TokenUser, std::ptr::null_mut(), 0, &raw mut needed);
+            }
+            if needed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let elem_size = std::mem::size_of::<TOKEN_USER>();
+            let count = (needed as usize).div_ceil(elem_size).max(1);
+            let byte_len = u32::try_from(count.checked_mul(elem_size).ok_or_else(|| io::Error::other("TOKEN_USER size overflow"))?)
+                .map_err(|_| io::Error::other("TOKEN_USER size overflow"))?;
+            // SAFETY: `TOKEN_USER` is plain C data; all-zeros initialization is valid.
+            let mut buf: Vec<TOKEN_USER> = vec![unsafe { std::mem::zeroed() }; count];
+            // SAFETY: `buf` is aligned to `align_of::<TOKEN_USER>()` and has `byte_len >= needed` writable bytes.
+            if unsafe { GetTokenInformation(token.raw(), TokenUser, buf.as_mut_ptr().cast(), byte_len, &raw mut needed) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if (needed as usize) < elem_size {
+                return Err(io::Error::other("short TOKEN_USER buffer"));
+            }
+            Ok(Self(buf))
         }
-        let token = OwnedHandle(token);
-        let mut needed = 0u32;
-        // SAFETY: first call probes the required buffer length.
-        unsafe {
-            GetTokenInformation(token.raw(), TokenUser, std::ptr::null_mut(), 0, &raw mut needed);
+
+        /// Pointer to the user SID, valid for as long as `&self` is alive.
+        pub(crate) fn sid(&self) -> *mut std::ffi::c_void {
+            self.0[0].User.Sid
         }
-        if needed == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buf = vec![0u8; needed as usize];
-        // SAFETY: `buf` has at least `needed` writable bytes.
-        if unsafe { GetTokenInformation(token.raw(), TokenUser, buf.as_mut_ptr().cast(), needed, &raw mut needed) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(buf)
     }
 
     /// Build a Windows security descriptor with a protected DACL granting full
@@ -294,12 +313,8 @@ mod imp {
         fn new() -> io::Result<Self> {
             // SAFETY: `GetCurrentProcess` returns a pseudo-handle that does not need closing.
             let me = unsafe { GetCurrentProcess() };
-            let buf = process_token_user(me)?;
-            if buf.len() < std::mem::size_of::<TOKEN_USER>() {
-                return Err(io::Error::other("short TOKEN_USER buffer"));
-            }
-            // SAFETY: `GetTokenInformation(TokenUser)` populated a valid `TOKEN_USER` at the start of `buf`.
-            let sid = unsafe { (*(buf.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+            let buf = TokenUserBuf::for_process(me)?;
+            let sid = buf.sid();
             let mut sid_wide: *mut u16 = std::ptr::null_mut();
             // SAFETY: `sid` points inside `buf`, which lives across this call.
             if unsafe { ConvertSidToStringSidW(sid, &raw mut sid_wide) } == 0 || sid_wide.is_null() {
@@ -398,6 +413,7 @@ mod imp {
         write_closed: AtomicBool,
         read_closed_event: OwnedHandle,
         write_closed_event: OwnedHandle,
+        read_timeout_event: OwnedHandle,
         read_timeout: Mutex<Option<Duration>>,
         write_timeout: Mutex<Option<Duration>>,
         nonblocking: AtomicBool,
@@ -411,6 +427,7 @@ mod imp {
                 write_closed: AtomicBool::new(false),
                 read_closed_event: create_manual_event()?,
                 write_closed_event: create_manual_event()?,
+                read_timeout_event: create_manual_event()?,
                 read_timeout: Mutex::new(None),
                 write_timeout: Mutex::new(None),
                 nonblocking: AtomicBool::new(false),
@@ -477,10 +494,27 @@ mod imp {
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
 
-            let handles = [io_event.raw(), self.read_closed_event.raw()];
-            let wait_ms = timeout_ms(*self.read_timeout.lock());
-            // SAFETY: both event handles are valid for the duration of this call.
-            let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), FALSE, wait_ms) };
+            // Clear any stale timeout-change wakeup from before this read began.
+            // SAFETY: `read_timeout_event` is a valid event handle owned by `self`.
+            unsafe {
+                ResetEvent(self.read_timeout_event.raw());
+            }
+            let handles = [io_event.raw(), self.read_closed_event.raw(), self.read_timeout_event.raw()];
+            let wait = loop {
+                let wait_ms = timeout_ms(*self.read_timeout.lock());
+                // SAFETY: all three event handles are valid for the duration of this call.
+                let w = unsafe { WaitForMultipleObjects(3, handles.as_ptr(), FALSE, wait_ms) };
+                if w == WAIT_OBJECT_0 + 2 {
+                    // `set_read_timeout` updated the timeout while we were waiting:
+                    // reset and re-wait on the same in-flight overlapped read.
+                    // SAFETY: `read_timeout_event` is a valid event handle owned by `self`.
+                    unsafe {
+                        ResetEvent(self.read_timeout_event.raw());
+                    }
+                    continue;
+                }
+                break w;
+            };
             if wait == WAIT_OBJECT_0 {
                 // SAFETY: I/O event signaled; `GetOverlappedResult` retrieves the result.
                 if unsafe { GetOverlappedResult(raw, &raw const ov, &raw mut transferred, FALSE) } == 0 {
@@ -626,7 +660,9 @@ mod imp {
             let wide = to_wide_nul(&pipe_name);
             let deadline = Instant::now() + CONNECT_BUSY_WAIT;
             loop {
-                // SAFETY: `wide` is NUL-terminated UTF-16.
+                // SAFETY: `wide` is NUL-terminated UTF-16. `SECURITY_SQOS_PRESENT |
+                // SECURITY_IDENTIFICATION` prevents a malicious pipe server from
+                // impersonating the client token.
                 let h = unsafe {
                     CreateFileW(
                         wide.as_ptr(),
@@ -634,7 +670,7 @@ mod imp {
                         0,
                         std::ptr::null(),
                         OPEN_EXISTING,
-                        FILE_FLAG_OVERLAPPED,
+                        FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                         std::ptr::null_mut(),
                     )
                 };
@@ -664,6 +700,11 @@ mod imp {
 
         pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
             *self.0.read_timeout.lock() = dur;
+            // Wake any in-flight `read_buf` so the updated timeout takes effect immediately.
+            // SAFETY: `read_timeout_event` is a valid event handle owned by `self.0`.
+            unsafe {
+                SetEvent(self.0.read_timeout_event.raw());
+            }
             Ok(())
         }
 
@@ -713,10 +754,10 @@ mod imp {
             Ok((server_stream, client))
         }
 
-        /// The PID of the server process listening on this Named Pipe
-        /// (`GetNamedPipeServerProcessId`), verified to run under the same
-        /// user SID as this process.
-        pub fn peer_owner_pid(&self, path: &Path) -> Result<u32> {
+        /// Raw server PID reported by `GetNamedPipeServerProcessId` (without
+        /// verifying ownership; callers that need ownership verification should
+        /// use [`Self::peer_owner_pid`] or check the SID on a retained handle).
+        pub(crate) fn server_pid(&self) -> Result<u32> {
             let guard = self.0.handle.read();
             let handle = guard.as_ref().context("pipe is closed")?;
             let mut pid = 0u32;
@@ -724,28 +765,28 @@ mod imp {
             if unsafe { GetNamedPipeServerProcessId(handle.raw(), &raw mut pid) } == 0 || pid == 0 {
                 bail!("GetNamedPipeServerProcessId: {}", io::Error::last_os_error());
             }
-            drop(guard);
+            Ok(pid)
+        }
+
+        /// The PID of the server process listening on this Named Pipe
+        /// (`GetNamedPipeServerProcessId`), verified to run under the same
+        /// user SID as this process.
+        pub fn peer_owner_pid(&self, path: &Path) -> Result<u32> {
+            let pid = self.server_pid()?;
 
             // Verify the server process belongs to the current user SID.
             // SAFETY: `GetCurrentProcess` returns a pseudo-handle.
-            let my_buf = process_token_user(unsafe { GetCurrentProcess() }).context("read current user SID")?;
+            let my_buf = TokenUserBuf::for_process(unsafe { GetCurrentProcess() }).context("read current user SID")?;
             // SAFETY: plain Win32 call; handle checked and closed on drop.
             let peer_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
             if peer_proc.is_null() {
                 bail!("{} belongs to another user or inaccessible process (pid {pid})", path.display());
             }
             let peer_proc = OwnedHandle(peer_proc);
-            let peer_buf = process_token_user(peer_proc.raw())
+            let peer_buf = TokenUserBuf::for_process(peer_proc.raw())
                 .with_context(|| format!("{} belongs to another user or inaccessible process (pid {pid})", path.display()))?;
-            if my_buf.len() < std::mem::size_of::<TOKEN_USER>() || peer_buf.len() < std::mem::size_of::<TOKEN_USER>() {
-                bail!("short TOKEN_USER buffer");
-            }
-            // SAFETY: both buffers were populated by `GetTokenInformation(TokenUser)`.
-            let same = unsafe {
-                let my_sid = (*(my_buf.as_ptr().cast::<TOKEN_USER>())).User.Sid;
-                let peer_sid = (*(peer_buf.as_ptr().cast::<TOKEN_USER>())).User.Sid;
-                EqualSid(my_sid, peer_sid) != 0
-            };
+            // SAFETY: both `TokenUserBuf`s stay alive across `EqualSid`.
+            let same = unsafe { EqualSid(my_buf.sid(), peer_buf.sid()) != 0 };
             if !same {
                 bail!("{} belongs to another user (pid {pid})", path.display());
             }
@@ -855,6 +896,8 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use imp::TokenUserBuf;
 pub use imp::{LocalListener, LocalStream};
 
 /// Iterator over incoming connections from a [`LocalListener`].

@@ -16,9 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use goatty_client::local;
-use goatty_client::{AttachRequest, Connection, Control, Endpoint, LocalStream, PaneEvent, PaneSink};
-use goatty_proto::{StreamOpts, WinSize};
-use goatty_term::{Palette, TermSize, Terminal};
+use goatty_client::{Connection, Control, Endpoint, LocalStream, PaneEvent, PaneSink};
+use goatty_proto::WinSize;
+use goatty_term::{Frame, Palette, TermSize, Terminal};
 use parking_lot::Mutex;
 
 const SIZE: WinSize = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
@@ -79,15 +79,9 @@ impl MirrorSink {
     }
 
     fn text(&self) -> String {
-        let frame = self.term.frame();
-        let mut out = String::new();
-        for row in 0..frame.rows {
-            for col in 0..frame.cols {
-                out.push(frame.cell(col, row).c);
-            }
-            out.push('\n');
-        }
-        out
+        let mut f = Frame::default();
+        self.term.snapshot_into(&mut f);
+        (0..f.rows).map(|r| f.row(r).iter().map(|c| c.ch).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
     }
 
     fn wait_for(&self, needle: &str, timeout: Duration) -> bool {
@@ -144,10 +138,21 @@ fn windows_daemon_named_pipes_conpty_and_proxy_end_to_end() {
     // Detach and reattach on a fresh mirror sink: screen contents survive.
     conn.detach(id);
     let sink2 = MirrorSink::new();
-    conn.attach(AttachRequest { session: id, size: SIZE, opts: StreamOpts::LOCAL, sink: sink2.clone() }).unwrap();
+    conn.attach(id, SIZE, sink2.clone()).unwrap();
     assert!(sink2.wait_for("WIN_CONPTY_OK_12345", Duration::from_secs(10)), "reattached screen:\n{}", sink2.text());
 
-    // Kill ends the session cleanly via the Job Object.
+    // Short-lived `Run` exits cleanly, closes ConPTY, sends Exited, and leaves `list_sessions`.
+    let run_sink = MirrorSink::new();
+    let _run_id =
+        conn.run(SIZE, None, vec!["cmd.exe".into(), "/C".into(), "echo".into(), "WIN_RUN_EXIT_OK".into()], run_sink.clone()).unwrap();
+    assert!(run_sink.wait_for("WIN_RUN_EXIT_OK", Duration::from_secs(10)), "run screen:\n{}", run_sink.text());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ctl.list_sessions().unwrap().len() != 1 {
+        assert!(Instant::now() < deadline, "short-lived Run session did not exit cleanly");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Kill ends the remaining interactive session cleanly via the Job Object.
     conn.kill(id).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !ctl.list_sessions().unwrap().is_empty() {
@@ -162,8 +167,12 @@ fn windows_daemon_named_pipes_conpty_and_proxy_end_to_end() {
 #[test]
 fn windows_outdated_detection_restart_policy_and_force_stop() {
     let dir = tempfile::Builder::new().prefix("goatty-win-restart-").tempdir().unwrap();
-    let exe_v1 = dir.path().join("goattyd-v1.exe");
-    let exe_v2 = dir.path().join("goattyd-v2.exe");
+    let v1_dir = dir.path().join("v1");
+    let v2_dir = dir.path().join("v2");
+    std::fs::create_dir_all(&v1_dir).unwrap();
+    std::fs::create_dir_all(&v2_dir).unwrap();
+    let exe_v1 = v1_dir.join("goattyd.exe");
+    let exe_v2 = v2_dir.join("goattyd.exe");
     let sock = dir.path().join("d.sock");
     std::fs::copy(env!("CARGO_BIN_EXE_goattyd"), &exe_v1).unwrap();
 
@@ -178,9 +187,11 @@ fn windows_outdated_detection_restart_policy_and_force_stop() {
     // Running binary vs itself: not outdated.
     assert_eq!(local::outdated_than(pid, exe_v1.clone()), None);
 
-    // A newer copy written after the daemon started is detected as outdated.
+    // On Windows, `std::fs::copy` preserves the source mtime via `CopyFileEx`.
+    // Touch `exe_v2` explicitly so its mtime is strictly newer than the daemon start time.
     std::thread::sleep(Duration::from_millis(50));
     std::fs::copy(env!("CARGO_BIN_EXE_goattyd"), &exe_v2).unwrap();
+    std::fs::File::options().write(true).open(&exe_v2).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
     let outdated = local::outdated_than(pid, exe_v2.clone()).expect("newer copy should be detected as outdated");
     assert_eq!(outdated.pid, pid);
 

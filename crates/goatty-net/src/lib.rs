@@ -129,6 +129,14 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     #[cfg(not(unix))]
     let _ = mode;
     let mut f = opts.open(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(windows)]
+    if mode & 0o077 == 0
+        && let Err(e) = identity::set_owner_only_dacl(&tmp)
+    {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     let written = f.write_all(data).and_then(|()| f.sync_all()).and_then(|()| {
         drop(f);
         std::fs::rename(&tmp, path)

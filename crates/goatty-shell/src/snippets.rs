@@ -326,6 +326,68 @@ struct Output {
     capped: bool,
 }
 
+#[cfg(windows)]
+mod win_job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    };
+
+    pub(super) struct JobObject(HANDLE);
+
+    impl JobObject {
+        pub(super) fn new() -> std::io::Result<Self> {
+            // SAFETY: null attributes and unnamed job object are valid.
+            let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if h.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            let job = Self(h);
+            // SAFETY: plain C struct; zeroed initialization is valid.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `job.0` is valid and `info` has exact size.
+            if unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+
+        pub(super) fn assign(&self, proc_handle: HANDLE) -> std::io::Result<()> {
+            // SAFETY: both `self.0` and `proc_handle` are valid open handles.
+            if unsafe { AssignProcessToJobObject(self.0, proc_handle) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        pub(super) fn terminate(&self) {
+            // SAFETY: `self.0` is a valid job handle owned by `self`.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid handle owned exclusively by `self`.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
 /// Run `cmd` in its own process group: no stdin, output capped, killed
 /// (with everything it started) at `timeout`.
 fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Output> {
@@ -344,11 +406,12 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
                 c.arg("-c").arg(text);
                 c
             }
-            #[cfg(windows)]
+            #[cfg(not(unix))]
             {
-                let mut c = std::process::Command::new("cmd.exe");
-                c.args(["/C", text]);
-                c
+                // Snippet shell templates are rendered with POSIX single-quoting,
+                // which `cmd.exe` does not treat as quoting (command injection risk).
+                let _ = text;
+                bail!("shell snippet sources aren't supported on Windows yet (tracked in #278)")
             }
         }
     };
@@ -373,7 +436,20 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
         use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
         c.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
+    #[cfg(windows)]
+    let job = win_job::JobObject::new().context("create Windows job object")?;
     let mut child = c.spawn().context("couldn't start it")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        if let Err(e) = job.assign(child.as_raw_handle())
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).context("assign snippet subprocess to Windows job object");
+        }
+    }
     #[cfg(unix)]
     let pid = child.id();
     let mut stdout = child.stdout.take().context("no stdout")?;
@@ -399,7 +475,12 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            job.terminate();
+            let _ = child.kill();
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = child.kill();
         }
@@ -411,11 +492,13 @@ fn run(cmd: &Command, dir: &Path, path: &str, timeout: Duration) -> Result<Outpu
         if Instant::now() >= deadline {
             kill(&mut child);
             let _ = child.wait();
+            let _ = out_thread.join();
+            let _ = err_thread.join();
             bail!("it took longer than {} s", timeout.as_secs_f64());
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    // Whatever it left running in its group (a pager, a subshell) goes too.
+    // Whatever it left running in its group / job (a pager, a subshell) goes too.
     kill(&mut child);
     let mut out = out_thread.join().unwrap_or_default();
     let capped = out.len() > snippets::MAX_OUTPUT;

@@ -101,7 +101,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --locked --workspace --exclude goatty-app --all-targets -- -D warnings
-      - name: Tests
-        run: |
-          cargo test --locked --no-fail-fast -p goatty-proto -p goatty-config -p goatty-plugin -p goatty-term -p goatty-net -p goatty-client -p goatty-daemon
-          cargo test --locked -p goatty-shell --lib dirs::tests
+      - name: Tests (core crates & daemon)
+        run: cargo test --locked --no-fail-fast -p goatty-proto -p goatty-config -p goatty-plugin -p goatty-term -p goatty-net -p goatty-client -p goatty-daemon
+      - name: Tests (goatty-shell dirs)
+        run: cargo test --locked -p goatty-shell --lib dirs::tests

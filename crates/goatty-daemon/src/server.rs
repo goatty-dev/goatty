@@ -74,6 +74,9 @@ pub(crate) struct NewSession {
     pub managed: bool,
     /// The connection that asked for it (`Create`, `Run`); `None` when restored.
     pub creator: Option<u64>,
+    /// Launch directory passed to `Pty::spawn` (used to seed initial CWD when
+    /// the platform lacks `/proc/<pid>/cwd`, such as Windows before OSC 7).
+    pub initial_cwd: Option<PathBuf>,
 }
 
 /// The program this process runs, as a path a restart can run again (not
@@ -144,6 +147,7 @@ impl Daemon {
         if let Some(cwd) = cwd.filter(|c| std::path::Path::new(c).is_dir()) {
             cmd.cwd = Some(cwd.into());
         }
+        let initial_cwd = cmd.cwd.clone();
         let (pty, reader) = Pty::spawn(&cmd, size).with_context(|| format!("couldn't start {}", cmd.program))?;
         // The daemon's terminal is authoritative and answers queries
         // (DA, DSR, OSC 4/10/11...). Clients run with answering disabled.
@@ -153,7 +157,7 @@ impl Daemon {
         let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let pid = pty.pid();
         log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
-        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator: Some(conn) })?;
+        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator: Some(conn), initial_cwd })?;
         #[cfg(unix)]
         if crate::systemd::has_fd_store() {
             crate::systemd::store(&session.stored(), session.master_fd);
@@ -164,18 +168,19 @@ impl Daemon {
     /// Register a session and start its threads: query replies → PTY, and
     /// PTY → terminal + subscribers until the process exits.
     pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
-        let NewSession { id, pty, reader, term, chans, created_unix, managed, creator } = n;
+        let NewSession { id, pty, reader, term, chans, created_unix, managed, creator, initial_cwd } = n;
         let pid = pty.pid();
         #[cfg(unix)]
         let master_fd = pty.master_fd().as_raw_fd();
         #[cfg(windows)]
-        let resizer = pty.resizer();
+        let (resizer, exit_watch) = (pty.resizer(), pty.exit_watcher());
         let proc_cwd = pty.cwd();
         let input = pty.input().context("duplicate the PTY for input")?;
         let init_cwd = term
             .current_directory()
             .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
+            .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()))
+            .or_else(|| initial_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
         for _ in chans.ui.try_iter() {}
         let subs = Arc::new(Mutex::new(Vec::new()));
         let cwd = Arc::new(CwdCoordinator::new(id, subs.clone(), init_cwd, proc_cwd));
@@ -255,6 +260,16 @@ impl Daemon {
                 }
                 s.finish(code);
                 daemon.session_ended(s.id);
+            })?;
+        }
+        // Windows ConPTY keeps the output pipe open until `ClosePseudoConsole` is
+        // called. Watch the child process handle on its own thread (without holding
+        // `Arc<Session>`) so closing the pseudoconsole runs concurrently while
+        // `s{id}-reader` drains remaining output until EOF.
+        #[cfg(windows)]
+        {
+            std::thread::Builder::new().name(format!("s{id}-exit")).spawn(move || {
+                exit_watch.wait_and_close_console();
             })?;
         }
         self.sessions.lock().insert(id, session.clone());

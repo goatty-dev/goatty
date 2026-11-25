@@ -102,8 +102,8 @@ pub fn render_task_xml(exe: &Path, log_path: &Path, user_id: Option<&str>) -> St
     <Description>{DESCRIPTION}</Description>
   </RegistrationInfo>
   <Triggers>
-    <LogonTrigger>{user_tag}
-      <Enabled>true</Enabled>
+    <LogonTrigger>
+      <Enabled>true</Enabled>{user_tag}
     </LogonTrigger>
   </Triggers>
   <Principals>
@@ -378,9 +378,15 @@ mod tests {
 
         assert!(is_goatty_task(&xml));
         assert!(xml.contains("<LogonTrigger>"));
-        assert!(xml.contains(r"<UserId>DESKTOP\alice</UserId>"));
-        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
-        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        let trigger = xml.split("<LogonTrigger>").nth(1).unwrap().split("</LogonTrigger>").next().unwrap();
+        let enabled_pos = trigger.find("<Enabled>true</Enabled>").expect("LogonTrigger missing Enabled");
+        let trigger_user_pos = trigger.find(r"<UserId>DESKTOP\alice</UserId>").expect("LogonTrigger missing UserId");
+        assert!(enabled_pos < trigger_user_pos, "Task Scheduler schema requires <Enabled> before <UserId> in <LogonTrigger>: {trigger}");
+        let principal = xml.split(r#"<Principal id="Author">"#).nth(1).unwrap().split("</Principal>").next().unwrap();
+        let principal_user_pos = principal.find(r"<UserId>DESKTOP\alice</UserId>").expect("Principal missing UserId");
+        let logon_type_pos = principal.find("<LogonType>InteractiveToken</LogonType>").expect("Principal missing LogonType");
+        let run_level_pos = principal.find("<RunLevel>LeastPrivilege</RunLevel>").expect("Principal missing RunLevel");
+        assert!(principal_user_pos < logon_type_pos && logon_type_pos < run_level_pos, "invalid Principal element order: {principal}");
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
         assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));

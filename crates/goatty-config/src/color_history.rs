@@ -154,6 +154,7 @@ mod tests {
         assert_eq!(ColorHistory::load(&path).colors(), &[Color(0x112233), Color(0x445566)]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn state_dir_follows_xdg() {
         let d = state_dir_for(false, |k| (k == "HOME").then(|| "/home/u".into())).unwrap();
