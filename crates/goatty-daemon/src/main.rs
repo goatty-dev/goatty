@@ -722,6 +722,7 @@ fn service_uninstall() -> Result<()> {
 
 fn service_status() -> Result<()> {
     let s = goatty_client::service::status();
+    #[cfg(not(windows))]
     let dir = s.unit_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "?".into());
     if !s.installed {
         #[cfg(target_os = "macos")]
