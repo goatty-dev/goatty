@@ -520,14 +520,8 @@ fn save_remote_copy_in(session_dir: &Path, endpoint_key: &str, remote_path: &str
         set_file_readonly(&tmp)?;
         // Windows refuses to overwrite a read-only destination via `rename`.
         #[cfg(windows)]
-        if dest.exists()
-            && let Ok(meta) = fs::metadata(&dest)
-        {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&dest, perms);
-            }
+        if dest.exists() {
+            clear_readonly_file(&dest);
         }
         fs::rename(&tmp, &dest)?;
         Ok(())
@@ -535,13 +529,7 @@ fn save_remote_copy_in(session_dir: &Path, endpoint_key: &str, remote_path: &str
 
     if let Err(e) = write_res {
         #[cfg(windows)]
-        if let Ok(meta) = fs::metadata(&tmp) {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&tmp, perms);
-            }
-        }
+        clear_readonly_file(&tmp);
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -549,19 +537,27 @@ fn save_remote_copy_in(session_dir: &Path, endpoint_key: &str, remote_path: &str
 }
 
 #[cfg(windows)]
-fn clear_readonly_recursive(path: &Path) {
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_readonly_file(path: &Path) {
+    // On Windows this clears only the DOS `FILE_ATTRIBUTE_READONLY` attribute
+    // (it does not grant world-writable permissions like Unix `chmod`).
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();
         if perms.readonly() {
             perms.set_readonly(false);
             let _ = fs::set_permissions(path, perms);
         }
-        if meta.is_dir()
-            && let Ok(entries) = fs::read_dir(path)
-        {
-            for entry in entries.flatten() {
-                clear_readonly_recursive(&entry.path());
-            }
+    }
+}
+
+#[cfg(windows)]
+fn clear_readonly_recursive(path: &Path) {
+    clear_readonly_file(path);
+    if path.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_readonly_recursive(&entry.path());
         }
     }
 }
