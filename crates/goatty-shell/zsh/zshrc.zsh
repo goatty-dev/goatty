@@ -366,6 +366,12 @@ typeset -gU path fpath
 _goatty_path_marks+=("settings"$'\t'"$PATH")
 path+=("$_goatty_bin")
 _goatty_path_marks+=("tools"$'\t'"$PATH")
+# The goattyd running this shell answers to `goattyd` even when it isn't in
+# PATH (a host where goatty installed it under a versioned name, or
+# --remote-daemon).
+if (( ! $+commands[goattyd] )) && [[ -n $_goatty_daemon ]]; then
+  goattyd() { "$_goatty_daemon" "$@" }
+fi
 # Completion functions of goatty and goatty's tools (goattyd's, starship's
 # when goatty installed it), after the system's for the same reason.
 fpath+=("$_goatty_fpath")
