@@ -134,7 +134,9 @@ fn mib(path: &std::path::Path) -> String {
 /// upload for a target (`remote::find_bundled` outside tests).
 pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>) -> Ask {
     let ver = env!("CARGO_PKG_VERSION");
-    let dest = format!("~/{}", remote::BIN_DIR);
+    let dest = |platform: &Platform| {
+        if platform.is_windows() { format!(r"%USERPROFILE%\{}", remote::WINDOWS_BIN_DIR) } else { format!("~/{}", remote::BIN_DIR) }
+    };
     let cancel = (Choice::Cancel, "Cancel".to_string());
     let plain = (Choice::Plain, "Plain SSH".to_string());
     match problem {
@@ -142,7 +144,9 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
             None => Ask {
                 title: format!("goattyd doesn't run on {host}"),
                 body: vec![
-                    format!("{host} is {platform}. goattyd, goatty's session daemon, is available for Linux on x86_64 and aarch64 so far."),
+                    format!(
+                        "{host} is {platform}. goattyd, goatty's session daemon, is available for Linux and Windows on x86_64 and aarch64 so far."
+                    ),
                     PLAIN_NOTE.into(),
                 ],
                 warning: None,
@@ -157,9 +161,10 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                              the window, and get goatty's shell setup. It isn't installed there yet."
                         ),
                         format!(
-                            "goatty can copy goattyd {ver} for {platform} ({}) to {dest} on {host}. Nothing else changes: no sudo, \
+                            "goatty can copy goattyd {ver} for {platform} ({}) to {} on {host}. Nothing else changes: no sudo, \
                              no PATH or dotfile edits.",
-                            mib(&bundled.path)
+                            mib(&bundled.path),
+                            dest(platform)
                         ),
                     ];
                     body.push(SETUP_NOTE.into());
@@ -221,8 +226,9 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     body: vec![
                         format!("{mismatch}."),
                         format!(
-                            "goatty can copy goattyd {ver} for {platform} ({}) to {dest} on {host} and restart the daemon with it.",
-                            mib(&bundled.path)
+                            "goatty can copy goattyd {ver} for {platform} ({}) to {} on {host} and restart the daemon with it.",
+                            mib(&bundled.path),
+                            dest(platform)
                         ),
                     ],
                     warning,

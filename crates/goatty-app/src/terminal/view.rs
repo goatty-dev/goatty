@@ -1339,6 +1339,7 @@ impl TerminalView {
                 exists: &exists,
                 remote_stat: supports_remote.then_some(&remote_stat_fn as &dyn Fn(&str) -> RemoteLookup),
                 remote_can_fetch: supports_remote,
+                remote_windows: is_remote && conn.as_ref().is_some_and(|c| c.host().os == "windows"),
             };
             links::resolve(link, &place)
         };

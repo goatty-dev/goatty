@@ -68,6 +68,11 @@ pub struct SshTarget {
     pub askpass: Option<PathBuf>,
     /// The ssh client to run (tests substitute a fake).
     pub program: String,
+    /// The host turned out to run Windows (its OpenSSH runs commands with
+    /// cmd.exe or PowerShell, not sh): goattyd is started and installed the
+    /// Windows way ([`remote`]). Learned on the first connect and shared by
+    /// clones, so reconnects go straight there.
+    pub windows: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The OpenSSH client to run: `ssh` from `PATH`. On Windows, when it isn't
@@ -89,7 +94,16 @@ pub fn ssh_program() -> String {
 
 impl SshTarget {
     pub fn new(host: &str) -> Self {
-        Self { host: host.into(), remote_daemon: None, askpass: None, program: ssh_program() }
+        Self { host: host.into(), remote_daemon: None, askpass: None, program: ssh_program(), windows: Arc::default() }
+    }
+
+    /// Whether the host is known to run Windows.
+    pub fn is_windows(&self) -> bool {
+        self.windows.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_windows(&self) {
+        self.windows.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `ssh … host <remote>`: no remote PTY (we carry raw bytes), no `~`
@@ -237,8 +251,12 @@ impl Endpoint {
                 })
             }
             Endpoint::Ssh(t) => {
-                let script = remote::proxy_script(t.remote_daemon.as_deref());
-                spawn_stdio(t.command_with(&format!("sh -c {}", sh_quote(&script)), interactive), &t.host)
+                let remote = if t.is_windows() {
+                    remote::windows_proxy_command(t.remote_daemon.as_deref())?
+                } else {
+                    format!("sh -c {}", sh_quote(&remote::proxy_script(t.remote_daemon.as_deref())))
+                };
+                spawn_stdio(t.command_with(&remote, interactive), &t.host)
             }
             Endpoint::Command { program, args, label } => {
                 let mut c = Command::new(program);
@@ -295,7 +313,7 @@ fn spawn_stdio(mut cmd: Command, label: &str) -> Result<Transport> {
     Ok(Transport {
         reader: BufReader::with_capacity(256 << 10, Box::new(stdout)),
         writer: Box::new(stdin),
-        closer: Closer(Arc::new(Mutex::new(Some(CloseHandle::Child(child))))),
+        closer: Closer(Arc::new(Mutex::new(Some(CloseHandle::Child(child, stderr.clone()))))),
         stderr,
     })
 }
@@ -308,6 +326,8 @@ pub struct StderrTail(Arc<(Mutex<TailState>, Condvar)>);
 struct TailState {
     lines: VecDeque<String>,
     done: bool,
+    /// The command's exit code, once the closer reaped it.
+    exit: Option<i32>,
 }
 
 const TAIL_LINES: usize = 40;
@@ -336,6 +356,12 @@ impl StderrTail {
         tail
     }
 
+    /// The command's exit code, when it exited on its own (or was reaped
+    /// by [`Closer::reap`]) with one.
+    pub fn exit(&self) -> Option<i32> {
+        self.0.0.lock().exit
+    }
+
     /// The lines so far.
     pub fn lines(&self) -> Vec<String> {
         self.0.0.lock().lines.iter().cloned().collect()
@@ -357,7 +383,8 @@ impl StderrTail {
 
 pub(crate) enum CloseHandle {
     Socket(LocalStream),
-    Child(Child),
+    /// A transport command, and where its exit code goes.
+    Child(Child, StderrTail),
     Net(goatty_net::link::Closer),
 }
 
@@ -367,13 +394,30 @@ pub struct Closer(pub(crate) Arc<Mutex<Option<CloseHandle>>>);
 
 impl Closer {
     pub fn close(&self) {
+        self.reap(Duration::ZERO);
+    }
+
+    /// Like [`Self::close`], but a transport command gets up to `grace` to
+    /// exit on its own first, so its exit code is its own (ssh passes on
+    /// the remote command's) rather than the kill's.
+    pub fn reap(&self, grace: Duration) {
         match self.0.lock().take() {
             Some(CloseHandle::Socket(s)) => {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
-            Some(CloseHandle::Child(mut c)) => {
-                let _ = c.kill();
-                let _ = c.wait();
+            Some(CloseHandle::Child(mut c, tail)) => {
+                let deadline = Instant::now() + grace;
+                let status = loop {
+                    match c.try_wait() {
+                        Ok(Some(status)) => break Some(status),
+                        Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                        _ => {
+                            let _ = c.kill();
+                            break c.wait().ok();
+                        }
+                    }
+                };
+                tail.0.0.lock().exit = status.and_then(|s| s.code());
             }
             Some(CloseHandle::Net(c)) => c.close(),
             None => {}
@@ -483,11 +527,18 @@ fn spawn_daemon(daemon_exe: Option<PathBuf>, dir: &std::path::Path, log_path: &s
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+        use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
         // Detach from any parent console and start a fresh process group so
         // goattyd survives GUI/terminal exit without flashing a console window
         // (stdin/stdout/stderr are explicitly redirected above; note Win32
         // ignores CREATE_NO_WINDOW when combined with DETACHED_PROCESS).
+        // Started by `goattyd proxy` in an SSH session, it would be in the
+        // session's job object, which Win32-OpenSSH may end with the session:
+        // leave it when the job allows that, else start it inside.
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_ok() {
+            return Ok(());
+        }
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     cmd.spawn().context("spawn goattyd")?;
