@@ -111,6 +111,11 @@ pub fn add(
     if command.trim().is_empty() {
         bail!("give the command the alias runs: goattyd alias add {name} COMMAND…");
     }
+    if cfg!(windows)
+        && let Some(why) = super::powershell_alias_problem(name, command)
+    {
+        bail!("{name:?}: command isn't valid PowerShell ({why})");
+    }
     let settings = svc.settings().value;
     if let Some(existing) = settings.aliases.get(name).filter(|_| !force) {
         bail!("{name} already exists ({}); change it with `goattyd alias edit {name} …`, or pass --force to replace it", existing.command);
@@ -160,6 +165,12 @@ pub fn edit(svc: &HostService, name: &str, e: Edit) -> Result<()> {
     if let Some(c) = e.command {
         if c.trim().is_empty() {
             bail!("the command can't be empty (remove the alias with `goattyd alias remove {name}`)");
+        }
+        let target_name = e.rename.as_deref().unwrap_or(name);
+        if cfg!(windows)
+            && let Some(why) = super::powershell_alias_problem(target_name, &c)
+        {
+            bail!("{target_name:?}: command isn't valid PowerShell ({why})");
         }
         alias.command = c.trim().to_owned();
     }

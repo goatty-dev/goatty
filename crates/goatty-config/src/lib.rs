@@ -56,8 +56,8 @@ pub use color_history::ColorHistory;
 pub use colorspace::ColorFormat;
 pub use command_history::CommandHistory;
 pub use host::{
-    HistorySettings, HostSettings, ImportFrom, ImportSettings, PluginConfig, ShellSettings, UserAlias, ZshSettings, alias_name_problem,
-    is_alias_name, is_snippet_id, normalize_path_entry, path_entry_problem,
+    HistorySettings, HostSettings, ImportFrom, ImportSettings, PluginConfig, PowerShellSettings, ShellSettings, UserAlias, ZshSettings,
+    alias_name_problem, is_alias_name, is_snippet_id, normalize_path_entry, path_entry_problem,
 };
 pub use prompt::{PromptSettings, PromptStyle};
 pub use store::{Document, FileStamp, Issue, Loaded};

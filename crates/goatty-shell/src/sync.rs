@@ -762,8 +762,9 @@ mod tests {
     fn greet(version: &str) -> String {
         format!(
             "schema = 1\nid = \"greet\"\nname = \"Greet\"\nversion = \"{version}\"\nsummary = \"s\"\npublisher = \"tests\"\n\n\
+             [compat]\nos = [\"linux\", \"macos\", \"windows\"]\nshells = [\"zsh\", \"powershell\"]\n\n\
              [[setting]]\nid = \"name\"\nlabel = \"Name\"\ntype = \"string\"\ndefault = \"world\"\n\n\
-             [zsh]\ninit = \"zsh/init.zsh\"\n\n[permissions]\nshell-code = \"defines greet\"\n"
+             [zsh]\ninit = \"zsh/init.zsh\"\n\n[powershell]\ninit = \"pwsh/init.ps1\"\n\n[permissions]\nshell-code = \"defines greet\"\n"
         )
     }
 
@@ -779,7 +780,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg = tmp.path().join("registry");
         let (g1, g2) = (greet("0.1.0"), greet("0.2.0"));
-        let init: &[(&str, &str)] = &[("zsh/init.zsh", "greet() { print hi }\n")];
+        let init: &[(&str, &str)] =
+            &[("zsh/init.zsh", "greet() { print hi }\n"), ("pwsh/init.ps1", "function global:greet { Write-Output 'hi' }\n")];
         let (public, _) =
             crate::plugins::registry::tests::make_registry(&reg, &[("greet", "0.1.0", &g1, init), ("greet", "0.2.0", &g2, init)]);
         let source = crate::plugins::registry::Source {

@@ -252,11 +252,11 @@ impl Tool {
     }
 }
 
-/// `~/x` for paths under `$HOME`.
+/// `~/x` (or `~\x` on Windows) for paths under the user's home directory.
 pub fn tilde(p: &Path) -> String {
-    match std::env::var_os("HOME").and_then(|h| p.strip_prefix(h).ok().map(Path::to_path_buf)) {
+    match Dirs::home_dir().and_then(|h| p.strip_prefix(h).ok().map(Path::to_path_buf)) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
         None => p.display().to_string(),
     }
 }
@@ -309,7 +309,7 @@ impl HostService {
         let ctx = self.launcher.import_context().context("no home directory to import from")?;
         let host = self.settings();
         let shell = &host.value.shell;
-        let managed = shell.managed && crate::launch::is_zsh(&crate::launch::resolve_program(shell.program.as_deref()));
+        let managed = shell.managed && crate::launch::is_managed_shell(&crate::launch::resolve_program(shell.program.as_deref()));
         Ok(crate::import::status(dirs, &host.value, managed, &ctx, refresh))
     }
 }
@@ -325,37 +325,52 @@ pub fn status(svc: &HostService) -> Result<Status> {
     let host = svc.settings();
     let launch = svc.launcher.launch(&host);
     let shell = &host.value.shell;
+    let additions_path = if cfg!(windows) { dirs.user_ps_profile() } else { dirs.user_zshrc() };
     let mut s = Status {
         program: launch.program.clone(),
         managed: launch.managed,
-        config_dir: tilde(&dirs.zsh_dir()),
+        config_dir: tilde(&dirs.shell_dir()),
         generation: generation::current(dirs),
         settings_issues: host.file.issues.iter().map(ToString::to_string).collect(),
         env_overrides: host.env_overrides.iter().map(|s| s.to_string()).collect(),
-        additions: tilde(&dirs.user_zshrc()),
-        additions_exist: dirs.user_zshrc().exists(),
+        additions: tilde(&additions_path),
+        additions_exist: additions_path.exists(),
         dismissed: dirs.hint_marker().exists(),
         offered: dirs.offer_marker().exists(),
         ..Status::default()
     };
     if !launch.managed {
+        let managed_name = if cfg!(windows) { "PowerShell" } else { "zsh" };
         s.unmanaged = Some(if !shell.managed {
-            "Managed zsh is off: sessions use your own dotfiles only.".into()
-        } else if crate::launch::is_zsh(&launch.program) {
-            "goatty couldn't write its shell configuration (see goattyd's log): sessions use your own dotfiles only.".into()
+            format!("Managed {managed_name} is off: sessions use your own configuration only.")
+        } else if crate::launch::is_managed_shell(&launch.program) {
+            "goatty couldn't write its shell configuration (see goattyd's log): sessions use your own configuration only.".into()
         } else {
-            "goatty's managed configuration is for zsh only: this shell starts as is.".into()
+            format!("goatty's managed configuration is for {managed_name} only: this shell starts as is.")
         });
+    } else if cfg!(windows) && crate::launch::is_windows_powershell(&launch.program) {
+        s.settings_issues.push(
+            "Running Windows PowerShell 5.1; install PowerShell 7 (`winget install Microsoft.PowerShell`) for inline autosuggestions and faster startup.".into(),
+        );
     }
-    let zdotdir = std::env::var_os("ZDOTDIR").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from).unwrap_or_default();
-    let z = &shell.zsh;
-    s.user_files = [(".zshenv", z.user_env), (".zprofile", z.user_env), (".zshrc", z.user_rc)]
-        .into_iter()
-        .map(|(name, sourced)| {
-            let path = zdotdir.join(name);
-            UserFile { path: tilde(&path), sourced, exists: path.is_file() }
-        })
-        .collect();
+    if cfg!(windows) {
+        let home = Dirs::home_dir().unwrap_or_default();
+        let docs = home.join("Documents");
+        let ps7 = docs.join("PowerShell").join("Microsoft.PowerShell_profile.ps1");
+        let ps5 = docs.join("WindowsPowerShell").join("Microsoft.PowerShell_profile.ps1");
+        let sourced = shell.powershell.user_profile;
+        s.user_files = [ps7, ps5].into_iter().map(|path| UserFile { path: tilde(&path), sourced, exists: path.is_file() }).collect();
+    } else {
+        let zdotdir = std::env::var_os("ZDOTDIR").or_else(|| std::env::var_os("HOME")).map(std::path::PathBuf::from).unwrap_or_default();
+        let z = &shell.zsh;
+        s.user_files = [(".zshenv", z.user_env), (".zprofile", z.user_env), (".zshrc", z.user_rc)]
+            .into_iter()
+            .map(|(name, sourced)| {
+                let path = zdotdir.join(name);
+                UserFile { path: tilde(&path), sourced, exists: path.is_file() }
+            })
+            .collect();
+    }
 
     let probe = if launch.managed {
         match doctor::probe(&launch, PROBE_TIMEOUT) {
@@ -422,8 +437,15 @@ impl Feature {
 /// Whether `detail` (reported by `goatty-status`) points inside goatty's
 /// managed `bin/` or `plugins/` directories.
 pub fn is_managed_detail(dirs: &Dirs, detail: &str) -> bool {
-    let path = Path::new(detail);
-    path.starts_with(dirs.bin_dir()) || path.starts_with(dirs.plugins_dir())
+    if cfg!(windows) {
+        let lower = detail.replace('/', "\\").to_ascii_lowercase();
+        let bin = dirs.bin_dir().to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        let plugins = dirs.plugins_dir().to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        lower.starts_with(&bin) || lower.starts_with(&plugins)
+    } else {
+        let path = Path::new(detail);
+        path.starts_with(dirs.bin_dir()) || path.starts_with(dirs.plugins_dir())
+    }
 }
 
 fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
@@ -446,9 +468,10 @@ fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
         }
         State::Ok(detail) => {
             let path = Path::new(detail);
-            let managed = builtins::get(id)
-                .filter(|_| is_managed_detail(dirs, detail))
-                .and_then(|b| b.manifest().packages.iter().find_map(|p| packages::managed(dirs, p)).map(|(v, _)| v));
+            let shell = builtins::host_managed_shell();
+            let managed = builtins::get(id).filter(|_| is_managed_detail(dirs, detail)).and_then(|b| {
+                b.manifest().packages.iter().filter(|p| p.applies_to_shell(shell)).find_map(|p| packages::managed(dirs, p)).map(|(v, _)| v)
+            });
             FeatureState::Loaded { detail: tilde(path), managed }
         }
         State::Off => FeatureState::Off,
@@ -461,6 +484,8 @@ fn feature(id: &str, state: &State, dirs: &Dirs) -> Feature {
 /// asked), else where goattyd finds it, and what installing would take.
 fn tool(b: &'static Builtin, plugins: &Plugins<'_>, host: &Effective<HostSettings>, probe: Option<&doctor::Probe>) -> Tool {
     let m = b.manifest();
+    let shell = builtins::host_managed_shell();
+    let pkgs: Vec<_> = m.packages.iter().filter(|p| p.applies_to_shell(shell)).collect();
     let mut t = Tool {
         id: b.id.into(),
         name: m.name.clone(),
@@ -469,11 +494,11 @@ fn tool(b: &'static Builtin, plugins: &Plugins<'_>, host: &Effective<HostSetting
         default_install: b.default_install,
         location: ToolLocation::Missing,
         download: 0,
-        version: m.packages.first().map(|p| p.version.clone()).unwrap_or_default(),
+        version: pkgs.first().map(|p| p.version.clone()).unwrap_or_default(),
         unavailable: None,
     };
     let path = std::env::var("PATH").ok();
-    let found: Vec<_> = m.packages.iter().map(|p| packages::locate(plugins.dirs, p, path.as_deref())).collect();
+    let found: Vec<_> = pkgs.iter().map(|p| packages::locate(plugins.dirs, p, path.as_deref())).collect();
     let mut location = match found.first() {
         _ if found.contains(&packages::Location::Missing) => ToolLocation::Missing,
         Some(packages::Location::System(p)) => ToolLocation::System { path: tilde(p) },
@@ -558,6 +583,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Reply>(&serde_json::to_string(&reply).unwrap()).unwrap(), reply);
     }
 
+    #[cfg(unix)]
     #[test]
     fn everywhere_requests_turn_the_line_on_and_off() {
         use crate::everywhere::{Action, State};
@@ -606,7 +632,8 @@ mod tests {
         let svc = HostService::new(Launcher::new(Some(dirs.clone()), None), Some(dirs.host_file()));
         let before = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
         assert_eq!(svc.shell_request(Request::Refresh).unwrap(), Reply::Done);
-        assert!(dirs.zsh_dir().join("entry.zsh").is_file());
+        let expected_entry = if cfg!(windows) { dirs.pwsh_dir().join("init.ps1") } else { dirs.zsh_dir().join("entry.zsh") };
+        assert!(expected_entry.is_file());
         let stamp = std::fs::metadata(dirs.refresh_stamp()).unwrap().modified().unwrap();
         assert!(stamp >= before && stamp <= std::time::SystemTime::now(), "{stamp:?}");
         let json = serde_json::to_string(&Request::Everywhere { action: crate::everywhere::Action::On, shown: None }).unwrap();
@@ -638,7 +665,8 @@ mod tests {
         assert_eq!(list[0].title(), "small history");
         assert_eq!(list[1].summary(), "history.size 5000 → 6000");
         let Reply::Diff { files } = svc.shell_request(Request::GenerationDiff { number: 2 }).unwrap() else { panic!() };
-        assert_eq!(files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["settings.zsh"]);
+        let expected_settings = if cfg!(windows) { "settings.ps1" } else { "settings.zsh" };
+        assert_eq!(files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), [expected_settings]);
     }
 
     #[test]

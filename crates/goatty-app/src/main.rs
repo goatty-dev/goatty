@@ -101,7 +101,8 @@ fn main() -> Result<()> {
     .init();
     // goatty's completions in the managed shell, kept current off the UI thread.
     let _ = std::thread::Builder::new().name("completions".into()).spawn(|| {
-        let script = cli::completion_script(clap_complete::Shell::Zsh);
+        let shell = if cfg!(windows) { clap_complete::Shell::PowerShell } else { clap_complete::Shell::Zsh };
+        let script = cli::completion_script(shell);
         goatty_shell::completions::write_own(goatty_shell::Dirs::from_env().as_ref(), "goatty", &script);
     });
     let client = goatty_config::load_client().value;
@@ -129,7 +130,8 @@ fn main() -> Result<()> {
         None => {
             // No daemon: this process owns the shell and the host settings.
             // Initial size is a guess; the terminal resizes on first layout.
-            let daemon = std::env::current_exe().ok().map(|e| e.with_file_name("goattyd")).filter(|d| d.exists());
+            let daemon_name = if cfg!(windows) { "goattyd.exe" } else { "goattyd" };
+            let daemon = std::env::current_exe().ok().map(|e| e.with_file_name(daemon_name)).filter(|d| d.exists());
             let host = Arc::new(HostService::from_env(daemon));
             log::info!("backend: local pty");
             let session = Session::local(TermSize::new(100, 30), &host, None)?;

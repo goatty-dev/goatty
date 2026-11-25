@@ -416,3 +416,69 @@ fn the_table_is_quoted_data() {
     let out = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out, format!("{}\n$'| y \\'$(rm -rf ~)\\' \\C-A2\\C-A'\n1 2\n", rules[1].re), "zsh's (q+) shows \\x01 as \\C-A");
 }
+
+#[test]
+fn powershell_snippet_and_expansion_table() {
+    let s = snippet(
+        r#"
+id = "find-name"
+title = "Find by name"
+line = "find {dir} -iname {pattern}"
+[[input]]
+id = "dir"
+label = "Dir"
+type = "folder"
+[[input]]
+id = "pattern"
+label = "Pattern"
+"#,
+    );
+    let rendered = s.render_powershell(&values(&[("dir", "~/my dir"), ("pattern", "it's $(bad)")]));
+    assert_eq!(rendered, "find (Join-Path $HOME 'my dir') -iname 'it''s $(bad)'");
+
+    let e =
+        |say: &str, to: &str| compile(&Expansion { say: say.into(), to: to.into(), description: String::new(), inputs: BTreeMap::new() });
+    let rules = vec![
+        e("| sorted nicely", "| sort").unwrap(),
+        e("| x {w} nicely", "| y '$(rm -rf ~)' {w}").unwrap(),
+        e("all done", "echo ok").unwrap(),
+        e("all DONE", "echo OK").unwrap(),
+    ];
+    let t = render_table_powershell(&rules);
+    assert!(t.contains("$global:_goatty_exp_re = @("), "{t}");
+    assert!(t.contains(r"\s+"), "POSIX [[:space:]] converted to .NET \\s: {t}");
+    assert!(!t.contains("[[:space:]]"), "{t}");
+    assert!(t.contains("New-Object System.Collections.Hashtable([System.StringComparer]::Ordinal)"), "{t}");
+    assert!(t.contains("$global:_goatty_exp_last['nicely'] = @(0, 1)"), "0-based indices for PowerShell: {t}");
+    assert!(t.contains("$global:_goatty_exp_last['done'] = @(2)"), "{t}");
+    assert!(t.contains("$global:_goatty_exp_last['DONE'] = @(3)"), "{t}");
+}
+
+#[test]
+fn powershell_snippet_rejects_curly_quoted_placeholders_and_assembles_embedded_words() {
+    let curly =
+        snippet("id = \"bad\"\ntitle = \"Bad\"\nline = \"Write-Output \u{201c}{x}\u{201d}\"\n[[input]]\nid = \"x\"\nlabel = \"X\"\n");
+    assert!(curly.pieces_powershell().is_err(), "curly double quotes must reject placeholder");
+    // Rendering refuses to substitute untrusted values into an unsafe quoted line.
+    assert_eq!(curly.render_powershell(&values(&[("x", "$(Get-Date)")])), "Write-Output \u{201c}{x}\u{201d}");
+
+    let backslash_quote = snippet("id = \"bq\"\ntitle = \"BQ\"\nline = 'Write-Output \\\"{x}\\\"'\n[[input]]\nid = \"x\"\nlabel = \"X\"\n");
+    assert!(backslash_quote.pieces_powershell().is_err(), "backslash does not escape quotes in PowerShell");
+
+    let embedded = snippet(
+        r#"
+id = "embed"
+title = "Embed"
+line = "tool --out={dir}/file.txt --tag=pre-{x}-post {dir}"
+[[input]]
+id = "dir"
+label = "Dir"
+type = "folder"
+[[input]]
+id = "x"
+label = "X"
+"#,
+    );
+    let rendered = embedded.render_powershell(&values(&[("dir", "~/src"), ("x", "a\u{2019}b")]));
+    assert_eq!(rendered, "tool ('--out=' + $HOME + '/src/file.txt') ('--tag=pre-a' + [char]0x2019 + 'b-post') (Join-Path $HOME 'src')");
+}

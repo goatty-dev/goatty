@@ -55,11 +55,20 @@ step = 10
 unit = "characters"
 advanced = true
 
+[compat]
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]
+
 [zsh]
 init = "zsh/init.zsh"
 load = "line-editor"
 # It wraps the widgets defined before it: let fzf, fzf-tab and the Atuin
 # plugin (from the registry) define theirs first.
+after = ["fzf", "fzf-tab", "atuin"]
+
+[powershell]
+init = "pwsh/init.ps1"
+load = "line-editor"
 after = ["fzf", "fzf-tab", "atuin"]
 
 [permissions]

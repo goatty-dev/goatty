@@ -128,14 +128,17 @@ pub fn alias_name_problem(name: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellSettings {
-    /// Shell program. `None`: zsh if installed, else `$SHELL`, else /bin/sh.
+    /// Shell program. `None`: zsh if installed, else `$SHELL`, else /bin/sh
+    /// (on Windows: `pwsh.exe`, else `powershell.exe`, else `cmd.exe`).
     pub program: Option<String>,
-    /// Run zsh with goatty's managed configuration (see `goatty-shell`).
-    /// `false`: plain zsh with only the user's own dotfiles. Other shells
-    /// are always launched as they are.
+    /// Run the managed shell (zsh on Unix, PowerShell on Windows) with
+    /// goatty's generated configuration (see `goatty-shell`). `false`: plain
+    /// shell with only the user's own profile/dotfiles. Other shells are
+    /// always launched as they are.
     pub managed: bool,
     pub zsh: ZshSettings,
-    /// Folders added to the end of `PATH` in goatty's managed zsh, in this
+    pub powershell: PowerShellSettings,
+    /// Folders added to the end of `PATH` in goatty's managed shell, in this
     /// order (`~/…` is the home directory). Folders that don't exist when
     /// a shell starts are skipped.
     pub path: Vec<String>,
@@ -143,7 +146,7 @@ pub struct ShellSettings {
     /// from `.zshrc` or `.bashrc`) into goatty's managed zsh.
     pub import: ImportSettings,
     /// Expansions (#89): plain words turn into a command while you type
-    /// (`| first 20 lines` + Space → `| head -n 20`), in goatty's managed zsh.
+    /// (`| first 20 lines` + Space → `| head -n 20`), in goatty's managed shell.
     pub expansions: bool,
 }
 
@@ -153,10 +156,29 @@ impl Default for ShellSettings {
             program: None,
             managed: true,
             zsh: ZshSettings::default(),
+            powershell: PowerShellSettings::default(),
             path: Vec::new(),
             import: ImportSettings::default(),
             expansions: true,
         }
+    }
+}
+
+/// How goatty's managed PowerShell starts on Windows (#278).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PowerShellSettings {
+    /// Also dot-source the user's `$PROFILE` (`CurrentUserCurrentHost`),
+    /// guarded. Off by default: most profiles load their own prompt and
+    /// modules, which would fight goatty's.
+    pub user_profile: bool,
+    /// OSC 133 prompt marks and OSC 7 working directory reports.
+    pub integration: bool,
+}
+
+impl Default for PowerShellSettings {
+    fn default() -> Self {
+        Self { user_profile: false, integration: true }
     }
 }
 
@@ -212,13 +234,35 @@ pub enum ImportFrom {
     Bash,
 }
 
+/// Whether `dir` starts with a Windows drive root (`C:\…` or `C:/…`) or UNC prefix (`\\…`).
+fn is_windows_abs_path(dir: &str) -> bool {
+    let b = dir.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')) || dir.starts_with(r"\\")
+}
+
 /// Why `dir` can't go into [`ShellSettings::path`], if it can't: it must be
-/// absolute or start with `~/`, and be one line without `:`.
+/// absolute or start with `~/`, and be one line without the platform's PATH
+/// separator (`:` on Unix, `;` on Windows).
 pub fn path_entry_problem(dir: &str) -> Option<&'static str> {
+    path_entry_problem_for(cfg!(windows), dir)
+}
+
+fn path_entry_problem_for(windows: bool, dir: &str) -> Option<&'static str> {
     if dir.trim().is_empty() {
         Some("Enter a folder")
     } else if dir.contains(['\0', '\n', '\r']) {
         Some("Must be a single line")
+    } else if windows {
+        if dir.contains(';') {
+            Some("PATH entries can't contain ;")
+        } else if is_windows_abs_path(dir) {
+            // Only the drive-letter colon at index 1 is valid.
+            if dir.len() > 2 && dir[2..].contains(':') { Some("PATH entries can't contain :") } else { None }
+        } else if dir == "~" || dir.starts_with("~/") || dir.starts_with(r"~\") || dir.starts_with('/') {
+            if dir.contains(':') { Some("PATH entries can't contain :") } else { None }
+        } else {
+            Some("Use a full path: C:\\… or ~\\…")
+        }
     } else if dir.contains(':') {
         Some("PATH entries can't contain :")
     } else if !(dir.starts_with('/') || dir == "~" || dir.starts_with("~/")) {
@@ -228,9 +272,16 @@ pub fn path_entry_problem(dir: &str) -> Option<&'static str> {
     }
 }
 
-/// `dir` as stored: without a trailing `/` (except `/` itself).
+/// `dir` as stored: without a trailing `/` or `\` (preserving `/` or `C:\`).
 pub fn normalize_path_entry(dir: &str) -> String {
     let d = dir.trim();
+    if is_windows_abs_path(d) {
+        let t = d.trim_end_matches(['/', '\\']);
+        if t.len() == 2 && t.as_bytes()[1] == b':' {
+            return format!("{t}{}", &d[2..3]);
+        }
+        return if t.is_empty() { d.to_string() } else { t.to_string() };
+    }
     let t = d.trim_end_matches('/');
     if t.is_empty() { d.chars().take(1).collect() } else { t.to_string() }
 }
@@ -528,17 +579,30 @@ mod tests {
 
     #[test]
     fn path_entries() {
-        assert_eq!(path_entry_problem("~/bin"), None);
-        assert_eq!(path_entry_problem("/opt/x y/bin"), None);
-        assert_eq!(path_entry_problem("bin"), Some("Use a full path: /… or ~/…"));
-        assert_eq!(path_entry_problem("~user/bin"), Some("Use a full path: /… or ~/…"));
-        assert_eq!(path_entry_problem("/a:/b"), Some("PATH entries can't contain :"));
-        assert_eq!(path_entry_problem(" "), Some("Enter a folder"));
+        assert_eq!(path_entry_problem_for(false, "~/bin"), None);
+        assert_eq!(path_entry_problem_for(false, "/opt/x y/bin"), None);
+        assert_eq!(path_entry_problem_for(false, "bin"), Some("Use a full path: /… or ~/…"));
+        assert_eq!(path_entry_problem_for(false, "~user/bin"), Some("Use a full path: /… or ~/…"));
+        assert_eq!(path_entry_problem_for(false, "/a:/b"), Some("PATH entries can't contain :"));
+        assert_eq!(path_entry_problem_for(false, " "), Some("Enter a folder"));
+        assert_eq!(path_entry_problem_for(true, r"C:\Users\me\bin"), None);
+        assert_eq!(path_entry_problem_for(true, "C:/tools"), None);
+        assert_eq!(path_entry_problem_for(true, r"~\bin"), None);
+        assert_eq!(path_entry_problem_for(true, "~/bin"), None);
+        assert_eq!(path_entry_problem_for(true, r"\\server\share\bin"), None);
+        assert_eq!(path_entry_problem_for(true, r"C:\a;C:\b"), Some("PATH entries can't contain ;"));
+        assert_eq!(path_entry_problem_for(true, r"C:\a:b"), Some("PATH entries can't contain :"));
+        assert_eq!(path_entry_problem_for(true, "bin"), Some("Use a full path: C:\\… or ~\\…"));
         assert_eq!(normalize_path_entry(" ~/bin/ "), "~/bin");
         assert_eq!(normalize_path_entry("/"), "/");
+        assert_eq!(normalize_path_entry(r" C:\tools\ "), r"C:\tools");
+        assert_eq!(normalize_path_entry(r"C:\"), r"C:\");
         let s: HostSettings = serde_json::from_str(r#"{"shell": {"path": ["~/bin"]}}"#).unwrap();
         assert_eq!(s.shell.path, ["~/bin"]);
         assert!(s.shell.managed, "other shell settings keep their defaults");
+        assert!(!s.shell.powershell.user_profile && s.shell.powershell.integration);
+        assert!(crate::store::is_known_key::<HostSettings>("shell.powershell.user_profile"));
+        assert!(crate::store::is_known_key::<HostSettings>("shell.powershell.integration"));
         let mut s: HostSettings = serde_json::from_str(r#"{"shell": {"path": ["~/bin", "bin", "/a:/b"]}}"#).unwrap();
         let issues = s.validate();
         assert_eq!(s.shell.path, ["~/bin"], "bad entries are dropped on load");

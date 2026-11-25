@@ -1239,7 +1239,7 @@ pub fn status(dirs: &Dirs, settings: &HostSettings, managed: bool, ctx: &Context
     s
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

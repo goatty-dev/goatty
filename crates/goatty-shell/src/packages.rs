@@ -23,20 +23,40 @@ pub enum Location {
 /// broken.
 pub fn managed(dirs: &Dirs, p: &Package) -> Option<(String, PathBuf)> {
     let tool_dir = dirs.tools_dir().join(&p.id);
-    let version_of = |link: &Path| -> Option<String> {
+    let version_of_link = |link: &Path| -> Option<String> {
+        #[cfg(unix)]
         let target = std::fs::read_link(link).ok()?;
-        let rel = target.strip_prefix(&tool_dir).ok()?;
+        #[cfg(windows)]
+        let target = crate::winlink::read_junction(link).ok()?;
+        #[cfg(windows)]
+        let tool_base = crate::winlink::strip_verbatim(&tool_dir);
+        #[cfg(unix)]
+        let tool_base = tool_dir.clone();
+        let rel = target.strip_prefix(&tool_base).ok()?;
         rel.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned())
     };
     let mut found: Option<(String, PathBuf)> = None;
     for b in &p.bin {
-        let link = dirs.bin_dir().join(bin_name(b));
-        let v = version_of(&link).filter(|_| link.is_file())?;
+        let file_name = crate::install::bin_file_name(b);
+        let link = dirs.bin_dir().join(&file_name);
+        #[cfg(unix)]
+        let v = version_of_link(&link).filter(|_| link.is_file())?;
+        #[cfg(windows)]
+        let v = {
+            if !link.is_file() {
+                return None;
+            }
+            let (owner, version) = crate::install::read_bin_owner(dirs, &file_name)?;
+            if owner != p.id || !tool_dir.join(&version).is_dir() {
+                return None;
+            }
+            version
+        };
         found.get_or_insert((v, link));
     }
     if let Some(src) = &p.source {
         let link = dirs.plugins_dir().join(&p.id);
-        let v = version_of(&link).filter(|_| link.join(src).is_file())?;
+        let v = version_of_link(&link).filter(|_| link.join(src).is_file())?;
         found = Some(found.unwrap_or((v, link.join(src))));
     }
     found
@@ -77,17 +97,25 @@ pub fn which(exe: &str, path_var: Option<&str>, managed_bin: &Path) -> Option<Pa
     #[cfg(not(unix))]
     {
         let has_ext = Path::new(exe).extension().is_some();
+        let exts: Vec<String> = if has_ext {
+            Vec::new()
+        } else {
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| e.to_ascii_lowercase())
+                .collect()
+        };
         std::env::split_paths(path_var?).filter(|d| d != managed_bin).find_map(|d| {
             let direct = d.join(exe);
             if direct.is_file() {
                 return Some(direct);
             }
-            if !has_ext {
-                for ext in [".exe", ".cmd", ".bat"] {
-                    let candidate = d.join(format!("{exe}{ext}"));
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
+            for ext in &exts {
+                let candidate = d.join(format!("{exe}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
                 }
             }
             None
@@ -151,5 +179,37 @@ mod tests {
         let link = dirs.plugins_dir().join("autosuggestions/zsh-autosuggestions.zsh");
         assert_eq!(managed(&dirs, &p), Some(("0.7.1".into(), link.clone())));
         assert_eq!(locate(&dirs, &p, None), Location::Managed { path: link, version: "0.7.1".into() });
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::builtins;
+
+    #[test]
+    fn locates_managed_and_system_windows_executables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        let sys = tmp.path().join("sysbin");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::create_dir_all(dirs.bin_dir()).unwrap();
+
+        let starship = &builtins::get("starship").unwrap().manifest().packages[0];
+        let path = std::env::join_paths([&sys, &dirs.bin_dir()]).unwrap();
+        let path = path.to_str().unwrap();
+        assert_eq!(locate(&dirs, starship, Some(path)), Location::Missing);
+
+        // Install a managed starship.exe with sidecar metadata and tools version dir.
+        std::fs::create_dir_all(dirs.tools_dir().join("starship/1.27.0")).unwrap();
+        let bin_exe = dirs.bin_dir().join("starship.exe");
+        std::fs::write(&bin_exe, b"MZmanaged").unwrap();
+        std::fs::write(dirs.bin_dir().join(".starship.exe.goatty"), "starship\n1.27.0\n").unwrap();
+        assert_eq!(locate(&dirs, starship, Some(path)), Location::Managed { path: bin_exe.clone(), version: "1.27.0".into() });
+
+        // A system copy on PATH wins.
+        let sys_exe = sys.join("starship.exe");
+        std::fs::write(&sys_exe, b"MZsystem").unwrap();
+        assert_eq!(locate(&dirs, starship, Some(path)), Location::System(sys_exe));
     }
 }

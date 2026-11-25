@@ -1,6 +1,6 @@
 # Plugins (Stage 5)
 
-A goatty plugin packages a command-line tool so that someone who has never used it gets a good setup in one click: goatty downloads the tool into its own directory, shows its most useful options on the **Plugins** settings page with plain-words explanations, and wires those settings into goatty's managed zsh. Nothing outside goatty's directories changes, and nothing runs as root.
+A goatty plugin packages a command-line tool so that someone who has never used it gets a good setup in one click: goatty downloads the tool into its own directory, shows its most useful options on the **Plugins** settings page with plain-words explanations, and wires those settings into goatty's managed shell (zsh on Unix, PowerShell on Windows). Nothing outside goatty's directories changes, and nothing runs as root.
 
 Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatty-shell/src/plugins/` (on a host: registries, plans, installs, rendering), `crates/goatty-app/src/settings_window/plugins.rs` (the page). Repositories: [goatty-registry](https://github.com/goatty-dev/goatty-registry) (the official registry) and [goatty-plugin-template](https://github.com/goatty-dev/goatty-plugin-template) (start here to write one; includes a Claude Code skill).
 
@@ -10,21 +10,21 @@ Code: `crates/goatty-plugin` (format, trust, bin `goatty-plugin`), `crates/goatt
 |---|---|---|---|
 | Install programs | `[[package]]` + `[[package.asset]]` (url, sha256, size) | `tools/<pkg>/<version>/`, links in `bin/` (on PATH in goatty shells only) | `binaries` (reason required) |
 | Install zsh plugins | `[[package]]` with `source` (a `.zsh` script) and `system_paths` | `plugins/<pkg>` → the package; sourced at the plugin's slot (a distro copy first) | `binaries` (reason required) |
-| Load order | `zsh.load` (`line-editor`, `prompt`, `normal`, `last`), `zsh.after` | the plugin's code goes into that slot's file, after the named plugins | – |
+| Load order | `zsh.load` / `powershell.load` (`line-editor`, `prompt`, `normal`, `last`), `zsh.after` / `powershell.after` | the plugin's code goes into that slot's file, after the named plugins | – |
 | Settings | `[[setting]]` (bool, choice, integer, string, path, list) | controls on the Plugins page, values in `host.json` | – |
-| Aliases | `[[alias]]` (command, args templates, `when`) | `alias -- name='cmd args…'`, only when the command exists | `aliases` |
-| Environment | `[[env]]` (value template, `when`) | `export NAME='value'` before compinit | `env` |
+| Aliases | `[[alias]]` (command, args templates, `when`) | `alias -- name='cmd args…'` (zsh) or `function global:name { … }` (PowerShell), only when the command exists | `aliases` |
+| Environment | `[[env]]` (value template, `when`) | `export NAME='value'` (zsh) or `Set-Item -Path 'Env:NAME' -Value 'value'` (PowerShell) in the early init file | `env` |
 | Config files | `[[file]]` (`lines` or `text`, optional `env` pointing at it) | a file in the generation, e.g. bat's `BAT_CONFIG_PATH` | `config-files` |
 | Completions | `zsh.fpath` (directories in the plugin) | `fpath` entries before compinit | – |
-| Shell code | `zsh.init` (a `.zsh` file in the plugin) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
+| Shell code | `zsh.init` (`.zsh`), `powershell.init` (`.ps1`) | sourced at top level with `$goatty_settings` | `shell-code` (reason required) |
 | Palette commands | `[[command]]` + `[[command.input]]` (typed inputs: label, placeholder, checks; a list to pick from with `[command.input.source]` + `strict`), `[command.menu]`, `keys` + `[command.pane]` | an entry in goatty's command palette (and, with `menu`, the terminal's right-click menu) that asks for its inputs, then types its quoted `run` line into the focused terminal, or sends `keys` to the program running there (only where `pane` says it applies) | `commands` |
 | Snippets | `[[snippet]]` + `[[snippet.input]]` (a command line with `{input}` blanks; typed inputs, flags, several values) | entries in the snippet picker (Ctrl+Shift+S) that ask for their blanks and put the quoted line on the prompt ([`snippets.md`](snippets.md)) | `snippets` |
 | Suggestions (lists to pick from) | `[snippet.input.source]`, `[command.input.source]` (`run`: argv of a package executable or required command; `split`, `column`, `label`, `detail`, `skip`, `on_fail`, `timeout`) | the host runs it when the field opens, in the pane's directory, without a shell | `snippet-sources` (reason required) |
-| Expansions | `[[expansion]]` (`say` → `to`, placeholders typed `word`/`integer`) | a row in the generation's `expansions.zsh`, rewritten on Space by goatty's widget | `snippets` |
+| Expansions | `[[expansion]]` (`say` → `to`, placeholders typed `word`/`integer`) | a row in the generation's `expansions.zsh` / `expansions.ps1`, rewritten on Space by goatty's widget | `snippets` |
 | Needs a system program | `[requires] commands` | integration only when present (`plugin:x missing` otherwise) | – |
 | Needs other plugins | `[requires] plugins` | the missing ones are installed along with it, after one review | – |
 
-Everything goatty writes itself is quoted: a setting value can never become shell syntax (`tests: values_cannot_escape_quotes` runs real zsh). The only code a plugin brings is its `zsh.init` file, which is shown in full before installing and re-checked against its approved checksum every time a configuration is built.
+Everything goatty writes itself is quoted: a setting value can never become shell syntax (`tests: values_cannot_escape_quotes` runs real zsh; `powershell_startup` tests PowerShell quoting). The only code a plugin brings is its `zsh.init` or `powershell.init` file, which is shown in full before installing and re-checked against its approved checksum every time a configuration is built.
 
 Not yet: application plugins (UI, commands that run code inside goatty) need a runtime goatty doesn't have (category `application` is rejected; WASM later, plan §7). The earlier `prompt` category was removed (#96): any installed manifest that still declares `category = "prompt"` fails to load and is reported as an issue; remove it with `goattyd plugin uninstall ID` and reinstall an updated version. Tracked: other shells (#103), more first-party plugins (#99), index expiry (#100), installing an imported profile's plugins (#101), publishing the repos (#93).
 
@@ -47,8 +47,8 @@ category = "environment"
 
 [compat]
 goatty = ">=0.0.1"              # semver requirement
-os = ["linux"]
-shells = ["zsh"]                # default
+os = ["linux", "macos", "windows"]
+shells = ["zsh", "powershell"]  # default: ["zsh"]
 
 [requires]
 commands = ["docker"]           # must exist on the host; goatty won't install them
@@ -71,7 +71,7 @@ completions = ["eza", "--completions", "zsh"]   # optional: prints the zsh compl
 #                                       # /opt/local/, /run/current-system/sw/, /nix/var/nix/profiles/
 
 [[package.asset]]
-target = "x86_64-linux"         # x86_64/aarch64 × linux/macos, or "any"
+target = "x86_64-linux"         # x86_64/aarch64 × linux/macos/windows, or "any"
 url = "https://github.com/…/eza_x86_64-unknown-linux-musl.tar.gz"   # https only
 sha256 = "e06eeb…"              # checked before anything is unpacked
 size = 1412332
@@ -118,6 +118,12 @@ fpath = ["zsh/completions"]
 when = "completion"
 load = "normal"                 # line-editor | prompt | normal (default) | last
 after = ["fzf"]                 # in the same slot, load after these plugins when they're there
+
+[powershell]                    # optional: Windows managed PowerShell integration (#278)
+init = "pwsh/init.ps1"          # a .ps1 file in the plugin (same `shell-code` permission)
+when = "completion"
+load = "normal"                 # line-editor | prompt | normal (default) | last
+after = ["fzf"]
 
 [[command]]                     # an entry in the command palette (#91)
 id = "tree"                     # palette id: plugin.eza.tree

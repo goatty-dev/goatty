@@ -54,7 +54,7 @@ enum Cmd {
     /// Run goattyd as a user service (systemd on Linux, launchd on macOS, Scheduled Task on Windows).
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// goatty's managed zsh on this host: status, tool installs and updates.
+    /// goatty's managed shell on this host (zsh on Unix, PowerShell on Windows): status, tool installs and updates.
     #[command(subcommand)]
     Shell(ShellCmd),
     /// This host's settings (host.json: shell, prompt, history).
@@ -409,7 +409,8 @@ fn main() -> Result<()> {
             // in the managed shell current, off the startup path.
             let _ = std::thread::Builder::new().name("completions".into()).spawn(|| {
                 let dirs = goatty_shell::Dirs::from_env();
-                goatty_shell::completions::write_own(dirs.as_ref(), "goattyd", &completion_script(clap_complete::Shell::Zsh));
+                let shell = if cfg!(windows) { clap_complete::Shell::PowerShell } else { clap_complete::Shell::Zsh };
+                goatty_shell::completions::write_own(dirs.as_ref(), "goattyd", &completion_script(shell));
                 if let Some(dirs) = &dirs {
                     goatty_shell::completions::backfill(dirs);
                 }

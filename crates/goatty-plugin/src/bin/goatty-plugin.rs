@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use goatty_plugin::{bundle, index, manifest, permissions, schema, sign, snippets, zsh};
+use goatty_plugin::{bundle, index, manifest, permissions, powershell, schema, sign, snippets, zsh};
 
 #[derive(Parser)]
 #[command(name = "goatty-plugin", version, about = "Build, check and publish goatty plugins")]
@@ -22,12 +22,15 @@ enum Cmd {
     New { id: String, dir: Option<PathBuf> },
     /// Check a plugin directory (default: .); exit status 1 on problems.
     Validate { dir: Option<PathBuf> },
-    /// Print the zsh code and config files goatty would generate.
+    /// Print the shell code and config files goatty would generate.
     Render {
         dir: Option<PathBuf>,
         /// A setting value: KEY=VALUE (repeatable).
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
+        /// Target shell (`zsh` or `powershell`).
+        #[arg(long, default_value = "zsh")]
+        shell: String,
     },
     /// Print the sha256 and size of downloads (URLs) or files, for [[package.asset]].
     Hash {
@@ -83,7 +86,7 @@ fn run(cli: Cli) -> Result<bool> {
     match cli.cmd {
         Cmd::New { id, dir } => new(&id, &dir.unwrap_or_else(|| PathBuf::from(&id))).map(|()| true),
         Cmd::Validate { dir } => validate(&dir_or_cwd(dir)),
-        Cmd::Render { dir, set } => render(&dir_or_cwd(dir), &set).map(|()| true),
+        Cmd::Render { dir, set, shell } => render(&dir_or_cwd(dir), &set, &shell).map(|()| true),
         Cmd::Hash { sources } => hash(&sources).map(|()| true),
         Cmd::CheckDownloads { dirs } => check_downloads(&if dirs.is_empty() { vec![PathBuf::from(".")] } else { dirs }),
         Cmd::Keygen { file } => {
@@ -201,7 +204,7 @@ fn validate(dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn render(dir: &Path, set: &[String]) -> Result<()> {
+fn render(dir: &Path, set: &[String], shell: &str) -> Result<()> {
     let m = manifest::load_dir(dir)?;
     let mut stored = BTreeMap::new();
     for kv in set {
@@ -213,22 +216,45 @@ fn render(dir: &Path, set: &[String]) -> Result<()> {
     for (k, msg) in issues {
         eprintln!("warning: {k}: {msg}");
     }
-    let home = std::env::var("HOME").ok();
-    let r = zsh::render(
-        &m,
-        &values,
-        &zsh::Ctx {
-            dir: format!("$_goatty_dir/plugins/{}", m.id),
-            home: home.as_deref(),
-            label: format!("{} {}", m.id, m.version),
-            feature: zsh::feature(&m.id),
-            packages: "$_goatty_pkgs".into(),
-        },
-    );
-    println!("### plugins-early.zsh (before compinit)\n{}", if r.early.is_empty() { "(nothing)\n" } else { &r.early });
-    println!("### {} (load = \"{}\")\n{}", r.load.file(), r.load.key(), r.main);
-    for (name, contents) in &r.files {
-        println!("### plugins/{}/{name}\n{contents}", m.id);
+    match shell {
+        "zsh" => {
+            let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok();
+            let r = zsh::render(
+                &m,
+                &values,
+                &zsh::Ctx {
+                    dir: format!("$_goatty_dir/plugins/{}", m.id),
+                    home: home.as_deref(),
+                    label: format!("{} {}", m.id, m.version),
+                    feature: zsh::feature(&m.id),
+                    packages: "$_goatty_pkgs".into(),
+                },
+            );
+            println!("### plugins-early.zsh (before compinit)\n{}", if r.early.is_empty() { "(nothing)\n" } else { &r.early });
+            println!("### {} (load = \"{}\")\n{}", r.load.file(), r.load.key(), r.main);
+            for (name, contents) in &r.files {
+                println!("### plugins/{}/{name}\n{contents}", m.id);
+            }
+        }
+        "powershell" | "pwsh" => {
+            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok();
+            let r = powershell::render(
+                &m,
+                &values,
+                &powershell::Ctx {
+                    dir: format!("(Join-Path $_goatty_dir {})", powershell::quote(&format!("plugins/{}", m.id))),
+                    home: home.as_deref(),
+                    label: format!("{} {}", m.id, m.version),
+                    feature: zsh::feature(&m.id),
+                },
+            );
+            println!("### plugins-early.ps1\n{}", if r.early.is_empty() { "(nothing)\n" } else { &r.early });
+            println!("### {} (load = \"{}\")\n{}", r.load.ps_file(), r.load.key(), r.main);
+            for (name, contents) in &r.files {
+                println!("### plugins/{}/{name}\n{contents}", m.id);
+            }
+        }
+        other => bail!("unknown shell {other:?}: use `zsh` or `powershell`"),
     }
     if !m.snippets.is_empty() {
         println!("### snippets (what the picker inserts, with each input's default or ‹label›)");
@@ -241,7 +267,11 @@ fn render(dir: &Path, set: &[String]) -> Result<()> {
     }
     if !m.expansions.is_empty() {
         let rules: Vec<snippets::Compiled> = m.expansions.iter().filter_map(|e| snippets::compile(e).ok()).collect();
-        println!("### expansions.zsh\n{}", snippets::render_table(&rules));
+        if matches!(shell, "powershell" | "pwsh") {
+            println!("### expansions.ps1\n{}", snippets::render_table_powershell(&rules));
+        } else {
+            println!("### expansions.zsh\n{}", snippets::render_table(&rules));
+        }
     }
     Ok(())
 }

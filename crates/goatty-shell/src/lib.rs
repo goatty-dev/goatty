@@ -49,12 +49,15 @@ pub mod launch;
 pub mod packages;
 pub mod path_report;
 pub mod plugins;
+pub mod powershell;
 pub mod service;
 pub mod setup;
 pub mod snippet_cmd;
 pub mod snippets;
 pub mod starship;
 pub mod sync;
+#[cfg(windows)]
+pub(crate) mod winlink;
 pub mod zsh;
 
 pub use dirs::Dirs;

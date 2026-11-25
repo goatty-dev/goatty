@@ -385,9 +385,11 @@ impl Plugins<'_> {
         let path = std::env::var("PATH").ok();
         let managed_bin = self.dirs.bin_dir();
         let on_path = |exe: &str| packages::which(exe, path.as_deref(), &managed_bin);
+        let managed_shell = builtins::host_managed_shell();
         let downloads = m
             .packages
             .iter()
+            .filter(|p| p.applies_to_shell(managed_shell))
             .map(|p| {
                 let names: Vec<String> = p.bin.iter().map(|b| manifest::bin_name(b).to_owned()).collect();
                 let system = match packages::locate(self.dirs, p, path.as_deref()) {
@@ -415,7 +417,8 @@ impl Plugins<'_> {
 
         let (aliases, env) = shell_additions(m, settings);
         let files = m.files.iter().map(|f| f.name.clone()).collect();
-        let shell_code = match &m.zsh.init {
+        let init_file = if cfg!(windows) { &m.powershell.init } else { &m.zsh.init };
+        let shell_code = match init_file {
             Some(init) => {
                 let bytes = c.read(init)?;
                 if c.files.get(init).is_none_or(|sha| goatty_plugin::bundle::sha256_hex(&bytes) != *sha) {
@@ -441,10 +444,17 @@ impl Plugins<'_> {
         }
         for a in &m.aliases {
             if on_path(&a.name).is_some() {
-                warnings.push(format!(
-                    "`{}` is an existing command; in goatty shells the alias replaces it (turn it off in the plugin's settings, or `unalias {}` in ~/.config/goatty/zshrc).",
-                    a.name, a.name
-                ));
+                if cfg!(windows) {
+                    warnings.push(format!(
+                        "`{}` is an existing command; in goatty shells the alias replaces it (turn it off in the plugin's settings, or remove the function in %APPDATA%\\goatty\\profile.ps1).",
+                        a.name
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "`{}` is an existing command; in goatty shells the alias replaces it (turn it off in the plugin's settings, or `unalias {}` in ~/.config/goatty/zshrc).",
+                        a.name, a.name
+                    ));
+                }
             }
         }
         let other_aliases: BTreeMap<String, String> = lock
@@ -502,7 +512,8 @@ impl Plugins<'_> {
     fn previous(&self, id: &str, lock: &Lock, settings: &HostSettings, on_path: &dyn Fn(&str) -> Option<PathBuf>) -> Option<Previous> {
         let e = lock.plugins.get(id)?;
         let m = lock::manifest_of(self.dirs, id, e).map_err(|err| log::info!("plan: can't read installed {id}: {err:#}")).ok()?;
-        let shell_code = match &m.zsh.init {
+        let init_file = if cfg!(windows) { &m.powershell.init } else { &m.zsh.init };
+        let shell_code = match init_file {
             Some(init) => {
                 let bytes = lock::read_checked(self.dirs, id, e, init).ok()?;
                 Some((init.clone(), String::from_utf8_lossy(&bytes).into_owned()))
@@ -590,8 +601,9 @@ impl Plugins<'_> {
         let staging = self.dirs.installed_dir().join(format!(".{}.partial-{}", m.id, std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         let mut spool = Spool(vec![staging.clone()]);
+        let managed_shell = builtins::host_managed_shell();
         let mut fetched: Vec<Option<PathBuf>> = Vec::new();
-        for (p, d) in m.packages.iter().zip(&plan.downloads) {
+        for (p, d) in m.packages.iter().filter(|p| p.applies_to_shell(managed_shell)).zip(&plan.downloads) {
             if !d.fetches() {
                 fetched.push(None);
                 continue;
@@ -621,8 +633,9 @@ impl Plugins<'_> {
         let previous = lock.plugins.get(&m.id).cloned();
         let mut packages = Vec::new();
         let mut fresh: Vec<(String, Vec<String>)> = Vec::new();
+        let managed_shell = builtins::host_managed_shell();
         let result = (|| -> Result<()> {
-            for ((p, d), bytes) in m.packages.iter().zip(&plan.downloads).zip(fetched) {
+            for ((p, d), bytes) in m.packages.iter().filter(|p| p.applies_to_shell(managed_shell)).zip(&plan.downloads).zip(fetched) {
                 if let Some(sys) = &d.system {
                     packages.push(lock::Package {
                         id: p.id.clone(),
@@ -914,7 +927,56 @@ impl Plugins<'_> {
             "whence", "where", "which", "zcompile", "zmodload", "zstyle",
         ];
 
+        /// PowerShell builtins/cmdlets/aliases that run in the shell without an external binary on PATH.
+        const PS_BUILTINS: &[&str] = &[
+            "cat",
+            "cd",
+            "clear",
+            "cls",
+            "copy",
+            "cp",
+            "del",
+            "dir",
+            "echo",
+            "exit",
+            "foreach-object",
+            "gci",
+            "get-childitem",
+            "get-command",
+            "get-content",
+            "get-help",
+            "get-location",
+            "get-process",
+            "kill",
+            "ls",
+            "measure-object",
+            "mkdir",
+            "move",
+            "mv",
+            "pop-location",
+            "popd",
+            "ps",
+            "push-location",
+            "pushd",
+            "pwd",
+            "remove-item",
+            "rm",
+            "select-object",
+            "select-string",
+            "set-location",
+            "sl",
+            "sort-object",
+            "stop-process",
+            "type",
+            "where-object",
+            "write-output",
+        ];
+
         let target = current_target();
+        let managed_shell = builtins::host_managed_shell();
+        let is_shell_builtin = |prog: &str| {
+            if cfg!(windows) { PS_BUILTINS.iter().any(|b| b.eq_ignore_ascii_case(prog)) } else { ZSH_BUILTINS.contains(&prog) }
+        };
         let managed_path = std::cell::OnceCell::new();
         let mut found: BTreeMap<String, bool> = BTreeMap::new();
         let mut unavailable_of = |m: &Manifest| -> Vec<String> {
@@ -930,7 +992,7 @@ impl Plugins<'_> {
                     !manifest::applies(&c.when, &values)
                         || (c.keys.is_empty()
                             && c.run.first().is_none_or(|prog| {
-                                if !c.open_in.launches_direct() && ZSH_BUILTINS.contains(&prog.as_str()) {
+                                if !c.open_in.launches_direct() && is_shell_builtin(prog.as_str()) {
                                     false
                                 } else {
                                     !*found.entry(prog.clone()).or_insert_with(|| {
@@ -947,6 +1009,7 @@ impl Plugins<'_> {
         let package_status = |m: &Manifest| -> Vec<PackageStatus> {
             m.packages
                 .iter()
+                .filter(|p| p.applies_to_shell(managed_shell))
                 .map(|p| PackageStatus {
                     id: p.id.clone(),
                     version: p.version.clone(),
@@ -1130,9 +1193,18 @@ impl Active {
         }
     }
 
-    /// The files the shell sources: the init file and the `fpath` directories' contents.
+    /// The files the shell sources on this host: the init file and (on zsh)
+    /// the `fpath` directories' contents.
     pub fn shell_files(&self) -> Vec<String> {
+        self.shell_files_for(builtins::host_managed_shell())
+    }
+
+    /// The files `shell` (`"zsh"` or `"powershell"`) sources from this plugin.
+    pub fn shell_files_for(&self, shell: &str) -> Vec<String> {
         let m = &self.manifest;
+        if shell == "powershell" {
+            return m.powershell.init.iter().cloned().collect();
+        }
         let mut v: Vec<String> = m.zsh.init.iter().cloned().collect();
         v.extend(self.file_names().into_iter().filter(|f| m.zsh.fpath.iter().any(|d| f.starts_with(&format!("{d}/")))));
         v
@@ -1211,18 +1283,24 @@ pub fn active(dirs: &Dirs, settings: &HostSettings) -> (Vec<Active>, Vec<String>
 }
 
 /// Sort plugins into the order they load: by [`Load`] slot, then within a
-/// slot each after the plugins its `zsh.after` names (when they're there),
+/// slot each after the plugins its `after` list names (when they're there),
 /// otherwise in the order given (built-in plugins first, then by id). A
 /// cycle is broken by taking the first remaining plugin.
 pub fn load_order(list: Vec<Active>) -> Vec<Active> {
+    fn slot_of(m: &Manifest) -> Load {
+        if cfg!(windows) { goatty_plugin::powershell::load_slot(m) } else { m.zsh.load }
+    }
+    fn after_of(m: &Manifest) -> &[String] {
+        if cfg!(windows) { goatty_plugin::powershell::after_list(m) } else { &m.zsh.after }
+    }
     let mut out = Vec::with_capacity(list.len());
     let mut rest = list;
     for slot in Load::ALL {
-        let (mut left, others): (Vec<Active>, Vec<Active>) = rest.into_iter().partition(|a| a.manifest.zsh.load == slot);
+        let (mut left, others): (Vec<Active>, Vec<Active>) = rest.into_iter().partition(|a| slot_of(&a.manifest) == slot);
         rest = others;
         while !left.is_empty() {
             let ready =
-                left.iter().position(|a| !a.manifest.zsh.after.iter().any(|dep| left.iter().any(|o| o.manifest.id == *dep))).unwrap_or(0);
+                left.iter().position(|a| !after_of(&a.manifest).iter().any(|dep| left.iter().any(|o| o.manifest.id == *dep))).unwrap_or(0);
             out.push(left.remove(ready));
         }
     }

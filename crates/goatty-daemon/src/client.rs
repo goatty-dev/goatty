@@ -398,9 +398,10 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
                 ClientMsg::SetHostSettings { req, json, apply } => reply(crate::settings::set(&daemon, req, &json, apply)),
                 ClientMsg::ListGenerations { req } => reply(crate::settings::generations(&daemon, req)),
                 ClientMsg::Rollback { req, generation } => reply(crate::settings::rollback(&daemon, req, generation)),
-                ClientMsg::ReloadShells { req } => {
-                    reply(ServerMsg::ShellsReloaded { req, count: u32::try_from(daemon.host.reload_shells()).unwrap_or(u32::MAX) })
-                }
+                ClientMsg::ReloadShells { req } => match daemon.host.reload_shells() {
+                    Ok(count) => reply(ServerMsg::ShellsReloaded { req, count: u32::try_from(count).unwrap_or(u32::MAX) }),
+                    Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
+                },
                 ClientMsg::Plugin { req, request } => {
                     // Installs download and build a generation: don't hold
                     // up this connection's input (keystrokes) meanwhile.

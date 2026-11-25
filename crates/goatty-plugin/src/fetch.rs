@@ -98,12 +98,23 @@ pub fn download_with(url: &str, cache: &Path, progress: &mut dyn FnMut(u64) -> b
 
 fn fetch_to(url: &str, out: &Path, progress: &mut dyn FnMut(u64) -> bool) -> Result<()> {
     let max = MAX_DOWNLOAD.to_string();
-    let attempts: [(&str, Vec<&str>); 2] = [
-        ("curl", vec!["--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-fsSL", "--retry", "2", "--max-filesize", &max, "-o"]),
-        ("wget", vec!["-q", "--https-only", "-O"]),
-    ];
+    let curl_args =
+        vec!["--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-fsSL", "--retry", "2", "--max-filesize", &max, "-o"];
+    let wget_args = vec!["-q", "--https-only", "-O"];
+    #[cfg(windows)]
+    let attempts: [(&str, &[&str]); 3] = [("curl.exe", &curl_args), ("curl", &curl_args), ("wget", &wget_args)];
+    #[cfg(not(windows))]
+    let attempts: [(&str, &[&str]); 2] = [("curl", &curl_args), ("wget", &wget_args)];
     for (prog, args) in attempts {
-        let child = Command::new(prog).args(args).arg(out).arg(url).stdin(Stdio::null()).spawn();
+        let mut cmd = Command::new(prog);
+        cmd.args(args).arg(out).arg(url).stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let child = cmd.spawn();
         let mut child = match child {
             Ok(c) => c,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
@@ -139,5 +150,28 @@ pub struct Fixed(pub std::collections::BTreeMap<String, Vec<u8>>);
 impl Fetch for Fixed {
     fn fetch(&self, url: &str) -> Result<Vec<u8>> {
         self.0.get(url).cloned().with_context(|| format!("no such URL in the test fixture: {url}"))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// Verify Windows's built-in Schannel `curl.exe` accepts our security flags.
+    #[test]
+    fn windows_curl_supports_required_flags() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = Command::new("curl.exe")
+            .args(["--help", "all"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .output()
+            .expect("Windows includes curl.exe");
+        assert!(out.status.success(), "curl.exe --help all failed");
+        let help = String::from_utf8_lossy(&out.stdout);
+        for flag in ["--proto", "--proto-redir", "--tlsv1.2", "--max-filesize"] {
+            assert!(help.contains(flag), "curl.exe help missing {flag}");
+        }
     }
 }

@@ -80,10 +80,7 @@ pub fn user_expansions(settings: &HostSettings) -> (Vec<(String, Expansion, bool
     (out, issues)
 }
 
-/// `expansions.zsh` for `settings` and the active plugins: the user's
-/// enabled expansions first (they win), then the plugins' in load order.
-/// Empty when `shell.expansions` is off. Returns the problems too.
-pub fn render_expansions(settings: &HostSettings, active: &[Active]) -> (String, Vec<String>) {
+fn collect_expansions(settings: &HostSettings, active: &[Active]) -> (Vec<Compiled>, Vec<String>) {
     let mut rules: Vec<Compiled> = Vec::new();
     let mut issues = Vec::new();
     if settings.shell.expansions {
@@ -97,15 +94,95 @@ pub fn render_expansions(settings: &HostSettings, active: &[Active]) -> (String,
         let mut seen = BTreeSet::new();
         rules.retain(|r| seen.insert(r.say.clone()));
     }
+    (rules, issues)
+}
+
+/// `expansions.zsh` for `settings` and the active plugins: the user's
+/// enabled expansions first (they win), then the plugins' in load order.
+/// Empty when `shell.expansions` is off. Returns the problems too.
+pub fn render_expansions(settings: &HostSettings, active: &[Active]) -> (String, Vec<String>) {
+    let (rules, issues) = collect_expansions(settings, active);
     (snippets::render_table(&rules), issues)
 }
 
-/// zsh builtins and keywords a snippet line may use: never "missing".
+/// `expansions.ps1` for `settings` and the active plugins (#278).
+pub fn render_expansions_powershell(settings: &HostSettings, active: &[Active]) -> (String, Vec<String>) {
+    let (rules, issues) = collect_expansions(settings, active);
+    (snippets::render_table_powershell(&rules), issues)
+}
+
+/// Shell builtins and keywords a snippet line may use: never "missing".
 const BUILTINS: &[&str] = &[
-    "cd", "echo", "printf", "print", "export", "source", "alias", "unalias", "eval", "exec", "exit", "history", "jobs", "fg", "bg", "kill",
-    "pwd", "read", "set", "unset", "test", "type", "wait", "which", "where", "whence", "pushd", "popd", "dirs", "time", "ulimit", "umask",
-    "true", "false", "for", "while", "if", "then", "do", "done", "fi", "case", "esac", "noglob", "sudo", "builtin", "command", "local",
-    "typeset", "fc", "r", "z",
+    "cd",
+    "echo",
+    "printf",
+    "print",
+    "export",
+    "source",
+    "alias",
+    "unalias",
+    "eval",
+    "exec",
+    "exit",
+    "history",
+    "jobs",
+    "fg",
+    "bg",
+    "kill",
+    "pwd",
+    "read",
+    "set",
+    "unset",
+    "test",
+    "type",
+    "wait",
+    "which",
+    "where",
+    "whence",
+    "pushd",
+    "popd",
+    "dirs",
+    "time",
+    "ulimit",
+    "umask",
+    "true",
+    "false",
+    "for",
+    "while",
+    "if",
+    "then",
+    "do",
+    "done",
+    "fi",
+    "case",
+    "esac",
+    "noglob",
+    "sudo",
+    "builtin",
+    "command",
+    "local",
+    "typeset",
+    "fc",
+    "r",
+    "z",
+    // Common PowerShell cmdlets & built-in aliases.
+    "ls",
+    "dir",
+    "cat",
+    "ps",
+    "cls",
+    "clear",
+    "select",
+    "sort",
+    "where-object",
+    "foreach-object",
+    "get-childitem",
+    "get-content",
+    "get-process",
+    "stop-process",
+    "set-location",
+    "select-string",
+    "write-output",
 ];
 
 /// The PATH a new managed shell gets, closely enough to tell which programs
@@ -127,13 +204,14 @@ pub(crate) fn managed_path_with(dirs: &Dirs, settings: &HostSettings, env_path: 
     folders.extend(
         std::env::split_paths(env_path.unwrap_or_default()).filter(|d| !d.as_os_str().is_empty()).map(|d| d.to_string_lossy().into_owned()),
     );
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = Dirs::home_dir();
     folders.extend(settings.shell.path.iter().map(|p| crate::path_report::expand(p, home.as_deref())));
     folders.push(dirs.bin_dir().to_string_lossy().into_owned());
     let mut seen = BTreeSet::new();
     folders.retain(|f| seen.insert(f.clone()));
-    let sep = if cfg!(windows) { ";" } else { ":" };
-    folders.join(sep)
+    std::env::join_paths(&folders)
+        .map(|os| os.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| folders.join(if cfg!(windows) { ";" } else { ":" }))
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -313,7 +391,7 @@ pub fn suggest_command(
 /// an input's type) made the home directory: a source runs without a
 /// shell, which would have expanded it. The stored answers keep their `~`.
 fn expand_paths(values: &snippets::Answers, kind_of: impl Fn(&str) -> Option<InputKind>) -> snippets::Answers {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = Dirs::home_dir();
     values
         .iter()
         .map(|(id, v)| {
@@ -331,7 +409,7 @@ fn expand_paths(values: &snippets::Answers, kind_of: impl Fn(&str) -> Option<Inp
 /// Run a source's `cmd` in `cwd` (the pane's directory; the home directory
 /// when it's missing, gone, or the source says so) and read its output.
 fn run_source(dirs: &Dirs, settings: &HostSettings, src: &snippets::Source, cmd: &Command, cwd: Option<&str>) -> Result<Suggestions> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let home = Dirs::home_dir().unwrap_or_else(|| PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" }));
     let dir = match (src.cwd, cwd) {
         (snippets::SourceCwd::Pane, Some(c)) if Path::new(c).is_dir() => PathBuf::from(c),
         _ => home,

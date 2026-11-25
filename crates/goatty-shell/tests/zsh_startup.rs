@@ -631,7 +631,7 @@ fn reloads_on_request() {
     // Idle at an empty prompt: reloads right away (same pid: exec).
     sh.run("x=1");
     let n = sh.prompts();
-    assert_eq!(svc.reload_shells(), 1);
+    assert_eq!(svc.reload_shells().unwrap(), 1);
     sh.wait_for_prompts(n + 1);
     sh.wait_for_idle();
     sh.run("print -r -- X=${x:-unset} P=$$");
@@ -643,7 +643,7 @@ fn reloads_on_request() {
     let offset = sh.out.len();
     sh.input.write(b"while [[ ! -e $HOME/busy-done ]]; do /bin/sleep 0.02; done\r").unwrap();
     sh.wait_for_from(offset, b"\x1b]133;C");
-    assert_eq!(svc.reload_shells(), 1);
+    assert_eq!(svc.reload_shells().unwrap(), 1);
     assert_eq!(sh.prompts(), n, "no reload while a command is running");
     sb.file("busy-done", "");
     sh.wait_for_prompts(n + 1);
@@ -659,7 +659,7 @@ fn reloads_on_request() {
     let offset = sh.out.len();
     sh.input.write(b"print -r -- typed").unwrap();
     sh.wait_for_from(offset, b"typed");
-    assert_eq!(svc.reload_shells(), 1);
+    assert_eq!(svc.reload_shells().unwrap(), 1);
     let deadline = Instant::now() + Duration::from_secs(3);
     while sh.prompts() == n && Instant::now() < deadline {
         match sh.rx.recv_timeout(Duration::from_millis(50)) {
@@ -678,7 +678,7 @@ fn reloads_on_request() {
     // Background jobs: only a reminder, the shell keeps its state.
     sh.run("w=1; /bin/sleep 30 &");
     let n = sh.prompts();
-    assert_eq!(svc.reload_shells(), 1);
+    assert_eq!(svc.reload_shells().unwrap(), 1);
     sh.wait_for_prompts(n + 1);
     sh.wait_for_idle();
     sh.run("print -r -- W=${w:-unset}; kill %1");
@@ -690,7 +690,7 @@ fn reloads_on_request() {
     while sh.rx.recv_timeout(Duration::from_secs(2)).is_ok() {}
     let _ = sh.pty.try_wait();
     svc.untrack_shell(pid);
-    assert_eq!(svc.reload_shells(), 0);
+    assert_eq!(svc.reload_shells().unwrap(), 0);
 }
 
 /// Installed plugins load in a real managed shell: aliases with setting
@@ -1048,7 +1048,7 @@ fn reloads_when_signaled_while_the_prompt_draws() {
     // The next prompt is now being drawn (its $(sleep) runs for 0.6 s).
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(sh.prompts(), n, "the prompt is still being drawn");
-    assert_eq!(svc.reload_shells(), 1);
+    assert_eq!(svc.reload_shells().unwrap(), 1);
     // That prompt, then the reloaded shell's.
     sh.wait_for_prompts(n + 2);
     sh.wait_for_idle();

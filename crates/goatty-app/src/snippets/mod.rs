@@ -160,7 +160,12 @@ pub fn ask_for(hs: &HostSnippet, link: &HostLink, cwd: Option<PathBuf>, back: Op
     let then_snippet = snippet.clone();
     let origin = link.clone();
     let mut ask = Ask::new(snippet.title.clone(), fields, move |answers, window, cx| {
-        insert(&then_snippet.render(answers), &origin, window, cx);
+        let is_ps = window.root::<crate::workspace::Workspace>().flatten().and_then(|ws| ws.read(cx).focused_terminal()).is_some_and(|v| {
+            let proc = v.read(cx).process();
+            proc.is_some_and(goatty_shell::launch::is_powershell) || (cfg!(windows) && origin.is_local() && proc.is_none())
+        });
+        let rendered = if is_ps { then_snippet.render_powershell(answers) } else { then_snippet.render(answers) };
+        insert(&rendered, &origin, window, cx);
     })
     .remote(!link.is_local());
     let preview_snippet = snippet.clone();

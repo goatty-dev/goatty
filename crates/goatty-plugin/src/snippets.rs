@@ -454,6 +454,133 @@ pub fn parse_line(line: &str, is_input: impl Fn(&str) -> bool) -> Result<Vec<Pie
     Ok(out)
 }
 
+/// Split `line` into text and placeholders using PowerShell quoting rules
+/// (ASCII and Unicode curly single/double quotes, backtick escapes, and
+/// literal backslashes). Rejects placeholders inside PowerShell quotes.
+pub fn parse_line_powershell(line: &str, is_input: impl Fn(&str) -> bool) -> Result<Vec<Piece>, String> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Q {
+        None,
+        Single,
+        Double,
+    }
+    if line.contains(['\n', '\r']) {
+        return Err("a snippet is one line".into());
+    }
+    if line.chars().any(|c| c.is_control() && c != '\t') {
+        return Err("control characters aren't allowed".into());
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut out: Vec<Piece> = Vec::new();
+    let mut text = String::new();
+    let mut q = Q::None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if (c == '{' && next == Some('{')) || (c == '}' && next == Some('}')) {
+            text.push(c);
+            i += 2;
+            continue;
+        }
+        if c == '{' && chars.get(i.wrapping_sub(1)) != Some(&'$') {
+            let close = chars[i + 1..].iter().position(|&c| c == '}').map(|p| p + i + 1);
+            if let Some(end) = close {
+                let name: String = chars[i + 1..end].iter().collect();
+                if is_input_id(&name) {
+                    let known = is_input(&name);
+                    if q != Q::None {
+                        if known {
+                            return Err(format!("{{{name}}} is inside quotes: put it outside them, goatty quotes the value"));
+                        }
+                    } else {
+                        if !known {
+                            return Err(format!("{{{name}}}: no input {name:?} (write {{{{{name}}}}} for literal braces)"));
+                        }
+                        let start = match text.chars().last() {
+                            Some(c) => breaks_word(c),
+                            None => out.is_empty(),
+                        };
+                        let end_ok = chars.get(end + 1).is_none_or(|&c| breaks_word(c));
+                        if !text.is_empty() {
+                            out.push(Piece::Text(std::mem::take(&mut text)));
+                        }
+                        out.push(Piece::Var { name, start, end: end_ok });
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        match q {
+            Q::None => {
+                if c == '`' {
+                    let Some(n) = next else { return Err("ends with a lone `".into()) };
+                    text.push(c);
+                    text.push(n);
+                    i += 2;
+                    continue;
+                } else if crate::powershell::is_ps_single_quote(c) {
+                    q = Q::Single;
+                } else if crate::powershell::is_ps_double_quote(c) {
+                    q = Q::Double;
+                }
+            }
+            Q::Single => {
+                if crate::powershell::is_ps_single_quote(c) {
+                    if next.is_some_and(crate::powershell::is_ps_single_quote) {
+                        text.push(c);
+                        text.push(next.unwrap());
+                        i += 2;
+                        continue;
+                    }
+                    q = Q::None;
+                }
+            }
+            Q::Double => {
+                if c == '`' {
+                    let Some(n) = next else { return Err("ends with a lone `".into()) };
+                    text.push(c);
+                    text.push(n);
+                    i += 2;
+                    continue;
+                } else if crate::powershell::is_ps_double_quote(c) {
+                    if next.is_some_and(crate::powershell::is_ps_double_quote) {
+                        text.push(c);
+                        text.push(next.unwrap());
+                        i += 2;
+                        continue;
+                    }
+                    q = Q::None;
+                }
+            }
+        }
+        text.push(c);
+        i += 1;
+    }
+    if q != Q::None {
+        return Err("a quote isn't closed".into());
+    }
+    if !text.is_empty() {
+        out.push(Piece::Text(text));
+    }
+    for k in 1..out.len() {
+        if matches!(out[k - 1], Piece::Var { .. })
+            && let Piece::Var { start, .. } = &mut out[k]
+        {
+            *start = false;
+        }
+    }
+    for k in 0..out.len().saturating_sub(1) {
+        if matches!(out[k + 1], Piece::Var { .. })
+            && let Piece::Var { end, .. } = &mut out[k]
+        {
+            *end = false;
+        }
+    }
+    Ok(out)
+}
+
 /// How a part of a [`Snippet::preview`] looks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Seg {
@@ -484,21 +611,111 @@ impl Snippet {
         parse_line(&self.line, |n| self.input(n).is_some())
     }
 
+    /// The line split into text and placeholders using PowerShell quoting rules.
+    pub fn pieces_powershell(&self) -> Result<Vec<Piece>, String> {
+        parse_line_powershell(&self.line, |n| self.input(n).is_some())
+    }
+
     /// The line as typed into the terminal for `values`: each value one
     /// quoted word (several for a `multiple` input), `~/` kept expandable,
     /// empty optional values left out with their space.
     pub fn render(&self, values: &Answers) -> String {
-        let segs = self.segments(values, None, true);
+        let segs = self.segments(values, None, true, false);
         tidy(&segs.iter().map(Seg::text).collect::<String>())
+    }
+
+    /// Like [`render`](Self::render), quoting placeholder values for
+    /// PowerShell (single-quote escaping `''`, `$HOME` for `~/` paths, and
+    /// whole-argument assembly for embedded placeholders) (#278).
+    pub fn render_powershell(&self, values: &Answers) -> String {
+        let Ok(pieces) = self.pieces_powershell() else { return tidy(&self.line) };
+        let mut out = String::new();
+        let mut i = 0usize;
+        let mut pending_text: Option<String> = None;
+
+        while pending_text.is_some() || i < pieces.len() {
+            if let Some(t) = pending_text.take() {
+                if matches!(pieces.get(i), Some(Piece::Var { start: false, .. })) {
+                    let split = t.rfind(breaks_word).map(|idx| idx + t[idx..].chars().next().map_or(0, char::len_utf8)).unwrap_or(0);
+                    out.push_str(&t[..split]);
+                    let mut word = EmbeddedPsWord::default();
+                    word.push_literal(&t[split..]);
+                    i = self.collect_embedded_ps_word(&pieces, i, values, &mut word, &mut pending_text);
+                    out.push_str(&word.finish());
+                } else {
+                    out.push_str(&t);
+                }
+                continue;
+            }
+            match &pieces[i] {
+                Piece::Text(t) => {
+                    i += 1;
+                    pending_text = Some(t.clone());
+                }
+                Piece::Var { name, start: true, end: true } => {
+                    i += 1;
+                    let Some(input) = self.input(name) else { continue };
+                    let text = values.get(name).map(|v| render_value(input, v, true, true)).unwrap_or_default();
+                    if text.is_empty() {
+                        if out.ends_with(' ') {
+                            out.pop();
+                        }
+                    } else {
+                        out.push_str(&text);
+                    }
+                }
+                Piece::Var { .. } => {
+                    let mut word = EmbeddedPsWord::default();
+                    i = self.collect_embedded_ps_word(&pieces, i, values, &mut word, &mut pending_text);
+                    out.push_str(&word.finish());
+                }
+            }
+        }
+        tidy(&out)
+    }
+
+    fn collect_embedded_ps_word(
+        &self,
+        pieces: &[Piece],
+        mut i: usize,
+        values: &Answers,
+        word: &mut EmbeddedPsWord,
+        pending_text: &mut Option<String>,
+    ) -> usize {
+        while i < pieces.len() {
+            match &pieces[i] {
+                Piece::Var { name, end, .. } => {
+                    i += 1;
+                    if let Some(input) = self.input(name)
+                        && let Some(val) = values.get(name)
+                    {
+                        word.push_var(input, val);
+                    }
+                    if *end {
+                        break;
+                    }
+                }
+                Piece::Text(t) => {
+                    i += 1;
+                    let split = t.find(breaks_word).unwrap_or(t.len());
+                    word.push_literal(&t[..split]);
+                    if split < t.len() {
+                        *pending_text = Some(t[split..].to_owned());
+                        break;
+                    }
+                }
+            }
+        }
+        i
     }
 
     /// The line for showing while values are asked: filled values, blanks
     /// as `‹label›` (`current` marks the one being asked).
     pub fn preview(&self, values: &Answers, current: Option<&str>) -> Vec<Seg> {
-        self.segments(values, current, false)
+        self.segments(values, current, false, false)
     }
 
-    fn segments(&self, values: &Answers, current: Option<&str>, done: bool) -> Vec<Seg> {
+    fn segments(&self, values: &Answers, current: Option<&str>, done: bool, powershell: bool) -> Vec<Seg> {
         let Ok(pieces) = self.pieces() else { return vec![Seg::Text(self.line.clone())] };
         let mut out: Vec<Seg> = Vec::new();
         for p in pieces {
@@ -507,7 +724,7 @@ impl Snippet {
                 Piece::Var { name, start, end } => {
                     let Some(input) = self.input(&name) else { continue };
                     let value = values.get(&name);
-                    let text = value.map(|v| render_value(input, v, start)).unwrap_or_default();
+                    let text = value.map(|v| render_value(input, v, start, powershell)).unwrap_or_default();
                     if text.is_empty() {
                         let answered = value.is_some() && (done || input.optional || input.kind == InputKind::Flag);
                         if answered || done {
@@ -566,7 +783,7 @@ impl Snippet {
 }
 
 /// One value as it goes into the line.
-fn render_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
+fn render_value(input: &SnippetInput, value: &str, word_start: bool, powershell: bool) -> String {
     match input.kind {
         InputKind::Flag => {
             if value == "yes" {
@@ -575,17 +792,32 @@ fn render_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
                 String::new()
             }
         }
-        _ if input.multiple => value.split('\n').filter(|v| !v.is_empty()).map(|v| one_value(input, v, true)).collect::<Vec<_>>().join(" "),
+        _ if input.multiple => {
+            value.split('\n').filter(|v| !v.is_empty()).map(|v| one_value(input, v, true, powershell)).collect::<Vec<_>>().join(" ")
+        }
         _ if value.is_empty() => String::new(),
-        _ => one_value(input, value, word_start),
+        _ => one_value(input, value, word_start, powershell),
     }
 }
 
-fn one_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
+fn one_value(input: &SnippetInput, value: &str, word_start: bool, powershell: bool) -> String {
     if input.raw() {
         return value.to_string();
     }
     let path = matches!(input.kind, InputKind::Path | InputKind::Folder);
+    if powershell {
+        if let Some(rest) = value.strip_prefix('~').filter(|r| path && (r.is_empty() || r.starts_with('/') || r.starts_with('\\'))) {
+            let rest = rest.trim_start_matches(['/', '\\']);
+            return if rest.is_empty() {
+                "$HOME".to_string()
+            } else if word_start {
+                format!("(Join-Path $HOME {})", crate::powershell::quote(rest))
+            } else {
+                format!("($HOME + {})", crate::powershell::quote(&format!("/{rest}")))
+            };
+        }
+        return crate::powershell::word(value);
+    }
     if let Some(rest) = value.strip_prefix('~').filter(|r| path && (r.is_empty() || r.starts_with('/'))) {
         let rest = rest.trim_start_matches('/');
         // A tilde only expands at the start of a word.
@@ -593,6 +825,60 @@ fn one_value(input: &SnippetInput, value: &str, word_start: bool) -> String {
         return if rest.is_empty() { home.to_string() } else { format!("{home}/{}", word(rest)) };
     }
     word(value)
+}
+
+/// Accumulator for a single PowerShell argument that mixes literal text and
+/// one or more embedded placeholders (e.g. `--out={dir}/file.txt`), producing
+/// one complete argument expression so PowerShell never splits at `(`.
+#[derive(Default)]
+struct EmbeddedPsWord {
+    exprs: Vec<String>,
+    text: String,
+    has_home: bool,
+}
+
+impl EmbeddedPsWord {
+    fn push_literal(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+
+    fn push_var(&mut self, input: &SnippetInput, value: &str) {
+        if input.kind == InputKind::Flag {
+            if value == "yes"
+                && let Some(on) = &input.on
+            {
+                self.text.push_str(on);
+            }
+            return;
+        }
+        if value.is_empty() {
+            return;
+        }
+        let is_path = matches!(input.kind, InputKind::Path | InputKind::Folder);
+        if !input.raw()
+            && let Some(rest) = value.strip_prefix('~').filter(|r| is_path && (r.is_empty() || r.starts_with('/') || r.starts_with('\\')))
+        {
+            self.has_home = true;
+            if !self.text.is_empty() {
+                self.exprs.push(crate::powershell::quote(&std::mem::take(&mut self.text)));
+            }
+            self.exprs.push("$HOME".into());
+            self.text.push_str(rest);
+        } else {
+            self.text.push_str(value);
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.has_home {
+            if !self.text.is_empty() {
+                self.exprs.push(crate::powershell::quote(&self.text));
+            }
+            if self.exprs.len() == 1 { self.exprs.pop().unwrap_or_default() } else { format!("({})", self.exprs.join(" + ")) }
+        } else {
+            crate::powershell::word(&self.text)
+        }
+    }
 }
 
 /// Collapse the doubled spaces a left-out value leaves at the ends.
@@ -1064,6 +1350,11 @@ pub fn check_snippet(s: &Snippet, at: &str, owner: Owner<'_>) -> Vec<Problem> {
     match s.pieces() {
         Err(e) => err(format!("{at}.line"), e),
         Ok(pieces) => {
+            if cfg!(windows)
+                && let Err(e) = s.pieces_powershell()
+            {
+                err(format!("{at}.line"), e);
+            }
             let used: BTreeSet<&str> = pieces
                 .iter()
                 .filter_map(|p| match p {
@@ -1373,16 +1664,57 @@ pub fn render_table(rules: &[Compiled]) -> String {
     out
 }
 
+/// Convert a [`Compiled::re`] POSIX ERE into an equivalent .NET regex for PowerShell.
+fn dotnet_regex(re: &str) -> String {
+    re.replace("[^[:space:]]", r"\S").replace("[[:space:]]", r"\s")
+}
+
+/// `expansions.ps1`: the table goatty's PowerShell expansion handlers
+/// (`goatty-shell/pwsh/expand.ps1`) read, in priority order. Data only:
+/// every string is quoted with [`crate::powershell::quote`].
+pub fn render_table_powershell(rules: &[Compiled]) -> String {
+    let mut out = String::from(
+        "# goatty expansions: generated from the plugins' [[expansion]] and host.json's expansions.\n# Change them in goatty's settings window (Snippets).\n",
+    );
+    let list = |f: &dyn Fn(&Compiled) -> String| rules.iter().map(f).collect::<Vec<_>>().join(", ");
+    out.push_str(&format!("$global:_goatty_exp_re = @({})\n", list(&|r| crate::powershell::quote(&dotnet_regex(&r.re)))));
+    out.push_str(&format!("$global:_goatty_exp_to = @({})\n", list(&|r| crate::powershell::quote(&r.to))));
+    out.push_str(&format!("$global:_goatty_exp_say = @({})\n", list(&|r| crate::powershell::quote(&r.say))));
+    // 0-based indices for PowerShell arrays. Use Ordinal (case-sensitive)
+    // Hashtables so rules differing only by case (e.g. `done` vs `DONE`)
+    // never collide as duplicate literal hashtable keys.
+    for (name, trailing) in [("_goatty_exp_last", false), ("_goatty_exp_last2", true)] {
+        let mut by: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (i, r) in rules.iter().enumerate().filter(|(_, r)| r.trailing == trailing) {
+            by.entry(r.last.as_str()).or_default().push(i.to_string());
+        }
+        out.push_str(&format!("$global:{name} = New-Object System.Collections.Hashtable([System.StringComparer]::Ordinal)\n"));
+        for (k, v) in by {
+            out.push_str(&format!("$global:{name}[{}] = @({})\n", crate::powershell::quote(k), v.join(", ")));
+        }
+    }
+    out
+}
+
 /// Problems with a plugin's `[[snippet]]`s and `[[expansion]]`s.
 pub(crate) fn check(m: &crate::manifest::Manifest, programs: &BTreeSet<&str>) -> Vec<Problem> {
     let mut out = Vec::new();
     let mut ids = BTreeSet::new();
+    let checks_ps = m.shells().contains(&"powershell");
     for (i, s) in m.snippets.iter().enumerate() {
         let at = format!("snippet[{i}]");
         if !ids.insert(s.id.as_str()) {
             out.push(Problem { path: format!("{at}.id"), message: format!("{:?} is used twice", s.id) });
         }
-        out.extend(check_snippet(s, &at, Owner::Plugin(programs)));
+        let problems = check_snippet(s, &at, Owner::Plugin(programs));
+        let has_line_err = problems.iter().any(|p| p.path == format!("{at}.line"));
+        out.extend(problems);
+        if checks_ps
+            && !has_line_err
+            && let Err(e) = s.pieces_powershell()
+        {
+            out.push(Problem { path: format!("{at}.line"), message: e });
+        }
     }
     let mut says = BTreeSet::new();
     for (i, e) in m.expansions.iter().enumerate() {
