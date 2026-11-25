@@ -357,6 +357,12 @@ pub struct TerminalView {
     /// Text the input method (IME, dead keys, compose) is composing; it
     /// goes to the program only once committed (#21).
     preedit: String,
+    /// On Windows, the previous keydown propagated to `TranslateMessage` for
+    /// dead-key / AltGr character input (`ev.prefer_character_input`) and has
+    /// not yet emitted a `WM_CHAR` commit. Letting the next printable key
+    /// propagate too lets Windows finish dead-key composition and clear its
+    /// kernel dead-key state.
+    dead_key_pending: bool,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -493,6 +499,7 @@ impl TerminalView {
             right_to_program: false,
             buttons_to_program: 0,
             preedit: String::new(),
+            dead_key_pending: false,
         };
         view.apply_settings(&app);
         view
@@ -2064,9 +2071,30 @@ impl TerminalView {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.poke_cursor();
         cx.notify();
+        let mode = self.session.terminal.mode();
+        let raw_mode = mode.kitty_flags() != 0 || mode.contains(TermMode::WIN32_INPUT_MODE);
+        if cfg!(target_os = "windows") {
+            let m = ev.keystroke.modifiers;
+            if std::mem::take(&mut self.dead_key_pending) && !m.control && !m.alt && !m.platform && ev.keystroke.key_char.is_some() {
+                // Let Windows `TranslateMessage` finish the pending dead-key
+                // sequence and emit `WM_CHAR` into `EntityInputHandler`.
+                return;
+            }
+            // Windows sets `prefer_character_input` for dead keys (`ToUnicode`
+            // < 0) and AltGr characters. Propagating lets `TranslateMessage`
+            // compose dead keys (including AltGr dead keys) and emit `WM_CHAR`
+            // cleanly; if `WM_CHAR` fires immediately, `commit` clears
+            // `dead_key_pending`. In kitty/win32 modes, only pure dead keys
+            // (no Ctrl/Alt) need `TranslateMessage`; AltGr goes through
+            // `terminal_key` so protocol encoding still applies.
+            let is_windows_dead_key = !m.control && !m.alt && !m.platform;
+            if ev.prefer_character_input && ev.keystroke.key_char.is_some() && (!raw_mode || is_windows_dead_key) {
+                self.dead_key_pending = true;
+                return;
+            }
+        }
         let kind = if ev.is_held { KeyKind::Repeat } else { KeyKind::Press };
         let Some(key) = terminal_key(&ev.keystroke, kind) else { return };
-        let mode = self.session.terminal.mode();
         if let Some(bytes) = encode_key_event_with(&key, mode, self.key_options) {
             cx.stop_propagation();
             // A dead key's composition ends with the composed key itself,
@@ -2079,7 +2107,8 @@ impl TerminalView {
             self.session.terminal.selection_clear();
             self.send(&bytes, cx);
             window.invalidate_character_coordinates();
-            if mode.contains(TermMode::KITTY_EVENT_TYPES) && !self.keys_down.contains(&ev.keystroke.key) {
+            let wants_release = mode.contains(TermMode::KITTY_EVENT_TYPES) || mode.contains(TermMode::WIN32_INPUT_MODE);
+            if wants_release && !self.keys_down.contains(&ev.keystroke.key) {
                 // Bounded: a release can come under another name (Shift let
                 // go first turns `!` into `1`) and never match.
                 if self.keys_down.len() >= 16 {
@@ -2520,6 +2549,7 @@ impl TerminalView {
 
     /// The input method's text, sent as typed (no key encoding).
     fn commit(&mut self, text: &str, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.dead_key_pending = false;
         self.end_composition(cx);
         self.poke_cursor();
         if text.is_empty() || self.exited {

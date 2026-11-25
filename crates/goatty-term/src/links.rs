@@ -402,6 +402,13 @@ fn looks_like_path(p: &str) -> bool {
     if p.starts_with('/') || p.starts_with("~/") || p.starts_with("./") || p.starts_with("../") {
         return true;
     }
+    if (p.starts_with("~\\") || p.starts_with(".\\") || p.starts_with("..\\"))
+        && !p.contains("\\\\")
+        && !p.contains(" \\")
+        && !p.contains("\\ ")
+    {
+        return true;
+    }
     if p.contains('/') {
         // `src/main.rs`, `docs/`; not `1/2`, `and/or`, or `"hello / world"` prose.
         if p.contains(" /") || p.contains("/ ") {
@@ -629,6 +636,10 @@ mod tests {
         assert_eq!(found(r"C:\proj\Program.cs(12,5): error"), [(Path, r"C:\proj\Program.cs".into(), Some(12), Some(5))]);
         assert_eq!(found(r#""C:\My Documents\x.txt":9"#), [(Path, r"C:\My Documents\x.txt".into(), Some(9), None)]);
         assert_eq!(found(r"C:\123"), [(Path, r"C:\123".into(), None, None)]);
+        assert_eq!(found(r".\src\main.rs:12:5"), [(Path, r".\src\main.rs".into(), Some(12), Some(5))]);
+        assert_eq!(found(r".\Makefile ..\docs"), [(Path, r".\Makefile".into(), None, None), (Path, r"..\docs".into(), None, None)]);
+        assert_eq!(found(r"~\notes.md"), [(Path, r"~\notes.md".into(), None, None)]);
+        assert_eq!(found(r"src\main.rs:4:2"), [(Path, r"src\main.rs".into(), Some(4), Some(2))]);
     }
 
     #[test]

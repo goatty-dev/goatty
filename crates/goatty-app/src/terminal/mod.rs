@@ -4,7 +4,7 @@
 pub(crate) mod box_drawing;
 pub(crate) mod element;
 mod glyphs;
-mod keys;
+pub(crate) mod keys;
 mod links;
 mod stats;
 mod view;

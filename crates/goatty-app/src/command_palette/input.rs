@@ -416,12 +416,19 @@ pub fn ask(window: &mut Window, cx: &mut App, ask: Ask) {
     });
 }
 
-/// `~` and `~/…` with `home`.
+/// `~`, `~/…`, and `~\…` with `home`.
 pub fn expand_home(path: &str, home: Option<&Path>) -> PathBuf {
     match (path.strip_prefix('~'), home) {
-        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
         _ => PathBuf::from(path),
     }
+}
+
+fn is_windows_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
 }
 
 /// `path` with the home directory as `~` (for showing and storing).
@@ -454,14 +461,14 @@ pub fn missing_path(spec: &CommandInput, value: &str, home: Option<&Path>, base:
 }
 
 /// Which folder to list for `text` and the name prefix to filter by:
-/// everything up to and including the last `/`. `None` for text that
-/// isn't a path yet (no `/`, other than a lone `~`).
+/// everything up to and including the last `/` or `\`. `None` for text that
+/// isn't a path yet (no separator, other than a lone `~`).
 pub fn listing_for(text: &str) -> Option<(String, String)> {
     if text == "~" {
         return Some(("~/".into(), String::new()));
     }
-    let i = text.rfind('/')?;
-    if !(text.starts_with('/') || text.starts_with("~/")) {
+    let i = text.rfind(['/', '\\'])?;
+    if !(text.starts_with('/') || text.starts_with("~/") || text.starts_with("~\\") || is_windows_drive_prefix(text)) {
         return None;
     }
     Some((text[..=i].to_string(), text[i + 1..].to_string()))
@@ -469,9 +476,10 @@ pub fn listing_for(text: &str) -> Option<(String, String)> {
 
 /// The suggestions for a folder's `entries` (name, is a folder): names
 /// starting with `prefix` (case-insensitive; hidden ones only for a `.`
-/// prefix), folders first, each completing `base` + name (+ `/`).
+/// prefix), folders first, each completing `base` + name (+ `/` or `\`).
 pub fn path_suggestions(base: &str, prefix: &str, mut entries: Vec<(String, bool)>, folders_only: bool) -> Vec<Suggestion> {
     let lower = prefix.to_lowercase();
+    let sep = if base.ends_with('\\') { "\\" } else { "/" };
     entries.retain(|(name, dir)| {
         (*dir || !folders_only) && (prefix.starts_with('.') || !name.starts_with('.')) && name.to_lowercase().starts_with(&lower)
     });
@@ -480,7 +488,7 @@ pub fn path_suggestions(base: &str, prefix: &str, mut entries: Vec<(String, bool
         .into_iter()
         .take(MAX_PATH_SUGGESTIONS)
         .map(|(name, dir)| {
-            let value = format!("{base}{name}{}", if dir { "/" } else { "" });
+            let value = format!("{base}{name}{}", if dir { sep } else { "" });
             Suggestion { label: value.clone(), value, detail: dir.then(|| "folder".into()) }
         })
         .collect()
@@ -502,10 +510,14 @@ pub fn list_folder(text: &str, home: Option<&Path>, folders_only: bool) -> Vec<S
     path_suggestions(&base, &prefix, entries, folders_only)
 }
 
-/// The value as a path field would store it: a trailing `/` from
-/// completing removed.
+/// The value as a path field would store it: a trailing `/` or `\` from
+/// completing removed (preserving `/` and Windows drive roots like `C:\`).
 pub fn trim_completed(value: &str) -> &str {
-    if value.len() > 1 { value.strip_suffix('/').unwrap_or(value) } else { value }
+    if value.len() > 1 && !(value.len() == 3 && is_windows_drive_prefix(value)) {
+        value.strip_suffix(['/', '\\']).unwrap_or(value)
+    } else {
+        value
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +593,9 @@ mod tests {
         assert_eq!(v, ["/usr/.hidden/"]);
         assert_eq!(trim_completed("/usr/local/"), "/usr/local");
         assert_eq!(trim_completed("/"), "/");
+        assert_eq!(listing_for(r"C:\Users\al"), Some((r"C:\Users\".into(), "al".into())));
+        assert_eq!(trim_completed(r"C:\Users\"), r"C:\Users");
+        assert_eq!(trim_completed(r"C:\"), r"C:\");
     }
 
     #[test]

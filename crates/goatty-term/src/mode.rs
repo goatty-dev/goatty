@@ -34,6 +34,9 @@ impl TermMode {
     pub const KITTY_ALTERNATE_KEYS: Self = Self(1 << 16);
     pub const KITTY_ALL_KEYS: Self = Self(1 << 17);
     pub const KITTY_ASSOCIATED_TEXT: Self = Self(1 << 18);
+    /// Win32 input mode (`CSI ? 9001 h` / `l`): lossless Windows/ConPTY key
+    /// encoding (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`).
+    pub const WIN32_INPUT_MODE: Self = Self(1 << 19);
 
     /// Any mouse reporting protocol enabled.
     pub const MOUSE_MODE: Self = Self(Self::MOUSE_REPORT_CLICK.0 | Self::MOUSE_REPORT_X10.0 | Self::MOUSE_DRAG.0 | Self::MOUSE_MOTION.0);

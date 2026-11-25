@@ -438,11 +438,19 @@ const SAVE_TOAST_KEY: &str = "settings.save";
 
 /// Whether `program` (a path or a name on PATH) exists.
 pub(crate) fn has_program(program: &str) -> bool {
-    if program.contains('/') {
+    if program.contains('/') || (cfg!(windows) && program.contains('\\')) {
         let p = std::path::Path::new(program);
-        return p.is_file();
+        if p.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        if p.extension().is_none() {
+            let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+            return pathext.split(';').filter(|e| !e.is_empty()).any(|ext| std::path::PathBuf::from(format!("{program}{ext}")).is_file());
+        }
+        return false;
     }
-    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(program).is_file()))
+    goatty_shell::launch::which(program).is_some()
 }
 
 /// The terminal palette for a theme.

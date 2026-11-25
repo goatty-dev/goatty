@@ -131,7 +131,7 @@ fn resolve_uri(uri: &str, place: &Place<'_>) -> Option<Target> {
         _ => ("", after),
     };
     let path = path.split(['?', '#']).next().unwrap_or(path);
-    let path = percent_decode(path)?;
+    let path = normalize_file_uri_path(percent_decode(path)?);
     let local_host = host.is_empty() || host.eq_ignore_ascii_case("localhost") || place.hostname.is_some_and(|h| same_host(h, host));
     match place.remote_host {
         Some(remote) => Some(Target::Remote {
@@ -166,6 +166,17 @@ fn same_host(a: &str, b: &str) -> bool {
         (None, Some((b_short, _))) => a.eq_ignore_ascii_case(b_short),
         (Some((a_short, _)), None) => a_short.eq_ignore_ascii_case(b),
         _ => false,
+    }
+}
+
+/// Normalize RFC 8089 Windows `file:///C:/...` paths by stripping the leading
+/// `/` before an ASCII drive letter (`"/C:/Users/me"` -> `"C:/Users/me"`).
+fn normalize_file_uri_path(path: String) -> String {
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' && (b.len() == 3 || b[3] == b'/') {
+        path[1..].to_string()
+    } else {
+        path
     }
 }
 
@@ -218,9 +229,9 @@ fn resolve_path(text: &str, line: Option<u32>, column: Option<u32>, place: &Plac
             can_fetch: false,
         });
     }
-    let candidates: Vec<PathBuf> = if let Some(rest) = text.strip_prefix("~/") {
+    let candidates: Vec<PathBuf> = if let Some(rest) = text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
         vec![place.home?.join(rest)]
-    } else if Path::new(text).is_absolute() {
+    } else if Path::new(text).is_absolute() || is_windows_drive_path(text) {
         vec![PathBuf::from(text)]
     } else {
         let cwd = place.cwd?;
@@ -347,7 +358,49 @@ fn percent_decode(s: &str) -> Option<String> {
 
 /// This machine's host name, if the OS tells us cheaply.
 pub fn hostname() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    Some(goatty_client::hostname()).filter(|s| !s.is_empty())
+}
+
+/// Resolve `program` using Windows `PATHEXT` rules (so `.cmd`/`.bat` openers
+/// like VS Code's `code.cmd` work with `Command::new`). Pure helper so tests
+/// can exercise it on every OS.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_windows_program_in(program: &str, path_env: Option<&std::ffi::OsStr>, pathext_env: Option<&str>) -> PathBuf {
+    let direct = Path::new(program);
+    let has_sep = program.contains('/') || program.contains('\\');
+    let has_ext = direct.extension().is_some();
+    let exts: Vec<String> = if has_ext {
+        Vec::new()
+    } else {
+        pathext_env.unwrap_or(".COM;.EXE;.BAT;.CMD").split(';').filter(|e| !e.is_empty()).map(|e| e.to_ascii_lowercase()).collect()
+    };
+    if has_sep {
+        if direct.is_file() {
+            return direct.to_path_buf();
+        }
+        for ext in &exts {
+            let candidate = PathBuf::from(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        return direct.to_path_buf();
+    }
+    if let Some(path) = path_env {
+        for dir in std::env::split_paths(path) {
+            let exact = dir.join(program);
+            if exact.is_file() {
+                return exact;
+            }
+            for ext in &exts {
+                let candidate = dir.join(format!("{program}{ext}"));
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    direct.to_path_buf()
 }
 
 /// Run a file opener command (argv from `LinkSettings::file_command` or
@@ -356,7 +409,20 @@ pub fn hostname() -> Option<String> {
 pub fn spawn_opener(argv: &[String]) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
     let (program, args) = argv.split_first().ok_or_else(|| std::io::Error::other("empty command"))?;
-    let mut child = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        let path_env = std::env::var_os("PATH");
+        let pathext_env = std::env::var("PATHEXT").ok();
+        let resolved = resolve_windows_program_in(program, path_env.as_deref(), pathext_env.as_deref());
+        let mut c = Command::new(resolved);
+        c.creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = Command::new(program);
+    let mut child = cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     std::thread::Builder::new().name("link-opener".into()).spawn(move || {
         let _ = child.wait();
     })?;
@@ -389,11 +455,7 @@ fn fnv1a_64(parts: &[&[u8]]) -> u64 {
 }
 
 fn safe_basename(remote_path: &str) -> &str {
-    Path::new(remote_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains('/') && !n.contains('\0'))
-        .unwrap_or("file")
+    remote_path.rsplit(['/', '\\']).next().filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains('\0')).unwrap_or("file")
 }
 
 fn set_dir_private(path: &Path) -> std::io::Result<()> {
@@ -456,20 +518,59 @@ fn save_remote_copy_in(session_dir: &Path, endpoint_key: &str, remote_path: &str
         file.flush()?;
         drop(file);
         set_file_readonly(&tmp)?;
+        // Windows refuses to overwrite a read-only destination via `rename`.
+        #[cfg(windows)]
+        if dest.exists() {
+            clear_readonly_file(&dest);
+        }
         fs::rename(&tmp, &dest)?;
         Ok(())
     })();
 
     if let Err(e) = write_res {
+        #[cfg(windows)]
+        clear_readonly_file(&tmp);
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(dest)
 }
 
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_readonly_file(path: &Path) {
+    // On Windows this clears only the DOS `FILE_ATTRIBUTE_READONLY` attribute
+    // (it does not grant world-writable permissions like Unix `chmod`).
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clear_readonly_recursive(path: &Path) {
+    clear_readonly_file(path);
+    if path.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            clear_readonly_recursive(&entry.path());
+        }
+    }
+}
+
+fn remove_cache_dir(path: &Path) {
+    #[cfg(windows)]
+    clear_readonly_recursive(path);
+    let _ = fs::remove_dir_all(path);
+}
+
 /// Remove this process's cached remote file copies on clean exit.
 pub fn cleanup_remote_cache() {
-    let _ = fs::remove_dir_all(session_cache_dir());
+    remove_cache_dir(&session_cache_dir());
 }
 
 /// Remove leftover remote cache directories from previous runs older than 24 hours.
@@ -490,7 +591,27 @@ fn is_pid_alive(pid: u32) -> bool {
         let rc = unsafe { libc::kill(raw_pid, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, FALSE, GetLastError, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        // SAFETY: plain Win32 call; returned handle is validated and closed.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+        if handle.is_null() {
+            // SAFETY: `GetLastError` has no preconditions.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut exit_code = 0u32;
+        // SAFETY: `handle` is open and `exit_code` is a valid out-pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) };
+        // SAFETY: `handle` is owned exclusively by this scope.
+        unsafe {
+            CloseHandle(handle);
+        }
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -514,7 +635,7 @@ fn cleanup_stale_remote_cache_in(root: &Path, max_age: Duration, current_pid: u3
         if let Some(newest) = newest_mtime(&path, 3)
             && now.duration_since(newest).is_ok_and(|age| age >= max_age)
         {
-            let _ = fs::remove_dir_all(&path);
+            remove_cache_dir(&path);
         }
     }
 }
@@ -572,6 +693,8 @@ mod tests {
         assert_eq!(osc8("vscode://file/x"), Some(Target::Other("vscode://file/x".into())));
         assert_eq!(osc8("javascript alert"), None);
         assert_eq!(osc8("file:///tmp/a%20b.txt"), file("/tmp/a b.txt"));
+        assert_eq!(osc8("file:///C:/Users/me/my%20file.rs"), file("C:/Users/me/my file.rs"));
+        assert_eq!(osc8("file://localhost/C:/Users/me/a.rs"), file("C:/Users/me/a.rs"));
         assert_eq!(osc8("file://localhost/etc/hosts"), file("/etc/hosts"));
         assert_eq!(osc8("file://box/etc/hosts?x#y"), file("/etc/hosts"));
         assert_eq!(osc8("file:/etc/hosts"), file("/etc/hosts"));
@@ -593,7 +716,11 @@ mod tests {
 
     #[test]
     fn local_paths_must_exist() {
-        let exists = |p: &Path| ["/work/proj/src/main.rs", "/home/me/notes.md", "/etc/hosts", "/work/x"].iter().any(|e| Path::new(e) == p);
+        let exists = |p: &Path| {
+            ["/work/proj/src/main.rs", "/home/me/notes.md", "/etc/hosts", "/work/x", r"C:\Users\me\main.rs"]
+                .iter()
+                .any(|e| Path::new(e) == p)
+        };
         let place = local(&exists);
         let path = |t: &str| resolve(&link(LinkKind::Path, t), &place);
         assert_eq!(path("src/main.rs"), file("/work/proj/src/main.rs"));
@@ -601,16 +728,20 @@ mod tests {
         assert_eq!(path("../x"), file("/work/x"));
         assert_eq!(path("b/src/main.rs"), file("/work/proj/src/main.rs"), "git diff prefix");
         assert_eq!(path("~/notes.md"), file("/home/me/notes.md"));
+        #[cfg(unix)]
         assert_eq!(path("/etc/hosts"), file("/etc/hosts"));
         assert_eq!(path("src/nope.rs"), None);
         let mut with_pos = link(LinkKind::Path, "src/main.rs");
         (with_pos.line, with_pos.column) = (Some(3), Some(9));
         let t = resolve(&with_pos, &place).unwrap();
-        assert_eq!(t.describe(), "/work/proj/src/main.rs:3:9");
+        let expected_main = normalize(&Path::new("/work/proj").join("src/main.rs"));
+        assert_eq!(t.describe(), format!("{}:3:9", expected_main.display()));
 
         let no_cwd = Place { cwd: None, ..local(&exists) };
         assert_eq!(resolve(&link(LinkKind::Path, "src/main.rs"), &no_cwd), None, "relative needs a directory");
+        #[cfg(unix)]
         assert_eq!(resolve(&link(LinkKind::Path, "/etc/hosts"), &no_cwd), file("/etc/hosts"));
+        assert_eq!(resolve(&link(LinkKind::Path, r"C:\Users\me\main.rs"), &no_cwd), file(r"C:\Users\me\main.rs"));
     }
 
     #[test]
@@ -850,5 +981,28 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KiB");
         assert_eq!(format_bytes(10 * 1024 * 1024), "10 MiB");
         assert_eq!(format_bytes(25 * 1024 * 1024 + 512 * 1024), "25.5 MiB");
+    }
+
+    #[test]
+    fn windows_opener_resolves_pathext() {
+        let dir = tempfile::tempdir().unwrap();
+        let code_cmd = dir.path().join("code.cmd");
+        fs::write(&code_cmd, "@echo off\r\n").unwrap();
+        let path_env = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(resolve_windows_program_in("code", Some(path_env.as_os_str()), Some(".EXE;.CMD;.BAT")), code_cmd);
+        assert_eq!(resolve_windows_program_in(dir.path().join("code").to_str().unwrap(), None, Some(".EXE;.CMD")), code_cmd);
+        assert_eq!(
+            resolve_windows_program_in("missing-tool", Some(path_env.as_os_str()), Some(".EXE;.CMD")),
+            PathBuf::from("missing-tool")
+        );
+    }
+
+    #[test]
+    fn windows_local_drive_path_resolves() {
+        let exists = |p: &Path| p == Path::new(r"C:\Users\me\main.rs");
+        let place = local(&exists);
+        assert_eq!(resolve(&link(LinkKind::Path, r"C:\Users\me\main.rs"), &place), file(r"C:\Users\me\main.rs"));
+        assert!(is_pid_alive(std::process::id()));
+        assert!(!is_pid_alive(0));
     }
 }

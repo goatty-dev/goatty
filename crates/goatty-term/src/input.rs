@@ -130,6 +130,9 @@ pub fn encode_key_event_with(ev: &KeyEvent<'_>, mode: TermMode, opts: KeyOptions
     if mode.kitty_flags() != 0 {
         return kitty::encode(ev, mode, opts);
     }
+    if mode.contains(TermMode::WIN32_INPUT_MODE) {
+        return win32::encode(ev);
+    }
     // Legacy: a repeat is another press; releases aren't reported.
     match ev.kind {
         KeyKind::Release => None,
@@ -434,6 +437,116 @@ mod kitty {
         }
         out.push(end);
         out.into_bytes()
+    }
+}
+
+mod win32 {
+    //! Microsoft `win32-input-mode` (`CSI ? 9001 h`): encodes each key event as
+    //! `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _` so ConPTY and Windows TUIs receive
+    //! lossless modified keys, functional keys, and releases.
+
+    use std::fmt::Write as _;
+
+    use super::{Key, KeyEvent, KeyKind, Mods, ctrl_byte};
+
+    const LEFT_ALT_PRESSED: u32 = 0x0002;
+    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+    const SHIFT_PRESSED: u32 = 0x0010;
+
+    fn control_state(m: Mods) -> u32 {
+        let mut cs = 0;
+        if m.alt {
+            cs |= LEFT_ALT_PRESSED;
+        }
+        if m.ctrl {
+            cs |= LEFT_CTRL_PRESSED;
+        }
+        if m.shift {
+            cs |= SHIFT_PRESSED;
+        }
+        cs
+    }
+
+    fn functional(key: &Key<'_>) -> Option<(u16, u16)> {
+        Some(match key {
+            Key::Enter => (0x0D, 0x0D),
+            Key::Backspace => (0x08, 0x08),
+            Key::Tab => (0x09, 0x09),
+            Key::Escape => (0x1B, 0x1B),
+            Key::Space => (0x20, 0x20),
+            Key::PageUp => (0x21, 0),
+            Key::PageDown => (0x22, 0),
+            Key::End => (0x23, 0),
+            Key::Home => (0x24, 0),
+            Key::Left => (0x25, 0),
+            Key::Up => (0x26, 0),
+            Key::Right => (0x27, 0),
+            Key::Down => (0x28, 0),
+            Key::Insert => (0x2D, 0),
+            Key::Delete => (0x2E, 0),
+            Key::F(n @ 1..=24) => (0x70 + u16::from(n - 1), 0),
+            Key::F(_) | Key::Text(_) => return None,
+        })
+    }
+
+    fn char_vk(c: char) -> u16 {
+        match c {
+            'a'..='z' => c.to_ascii_uppercase() as u16,
+            'A'..='Z' | '0'..='9' => c as u16,
+            ';' | ':' => 0xBA,
+            '=' | '+' => 0xBB,
+            ',' | '<' => 0xBC,
+            '-' | '_' => 0xBD,
+            '.' | '>' => 0xBE,
+            '/' | '?' => 0xBF,
+            '`' | '~' => 0xC0,
+            '[' | '{' => 0xDB,
+            '\\' | '|' => 0xDC,
+            ']' | '}' => 0xDD,
+            '\'' | '"' => 0xDE,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn encode(ev: &KeyEvent<'_>) -> Option<Vec<u8>> {
+        let kd: u8 = match ev.kind {
+            KeyKind::Press | KeyKind::Repeat => 1,
+            KeyKind::Release => 0,
+        };
+        let cs = control_state(ev.mods);
+        if let Some((vk, mut uc)) = functional(&ev.key) {
+            if matches!(ev.key, Key::Space) && ev.mods.ctrl {
+                uc = 0;
+            }
+            return Some(format!("\x1b[{vk};0;{uc};{kd};{cs};1_").into_bytes());
+        }
+        let Key::Text(s) = ev.key else { return None };
+        if s.is_empty() {
+            return None;
+        }
+        let mut chars = s.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            let vk = ev.base.map(char_vk).filter(|&v| v != 0).unwrap_or_else(|| char_vk(c));
+            if ev.mods.ctrl
+                && let Some(ctrl) = ctrl_byte(c)
+            {
+                return Some(format!("\x1b[{vk};0;{ctrl};{kd};{cs};1_").into_bytes());
+            }
+            let mut units = [0u16; 2];
+            let encoded: &[u16] = c.encode_utf16(&mut units);
+            let mut out = String::new();
+            for &unit in encoded {
+                // Non-BMP characters travel as UTF-16 surrogate pairs with Vk=0.
+                let unit_vk = if encoded.len() == 1 { vk } else { 0 };
+                let _ = write!(out, "\x1b[{unit_vk};0;{unit};{kd};{cs};1_");
+            }
+            return Some(out.into_bytes());
+        }
+        let mut out = String::new();
+        for unit in s.encode_utf16() {
+            let _ = write!(out, "\x1b[0;0;{unit};{kd};{cs};1_");
+        }
+        Some(out.into_bytes())
     }
 }
 
@@ -785,6 +898,44 @@ mod tests {
             .unwrap(),
             b"\x1b[3;5~"
         );
+    }
+
+    #[test]
+    fn win32_input_mode_tracks_dec_private_9001_and_encodes_keys() {
+        let (term, _ch) = crate::Terminal::new(crate::TermSize::new(20, 5), false, std::sync::Arc::new(crate::Palette::default()));
+        assert!(!term.mode().contains(TermMode::WIN32_INPUT_MODE));
+        term.feed(b"\x1b[?9001h");
+        let m = term.mode();
+        assert!(m.contains(TermMode::WIN32_INPUT_MODE));
+
+        // Frame and reattach snapshot preserve WIN32_INPUT_MODE.
+        let mut frame = crate::Frame::default();
+        term.snapshot_into(&mut frame);
+        assert!(frame.mode.contains(TermMode::WIN32_INPUT_MODE));
+        let (reattached, _) = crate::Terminal::new(crate::TermSize::new(20, 5), false, std::sync::Arc::new(crate::Palette::default()));
+        reattached.feed(&term.reattach_snapshot());
+        assert!(reattached.mode().contains(TermMode::WIN32_INPUT_MODE));
+
+        // Key encoding: plain text, Ctrl+C, Ctrl+Backspace, Shift+Tab, arrows, F5, release, emoji.
+        assert_eq!(enc(Key::Text("a"), NONE, m), "\x1b[65;0;97;1;0;1_");
+        assert_eq!(enc(Key::Text("c"), CTRL, m), "\x1b[67;0;3;1;8;1_");
+        assert_eq!(enc(Key::Backspace, CTRL, m), "\x1b[8;0;8;1;8;1_");
+        assert_eq!(enc(Key::Tab, SHIFT, m), "\x1b[9;0;9;1;16;1_");
+        assert_eq!(enc(Key::Right, CTRL, m), "\x1b[39;0;0;1;8;1_");
+        assert_eq!(enc(Key::F(5), NONE, m), "\x1b[116;0;0;1;0;1_");
+        assert_eq!(encode_key_event(&ev(Key::Text("a"), NONE, KeyKind::Release), m).unwrap(), b"\x1b[65;0;97;0;0;1_");
+        // Non-BMP emoji splits into UTF-16 surrogate pair with Vk=0.
+        assert_eq!(enc(Key::Text("😀"), NONE, m), "\x1b[0;0;55357;1;0;1_\x1b[0;0;56832;1;0;1_");
+        // Kitty keyboard protocol takes precedence when explicitly enabled.
+        term.feed(b"\x1b[>1u");
+        assert_eq!(enc(Key::Text("c"), CTRL, term.mode()), "\x1b[99;5u");
+        // CSI ? 9001 l and RIS clear WIN32_INPUT_MODE.
+        term.feed(b"\x1b[?9001l");
+        assert!(!term.mode().contains(TermMode::WIN32_INPUT_MODE));
+        term.feed(b"\x1b[?1004;9001h");
+        assert!(term.mode().contains(TermMode::WIN32_INPUT_MODE));
+        term.feed(b"\x1bc");
+        assert!(!term.mode().contains(TermMode::WIN32_INPUT_MODE));
     }
 
     #[test]

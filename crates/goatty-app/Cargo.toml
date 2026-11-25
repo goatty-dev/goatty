@@ -21,7 +21,6 @@ anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 flume.workspace = true
-libc.workspace = true
 goatty-client.workspace = true
 goatty-net.workspace = true
 goatty-config.workspace = true
@@ -36,6 +35,12 @@ regex.workspace = true
 unicode-width.workspace = true
 ttf-parser.workspace = true
 fontdb.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
