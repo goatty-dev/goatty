@@ -110,6 +110,7 @@ pub(crate) mod tests {
                 for (path, data, mode) in files {
                     let opts = zip::write::SimpleFileOptions::default()
                         .compression_method(zip::CompressionMethod::Deflated)
+                        .system(zip::System::Unix)
                         .unix_permissions(*mode);
                     z.start_file(*path, opts).unwrap();
                     z.write_all(data).unwrap();

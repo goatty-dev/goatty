@@ -31,7 +31,9 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -226,6 +228,7 @@ impl Context {
 }
 
 /// The login shell from passwd.
+#[cfg(unix)]
 fn passwd_shell() -> Option<String> {
     let mut buf = vec![0u8; 16 * 1024];
     let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -246,6 +249,11 @@ fn passwd_shell() -> Option<String> {
     // until the end of this function.
     let shell = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) };
     Some(shell.to_string_lossy().into_owned())
+}
+
+#[cfg(not(unix))]
+fn passwd_shell() -> Option<String> {
+    None
 }
 
 /// The shell a harvest runs, and why that one.
@@ -489,17 +497,23 @@ impl Record {
     }
 }
 
-/// The import directory, private (0700): what's in it is the user's
+/// The import directory, private (0700 on Unix): what's in it is the user's
 /// environment, tokens included.
 fn private_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("chmod {}", dir.display()))
+    #[cfg(unix)]
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("chmod {}", dir.display()))?;
+    Ok(())
 }
 
-/// A new private (0600) file at `path`, replacing one that's there.
+/// A new private (0600 on Unix) file at `path`, replacing one that's there.
 fn private_file(path: &Path) -> Result<File> {
     let _ = std::fs::remove_file(path);
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).with_context(|| format!("create {}", path.display()))
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path).with_context(|| format!("create {}", path.display()))
 }
 
 /// A name for a temporary file next to `path` that no other writer (thread
@@ -516,7 +530,9 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
     private_dir(path.parent().context("no parent")?)?;
     if std::fs::read_to_string(path).is_ok_and(|old| old == text) {
         // Written before files were private.
-        return std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| format!("chmod {}", path.display()));
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(|| format!("chmod {}", path.display()))?;
+        return Ok(());
     }
     let tmp = temp_name(path, "tmp");
     let written = private_file(&tmp).and_then(|mut f| {
@@ -551,13 +567,11 @@ fn lock_file(dirs: &Dirs) -> Result<File> {
     let dir = dirs.import_dir();
     private_dir(&dir)?;
     let path = dir.join(".lock");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(&path).with_context(|| format!("open {}", path.display()))
 }
 
 fn now() -> u64 {
@@ -906,23 +920,35 @@ fn run(source: &Source, ctx: &Context, out: &Path, err: &Path, timeout: Duration
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
-    // A session of its own: its own process group (killed as one below),
-    // and no controlling terminal, so an interactive startup can't stop on
-    // SIGTTOU/SIGTTIN when goattyd (or `goattyd shell refresh`) runs in one.
-    // SAFETY: setsid is async-signal-safe and only changes the child.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+    #[cfg(unix)]
+    {
+        // A session of its own: its own process group (killed as one below),
+        // and no controlling terminal, so an interactive startup can't stop on
+        // SIGTTOU/SIGTTIN when goattyd (or `goattyd shell refresh`) runs in one.
+        // SAFETY: setsid is async-signal-safe and only changes the child.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
     }
     let mut child = cmd.spawn().with_context(|| format!("start {}", source.program))?;
+    #[cfg(unix)]
     let pgid = libc::pid_t::try_from(child.id()).ok();
-    let kill_group = || {
-        if let Some(pgid) = pgid {
-            // SAFETY: kill(2) has no memory-safety preconditions; the
-            // negative pid addresses the process group the child leads.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let kill_group = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        {
+            let _ = child;
+            if let Some(pgid) = pgid {
+                // SAFETY: kill(2) has no memory-safety preconditions; the
+                // negative pid addresses the process group the child leads.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child.kill();
         }
     };
     let status = loop {
@@ -930,7 +956,7 @@ fn run(source: &Source, ctx: &Context, out: &Path, err: &Path, timeout: Duration
             break status;
         }
         if start.elapsed() > timeout {
-            kill_group();
+            kill_group(&mut child);
             let _ = child.wait();
             anyhow::bail!(
                 "Your {} startup didn't finish within {} s. goatty keeps what it imported before; a startup file that waits for input or a network does this.",
@@ -941,7 +967,7 @@ fn run(source: &Source, ctx: &Context, out: &Path, err: &Path, timeout: Duration
         std::thread::sleep(Duration::from_millis(10));
     };
     let elapsed = start.elapsed();
-    kill_group();
+    kill_group(&mut child);
     log::debug!("import: {} exited with {status} after {elapsed:?}", source.program);
     Ok(elapsed)
 }

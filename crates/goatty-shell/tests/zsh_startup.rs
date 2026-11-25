@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The managed zsh, run for real in a sandboxed `$HOME`: startup order,
 //! the user's files, ZDOTDIR hand-back, feature detection, `goatty-setup`,
 //! and the OSC 133 / OSC 7 stream through a PTY.

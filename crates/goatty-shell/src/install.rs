@@ -9,6 +9,7 @@
 //! Downloads go through `curl` (or `wget`): the checksum, not the transport,
 //! is what makes an archive trusted, so goattyd needs no TLS stack of its own.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -84,6 +85,7 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
             if !meta.is_file() {
                 bail!("{}/{b} in the download is not a regular file", p.root);
             }
+            #[cfg(unix)]
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
         }
         if let Some(src) = p.source {
@@ -206,6 +208,7 @@ pub fn remove_links(id: &str, bins: &[String], dirs: &Dirs) -> Result<bool> {
 }
 
 /// Point `link` at `target`, atomically (symlink beside it, then rename).
+#[cfg(unix)]
 fn replace_symlink(target: &Path, link: &Path) -> Result<()> {
     let dir = link.parent().context("link has no parent")?;
     std::fs::create_dir_all(dir)?;
@@ -217,7 +220,13 @@ fn replace_symlink(target: &Path, link: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+/// Windows fallback until NTFS junctions / hardlinks land (#278).
+#[cfg(not(unix))]
+fn replace_symlink(_target: &Path, _link: &Path) -> Result<()> {
+    bail!("managed tool linking isn't supported on Windows yet (tracked in #278)")
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

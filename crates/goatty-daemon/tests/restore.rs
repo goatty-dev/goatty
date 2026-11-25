@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Sessions outlive goattyd (#131):
 //! * `Restart` re-executes the daemon (here: an updated build at the same
 //!   path) and the session, its screen and the workspaces carry over,

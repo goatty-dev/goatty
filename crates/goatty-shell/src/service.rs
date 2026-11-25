@@ -137,21 +137,30 @@ impl HostService {
         if !apply {
             return Ok(ApplyOutcome { issues, diff, applied: false, generation: self.active_generation() });
         }
-        let started = std::time::SystemTime::now();
-        let activated = self.launcher.apply(&host).context("not applied")?;
-        store::save(path, &host.file.value, &host.file.unknown)
-            .with_context(|| format!("built generation {} but couldn't save {}", activated.generation, path.display()))?;
-        log::info!("host settings saved; generation {} active", activated.generation);
-        // This save, right after writing it (a later one by someone else stays newer).
-        let saved = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(started).max(started);
-        // Shells reloaded after this apply read the import straight away.
-        self.launcher.prepare_import(&host.value);
-        // Current now, host.json included: shells outside goatty needn't ask
-        // for a refresh because of this save.
-        if let Some(dirs) = self.launcher.dirs() {
-            crate::launch::touch_stamp(dirs, saved);
+        #[cfg(not(unix))]
+        {
+            store::save(path, &host.file.value, &host.file.unknown).with_context(|| format!("couldn't save {}", path.display()))?;
+            log::info!("host settings saved");
+            Ok(ApplyOutcome { issues, diff: Vec::new(), applied: true, generation: None })
         }
-        Ok(ApplyOutcome { issues, diff, applied: true, generation: Some(activated.generation) })
+        #[cfg(unix)]
+        {
+            let started = std::time::SystemTime::now();
+            let activated = self.launcher.apply(&host).context("not applied")?;
+            store::save(path, &host.file.value, &host.file.unknown)
+                .with_context(|| format!("built generation {} but couldn't save {}", activated.generation, path.display()))?;
+            log::info!("host settings saved; generation {} active", activated.generation);
+            // This save, right after writing it (a later one by someone else stays newer).
+            let saved = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(started).max(started);
+            // Shells reloaded after this apply read the import straight away.
+            self.launcher.prepare_import(&host.value);
+            // Current now, host.json included: shells outside goatty needn't ask
+            // for a refresh because of this save.
+            if let Some(dirs) = self.launcher.dirs() {
+                crate::launch::touch_stamp(dirs, saved);
+            }
+            Ok(ApplyOutcome { issues, diff, applied: true, generation: Some(activated.generation) })
+        }
     }
 
     /// Change the stored host settings with `f` and apply them like the
@@ -281,15 +290,22 @@ impl HostService {
     /// `exec bash`, or the pid was reused) is unaffected. Returns how many
     /// shells were signaled.
     pub fn reload_shells(&self) -> usize {
-        let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
-        shells.retain(|&pid| {
-            let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
-            // SAFETY: kill(2) has no memory-safety preconditions; a stale
-            // pid at worst gets an ignored-by-default signal.
-            unsafe { libc::kill(pid, libc::SIGURG) == 0 }
-        });
-        log::info!("asked {} managed shell(s) to reload", shells.len());
-        shells.len()
+        #[cfg(unix)]
+        {
+            let mut shells = self.shells.lock().unwrap_or_else(|e| e.into_inner());
+            shells.retain(|&pid| {
+                let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+                // SAFETY: kill(2) has no memory-safety preconditions; a stale
+                // pid at worst gets an ignored-by-default signal.
+                unsafe { libc::kill(pid, libc::SIGURG) == 0 }
+            });
+            log::info!("asked {} managed shell(s) to reload", shells.len());
+            shells.len()
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
     }
 
     /// Activate generation `to` (default: the previous one) and restore its
@@ -314,7 +330,7 @@ fn changed(what: String, o: &ApplyOutcome) -> Changed {
     Changed { lines, generation: o.generation, reload: !o.diff.is_empty(), unneeded: Vec::new() }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::dirs::Dirs;

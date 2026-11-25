@@ -13,9 +13,9 @@
 
 use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
-use std::os::unix::net::UnixStream;
 
 use flume::TryRecvError;
+use goatty_client::LocalStream;
 
 use crate::client::{Lane, Outbound};
 
@@ -77,7 +77,7 @@ impl Lanes {
 /// Write `rx`'s frames to `stream` until the connection ends or is told to
 /// stop. An empty frame is a barrier: everything queued before it is
 /// written and flushed, then `flushed` hears of it.
-pub(crate) fn run(rx: &flume::Receiver<Outbound>, stream: &UnixStream, flushed: &flume::Sender<()>) {
+pub(crate) fn run(rx: &flume::Receiver<Outbound>, stream: &LocalStream, flushed: &flume::Sender<()>) {
     let mut w = BufWriter::with_capacity(128 << 10, stream);
     let mut lanes = Lanes::default();
     let mut barrier = false;
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn the_writer_sends_echo_before_a_queued_flood() {
-        let (a, mut b) = UnixStream::pair().unwrap();
+        let (a, mut b) = LocalStream::pair().unwrap();
         let (tx, rx) = flume::unbounded();
         for _ in 0..16 {
             tx.send(Outbound::session(frame(b'x', 64 << 10), 1)).unwrap();

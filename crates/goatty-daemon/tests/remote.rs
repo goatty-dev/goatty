@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Remote hosts end to end, without a real SSH server: a fake `ssh` runs
 //! the remote command locally under a sandboxed `$HOME`, so this covers what
 //! goatty runs on a host exactly:

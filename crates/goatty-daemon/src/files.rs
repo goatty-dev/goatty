@@ -2,6 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -14,7 +15,7 @@ use crate::server::Daemon;
 const MAX_CANDIDATES: usize = 16;
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+    goatty_proto::home_dir()
 }
 
 /// Lexically normalize `.` and `..` without hitting the filesystem (so symlinks
@@ -43,7 +44,7 @@ fn join_path(raw: &str, cwd: Option<&str>) -> Option<PathBuf> {
     }
     if raw == "~" {
         home_dir()
-    } else if let Some(rest) = raw.strip_prefix("~/") {
+    } else if let Some(rest) = raw.strip_prefix("~/").or_else(|| cfg!(windows).then(|| raw.strip_prefix(r"~\")).flatten()) {
         Some(home_dir()?.join(rest))
     } else {
         let p = Path::new(raw);
@@ -117,13 +118,13 @@ fn read_file_inner(raw_path: &str, max_bytes: u64) -> Result<(String, Vec<u8>)> 
         bail!("{} is {} bytes (limit is {limit} bytes)", resolved.display(), pre.len());
     }
 
-    // Open non-blocking without acquiring a controlling tty so FIFOs or device
-    // nodes raced into place cannot stall the worker thread.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(&resolved)
-        .with_context(|| format!("cannot open {}", resolved.display()))?;
+    // Open non-blocking without acquiring a controlling tty on Unix so FIFOs
+    // or device nodes raced into place cannot stall the worker thread.
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    let file = opts.open(&resolved).with_context(|| format!("cannot open {}", resolved.display()))?;
 
     let meta = file.metadata().with_context(|| format!("cannot stat {}", resolved.display()))?;
     if !meta.is_file() {
@@ -154,6 +155,7 @@ mod tests {
         assert_eq!(normalize_lexical(Path::new("/")), PathBuf::from("/"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_path_handles_abs_relative_and_invalid() {
         assert_eq!(resolve_path("/var/log/../log/syslog", Some("/tmp")), Some(PathBuf::from("/var/log/syslog")));
@@ -165,6 +167,19 @@ mod tests {
         assert_eq!(resolve_path("rel", Some("not-abs")), None);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn resolve_path_handles_windows_drive_paths() {
+        assert_eq!(resolve_path(r"C:\work\sub\..\file.rs", Some(r"C:\Temp")), Some(PathBuf::from(r"C:\work\file.rs")));
+        assert_eq!(resolve_path(r"src\main.rs", Some(r"C:\Users\u\repo")), Some(PathBuf::from(r"C:\Users\u\repo\src\main.rs")));
+        assert_eq!(resolve_path(r"..\other.rs", Some(r"C:\Users\u\repo")), Some(PathBuf::from(r"C:\Users\u\other.rs")));
+        assert_eq!(resolve_path("src/main.rs", None), None);
+        assert_eq!(resolve_path("", Some(r"C:\Temp")), None);
+        assert_eq!(resolve_path("bad\0path", Some(r"C:\Temp")), None);
+        assert_eq!(resolve_path("rel", Some("not-abs")), None);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn resolve_for_io_handles_symlinked_cwd_with_parent_dir() {
         let dir = tempfile::tempdir().unwrap();

@@ -55,6 +55,7 @@ pub(crate) struct Workspaces {
 }
 
 /// A workspace as the next goattyd gets it (see `crate::restore`).
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SavedWorkspace {
     pub id: WorkspaceId,
@@ -355,6 +356,7 @@ impl Workspaces {
     }
 
     /// Every workspace, for the next goattyd.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn export(&self) -> Vec<SavedWorkspace> {
         let mut list: Vec<SavedWorkspace> = self
             .map
@@ -376,6 +378,7 @@ impl Workspaces {
 
     /// The previous goattyd's workspaces, without windows: its connections
     /// are gone. Ones whose sessions all ended go (see [`Self::prune`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn import(list: Vec<SavedWorkspace>, alive: impl Fn(SessionId) -> bool) -> Self {
         let seq = list.iter().map(|w| w.created.max(w.active)).max().unwrap_or(0);
         let map = list

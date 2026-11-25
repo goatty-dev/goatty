@@ -114,7 +114,10 @@ mod tests {
         let err = copy_verified(&src, &tmp.path().join("dst2"), &files).unwrap_err();
         assert!(err.to_string().contains("checksum"), "{err}");
 
-        std::os::unix::fs::symlink("/etc/passwd", src.join("link")).unwrap();
-        assert!(list_files(&src).unwrap_err().to_string().contains("symlink"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", src.join("link")).unwrap();
+            assert!(list_files(&src).unwrap_err().to_string().contains("symlink"));
+        }
     }
 }

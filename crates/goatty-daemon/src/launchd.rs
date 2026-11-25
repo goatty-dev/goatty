@@ -8,11 +8,13 @@
 //!
 //! Off macOS this is a no-op returning `None`.
 
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 
 /// Claim the listening socket launchd created for this job, marked
 /// close-on-exec so spawned shells never inherit it. Only the first call
 /// queries launchd.
+#[cfg(unix)]
 pub(crate) fn activate_socket() -> Option<OwnedFd> {
     #[cfg(target_os = "macos")]
     {

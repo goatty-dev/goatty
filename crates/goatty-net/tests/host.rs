@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Availability end to end against a fake `tailscale` (never the user's):
 //! the route goes in and out of the Serve config without touching anything
 //! else, the gateway listens only while available, and paired devices get

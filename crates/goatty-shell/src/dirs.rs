@@ -32,8 +32,32 @@ pub struct Dirs {
     pub state: PathBuf,
 }
 
+fn is_abs(windows: bool, path: &Path) -> bool {
+    if windows {
+        let Some(s) = path.to_str() else {
+            return path.is_absolute();
+        };
+        let b = s.as_bytes();
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')) || s.starts_with(r"\\")
+    } else {
+        path.is_absolute()
+    }
+}
+
+fn home_dir_for(windows: bool, var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if windows {
+        if let Some(p) = var("USERPROFILE").filter(|h| !h.is_empty()) {
+            return Some(PathBuf::from(p));
+        }
+        if let (Some(drive), Some(path)) = (var("HOMEDRIVE").filter(|v| !v.is_empty()), var("HOMEPATH").filter(|v| !v.is_empty())) {
+            return Some(PathBuf::from(format!("{drive}{path}")));
+        }
+    }
+    var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
 impl Dirs {
-    /// From the process environment. `None` without `$HOME`.
+    /// From the process environment. `None` without a home directory (or Windows AppData dirs).
     pub fn from_env() -> Option<Self> {
         Self::from_vars(|k| std::env::var(k).ok())
     }
@@ -41,15 +65,34 @@ impl Dirs {
     /// From variables read through `var` (injectable for tests). Relative
     /// XDG paths are invalid per the spec and ignored.
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let home = PathBuf::from(var("HOME").filter(|h| !h.is_empty())?);
-        let xdg = |name: &str, fallback: &str| {
-            var(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(fallback)).join("goatty")
-        };
+        Self::from_vars_for(cfg!(windows), var)
+    }
+
+    fn from_vars_for(windows: bool, var: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let xdg = |name: &str| var(name).map(PathBuf::from).filter(|p| is_abs(windows, p)).map(|p| p.join("goatty"));
+        if windows {
+            let home = home_dir_for(true, &var);
+            let local_app = var("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .filter(|p| is_abs(true, p))
+                .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Local")));
+            let app_data = var("APPDATA")
+                .map(PathBuf::from)
+                .filter(|p| is_abs(true, p))
+                .or_else(|| home.as_ref().map(|h| h.join("AppData").join("Roaming")));
+            return Some(Self {
+                data: xdg("XDG_DATA_HOME").or_else(|| local_app.as_ref().map(|p| p.join("goatty")))?,
+                config: xdg("XDG_CONFIG_HOME").or_else(|| app_data.as_ref().map(|p| p.join("goatty")))?,
+                cache: xdg("XDG_CACHE_HOME").or_else(|| local_app.as_ref().map(|p| p.join("goatty").join("cache")))?,
+                state: xdg("XDG_STATE_HOME").or_else(|| local_app.as_ref().map(|p| p.join("goatty").join("state")))?,
+            });
+        }
+        let home = home_dir_for(false, &var)?;
         Some(Self {
-            data: xdg("XDG_DATA_HOME", ".local/share"),
-            config: xdg("XDG_CONFIG_HOME", ".config"),
-            cache: xdg("XDG_CACHE_HOME", ".cache"),
-            state: xdg("XDG_STATE_HOME", ".local/state"),
+            data: xdg("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share").join("goatty")),
+            config: xdg("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config").join("goatty")),
+            cache: xdg("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache").join("goatty")),
+            state: xdg("XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state").join("goatty")),
         })
     }
 
@@ -155,15 +198,16 @@ impl Dirs {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn xdg_defaults_and_overrides() {
-        let d = Dirs::from_vars(|k| (k == "HOME").then(|| "/home/u".into())).unwrap();
+        let d = Dirs::from_vars_for(false, |k| (k == "HOME").then(|| "/home/u".into())).unwrap();
         assert_eq!(d.data, Path::new("/home/u/.local/share/goatty"));
         assert_eq!(d.state, Path::new("/home/u/.local/state/goatty"));
         assert_eq!(d.zsh_dir(), Path::new("/home/u/.local/share/goatty/current/zsh"));
         assert_eq!(d.user_zshrc(), Path::new("/home/u/.config/goatty/zshrc"));
 
-        let d = Dirs::from_vars(|k| match k {
+        let d = Dirs::from_vars_for(false, |k| match k {
             "HOME" => Some("/home/u".into()),
             "XDG_DATA_HOME" => Some("/data".into()),
             "XDG_CACHE_HOME" => Some("relative/ignored".into()),
@@ -172,6 +216,31 @@ mod tests {
         .unwrap();
         assert_eq!(d.data, Path::new("/data/goatty"));
         assert_eq!(d.cache, Path::new("/home/u/.cache/goatty"));
-        assert!(Dirs::from_vars(|_| None).is_none());
+        assert!(Dirs::from_vars_for(false, |_| None).is_none());
+    }
+
+    #[test]
+    fn windows_defaults_and_xdg_overrides() {
+        let d = Dirs::from_vars_for(true, |k| match k {
+            "APPDATA" => Some(r"C:\Users\u\AppData\Roaming".into()),
+            "LOCALAPPDATA" => Some(r"C:\Users\u\AppData\Local".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(d.config, PathBuf::from(r"C:\Users\u\AppData\Roaming").join("goatty"));
+        assert_eq!(d.data, PathBuf::from(r"C:\Users\u\AppData\Local").join("goatty"));
+        assert_eq!(d.cache, PathBuf::from(r"C:\Users\u\AppData\Local").join("goatty").join("cache"));
+        assert_eq!(d.state, PathBuf::from(r"C:\Users\u\AppData\Local").join("goatty").join("state"));
+
+        let d = Dirs::from_vars_for(true, |k| match k {
+            "USERPROFILE" => Some(r"C:\Users\u".into()),
+            "XDG_CONFIG_HOME" => Some(r"D:\cfg".into()),
+            "XDG_CACHE_HOME" => Some("relative/ignored".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(d.config, PathBuf::from(r"D:\cfg").join("goatty"));
+        assert_eq!(d.cache, PathBuf::from(r"C:\Users\u").join("AppData").join("Local").join("goatty").join("cache"));
+        assert!(Dirs::from_vars_for(true, |_| None).is_none());
     }
 }

@@ -73,17 +73,30 @@ impl ColorHistory {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)
     }
 }
 
-/// `$XDG_STATE_HOME/goatty` (default `~/.local/state/goatty`).
+/// State directory (`$XDG_STATE_HOME/goatty`, default `~/.local/state/goatty`
+/// on Unix and `%LOCALAPPDATA%\goatty\state` on Windows).
 pub fn state_dir_from(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let base = var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| var("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("goatty"))
+    state_dir_for(cfg!(windows), var)
+}
+
+fn state_dir_for(windows: bool, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(xdg) = var("XDG_STATE_HOME").map(PathBuf::from).filter(|p| crate::is_abs_path(windows, p)) {
+        return Some(xdg.join("goatty"));
+    }
+    if windows {
+        let base = var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|p| crate::is_abs_path(true, p))
+            .or_else(|| crate::home_dir_for(true, &var).map(|h| h.join("AppData").join("Local")))?;
+        return Some(base.join("goatty").join("state"));
+    }
+    let home = crate::home_dir_for(false, &var)?;
+    Some(home.join(".local/state").join("goatty"))
 }
 
 /// The history file for this user. `None` without `$HOME`.
@@ -141,12 +154,22 @@ mod tests {
         assert_eq!(ColorHistory::load(&path).colors(), &[Color(0x112233), Color(0x445566)]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn state_dir_follows_xdg() {
-        let d = state_dir_from(|k| (k == "HOME").then(|| "/home/u".into())).unwrap();
+        let d = state_dir_for(false, |k| (k == "HOME").then(|| "/home/u".into())).unwrap();
         assert_eq!(d, PathBuf::from("/home/u/.local/state/goatty"));
-        let d = state_dir_from(|k| (k == "XDG_STATE_HOME").then(|| "/st".into())).unwrap();
+        let d = state_dir_for(false, |k| (k == "XDG_STATE_HOME").then(|| "/st".into())).unwrap();
         assert_eq!(d, PathBuf::from("/st/goatty"));
-        assert!(state_dir_from(|_| None).is_none());
+        assert!(state_dir_for(false, |_| None).is_none());
+    }
+
+    #[test]
+    fn state_dir_follows_windows_conventions_and_xdg_override() {
+        let d = state_dir_for(true, |k| (k == "LOCALAPPDATA").then(|| r"C:\Users\u\AppData\Local".into())).unwrap();
+        assert_eq!(d, PathBuf::from(r"C:\Users\u\AppData\Local").join("goatty").join("state"));
+        let d = state_dir_for(true, |k| (k == "XDG_STATE_HOME").then(|| r"D:\xdg\state".into())).unwrap();
+        assert_eq!(d, PathBuf::from(r"D:\xdg\state").join("goatty"));
+        assert!(state_dir_for(true, |_| None).is_none());
     }
 }

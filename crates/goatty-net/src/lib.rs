@@ -34,7 +34,6 @@ pub mod link;
 pub mod pairing;
 pub mod tailscale;
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -98,32 +97,55 @@ pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
 /// `N` bytes from the OS's random source.
 pub(crate) fn random<const N: usize>() -> Result<[u8; N]> {
     let mut out = [0u8; N];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut out)).context("read /dev/urandom")?;
+    getrandom::fill(&mut out).map_err(|e| anyhow::anyhow!("read OS randomness: {e}"))?;
     Ok(out)
 }
 
 /// Write `data` to `path` through a temporary file in the same directory
-/// (created 0700 if needed), with `mode`, so readers never see half a file.
+/// (created 0700 on Unix if needed), with `mode`, so readers never see half a file.
 pub(crate) fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = path.parent().context("path has no parent")?;
     if !dir.exists() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     // Unique per write: two writes at once must not share a temporary file.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp");
     let tmp = dir.join(format!(".{name}.{}.{n}.{}", std::process::id(), hex(&random::<4>()?)));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&tmp)
-        .with_context(|| format!("write {}", tmp.display()))?;
-    let written = f.write_all(data).and_then(|()| f.sync_all()).and_then(|()| std::fs::rename(&tmp, path));
+    let mut f = {
+        #[cfg(windows)]
+        {
+            if mode & 0o077 == 0 {
+                identity::create_private_file(&tmp).with_context(|| format!("write {}", tmp.display()))?
+            } else {
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).with_context(|| format!("write {}", tmp.display()))?
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(mode);
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+            opts.open(&tmp).with_context(|| format!("write {}", tmp.display()))?
+        }
+    };
+    let written = f.write_all(data).and_then(|()| f.sync_all()).and_then(|()| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }

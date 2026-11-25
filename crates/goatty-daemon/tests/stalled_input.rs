@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! A program that stops reading its input fills the PTY, and writing more
 //! blocks. That must not block the connection: it still answers pings, so
 //! a live client isn't taken for a dead one, and still sees its own EOF, so

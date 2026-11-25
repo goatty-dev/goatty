@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `goattyd alias …` against a sandboxed `$HOME` (#88): the user's
 //! aliases end up in host.json and the generated `aliases.zsh`; a local
 //! plugin's aliases are listed under it and can be switched off.

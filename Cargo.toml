@@ -26,6 +26,21 @@ serde_bytes = "0.11"
 # Snapshots and history over remote links (goatty-proto).
 zstd = { version = "0.14", default-features = false }
 libc = "0.2"
+getrandom = "0.4"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 log = "0.4"
 env_logger = "0.11"
 flume = "0.12"

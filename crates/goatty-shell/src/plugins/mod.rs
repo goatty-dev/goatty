@@ -1229,5 +1229,5 @@ pub fn load_order(list: Vec<Active>) -> Vec<Active> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests;

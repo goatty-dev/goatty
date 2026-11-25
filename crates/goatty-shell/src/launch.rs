@@ -121,7 +121,8 @@ impl Launcher {
     pub fn launch(&self, host: &Effective<HostSettings>) -> Launch {
         let shell = &host.value.shell;
         let program = resolve_program(shell.program.as_deref());
-        let mut launch = Launch { program, args: vec!["-l".into()], env: Vec::new(), managed: false };
+        let args = if cfg!(windows) && !is_zsh(&program) { Vec::new() } else { vec!["-l".into()] };
+        let mut launch = Launch { program, args, env: Vec::new(), managed: false };
         if !(shell.managed && is_zsh(&launch.program)) {
             return launch;
         }
@@ -243,14 +244,23 @@ pub(crate) fn touch_stamp(dirs: &Dirs, at: SystemTime) {
     }
 }
 
-/// `program` if given, else zsh if installed, else `$SHELL`, else /bin/sh.
+/// `program` if given; on Unix, else zsh if installed, else `$SHELL`, else `/bin/sh`;
+/// on Windows, else `pwsh.exe`, else `powershell.exe`, else `%COMSPEC%` / `cmd.exe`.
 pub fn resolve_program(program: Option<&str>) -> String {
-    program
-        .filter(|p| !p.is_empty())
-        .map(str::to_owned)
-        .or_else(|| which("zsh"))
-        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "/bin/sh".into())
+    if let Some(p) = program.filter(|p| !p.is_empty()) {
+        return p.to_owned();
+    }
+    #[cfg(windows)]
+    {
+        which("pwsh.exe")
+            .or_else(|| which("powershell.exe"))
+            .or_else(|| std::env::var("COMSPEC").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "cmd.exe".into())
+    }
+    #[cfg(not(windows))]
+    {
+        which("zsh").or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty())).unwrap_or_else(|| "/bin/sh".into())
+    }
 }
 
 /// `shell.program` names a shell that isn't on this host: new sessions
@@ -338,6 +348,7 @@ mod tests {
         assert!(!Launcher::new(None, None).launch(&h).managed, "no HOME: plain zsh");
     }
 
+    #[cfg(unix)]
     #[test]
     fn launch_command_finds_managed_bin_and_shell_path_and_sets_env() {
         use std::os::unix::fs::PermissionsExt;

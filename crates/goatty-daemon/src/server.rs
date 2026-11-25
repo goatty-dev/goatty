@@ -2,23 +2,28 @@
 //! registry.
 
 use std::collections::HashMap;
-use std::fs::File;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use goatty_client::LocalListener;
+#[cfg(unix)]
+use goatty_client::LocalStream;
 use goatty_proto::{HostInfo, SessionId, SessionInfo, WinSize};
 use goatty_shell::HostService;
-use goatty_term::pty::{Pty, ShellCommand};
+use goatty_term::pty::{Pty, PtyReader, ShellCommand};
 use goatty_term::{Palette, Terminal, TerminalChannels};
 use parking_lot::{Mutex, RwLock};
 
-use crate::session::{CwdCoordinator, Pause, Session, pump_output, to_size};
+#[cfg(unix)]
+use crate::session::Pause;
+use crate::session::{CwdCoordinator, Session, pump_output, to_size};
 use crate::workspaces::{Changes, Workspaces};
 
 /// The session registry shared by every connection.
@@ -35,9 +40,11 @@ pub(crate) struct Daemon {
     pub(crate) next_session: AtomicU64,
     pub(crate) next_conn: AtomicU64,
     /// The listening socket the accept loop serves (a restart passes it on).
+    #[cfg(unix)]
     pub(crate) listener_fd: Mutex<Option<RawFd>>,
     /// The goattyd file this process was started as: what a restart runs by
     /// default, so after an update it's the new build.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) exe: Option<PathBuf>,
     /// A restart is under way: no new sessions.
     pub(crate) restarting: AtomicBool,
@@ -51,6 +58,7 @@ pub(crate) struct Daemon {
     pub(crate) conns: Mutex<HashMap<u64, Arc<crate::client::Liveness>>>,
     /// The listening socket is owned by systemd or launchd (socket activation),
     /// so `shutdown` must not unlink the socket path.
+    #[cfg(unix)]
     pub(crate) socket_activated: AtomicBool,
 }
 
@@ -59,13 +67,16 @@ pub(crate) struct Daemon {
 pub(crate) struct NewSession {
     pub id: SessionId,
     pub pty: Pty,
-    pub reader: File,
+    pub reader: PtyReader,
     pub term: Terminal,
     pub chans: TerminalChannels,
     pub created_unix: u64,
     pub managed: bool,
     /// The connection that asked for it (`Create`, `Run`); `None` when restored.
     pub creator: Option<u64>,
+    /// Launch directory passed to `Pty::spawn` (used to seed initial CWD when
+    /// the platform lacks `/proc/<pid>/cwd`, such as Windows before OSC 7).
+    pub initial_cwd: Option<PathBuf>,
 }
 
 /// The program this process runs, as a path a restart can run again (not
@@ -86,12 +97,14 @@ impl Daemon {
             workspaces: Mutex::default(),
             next_session: AtomicU64::new(0),
             next_conn: AtomicU64::new(0),
+            #[cfg(unix)]
             listener_fd: Mutex::new(None),
             exe: own_exe(),
             restarting: AtomicBool::new(false),
             admission: RwLock::new(()),
             net: Mutex::new(None),
             conns: Mutex::default(),
+            #[cfg(unix)]
             socket_activated: AtomicBool::new(false),
         }
     }
@@ -134,6 +147,7 @@ impl Daemon {
         if let Some(cwd) = cwd.filter(|c| std::path::Path::new(c).is_dir()) {
             cmd.cwd = Some(cwd.into());
         }
+        let initial_cwd = cmd.cwd.clone();
         let (pty, reader) = Pty::spawn(&cmd, size).with_context(|| format!("couldn't start {}", cmd.program))?;
         // The daemon's terminal is authoritative and answers queries
         // (DA, DSR, OSC 4/10/11...). Clients run with answering disabled.
@@ -143,7 +157,8 @@ impl Daemon {
         let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let pid = pty.pid();
         log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
-        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator: Some(conn) })?;
+        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator: Some(conn), initial_cwd })?;
+        #[cfg(unix)]
         if crate::systemd::has_fd_store() {
             crate::systemd::store(&session.stored(), session.master_fd);
         }
@@ -153,14 +168,19 @@ impl Daemon {
     /// Register a session and start its threads: query replies → PTY, and
     /// PTY → terminal + subscribers until the process exits.
     pub(crate) fn start(self: &Arc<Self>, n: NewSession) -> Result<Arc<Session>> {
-        let NewSession { id, pty, reader, term, chans, created_unix, managed, creator } = n;
-        let (pid, master_fd) = (pty.pid(), pty.master_fd().as_raw_fd());
+        let NewSession { id, pty, reader, term, chans, created_unix, managed, creator, initial_cwd } = n;
+        let pid = pty.pid();
+        #[cfg(unix)]
+        let master_fd = pty.master_fd().as_raw_fd();
+        #[cfg(windows)]
+        let (resizer, exit_watch) = (pty.resizer(), pty.exit_watcher());
         let proc_cwd = pty.cwd();
         let input = pty.input().context("duplicate the PTY for input")?;
         let init_cwd = term
             .current_directory()
             .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
+            .or_else(|| proc_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()))
+            .or_else(|| initial_cwd.as_ref().map(|p| p.to_string_lossy().into_owned()));
         for _ in chans.ui.try_iter() {}
         let subs = Arc::new(Mutex::new(Vec::new()));
         let cwd = Arc::new(CwdCoordinator::new(id, subs.clone(), init_cwd, proc_cwd));
@@ -175,15 +195,20 @@ impl Daemon {
             cwd,
             fg: OnceLock::new(),
             managed,
+            #[cfg(unix)]
             pause: Pause::new()?,
             pid,
+            #[cfg(unix)]
             master_fd,
+            #[cfg(windows)]
+            resizer,
             ui_events: chans.ui.clone(),
             replies: chans.replies.clone(),
             replies_taken: AtomicU64::new(0),
             replies_written: AtomicU64::new(0),
             controller: Mutex::new(None),
             creator: Mutex::new(creator),
+            exited: Mutex::new(None),
         });
         if let Err(e) = session.watch_foreground() {
             log::warn!("session {id}: can't watch the foreground program: {e}");
@@ -194,23 +219,52 @@ impl Daemon {
             self.host.track_shell(pid);
         }
 
+        // Register before spawning the reader/exit threads so a fast-exiting
+        // command cannot run `sessions.remove(&id)` before `insert(id, ...)`
+        // and leave a finished session stranded in `ListSessions`.
+        self.sessions.lock().insert(id, session.clone());
+        let rollback = || {
+            self.sessions.lock().remove(&id);
+            if let Some(pid) = managed_pid {
+                self.host.untrack_shell(pid);
+            }
+            session.pty.lock().kill();
+        };
+
         // Query replies → PTY.
         {
             let s = Arc::downgrade(&session);
-            std::thread::Builder::new().name(format!("s{id}-replies")).spawn(move || {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-replies")).spawn(move || {
                 while let Ok(bytes) = chans.replies.recv() {
                     let Some(s) = s.upgrade() else { break };
                     s.replies_taken.fetch_add(1, Ordering::SeqCst);
                     let _ = s.input.lock().write(&bytes);
                     s.replies_written.fetch_add(1, Ordering::SeqCst);
                 }
-            })?;
+            }) {
+                rollback();
+                return Err(e.into());
+            }
+        }
+        // Windows ConPTY keeps the output pipe open until `ClosePseudoConsole` is
+        // called. Start the exit watcher BEFORE `s{id}-reader` so a failure to
+        // spawn `s{id}-exit` never leaves `s{id}-reader` blocked on an unclosed
+        // pseudoconsole, and a failure to spawn `s{id}-reader` still wakes
+        // `s{id}-exit` once `rollback()` kills the child.
+        #[cfg(windows)]
+        {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-exit")).spawn(move || {
+                exit_watch.wait_and_close_console();
+            }) {
+                rollback();
+                return Err(e.into());
+            }
         }
         // PTY → terminal + subscribers.
         {
             let s = session.clone();
             let daemon = self.clone();
-            std::thread::Builder::new().name(format!("s{id}-reader")).spawn(move || {
+            if let Err(e) = std::thread::Builder::new().name(format!("s{id}-reader")).spawn(move || {
                 pump_output(&s, reader);
                 // The PTY master can hit EOF/EIO slightly before the child is
                 // reapable via WNOHANG; retry briefly so short-lived `Run`
@@ -227,6 +281,7 @@ impl Daemon {
                 }
                 log::info!("session {}: exited ({code:?})", s.id);
                 daemon.sessions.lock().remove(&s.id);
+                #[cfg(unix)]
                 if crate::systemd::has_fd_store() {
                     crate::systemd::unstore(&s.stored());
                 }
@@ -235,9 +290,11 @@ impl Daemon {
                 }
                 s.finish(code);
                 daemon.session_ended(s.id);
-            })?;
+            }) {
+                rollback();
+                return Err(e.into());
+            }
         }
-        self.sessions.lock().insert(id, session.clone());
         Ok(session)
     }
 
@@ -307,10 +364,13 @@ impl Daemon {
         std::thread::sleep(Duration::from_millis(100));
         // Under systemd/launchd socket activation the supervisor owns the
         // socket file and keeps listening on it for the next connection.
+        // On Windows, Named Pipes vanish automatically when closed.
+        #[cfg(unix)]
         if !self.socket_activated.load(Ordering::SeqCst) {
             let _ = std::fs::remove_file(&self.socket);
         }
         // The Serve route stays (the next goattyd serves it again); the socket goes.
+        #[cfg(unix)]
         if let Some(net) = self.net.lock().as_ref() {
             let _ = std::fs::remove_file(net.socket());
         }
@@ -320,32 +380,40 @@ impl Daemon {
 
 pub(crate) fn host_info() -> HostInfo {
     let hostname = goatty_client::hostname();
-    HostInfo {
-        hostname,
-        user: std::env::var("USER").unwrap_or_default(),
-        os: std::env::consts::OS.into(),
-        daemon_version: env!("CARGO_PKG_VERSION").into(),
-    }
+    #[cfg(windows)]
+    let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default();
+    #[cfg(not(windows))]
+    let user = std::env::var("USER").unwrap_or_default();
+    HostInfo { hostname, user, os: std::env::consts::OS.into(), daemon_version: env!("CARGO_PKG_VERSION").into() }
 }
 
-fn bind(path: &Path) -> Result<(UnixListener, u64)> {
+#[cfg(unix)]
+fn bind(path: &Path) -> Result<(LocalListener, u64)> {
     let dir = path.parent().context("socket path has no parent")?;
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     if path.exists() {
-        if UnixStream::connect(path).is_ok() {
+        if LocalStream::connect(path).is_ok() {
             bail!("goattyd already running at {}", path.display());
         }
         std::fs::remove_file(path)?;
     }
-    let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
+    let listener = LocalListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let ino = std::fs::metadata(path)?.ino();
     Ok((listener, ino))
 }
 
-fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
-    *daemon.listener_fd.lock() = Some(listener.as_raw_fd());
+#[cfg(windows)]
+fn bind(path: &Path) -> Result<LocalListener> {
+    LocalListener::bind(path).with_context(|| format!("bind {}", path.display()))
+}
+
+fn accept_loop(daemon: Arc<Daemon>, listener: LocalListener) {
+    #[cfg(unix)]
+    {
+        *daemon.listener_fd.lock() = Some(listener.as_raw_fd());
+    }
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -374,45 +442,57 @@ pub enum Start {
     Restore(PathBuf),
 }
 
-/// Run the daemon on the socket at `path` until `goattyd stop`. Never returns
-/// `Ok`; startup errors (socket in use, permissions) are returned. Under
-/// systemd or launchd socket activation it serves the socket it was given.
+/// Run the daemon on the socket/pipe at `path` until `goattyd stop`. Never
+/// returns `Ok`; startup errors (endpoint in use, permissions) are returned.
+/// Under systemd or launchd socket activation it serves the socket it was given.
 pub fn serve(path: &Path, start: Start) -> Result<()> {
     crate::systemd::capture_env();
     let path = path.to_path_buf();
     let daemon = Arc::new(Daemon::new(path.clone()));
+    #[cfg(unix)]
+    let (listener, mut ino) = {
+        let listener = match start {
+            Start::Restore(state) => {
+                let listener = crate::restore::take_over(&daemon, &state)?;
+                log::info!("took over from the previous goattyd ({} sessions)", daemon.sessions.lock().len());
+                listener
+            }
+            Start::Normal => {
+                let passed = crate::systemd::take_passed();
+                crate::restore::adopt_stored(&daemon, passed.ptys);
+                let activated = passed
+                    .listener
+                    .map(|fd| {
+                        log::info!("using the socket from systemd");
+                        LocalListener::from(fd)
+                    })
+                    .or_else(|| {
+                        crate::launchd::activate_socket().map(|fd| {
+                            log::info!("using the socket from launchd");
+                            LocalListener::from(fd)
+                        })
+                    });
+                if activated.is_some() {
+                    daemon.socket_activated.store(true, Ordering::SeqCst);
+                }
+                activated
+            }
+        };
+        match listener {
+            Some(l) => (l, std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0)),
+            None => bind(&path)?,
+        }
+    };
+    #[cfg(windows)]
     let listener = match start {
         Start::Restore(state) => {
-            let listener = crate::restore::take_over(&daemon, &state)?;
-            log::info!("took over from the previous goattyd ({} sessions)", daemon.sessions.lock().len());
-            listener
+            let _ = crate::restore::take_over(&daemon, &state)?;
+            bind(&path)?
         }
-        Start::Normal => {
-            let passed = crate::systemd::take_passed();
-            crate::restore::adopt_stored(&daemon, passed.ptys);
-            let activated = passed
-                .listener
-                .map(|fd| {
-                    log::info!("using the socket from systemd");
-                    UnixListener::from(fd)
-                })
-                .or_else(|| {
-                    crate::launchd::activate_socket().map(|fd| {
-                        log::info!("using the socket from launchd");
-                        UnixListener::from(fd)
-                    })
-                });
-            if activated.is_some() {
-                daemon.socket_activated.store(true, Ordering::SeqCst);
-            }
-            activated
-        }
-    };
-    let (listener, mut ino) = match listener {
-        Some(l) => (l, std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0)),
-        None => bind(&path)?,
+        Start::Normal => bind(&path)?,
     };
     log::info!("goattyd {} listening on {} (pid {})", env!("CARGO_PKG_VERSION"), path.display(), std::process::id());
+    #[cfg(unix)]
     if crate::systemd::has_fd_store() {
         crate::restore::save_on_sigterm(daemon.clone())?;
     }
@@ -451,46 +531,175 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
             }
         })?;
     }
-    // Socket watchdog. On a server, systemd-logind deletes
-    // /run/user/$UID when the user's last login session ends (unless
-    // lingering is enabled). The daemon and its shells survive that, but the
-    // socket path vanishes, and the next `ssh host goattyd proxy` would start
-    // a second, empty daemon. Re-create the socket when it disappears.
-    let mut taken_over = false;
-    loop {
-        std::thread::sleep(Duration::from_secs(2));
-        crate::net::check(&daemon);
-        let current = std::fs::metadata(&path).ok().map(|m| m.ino());
-        if current == Some(ino) || daemon.restarting.load(Ordering::SeqCst) {
-            continue;
-        }
-        // Someone else listens there now (another daemon, or a systemd
-        // socket installed meanwhile): leave it alone, say so once.
-        if current.is_some() && UnixStream::connect(&path).is_ok() {
-            if !taken_over {
-                log::warn!("another listener took over {}; this daemon keeps serving its connected clients", path.display());
-                taken_over = true;
+    #[cfg(unix)]
+    {
+        // Socket watchdog. On a server, systemd-logind deletes
+        // /run/user/$UID when the user's last login session ends (unless
+        // lingering is enabled). The daemon and its shells survive that, but the
+        // socket path vanishes, and the next `ssh host goattyd proxy` would start
+        // a second, empty daemon. Re-create the socket when it disappears.
+        let mut taken_over = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            crate::net::check(&daemon);
+            let current = std::fs::metadata(&path).ok().map(|m| m.ino());
+            if current == Some(ino) || daemon.restarting.load(Ordering::SeqCst) {
+                continue;
             }
-            continue;
-        }
-        log::warn!("socket {} disappeared; re-binding", path.display());
-        match bind(&path) {
-            Ok((l, i)) => {
-                ino = i;
-                taken_over = false;
-                daemon.socket_activated.store(false, Ordering::SeqCst);
-                let d = daemon.clone();
-                std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, l))?;
+            // Someone else listens there now (another daemon, or a systemd
+            // socket installed meanwhile): leave it alone, say so once.
+            if current.is_some() && LocalStream::connect(&path).is_ok() {
+                if !taken_over {
+                    log::warn!("another listener took over {}; this daemon keeps serving its connected clients", path.display());
+                    taken_over = true;
+                }
+                continue;
             }
-            Err(e) => log::error!("re-bind failed: {e:#}"),
+            log::warn!("socket {} disappeared; re-binding", path.display());
+            match bind(&path) {
+                Ok((l, i)) => {
+                    ino = i;
+                    taken_over = false;
+                    daemon.socket_activated.store(false, Ordering::SeqCst);
+                    let d = daemon.clone();
+                    std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, l))?;
+                }
+                Err(e) => log::error!("re-bind failed: {e:#}"),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Named Pipes exist in the kernel object manager for as long as the
+        // listener holds a handle; no stale socket file or inode watchdog is needed.
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            crate::net::check(&daemon);
         }
     }
 }
 
 /// An inherited listening socket, close-on-exec from now on.
-pub(crate) fn listener_from_fd(fd: RawFd) -> Result<UnixListener> {
+#[cfg(unix)]
+pub(crate) fn listener_from_fd(fd: RawFd) -> Result<LocalListener> {
     goatty_term::pty::set_cloexec(fd, true).with_context(|| format!("the inherited socket (fd {fd}) isn't open"))?;
     // SAFETY: the previous goattyd passed this fd for exactly this, and
     // nothing in this process has adopted it before.
-    Ok(UnixListener::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    Ok(LocalListener::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use goatty_proto::{ServerMsg, StreamOpts, WinSize, read_msg};
+
+    use super::Daemon;
+    use crate::flow::FlowControl;
+    use crate::session::{SubConn, SubFeatures};
+
+    const SIZE: WinSize = WinSize { cols: 80, rows: 24, cell_width: 8, cell_height: 16 };
+
+    fn exit_cmd(code: u32) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd.exe".into(), "/C".into(), format!("exit {code}")]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["/bin/sh".into(), "-c".into(), format!("exit {code}")]
+        }
+    }
+
+    #[test]
+    fn subscribe_after_finish_still_delivers_exited_and_clears_session_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(dir.path().join("d.sock")));
+        let session = daemon.run(1, SIZE, None, exit_cmd(42)).unwrap();
+
+        // Wait until the fast-exiting child has been removed from `sessions`
+        // AND `Session::finish` has run BEFORE subscribing, deterministically
+        // exercising both ordering races (registration vs removal and finish vs subscribe).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.get(session.id).is_some() || session.exited.lock().is_none() {
+            assert!(Instant::now() < deadline, "session did not finish and leave sessions map");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(daemon.list().is_empty(), "finished session must not remain in list()");
+
+        // Subscribe AFTER `finish` has already completed: must still receive
+        // `Attached` followed by `Exited { code: Some(42) }`, and must not
+        // leave a dangling subscriber behind.
+        let (tx, rx) = flume::unbounded();
+        let flow = Arc::new(FlowControl::new());
+        let _sub = session.subscribe(SubConn { id: 1, features: SubFeatures::default(), flow: &flow, tx: &tx }, 7, SIZE, StreamOpts::LOCAL);
+        assert!(session.subs.lock().is_empty(), "late subscriber on finished session must not stay registered");
+
+        let mut saw_attached = false;
+        let mut exit_code = None;
+        for out in rx.try_iter() {
+            if out.stop {
+                continue;
+            }
+            let mut slice: &[u8] = &out.frame;
+            match read_msg::<_, ServerMsg>(&mut slice).unwrap() {
+                ServerMsg::Attached { req, session: sid, .. } => {
+                    assert_eq!(req, 7);
+                    assert_eq!(sid, session.id);
+                    saw_attached = true;
+                }
+                ServerMsg::Exited { session: sid, code } => {
+                    assert_eq!(sid, session.id);
+                    exit_code = Some(code);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_attached, "late subscriber must receive Attached snapshot");
+        assert_eq!(exit_code, Some(Some(42)), "late subscriber must receive Exited with the child exit code");
+    }
+
+    #[test]
+    fn subscribe_before_finish_delivers_exited_once_and_clears_session_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(dir.path().join("d.sock")));
+        // Command waits for a line on stdin before exiting with code 7 so
+        // `subscribe` deterministically runs while the session is still alive.
+        #[cfg(windows)]
+        let wait_cmd = vec!["cmd.exe".into(), "/C".into(), "set /p _= & exit 7".into()];
+        #[cfg(not(windows))]
+        let wait_cmd = vec!["/bin/sh".into(), "-c".into(), "read line; exit 7".into()];
+        let session = daemon.run(1, SIZE, None, wait_cmd).unwrap();
+
+        let (tx, rx) = flume::unbounded();
+        let flow = Arc::new(FlowControl::new());
+        let _sub = session.subscribe(SubConn { id: 1, features: SubFeatures::default(), flow: &flow, tx: &tx }, 9, SIZE, StreamOpts::LOCAL);
+        assert!(session.exited.lock().is_none(), "session exited before subscribe completed");
+        assert!(daemon.get(session.id).is_some(), "live session must be registered in sessions map");
+
+        // Release the waiting child and wait until exit cleanup has completed.
+        session.input.lock().write(b"go\r\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.get(session.id).is_some() || session.exited.lock().is_none() {
+            assert!(Instant::now() < deadline, "session did not exit and clean up");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(daemon.list().is_empty(), "finished session remained in list()");
+
+        // Drain EVERY message delivered to the subscriber and assert `Exited`
+        // arrived exactly once with exit code 7 (no duplicates).
+        let mut exited = Vec::new();
+        for out in rx.try_iter() {
+            if out.stop {
+                continue;
+            }
+            let mut slice: &[u8] = &out.frame;
+            if let ServerMsg::Exited { session: sid, code } = read_msg::<_, ServerMsg>(&mut slice).unwrap() {
+                assert_eq!(sid, session.id);
+                exited.push(code);
+            }
+        }
+        assert_eq!(exited, vec![Some(7)]);
+    }
 }

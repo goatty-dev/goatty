@@ -66,14 +66,36 @@ pub fn locate(dirs: &Dirs, p: &Package, path_var: Option<&str>) -> Location {
 
 /// First executable `exe` in `path_var`, skipping goatty's own `bin/`.
 pub fn which(exe: &str, path_var: Option<&str>, managed_bin: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::split_paths(path_var?)
-        .filter(|d| d != managed_bin)
-        .map(|d| d.join(exe))
-        .find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(path_var?)
+            .filter(|d| d != managed_bin)
+            .map(|d| d.join(exe))
+            .find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    }
+    #[cfg(not(unix))]
+    {
+        let has_ext = Path::new(exe).extension().is_some();
+        std::env::split_paths(path_var?).filter(|d| d != managed_bin).find_map(|d| {
+            let direct = d.join(exe);
+            if direct.is_file() {
+                return Some(direct);
+            }
+            if !has_ext {
+                for ext in [".exe", ".cmd", ".bat"] {
+                    let candidate = d.join(format!("{exe}{ext}"));
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        })
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::builtins;

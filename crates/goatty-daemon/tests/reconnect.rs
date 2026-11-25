@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end tests against a real goattyd:
 //! * detach/reattach keeps the shell and restores the screen,
 //! * full-screen apps are restored,

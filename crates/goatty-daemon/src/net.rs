@@ -38,9 +38,12 @@ fn make(daemon: &Arc<Daemon>) -> Result<Arc<Host>> {
         h.start(Box::new(move |stream, device| {
             let Some(daemon) = weak.upgrade() else { return };
             log::info!("tailnet: serving {}", device.name);
-            if let Err(e) = crate::client::handle(daemon, stream) {
+            #[cfg(unix)]
+            if let Err(e) = crate::client::handle(daemon, goatty_client::LocalStream::from(stream)) {
                 log::debug!("tailnet client error: {e:#}");
             }
+            #[cfg(not(unix))]
+            let _ = (daemon, stream);
         }));
     })?;
     Ok(host)

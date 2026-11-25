@@ -14,26 +14,32 @@
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::sync::OnceLock;
 
 use goatty_proto::SessionId;
 
+#[cfg(unix)]
 const SD_LISTEN_FDS_START: RawFd = 3;
 /// Prefix of the names of goattyd's PTYs in the fd store.
 const PTY_PREFIX: &str = "goatty-s";
 
+#[cfg(unix)]
 struct Env {
     /// `LISTEN_FDS` were for us: (fd, name).
     listen: Vec<(RawFd, String)>,
     notify: Option<String>,
 }
 
+#[cfg(unix)]
 static ENV: OnceLock<Env> = OnceLock::new();
 
 /// Read and remove systemd's variables. Call it before the process starts
-/// any thread; later calls return what the first one read.
+/// any thread; later calls return what the first one read. No-op off Unix.
 pub fn capture_env() {
+    #[cfg(unix)]
     ENV.get_or_init(|| {
         let pid = std::env::var("LISTEN_PID").ok();
         let fds = std::env::var("LISTEN_FDS").ok();
@@ -54,12 +60,14 @@ pub fn capture_env() {
     });
 }
 
+#[cfg(unix)]
 fn env() -> &'static Env {
     capture_env();
     ENV.get().expect("captured")
 }
 
 /// The fds systemd passed, close-on-exec from now on.
+#[cfg(unix)]
 pub(crate) struct Passed {
     /// The listening socket (the fd not named like a PTY).
     pub listener: Option<OwnedFd>,
@@ -68,6 +76,7 @@ pub(crate) struct Passed {
 }
 
 /// Take the fds systemd passed. Only the first call gets them.
+#[cfg(unix)]
 pub(crate) fn take_passed() -> Passed {
     static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut passed = Passed { listener: None, ptys: Vec::new() };
@@ -91,16 +100,19 @@ pub(crate) fn take_passed() -> Passed {
 }
 
 /// The `NOTIFY_SOCKET` systemd gave us, for a re-exec to pass on.
+#[cfg(unix)]
 pub(crate) fn notify_socket() -> Option<&'static str> {
     env().notify.as_deref()
 }
 
 /// The fd store is there (the unit was written with it).
+#[cfg(unix)]
 pub(crate) fn has_fd_store() -> bool {
     env().notify.is_some()
 }
 
 /// What a PTY's name in the fd store says about its session.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredPty {
     pub id: SessionId,
@@ -109,6 +121,7 @@ pub(crate) struct StoredPty {
     pub managed: bool,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl StoredPty {
     /// `goatty-s<id>-<created>-<m|p>` (names are at most 255 printable
     /// characters without `:`).
@@ -130,6 +143,7 @@ impl StoredPty {
 }
 
 /// Put a session's PTY master into the fd store.
+#[cfg(unix)]
 pub(crate) fn store(pty: &StoredPty, fd: RawFd) {
     if let Err(e) = notify(&format!("FDSTORE=1\nFDNAME={}", pty.fd_name()), &[fd]) {
         log::warn!("session {}: couldn't keep its PTY in systemd's fd store: {e}", pty.id);
@@ -137,6 +151,7 @@ pub(crate) fn store(pty: &StoredPty, fd: RawFd) {
 }
 
 /// Take a session's PTY out of the fd store (it ended).
+#[cfg(unix)]
 pub(crate) fn unstore(pty: &StoredPty) {
     if let Err(e) = notify(&format!("FDSTOREREMOVE=1\nFDNAME={}", pty.fd_name()), &[]) {
         log::warn!("session {}: couldn't remove its PTY from systemd's fd store: {e}", pty.id);
@@ -144,7 +159,7 @@ pub(crate) fn unstore(pty: &StoredPty) {
 }
 
 /// systemd is Linux only.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn notify(_state: &str, _fds: &[RawFd]) -> std::io::Result<()> {
     Ok(())
 }
@@ -153,6 +168,11 @@ fn notify(_state: &str, _fds: &[RawFd]) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn notify(state: &str, fds: &[RawFd]) -> std::io::Result<()> {
     let Some(path) = notify_socket() else { return Ok(()) };
+    notify_to(path, state, fds)
+}
+
+#[cfg(target_os = "linux")]
+fn notify_to(path: &str, state: &str, fds: &[RawFd]) -> std::io::Result<()> {
     // SAFETY: plain syscall; the result is checked and owned right away.
     let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
@@ -261,11 +281,10 @@ mod tests {
         assert_eq!(fds, 1);
     }
 
-    /// [`notify`] against an explicit socket path.
+    /// [`notify`] against an explicit socket path without relying on the
+    /// process-wide `ENV` `OnceLock` being uninitialized when other tests run.
     #[cfg(target_os = "linux")]
     fn send_to(path: &str, state: &str, fds: &[RawFd]) {
-        let _ = ENV.set(Env { listen: Vec::new(), notify: Some(path.to_string()) });
-        assert_eq!(notify_socket(), Some(path), "no other test sets the env");
-        notify(state, fds).unwrap();
+        notify_to(path, state, fds).unwrap();
     }
 }

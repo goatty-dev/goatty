@@ -16,14 +16,16 @@
 //! and `KillMode=process` leaves the shells alone when the daemon process
 //! ends.
 
-use std::path::{Path, PathBuf};
-#[cfg(not(target_os = "macos"))]
+use std::path::Path;
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+use std::path::PathBuf;
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 use std::process::{Command, Stdio};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 use anyhow::{Context, Result, bail};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 use super::{Installed, Status};
 
 pub const SOCKET_UNIT: &str = "goattyd.socket";
@@ -33,7 +35,7 @@ pub const SERVICE_UNIT: &str = "goattyd.service";
 const HEADER: &str = "# Written by `goattyd service install`; `goattyd service uninstall` removes it.";
 
 /// `$XDG_CONFIG_HOME/systemd/user`.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn unit_dir() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -43,13 +45,13 @@ pub fn unit_dir() -> Option<PathBuf> {
 }
 
 /// The socket the units listen on: `$XDG_RUNTIME_DIR/goatty/goattyd.sock`.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn unit_socket_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map(|r| PathBuf::from(r).join("goatty/goattyd.sock"))
 }
 
 /// The socket unit is installed (whether or not it's running).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn installed() -> bool {
     unit_dir().is_some_and(|d| d.join(SOCKET_UNIT).is_file())
 }
@@ -62,13 +64,13 @@ fn systemd_quote(s: &str) -> String {
 
 /// The program in an `ExecStart=` line we wrote (the reverse of
 /// [`systemd_quote`] for its first word).
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn exec_program(exec_start: &str) -> Option<PathBuf> {
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+fn exec_program(exec_start: &str) -> Option<std::path::PathBuf> {
     let rest = exec_start.strip_prefix('"')?;
     let (mut out, mut chars) = (String::new(), rest.chars());
     while let Some(c) = chars.next() {
         match c {
-            '"' => return Some(PathBuf::from(out)),
+            '"' => return Some(std::path::PathBuf::from(out)),
             '\\' => out.push(chars.next()?),
             '%' | '$' => {
                 chars.next().filter(|n| *n == c)?;
@@ -81,7 +83,7 @@ fn exec_program(exec_start: &str) -> Option<PathBuf> {
 }
 
 /// The goattyd the installed service runs.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn service_program() -> Option<PathBuf> {
     let text = std::fs::read_to_string(unit_dir()?.join(SERVICE_UNIT)).ok()?;
     text.lines().find_map(|l| l.strip_prefix("ExecStart=")).and_then(exec_program)
@@ -129,7 +131,7 @@ RestartSec=2
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn systemctl(args: &[&str]) -> Result<String> {
     let out = Command::new("systemctl")
         .arg("--user")
@@ -143,27 +145,27 @@ fn systemctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 fn is_active(unit: &str) -> bool {
     systemctl(&["is-active", "--quiet", unit]).is_ok()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn service_active() -> bool {
     is_active(SERVICE_UNIT)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn start_socket() -> Result<()> {
     systemctl(&["start", SOCKET_UNIT]).map(drop)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn stop_service() -> Result<()> {
     systemctl(&["stop", SERVICE_UNIT]).map(drop)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn linger() -> Option<bool> {
     let user = std::env::var("USER").ok()?;
     let out = Command::new("loginctl").args(["show-user", &user, "--property=Linger", "--value"]).stdin(Stdio::null()).output().ok()?;
@@ -174,7 +176,7 @@ pub fn linger() -> Option<bool> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn status() -> Status {
     let unit_dir = unit_dir();
     let installed = installed();
@@ -194,13 +196,13 @@ pub fn status() -> Status {
 }
 
 /// A service unit that has the fd store and leaves the shells running.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 fn keeps_sessions(unit: &str) -> bool {
     let has = |line: &str| unit.lines().any(|l| l.trim() == line);
     unit.lines().any(|l| l.starts_with("FileDescriptorStoreMax=")) && has("NotifyAccess=main") && has("KillMode=process")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn install(exe: &Path, socket_path: &Path) -> Result<Installed> {
     let unit_socket = unit_socket_path().context("XDG_RUNTIME_DIR is not set (no systemd user session?)")?;
     if socket_path != unit_socket {
@@ -229,7 +231,7 @@ pub fn install(exe: &Path, socket_path: &Path) -> Result<Installed> {
     Ok(Installed { unit_dir: dir, started: !foreign, linger: linger() })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(windows)))]
 pub fn uninstall() -> Result<bool> {
     let dir = unit_dir().context("$HOME is not set")?;
     let mut removed = false;

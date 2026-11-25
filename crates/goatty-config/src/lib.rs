@@ -67,17 +67,53 @@ pub use theme::{
 };
 pub use themes::{ThemeEntry, ThemeLibrary};
 
-/// `$XDG_CONFIG_HOME/goatty` (default `~/.config/goatty`). `None` without `$HOME`.
+pub(crate) fn is_abs_path(windows: bool, path: &std::path::Path) -> bool {
+    if windows {
+        let Some(s) = path.to_str() else {
+            return path.is_absolute();
+        };
+        let b = s.as_bytes();
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')) || s.starts_with(r"\\")
+    } else {
+        path.is_absolute()
+    }
+}
+
+pub(crate) fn home_dir_for(windows: bool, var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if windows {
+        if let Some(p) = var("USERPROFILE").filter(|h| !h.is_empty()) {
+            return Some(PathBuf::from(p));
+        }
+        if let (Some(drive), Some(path)) = (var("HOMEDRIVE").filter(|v| !v.is_empty()), var("HOMEPATH").filter(|v| !v.is_empty())) {
+            return Some(PathBuf::from(format!("{drive}{path}")));
+        }
+    }
+    var("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+/// Config directory (`$XDG_CONFIG_HOME/goatty`, default `~/.config/goatty` on
+/// Unix and `%APPDATA%\goatty` on Windows). `None` without a home/config base.
 pub fn config_dir() -> Option<PathBuf> {
     config_dir_from(|k| std::env::var(k).ok())
 }
 
 pub fn config_dir_from(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let base = var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| var("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("goatty"))
+    config_dir_for(cfg!(windows), var)
+}
+
+fn config_dir_for(windows: bool, var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(xdg) = var("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| is_abs_path(windows, p)) {
+        return Some(xdg.join("goatty"));
+    }
+    if windows {
+        let base = var("APPDATA")
+            .map(PathBuf::from)
+            .filter(|p| is_abs_path(true, p))
+            .or_else(|| home_dir_for(true, &var).map(|h| h.join("AppData").join("Roaming")))?;
+        return Some(base.join("goatty"));
+    }
+    let home = home_dir_for(false, &var)?;
+    Some(home.join(".config").join("goatty"))
 }
 
 /// The client settings file.
@@ -140,17 +176,36 @@ pub fn with_host_env(file: Loaded<HostSettings>) -> Effective<HostSettings> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn config_dir_follows_xdg() {
-        let d = config_dir_from(|k| (k == "HOME").then(|| "/home/u".into())).unwrap();
+        let d = config_dir_for(false, |k| (k == "HOME").then(|| "/home/u".into())).unwrap();
         assert_eq!(d, PathBuf::from("/home/u/.config/goatty"));
-        let d = config_dir_from(|k| match k {
+        let d = config_dir_for(false, |k| match k {
             "HOME" => Some("/home/u".into()),
             "XDG_CONFIG_HOME" => Some("/cfg".into()),
             _ => None,
         })
         .unwrap();
         assert_eq!(d, PathBuf::from("/cfg/goatty"));
-        assert!(config_dir_from(|_| None).is_none());
+        assert!(config_dir_for(false, |_| None).is_none());
+    }
+
+    #[test]
+    fn config_dir_follows_windows_conventions_and_xdg_override() {
+        let d = config_dir_for(true, |k| (k == "APPDATA").then(|| r"C:\Users\u\AppData\Roaming".into())).unwrap();
+        assert_eq!(d, PathBuf::from(r"C:\Users\u\AppData\Roaming").join("goatty"));
+
+        let d = config_dir_for(true, |k| (k == "USERPROFILE").then(|| r"C:\Users\u".into())).unwrap();
+        assert_eq!(d, PathBuf::from(r"C:\Users\u").join("AppData").join("Roaming").join("goatty"));
+
+        let d = config_dir_for(true, |k| match k {
+            "APPDATA" => Some(r"C:\Users\u\AppData\Roaming".into()),
+            "XDG_CONFIG_HOME" => Some(r"D:\xdg\config".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(d, PathBuf::from(r"D:\xdg\config").join("goatty"));
+        assert!(config_dir_for(true, |_| None).is_none());
     }
 }

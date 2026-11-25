@@ -319,34 +319,56 @@ pub const BACKUPS_KEPT: usize = 20;
 
 /// Atomically replace `path` with `text` (with a backup), unless identical.
 pub fn write_text(path: &Path, text: &str) -> io::Result<bool> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
     let old = std::fs::read_to_string(path).ok();
     if old.as_deref() == Some(text) {
         return Ok(false);
     }
     let dir = path.parent().ok_or_else(|| io::Error::other("settings path has no parent"))?;
     std::fs::create_dir_all(dir)?;
-    if old.is_some() {
-        backup(path)?;
+    if let Some(old) = old {
+        backup(path, &old)?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.tmp-{}-{seq}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let res = file.write_all(text.as_bytes()).and_then(|()| {
+        drop(file);
+        std::fs::rename(&tmp, path)
+    });
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res?;
     Ok(true)
 }
 
-fn backup(path: &Path) -> io::Result<PathBuf> {
+fn backup(path: &Path, old: &str) -> io::Result<PathBuf> {
+    use std::io::Write;
+
     let dir = path.parent().expect("checked").join("backups");
     std::fs::create_dir_all(&dir)?;
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let mut target = dir.join(format!("{stem}-{secs}.json"));
-    let mut n = 1;
-    while target.exists() {
-        target = dir.join(format!("{stem}-{secs}-{n}.json"));
-        n += 1;
+    let mut n = 0u64;
+    let (target, mut file) = loop {
+        let candidate = if n == 0 { dir.join(format!("{stem}-{secs}.json")) } else { dir.join(format!("{stem}-{secs}-{n}.json")) };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    if let Err(e) = file.write_all(old.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&target);
+        return Err(e);
     }
-    std::fs::copy(path, &target)?;
     let mut olds: Vec<PathBuf> = backups(path);
     while olds.len() > BACKUPS_KEPT {
         let _ = std::fs::remove_file(olds.remove(0));
@@ -690,5 +712,34 @@ mod tests {
             save(&path, &s, &[]).unwrap();
         }
         assert_eq!(backups(&path).len(), BACKUPS_KEPT);
+    }
+
+    #[test]
+    fn concurrent_saves_use_distinct_staging_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for t in 0..4usize {
+            let p = path.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for i in 0..8usize {
+                    let text = format!("{{\n  \"version\": 1,\n  \"worker\": {t},\n  \"iter\": {i}\n}}\n");
+                    write_text(&p, &text).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Final file is valid JSON written by one of the workers, and no staging files leak.
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&final_text).unwrap();
+        assert!(parsed.is_object());
+        let leftovers: Vec<_> =
+            std::fs::read_dir(tmp.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".tmp-")).collect();
+        assert!(leftovers.is_empty(), "leftover staging files: {leftovers:?}");
     }
 }

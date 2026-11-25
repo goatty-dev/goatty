@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end tests for adaptive flow control (#9, protocol v15):
 //! * fast remote proxy links measure RTT promptly and ramp their window up
 //!   well above `StreamOpts::REMOTE.window`,

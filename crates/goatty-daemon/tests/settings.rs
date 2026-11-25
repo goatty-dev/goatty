@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Host settings over the protocol (v4), against a real goattyd with a
 //! sandboxed `$HOME`: get, preview, apply (validate → generation → save),
 //! bad values, generations, rollback, `SetPalette` changing the answers
