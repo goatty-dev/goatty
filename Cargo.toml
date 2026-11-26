@@ -81,6 +81,9 @@ lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "x
 toml = "1.1"
 semver = "1"
 ed25519-dalek = "3"
+# Icon and version info in goatty.exe / goattyd.exe (build.rs; does nothing
+# when the target isn't Windows).
+winresource = { version = "0.1", default-features = false }
 
 goatty-term = { path = "crates/goatty-term" }
 goatty-proto = { path = "crates/goatty-proto" }

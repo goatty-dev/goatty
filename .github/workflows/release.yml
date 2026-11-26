@@ -239,9 +239,91 @@ jobs:
           test -f /usr/share/applications/dev.goatty.goatty.desktop
           test -f /usr/share/zsh/site-functions/_goatty
 
+  # goatty.exe and goattyd.exe, packaged as a per-user MSI
+  # (packaging/windows/goatty.wxs) and a portable .zip, both with the static
+  # Linux goattyds for remote hosts; plus goattyd-x86_64-windows.exe for
+  # remote Windows hosts (scripts/package-windows.ps1).
+  windows:
+    name: windows x86_64 packages
+    needs: [plan, remote-goattyd]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Link the C runtime statically: a fresh Windows doesn't have the Visual
+      # C++ runtime (vcruntime140.dll).
+      RUSTFLAGS: -C target-feature=+crt-static
+      WIX_VERSION: 5.0.2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist
+      - run: cargo build --profile dist --locked -p goatty-app -p goatty-daemon
+      - name: Check the binaries don't need the Visual C++ runtime
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1).FullName
+          foreach ($b in "goatty", "goattyd") {
+            $deps = & $dumpbin /nologo /dependents "target\dist\$b.exe" | Out-String
+            Write-Output $deps
+            if ($deps -match '(?i)vcruntime|msvcp') { throw "$b.exe needs the Visual C++ runtime" }
+          }
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: goattyd-*-linux
+          path: remote
+          merge-multiple: true
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          wix extension add --global WixToolset.Util.wixext/$env:WIX_VERSION
+          wix extension add --global WixToolset.UI.wixext/$env:WIX_VERSION
+      - name: Package
+        run: |
+          scripts/package-windows.ps1 -OutDir dist
+          # The same installer as an older version, for test-windows' upgrade test.
+          scripts/package-windows.ps1 -OutDir upgrade-test -MsiVersion 0.0.1
+          Get-ChildItem dist, upgrade-test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-packages
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-upgrade-test
+          path: upgrade-test/*.msi
+          if-no-files-found: error
+
+  # On a clean Windows: the portable archive runs, the MSI upgrades an older
+  # install with its goattyd running, and uninstalling removes everything.
+  test-windows:
+    name: install on windows
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-packages
+          path: packages
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-upgrade-test
+          path: upgrade-test
+      - run: scripts/test-windows-install.ps1 -Packages packages -UpgradeTest upgrade-test
+
   publish:
     name: Publish
-    needs: [plan, remote-goattyd, linux, test-packages, test-aur]
+    needs: [plan, remote-goattyd, linux, test-packages, test-aur, windows, test-windows]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -253,10 +335,20 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
+      # Not windows-upgrade-test: that's only for test-windows.
       - uses: actions/download-artifact@v8
         with:
+          pattern: goattyd-*
           path: assets
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: assets
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-packages
+          path: assets
       - name: Checksums
         working-directory: assets
         run: |
@@ -266,6 +358,7 @@ jobs:
         working-directory: assets
         run: |
           deb=$(echo goatty_*.deb) rpm=$(echo goatty-*.rpm) pkg=$(echo goatty-*.pkg.tar.zst) tgz=$(echo goatty-*-linux.tar.gz)
+          msi=$(echo goatty-*-windows.msi) zip=$(echo goatty-*-windows.zip)
           url="https://github.com/$GH_REPO/releases/download/$TAG"
           {
             echo "## Install (Linux x86_64)"
@@ -275,7 +368,14 @@ jobs:
             echo "- **Fedora**: \`sudo dnf install $url/$rpm\`"
             echo "- **Any other distro, no root**: extract \`$tgz\` and run \`./install.sh\` (installs into \`~/.local\`)"
             echo
-            echo "\`goattyd-<arch>-linux\` are the static daemons goatty installs on remote hosts over SSH. Verify downloads with \`sha256sum -c SHA256SUMS --ignore-missing\`."
+            echo "## Install (Windows 10/11 x86_64, preview)"
+            echo
+            echo "- **Installer**: download [\`$msi\`]($url/$msi) and open it. It installs for your user only (no administrator rights) into \`%LOCALAPPDATA%\\Programs\\goatty\`, adds it to your PATH and adds goatty to the Start Menu."
+            echo "- **Portable**: extract [\`$zip\`]($url/$zip) anywhere and run \`goatty.exe\`."
+            echo
+            echo "The Windows builds aren't code-signed yet: if SmartScreen stops the installer, choose *More info → Run anyway*. Upgrading or uninstalling stops the running goattyd, which ends its sessions."
+            echo
+            echo "\`goattyd-<arch>-linux\` and \`goattyd-x86_64-windows.exe\` are the daemons goatty installs on remote hosts over SSH. Verify downloads with \`sha256sum -c SHA256SUMS --ignore-missing\`."
             echo
             gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" --jq .body
           } >"$RUNNER_TEMP/notes.md"
