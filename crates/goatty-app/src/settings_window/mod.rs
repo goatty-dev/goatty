@@ -1494,8 +1494,14 @@ impl SettingsWindow {
                         // Without the host's file there's nothing to put them back on: say which
                         // machine values didn't make it, rather than holding on to them.
                         if let Some((_, patch)) = view.pending_machine.take() {
-                            let names: Vec<String> = patch.iter().map(|(p, _)| goatty_config::shared::display_path(p)).collect();
-                            let line = format!("⚠ Not saved on this host: {}. Set them again once it answers.", names.join(", "));
+                            let values: Vec<String> = patch
+                                .iter()
+                                .map(|(p, v)| match v {
+                                    Some(v) => format!("{} = {v}", goatty_config::shared::display_path(p)),
+                                    None => format!("{} back to its default", goatty_config::shared::display_path(p)),
+                                })
+                                .collect();
+                            let line = format!("⚠ Not saved on this host: {}. Set them again once it answers.", values.join(", "));
                             match view.outcome.as_mut() {
                                 Some(o) => o.lines.push(line),
                                 None => view.outcome = Some(Outcome { ok: false, lines: vec![line], diff: Vec::new(), reload: false }),

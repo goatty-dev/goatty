@@ -364,7 +364,7 @@ impl SettingsWindow {
                             {
                                 o.ok = false;
                                 o.lines
-                                    .push(format!("⚠ This host's own settings weren't applied: {e:#}. They're still here to apply again."));
+                                    .push(format!("⚠ This host's own settings weren't applied: {e:#}. They come back into the draft once the host's settings load."));
                             }
                         });
                     })
