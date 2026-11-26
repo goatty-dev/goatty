@@ -8,12 +8,13 @@
 
 use goatty_client::askpass::{AskKind, AskRequest};
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render, SharedString, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, Render, SharedString,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
 use crate::settings::AppSettings;
 use crate::ui::controls::{ButtonKind, button};
+use crate::ui::focus::Stops;
 use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
 
@@ -32,11 +33,7 @@ pub fn run(req: AskRequest) -> ! {
             },
             |window, cx| {
                 window.set_window_title(title(req.kind));
-                cx.new(|cx| {
-                    let view = Askpass { req, secret: String::new(), focus: cx.focus_handle() };
-                    view.focus.focus(window, cx);
-                    view
-                })
+                cx.new(|cx| Askpass::new(req, window, cx))
             },
         );
         if let Err(e) = opened {
@@ -74,6 +71,7 @@ struct Askpass {
     req: AskRequest,
     secret: String,
     focus: FocusHandle,
+    stops: Stops,
 }
 
 impl Focusable for Askpass {
@@ -83,6 +81,22 @@ impl Focusable for Askpass {
 }
 
 impl Askpass {
+    fn new(req: AskRequest, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
+        let (count, initial) = match req.kind {
+            AskKind::Secret => (3, 0),
+            AskKind::HostKey | AskKind::Confirm => (2, 1),
+            AskKind::Notice => (1, 0),
+        };
+        let focus = cx.focus_handle();
+        let stops = Stops::new(count, cx);
+        stops.focus(initial, window, cx);
+        Self { req, secret: String::new(), focus, stops }
+    }
+
+    fn secret_focused(&self, window: &Window) -> bool {
+        self.req.kind == AskKind::Secret && self.stops.focused_index(window) == Some(0)
+    }
+
     fn accept(&self) -> ! {
         match self.req.kind {
             AskKind::Secret => finish(Some(&self.secret), 0),
@@ -95,13 +109,26 @@ impl Askpass {
         finish_reject(self.req.kind)
     }
 
-    fn on_key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         let ks = &ev.keystroke;
         let m = ks.modifiers;
+        let secret_focused = self.secret_focused(window);
         match ks.key.as_str() {
-            "enter" => self.accept(),
             "escape" => self.reject(),
-            _ if self.req.kind != AskKind::Secret => return,
+            "tab" if m.shift && !m.control && !m.alt && !m.platform => {
+                self.stops.step(-1, window, cx);
+            }
+            "tab" if !m.modified() => {
+                self.stops.step(1, window, cx);
+            }
+            "left" if !m.modified() && !secret_focused => {
+                self.stops.step(-1, window, cx);
+            }
+            "right" if !m.modified() && !secret_focused => {
+                self.stops.step(1, window, cx);
+            }
+            "enter" if !m.modified() && (secret_focused || !self.stops.any_focused(window)) => self.accept(),
+            _ if !secret_focused => return,
             "backspace" if m.control => self.secret.clear(),
             "backspace" => {
                 self.secret.pop();
@@ -129,7 +156,7 @@ impl Askpass {
 }
 
 impl Render for Askpass {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
         let s = cx.global::<AppSettings>();
         let ui_font = s.ui_font.clone();
@@ -145,9 +172,11 @@ impl Render for Askpass {
             let fixed = kind == AskKind::HostKey && (l.contains("SHA256:") || l.contains("fingerprint is"));
             div().when(fixed, |d| d.font_family(mono.clone()).text_xs()).child(SharedString::from(l.to_string()))
         }));
+        let secret_focused = self.secret_focused(window);
         let field = (kind == AskKind::Secret).then(|| {
             let dots: String = "•".repeat(self.secret.chars().count());
-            div()
+            let el = div()
+                .id("ask-secret")
                 .flex()
                 .items_center()
                 .h(px(32.))
@@ -155,10 +184,18 @@ impl Render for Askpass {
                 .rounded_md()
                 .bg(ui.input_bg)
                 .border_1()
-                .border_color(ui.accent)
+                .border_color(if secret_focused { ui.accent } else { ui.border })
                 .text_color(ui.text)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.stops.focus(0, window, cx);
+                        cx.notify();
+                    }),
+                )
                 .child(dots)
-                .child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(ui.accent))
+                .when(secret_focused, |d| d.child(div().w(px(1.5)).h(px(16.)).ml(px(1.)).bg(ui.accent)));
+            self.stops.wrap(0, el, ui, ui.bg)
         });
         let (yes, no) = match kind {
             AskKind::Secret => ("OK", "Cancel"),
@@ -171,16 +208,28 @@ impl Render for Askpass {
             AskKind::Secret => "Asked by ssh for goatty's connection. Esc cancels.",
             _ => "",
         };
+        let mut btn_idx = usize::from(kind == AskKind::Secret);
         let mut buttons = div().flex().items_center().gap_2().child(div().flex_1().text_xs().text_color(ui.muted).child(hint));
         if !no.is_empty() {
-            buttons = buttons.child(button("ask-no", no, ButtonKind::Normal, ui, move |_, _| finish_reject(kind)));
+            buttons = buttons.child(self.stops.wrap(
+                btn_idx,
+                button("ask-no", no, ButtonKind::Normal, ui, move |_, _| finish_reject(kind)),
+                ui,
+                ui.bg,
+            ));
+            btn_idx += 1;
         }
         let secret_ok = self.secret.clone();
-        buttons = buttons.child(button("ask-yes", yes, ButtonKind::Primary, ui, move |_, _| match kind {
-            AskKind::Secret => finish(Some(&secret_ok), 0),
-            AskKind::HostKey => finish(Some("yes"), 0),
-            _ => finish(None, 0),
-        }));
+        buttons = buttons.child(self.stops.wrap(
+            btn_idx,
+            button("ask-yes", yes, ButtonKind::Primary, ui, move |_, _| match kind {
+                AskKind::Secret => finish(Some(&secret_ok), 0),
+                AskKind::HostKey => finish(Some("yes"), 0),
+                _ => finish(None, 0),
+            }),
+            ui,
+            ui.bg,
+        ));
 
         div()
             .track_focus(&self.focus)

@@ -39,8 +39,8 @@ use goatty_client::{Connection, Endpoint, RemoteProblem, SshTarget};
 use goatty_shell::HostService;
 use goatty_term::TermSize;
 use gpui::{
-    Animation, AnimationExt as _, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, Render,
-    SharedString, Transformation, WeakEntity, Window, div, percentage, prelude::*, px,
+    Animation, AnimationExt as _, App, AsyncWindowContext, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding,
+    KeyDownEvent, Render, SharedString, Transformation, WeakEntity, Window, actions, div, percentage, prelude::*, px,
 };
 
 use crate::hosts::pool;
@@ -48,9 +48,25 @@ use crate::session::{AttachMode, Session, Spawner, plain_ssh_argv};
 use crate::settings::AppSettings;
 use crate::toast::{self, Toast};
 use crate::ui::controls::{ButtonKind, button};
+use crate::ui::focus::Stops;
 use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
 use crate::workspace::saved::{self, Startup};
+
+pub const CONTEXT: &str = "ConnectView";
+
+actions!(connect_view, [Cancel, FocusNext, FocusPrev]);
+
+pub fn bindings() -> Vec<KeyBinding> {
+    let c = Some(CONTEXT);
+    vec![
+        KeyBinding::new("escape", Cancel, c),
+        KeyBinding::new("tab", FocusNext, c),
+        KeyBinding::new("right", FocusNext, c),
+        KeyBinding::new("shift-tab", FocusPrev, c),
+        KeyBinding::new("left", FocusPrev, c),
+    ]
+}
 
 /// What `goatty` was asked to connect to.
 #[derive(Clone)]
@@ -120,11 +136,7 @@ pub struct Ask {
     pub upload: Option<Bundled>,
 }
 
-const PLAIN_NOTE: &str = "Plain SSH opens a normal ssh session in a local goatty session instead. Nothing is installed on the host, \
-                          and goatty's shell setup, settings and plugins don't reach it there.";
-
-const SETUP_NOTE: &str = "Your shell setup comes along: this computer's prompt, aliases, plugins and their settings, and goatty's \
-                          tools, so the shell there feels like the one here (Settings → Hosts can turn that off).";
+const PLAIN_NOTE: &str = "Plain SSH connects normally without installing anything on the host.";
 
 fn mib(path: &std::path::Path) -> String {
     std::fs::metadata(path).map(|m| format!("{:.1} MiB", m.len() as f64 / (1024. * 1024.))).unwrap_or_else(|_| "? MiB".into())
@@ -144,9 +156,7 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
             None => Ask {
                 title: format!("goattyd doesn't run on {host}"),
                 body: vec![
-                    format!(
-                        "{host} is {platform}. goattyd, goatty's session daemon, is available for Linux and Windows on x86_64 and aarch64 so far."
-                    ),
+                    format!("{host} is {platform}. goattyd currently supports Linux and Windows (x86_64, aarch64)."),
                     PLAIN_NOTE.into(),
                 ],
                 warning: None,
@@ -155,24 +165,15 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
             },
             Some(target) => match find(target) {
                 Some(bundled) => {
-                    let mut body = vec![
-                        format!(
-                            "goatty keeps your shells on {host} in goattyd, its session daemon: they survive disconnects and closing \
-                             the window, and get goatty's shell setup. It isn't installed there yet."
-                        ),
-                        format!(
-                            "goatty can copy goattyd {ver} for {platform} ({}) to {} on {host}. Nothing else changes: no sudo, \
-                             no PATH or dotfile edits.",
-                            mib(&bundled.path),
-                            dest(platform)
-                        ),
-                    ];
-                    body.push(SETUP_NOTE.into());
+                    let mut body = vec![format!(
+                        "Copies goattyd {ver} ({platform}, {}) to {} (no sudo, no PATH or dotfile edits). Sessions survive disconnects \
+                         and get your shell setup.",
+                        mib(&bundled.path),
+                        dest(platform)
+                    )];
                     if bundled.this_build {
                         body.push(
-                            "This development build copies its own goattyd, which may not run on a host with an older C library. \
-                             goatty checks that it runs before using it."
-                                .into(),
+                            "Dev build: copies this build's goattyd, which may not run on an older C library (checked before use).".into(),
                         );
                     }
                     body.push(PLAIN_NOTE.into());
@@ -188,8 +189,7 @@ pub fn describe(problem: &RemoteProblem, find: impl Fn(&str) -> Option<Bundled>)
                     title: format!("No goattyd to install on {host}"),
                     body: vec![
                         format!(
-                            "{host} needs goattyd for {platform}, and this goatty doesn't include one (release archives carry them in \
-                             remote/). Install goattyd there yourself (`cargo install --path crates/goatty-daemon`), then retry."
+                            "No bundled goattyd for {platform}. Install it on {host} (`cargo install --path crates/goatty-daemon`), then retry."
                         ),
                         PLAIN_NOTE.into(),
                     ],
@@ -452,6 +452,7 @@ pub struct ConnectView {
     plan: ConnectPlan,
     step: Step,
     focus: FocusHandle,
+    stops: Stops,
     ready: Option<Ready>,
     /// Check that the local daemon is the installed build (off once the
     /// user chose, or it was restarted).
@@ -470,6 +471,11 @@ impl EventEmitter<ConnectEvent> for ConnectView {}
 
 impl Focusable for ConnectView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        if matches!(self.step, Step::Ask(_))
+            && let Some(h) = self.stops.last()
+        {
+            return h.clone();
+        }
         self.focus.clone()
     }
 }
@@ -484,6 +490,7 @@ impl ConnectView {
             plan,
             step: Step::Working(String::new()),
             focus: cx.focus_handle(),
+            stops: Stops::default(),
             ready: None,
             check_local: true,
             outdated: None,
@@ -554,6 +561,10 @@ impl ConnectView {
         cx: &mut Context<'_, Self>,
         job: impl FnOnce() -> Result<Ready> + Send + 'static,
     ) {
+        if self.stops.any_focused(window) {
+            window.focus(&self.focus, cx);
+        }
+        self.stops.clear();
         self.step = Step::Working(label);
         cx.emit(ConnectEvent::Changed);
         cx.notify();
@@ -577,7 +588,7 @@ impl ConnectView {
         .detach();
     }
 
-    fn finish(&mut self, result: Result<Ready>, _window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn finish(&mut self, result: Result<Ready>, window: &mut Window, cx: &mut Context<'_, Self>) {
         match result {
             Ok(ready) => {
                 let restarted = self.restarted.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -613,7 +624,13 @@ impl ConnectView {
                 } else {
                     failed(self.plan.endpoint.label(), &e, self.ssh_target().is_some())
                 };
+                let last = ask.choices.len().saturating_sub(1);
+                self.stops.resize(ask.choices.len(), cx);
+                let should_focus = self.focus.contains_focused(window, cx) || window.focused(cx).is_none();
                 self.step = Step::Ask(ask);
+                if should_focus {
+                    self.stops.focus(last, window, cx);
+                }
                 cx.emit(ConnectEvent::Changed);
                 cx.notify();
             }
@@ -718,16 +735,35 @@ impl ConnectView {
         }
     }
 
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if matches!(self.step, Step::Ask(_)) {
+            self.choose(Choice::Cancel, window, cx);
+        }
+    }
+
+    fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if matches!(self.step, Step::Ask(_)) {
+            self.stops.step(1, window, cx);
+        }
+    }
+
+    fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if matches!(self.step, Step::Ask(_)) {
+            self.stops.step(-1, window, cx);
+        }
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Step::Ask(ask) = &self.step else { return };
-        let choice = match ev.keystroke.key.as_str() {
-            "enter" => ask.choices.last().map(|c| c.0),
-            "escape" => Some(Choice::Cancel),
-            _ => None,
-        };
-        if let Some(c) = choice {
+        // Focused buttons handle Enter and Space through GPUI's on_click;
+        // Enter here is only the fallback when focus sits on the backdrop.
+        if ev.keystroke.key == "enter"
+            && !ev.keystroke.modifiers.modified()
+            && !self.stops.any_focused(window)
+            && let Some((choice, _)) = ask.choices.last()
+        {
             cx.stop_propagation();
-            self.choose(c, window, cx);
+            self.choose(*choice, window, cx);
         }
     }
 }
@@ -798,7 +834,11 @@ impl Render for ConnectView {
         let ui = Ui::get(cx);
         let ui_font = cx.global::<AppSettings>().ui_font.clone();
         let outer = div()
+            .key_context(CONTEXT)
             .track_focus(&self.focus)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
             .on_key_down(cx.listener(Self::on_key))
             .size_full()
             .flex()
@@ -832,9 +872,10 @@ impl Render for ConnectView {
                         _ => ButtonKind::Normal,
                     };
                     let (choice, view) = (*choice, cx.entity().downgrade());
-                    button(SharedString::from(format!("connect-{i}")), label.clone(), kind, ui, move |window, cx| {
+                    let btn = button(SharedString::from(format!("connect-{i}")), label.clone(), kind, ui, move |window, cx| {
                         let _ = view.update(cx, |v, cx| v.choose(choice, window, cx));
-                    })
+                    });
+                    self.stops.wrap(i, btn, ui, ui.surface)
                 });
                 let icon = if ask.warning.is_some() { (Icon::TriangleAlert, ui.warning) } else { (Icon::Info, ui.accent) };
                 card.p_5()

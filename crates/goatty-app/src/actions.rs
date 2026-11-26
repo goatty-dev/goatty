@@ -323,6 +323,7 @@ pub fn apply_keybindings(overrides: &BTreeMap<String, Option<String>>, cx: &mut 
     cx.bind_keys(crate::output_view::bindings());
     cx.bind_keys(crate::settings_window::bindings());
     cx.bind_keys(crate::welcome::bindings());
+    cx.bind_keys(crate::connect::bindings());
     cx.bind_keys(crate::paste_confirm::bindings());
     cx.bind_keys(crate::close_confirm::bindings());
     let palette_keys = goatty_config::keys::keys_for("command_palette", overrides);
