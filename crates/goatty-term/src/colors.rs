@@ -40,33 +40,32 @@ pub struct Palette {
 }
 
 impl Default for Palette {
-    /// "goatty night": a calm dark theme. Placeholder until the theme system
-    /// lands; chosen for legibility of the 16 ANSI colors on the background.
+    /// "goatty night": dark obsidian and brand orange with calm ANSI colors.
     fn default() -> Self {
         Self {
             ansi: [
-                Rgb::hex(0x1d2021), // black
-                Rgb::hex(0xe06c75), // red
-                Rgb::hex(0x98c379), // green
-                Rgb::hex(0xe5c07b), // yellow
-                Rgb::hex(0x61afef), // blue
-                Rgb::hex(0xc678dd), // magenta
-                Rgb::hex(0x56b6c2), // cyan
-                Rgb::hex(0xabb2bf), // white
-                Rgb::hex(0x5c6370), // bright black
-                Rgb::hex(0xff7a85),
-                Rgb::hex(0xb5e890),
-                Rgb::hex(0xffd68a),
-                Rgb::hex(0x82c4ff),
-                Rgb::hex(0xdf9cf2),
-                Rgb::hex(0x7fd4df),
-                Rgb::hex(0xf0f3f6), // bright white
+                Rgb::hex(0x1c1c22), // black
+                Rgb::hex(0xd6655c), // red
+                Rgb::hex(0x82b384), // green
+                Rgb::hex(0xe0a958), // yellow
+                Rgb::hex(0x6e9fd4), // blue
+                Rgb::hex(0xb688c9), // magenta
+                Rgb::hex(0x68b0ad), // cyan
+                Rgb::hex(0xc8c8c6), // white
+                Rgb::hex(0x6b6b76), // bright black
+                Rgb::hex(0xe8837a),
+                Rgb::hex(0x9bc99d),
+                Rgb::hex(0xf2be72),
+                Rgb::hex(0x8cb8e6),
+                Rgb::hex(0xcfa4de),
+                Rgb::hex(0x85cac7),
+                Rgb::hex(0xf2f2f0), // bright white
             ],
-            foreground: Rgb::hex(0xd7dae0),
-            background: Rgb::hex(0x16181d),
-            cursor: Rgb::hex(0xf5c26b),
-            selection_fg: Rgb::hex(0xf0f3f6),
-            selection_bg: Rgb::hex(0x3e4a5e),
+            foreground: Rgb::hex(0xecece8),
+            background: Rgb::hex(0x0c0c0f),
+            cursor: Rgb::hex(0xff5a00),
+            selection_fg: Rgb::hex(0xf2f2f0),
+            selection_bg: Rgb::hex(0x3d2418),
             bold_is_bright: true,
         }
     }

@@ -193,9 +193,12 @@ mod tests {
 
     #[test]
     fn ui_accent_defaults_to_ansi_blue_and_honors_override() {
+        let nord = goatty_config::find_theme("nord").unwrap().colors;
+        assert_eq!(Ui::from_theme(&nord).accent, h(nord.ansi[4]));
+
         let mut colors = goatty_config::find_theme("goatty-night").unwrap().colors;
         let default_ui = Ui::from_theme(&colors);
-        assert_eq!(default_ui.accent, h(colors.ansi[4]));
+        assert_eq!(default_ui.accent, h(Color(0xff5a00)));
 
         let green = colors.ansi[2];
         colors.accent = Some(green);

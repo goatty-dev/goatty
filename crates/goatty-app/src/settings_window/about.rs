@@ -7,6 +7,8 @@ use gpui::{AnyElement, ClipboardItem, Context, FontWeight, IntoElement, ParentEl
 
 use super::kit::{card, row, section};
 use super::{HostLink, SettingsWindow};
+use crate::settings::AppSettings;
+use crate::ui::brand;
 use crate::ui::controls::{ButtonKind, button_with};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
@@ -43,17 +45,7 @@ impl SettingsWindow {
             .gap(px(10.))
             .py(px(32.))
             .px(px(24.))
-            .child(
-                div()
-                    .size(px(72.))
-                    .rounded(px(22.))
-                    .bg(ui.accent)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .shadow_md()
-                    .child(Icon::Terminal.svg().size(px(38.)).text_color(ui.on_accent)),
-            )
+            .child(brand::logo(80., &cx.global::<AppSettings>().colors))
             .child(div().pt(px(6.)).text_size(px(26.)).font_weight(FontWeight::BOLD).child("goatty"))
             .child(div().text_size(px(text::BODY)).text_color(ui.muted).child("A fast terminal with batteries included"))
             .child(

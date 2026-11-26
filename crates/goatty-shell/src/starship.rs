@@ -371,6 +371,7 @@ mod tests {
                         .env("STARSHIP_CONFIG", &config)
                         .env("STARSHIP_CACHE", tmp.path())
                         .env("STARSHIP_LOG", "warn")
+                        .env("TERM", "xterm-256color")
                         .output()
                         .unwrap();
                     let err = String::from_utf8_lossy(&out.stderr);

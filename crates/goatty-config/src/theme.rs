@@ -242,6 +242,13 @@ const fn theme(id: &'static str, name: &'static str, ansi: [u32; 16], fg: u32, b
     }
 }
 
+impl Theme {
+    const fn with_accent(mut self, accent: u32) -> Self {
+        self.colors.accent = Some(c(accent));
+        self
+    }
+}
+
 pub const DEFAULT_THEME: &str = "goatty-night";
 
 /// Built-in themes. Palettes follow each scheme's published terminal colors.
@@ -250,28 +257,30 @@ pub static THEMES: &[Theme] = &[
         "goatty-night",
         "goatty night",
         [
-            0x1d2021, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, //
-            0x5c6370, 0xff7a85, 0xb5e890, 0xffd68a, 0x82c4ff, 0xdf9cf2, 0x7fd4df, 0xf0f3f6,
+            0x1c1c22, 0xd6655c, 0x82b384, 0xe0a958, 0x6e9fd4, 0xb688c9, 0x68b0ad, 0xc8c8c6, //
+            0x6b6b76, 0xe8837a, 0x9bc99d, 0xf2be72, 0x8cb8e6, 0xcfa4de, 0x85cac7, 0xf2f2f0,
         ],
-        0xd7dae0,
-        0x16181d,
-        0xf5c26b,
-        0xf0f3f6,
-        0x3e4a5e,
-    ),
+        0xecece8,
+        0x0c0c0f,
+        0xff5a00,
+        0xf2f2f0,
+        0x3d2418,
+    )
+    .with_accent(0xff5a00),
     theme(
         "goatty-day",
         "goatty day",
         [
-            0x2b2f36, 0xc8414c, 0x3f8f3a, 0xa86b00, 0x2f6fd0, 0x9a4fc2, 0x1f8a99, 0xbabec5, //
-            0x6b7280, 0xe0525e, 0x4fa847, 0xc48a10, 0x4b8ae8, 0xb26ad9, 0x2ba3b3, 0xe8e8e4,
+            0x18181d, 0xbd443c, 0x3e7d47, 0xa86a10, 0x356ea8, 0x884f9c, 0x2a7d7a, 0xb8b8be, //
+            0x6c6c76, 0xd4554c, 0x4d9457, 0xc27d18, 0x4683c2, 0xa163b5, 0x369490, 0xe6e5e0,
         ],
-        0x2b2f36,
-        0xfafaf8,
-        0xd9822b,
-        0x1d2021,
-        0xcfd8e6,
-    ),
+        0x18181d,
+        0xf7f6f3,
+        0xe04f00,
+        0x18181d,
+        0xf3d8c6,
+    )
+    .with_accent(0xe04f00),
     theme(
         "solarized-dark",
         "Solarized Dark",
@@ -581,11 +590,13 @@ mod tests {
         for (i, t) in THEMES.iter().enumerate() {
             assert!(THEMES[..i].iter().all(|o| o.id != t.id), "duplicate {}", t.id);
             assert_ne!(t.colors.foreground, t.colors.background, "{}", t.id);
-            assert_eq!(t.colors.accent, None);
-            assert_eq!(t.colors.accent(), t.colors.ansi[4]);
+            assert_eq!(t.colors.accent(), t.colors.accent.unwrap_or(t.colors.ansi[4]), "{}", t.id);
         }
         assert!(find_theme(DEFAULT_THEME).unwrap().colors.is_dark());
+        assert_eq!(find_theme(DEFAULT_THEME).unwrap().colors.accent, Some(Color(0xff5a00)));
         assert!(!find_theme("goatty-day").unwrap().colors.is_dark());
+        assert_eq!(find_theme("goatty-day").unwrap().colors.accent, Some(Color(0xe04f00)));
+        assert_eq!(find_theme("nord").unwrap().colors.accent, None);
     }
 
     #[test]
@@ -597,10 +608,11 @@ mod tests {
         assert_eq!(c.background, Color(0));
         assert_eq!(c.ansi[1], Color(0xff0000));
         assert_eq!(c.ansi[0], find_theme(DEFAULT_THEME).unwrap().colors.ansi[0]);
-        assert_eq!(c.accent, None);
-        assert_eq!(c.accent(), c.ansi[4]);
+        assert_eq!(c.accent, Some(Color(0xff5a00)));
+        assert_eq!(c.accent(), Color(0xff5a00));
         let round = ThemeColors::from_slice(&c.to_vec()).unwrap();
-        assert_eq!(round, c);
+        // `to_vec`/`from_slice` carry only the 21 terminal colors over the wire, not the UI accent.
+        assert_eq!(round, ThemeColors { accent: None, ..c });
         assert_eq!(ThemeSettings { name: "nope".into(), ..Default::default() }.colors(), ThemeSettings::default().colors());
 
         s.set_override(DEFAULT_THEME, ColorSlot::Accent, Some(Color(0x98c379)));

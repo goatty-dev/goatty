@@ -56,6 +56,9 @@ EOF
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$data_home/applications" >/dev/null 2>&1 || true
 fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -f "$data_home/icons/hicolor/index.theme" ]; then
+    gtk-update-icon-cache -q -t -f "$data_home/icons/hicolor" >/dev/null 2>&1 || true
+fi
 
 echo "Installed Goatty. The launcher is at $desktop_file"
 if ! printf '%s' ":${PATH:-}:" | grep -Fq ":$bin_dir:"; then
