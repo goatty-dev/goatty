@@ -2,8 +2,8 @@
 //! (startup, tabs, panes, notifications).
 
 use goatty_config::{
-    CtrlBackspace, CtrlDelete, LinkClick, LinkSettings, MiddleClick, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm, ProgramCopy,
-    RemoteFileOpen, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
+    CtrlBackspace, CtrlDelete, LinkClick, LinkSettings, MiddleClick, MouseSettings, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm,
+    ProgramCopy, RemoteFileOpen, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -137,19 +137,30 @@ impl SettingsWindow {
             )))
             .footer("Pipe into copy (cat file | copy) to put text on this computer's clipboard, even on a remote host. Programs can never read the clipboard.");
 
-        let mouse = section(ui, "Mouse").child(row(ui, "Right click").desc("Shift+right-click does the other thing").control(self.select(
-            "right-click",
-            "Right click",
-            opts(&[
-                (RightClick::Menu, "Shows goatty's menu", "Programs that use the mouse (vim, tmux) get the click"),
-                (RightClick::Always, "Always shows goatty's menu", "In vim and tmux too; Shift+right-click reaches them"),
-                (RightClick::Paste, "Copies or pastes", "Copies the selection, else pastes (like Windows Terminal)"),
-                (RightClick::Off, "Does nothing", "Programs that use the mouse still get the click"),
-            ]),
-            &s.mouse.right_click,
-            cx,
-            |v, _, cx| AppSettings::update(cx, |s| s.mouse.right_click = v),
-        )));
+        let mouse = section(ui, "Mouse")
+            .child(row(ui, "Right click").desc("Shift+right-click does the other thing").control(self.select(
+                "right-click",
+                "Right click",
+                opts(&[
+                    (RightClick::Menu, "Shows goatty's menu", "Programs that use the mouse (vim, tmux) get the click"),
+                    (RightClick::Always, "Always shows goatty's menu", "In vim and tmux too; Shift+right-click reaches them"),
+                    (RightClick::Paste, "Copies or pastes", "Copies the selection, else pastes (like Windows Terminal)"),
+                    (RightClick::Off, "Does nothing", "Programs that use the mouse still get the click"),
+                ]),
+                &s.mouse.right_click,
+                cx,
+                |v, _, cx| AppSettings::update(cx, |s| s.mouse.right_click = v),
+            )))
+            .child(row(ui, "Wheel scrolls").desc("Lines per notch of the mouse wheel; touchpads scroll by distance").control(stepper(
+                "scroll-lines",
+                match s.mouse.scroll_lines {
+                    1 => "1 line".to_string(),
+                    n => format!("{n} lines"),
+                },
+                ui,
+                client(|s| s.mouse.scroll_lines = s.mouse.scroll_lines.saturating_sub(1).max(MouseSettings::MIN_SCROLL_LINES)),
+                client(|s| s.mouse.scroll_lines = (s.mouse.scroll_lines + 1).min(MouseSettings::MAX_SCROLL_LINES)),
+            )));
 
         let middle_opts = if PRIMARY_SELECTION {
             opts(&[

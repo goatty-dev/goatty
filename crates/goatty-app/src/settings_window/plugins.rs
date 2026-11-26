@@ -37,6 +37,81 @@ use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
 use crate::ui::text_input::{TextInput, TextInputEvent};
 
+/// A `goatty://plugins/<id>[?version=<v>&registry=<name>]` link waiting for
+/// the host's catalog to load (#305).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PluginLink {
+    pub id: String,
+    pub version: Option<String>,
+    pub registry: Option<String>,
+}
+
+/// What a [`PluginLink`] resolves to against a host's [`Catalog`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PluginLinkResolution {
+    /// Open the installed plugin's detail page (canonical id).
+    Detail(String),
+    /// Open the install/update review for `(id, version)`, verifying
+    /// `registry` if requested, and landing on `fallback_detail` if the plan fails.
+    Review { id: String, version: Option<String>, registry: Option<String>, fallback_detail: Option<String> },
+    /// The link named a registry this host doesn't have (never added).
+    UnknownRegistry(String),
+    /// The plugin isn't installed or offered by the configured registries.
+    UnknownPlugin,
+}
+
+/// Match a `goatty://plugins/<id>` link against the host's catalog.
+/// Values from the link are matched against catalog entries and never passed
+/// straight through to paths or shell code.
+pub(super) fn resolve_plugin_link(cat: &Catalog, link: &PluginLink) -> PluginLinkResolution {
+    let canonical_registry = if let Some(reg) = &link.registry {
+        match cat.registries.iter().find(|r| r.name.eq_ignore_ascii_case(reg)) {
+            Some(r) => Some(r.name.clone()),
+            None => return PluginLinkResolution::UnknownRegistry(reg.clone()),
+        }
+    } else {
+        None
+    };
+
+    if let Some(inst) = cat.installed.iter().find(|i| i.id.eq_ignore_ascii_case(&link.id)) {
+        let same_version = link.version.as_deref().is_none_or(|v| v == inst.version);
+        if same_version || inst.builtin {
+            return PluginLinkResolution::Detail(inst.id.clone());
+        }
+        // A specific different version of a non-builtin installed plugin: open
+        // its review if the catalog offers this plugin (in the requested
+        // registry, if any), falling back to its detail page on error.
+        let offered = cat
+            .available
+            .iter()
+            .any(|a| a.id == inst.id && canonical_registry.as_deref().is_none_or(|r| a.registry.eq_ignore_ascii_case(r)));
+        if offered {
+            return PluginLinkResolution::Review {
+                id: inst.id.clone(),
+                version: link.version.clone(),
+                registry: canonical_registry,
+                fallback_detail: Some(inst.id.clone()),
+            };
+        }
+        return PluginLinkResolution::Detail(inst.id.clone());
+    }
+
+    if let Some(avail) = cat
+        .available
+        .iter()
+        .find(|a| a.id.eq_ignore_ascii_case(&link.id) && canonical_registry.as_deref().is_none_or(|r| a.registry.eq_ignore_ascii_case(r)))
+    {
+        return PluginLinkResolution::Review {
+            id: avail.id.clone(),
+            version: link.version.clone(),
+            registry: canonical_registry,
+            fallback_detail: None,
+        };
+    }
+
+    PluginLinkResolution::UnknownPlugin
+}
+
 /// The page's own state (the catalog is the host's).
 #[derive(Default)]
 pub struct PluginsPage {
@@ -55,6 +130,8 @@ pub struct PluginsPage {
     /// The installed plugin whose page is open.
     pub detail: Option<String>,
     pub tab: Tab,
+    /// A `goatty://plugins/<id>` link waiting for the catalog to finish loading.
+    pub(super) pending_link: Option<PluginLink>,
     /// Plugin whose Uninstall was clicked once (the second click removes it).
     pub confirm_uninstall: Option<String>,
     /// The install this window follows (#102): started here, or found
@@ -441,6 +518,7 @@ impl SettingsWindow {
         };
         self.plugins.in_flight += 1;
         cx.notify();
+        let asked = link.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -450,6 +528,12 @@ impl SettingsWindow {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                // Ignore replies from a host the window no longer follows so
+                // stale responses never corrupt the new host's catalog,
+                // in-flight count, or pending link.
+                if !view.link.as_ref().is_some_and(|l| l.same(&asked)) {
+                    return;
+                }
                 view.plugins.in_flight = view.plugins.in_flight.saturating_sub(1);
                 done(view, result, cx);
                 cx.notify();
@@ -472,8 +556,14 @@ impl SettingsWindow {
                     view.plugins.prune_reviews();
                     view.plugins.error = None;
                     view.sync_plugin_inputs(cx);
+                    if let Some(link) = view.plugins.pending_link.take() {
+                        view.apply_plugin_link(link, None, cx);
+                    }
                 }
-                Err(e) => view.plugins.error = Some(format!("{e:#}")),
+                Err(e) => {
+                    view.plugins.pending_link = None;
+                    view.plugins.error = Some(format!("{e:#}"));
+                }
             }),
             cx,
         );
@@ -619,6 +709,138 @@ impl SettingsWindow {
         );
     }
 
+    /// Open a `goatty://plugins/<id>` link on the host this settings window
+    /// already follows (never switches hosts, never adds a registry).
+    pub(super) fn open_plugin_link(&mut self, link: PluginLink, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.plugins.catalog.is_some() {
+            self.plugins.pending_link = None;
+            self.apply_plugin_link(link, Some(window), cx);
+        } else {
+            self.plugins.pending_link = Some(link);
+            if self.link.is_some() && !self.plugins.is_loading() {
+                self.load_plugins(false, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn apply_plugin_link(&mut self, link: PluginLink, window: Option<&mut Window>, cx: &mut Context<'_, Self>) {
+        let Some(cat) = &self.plugins.catalog else { return };
+        let show = |t: Toast, window: Option<&mut Window>, cx: &mut Context<'_, Self>| match window {
+            Some(w) => {
+                toast::show_in(w, cx, t);
+            }
+            None => super::show_toast(cx, t),
+        };
+        match resolve_plugin_link(cat, &link) {
+            PluginLinkResolution::Detail(id) => {
+                self.plugins.clear_review();
+                self.plugins.tab = Tab::Installed;
+                self.plugins.detail = Some(id);
+                self.plugins.confirm_uninstall = None;
+                self.plugins.show_advanced = false;
+                self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+            }
+            PluginLinkResolution::Review { id, version, registry, fallback_detail } => {
+                self.plugins.detail = None;
+                self.plugins.tab = Tab::Browse;
+                self.start_link_review(id, version, registry, fallback_detail, cx);
+            }
+            PluginLinkResolution::UnknownRegistry(reg) => {
+                self.plugins.clear_review();
+                self.plugins.detail = None;
+                self.plugins.tab = Tab::Browse;
+                show(
+                    Toast::warning(format!("Unknown plugin registry \u{201c}{reg}\u{201d}"))
+                        .body("Plugins only install from registries you already have.")
+                        .key("links.registry"),
+                    window,
+                    cx,
+                );
+            }
+            PluginLinkResolution::UnknownPlugin => {
+                self.plugins.clear_review();
+                self.plugins.detail = None;
+                self.plugins.tab = Tab::Browse;
+                show(Toast::info(crate::links::UNKNOWN_TOAST).key("links.unknown"), window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ask the host what installing (or updating to) `id` would do for a
+    /// `goatty://plugins/<id>` link, verifying any requested `registry` and
+    /// falling back gracefully if the version/plugin isn't known.
+    fn start_link_review(
+        &mut self,
+        id: String,
+        version: Option<String>,
+        expected_registry: Option<String>,
+        fallback_detail: Option<String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        // Return any open queued update review back to the queue and clear
+        // `from_queue` before starting the link's own review.
+        self.plugins.clear_review();
+        let req_id = self.plugins.begin_review(None);
+        let asked_version = version.is_some();
+        self.plugin_call(
+            api::Request::Plan { id, version },
+            |r| match r {
+                api::Reply::Plan(p) => Some(p),
+                _ => None,
+            },
+            Box::new(move |view, result: anyhow::Result<Box<Plan>>, cx| match result {
+                Ok(p) => {
+                    if let Some(reg) = &expected_registry
+                        && !p.source.eq_ignore_ascii_case(reg)
+                    {
+                        if view.plugins.fail_review(req_id).is_none() {
+                            return;
+                        }
+                        if let Some(det) = fallback_detail {
+                            view.plugins.tab = Tab::Installed;
+                            view.plugins.detail = Some(det);
+                        } else {
+                            view.plugins.tab = Tab::Browse;
+                        }
+                        super::show_toast(cx, Toast::info(crate::links::UNKNOWN_TOAST).key("links.unknown"));
+                        return;
+                    }
+                    if view.plugins.accept_review_plan(req_id, p) {
+                        view.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                    }
+                }
+                Err(e) => {
+                    if view.plugins.fail_review(req_id).is_none() {
+                        return;
+                    }
+                    if let Some(det) = fallback_detail {
+                        view.plugins.tab = Tab::Installed;
+                        view.plugins.detail = Some(det);
+                    } else {
+                        view.plugins.tab = Tab::Browse;
+                    }
+                    let msg = format!("{e:#}");
+                    if asked_version
+                        || msg.contains("has no version")
+                        || msg.contains("no registry has")
+                        || msg.contains("every version of")
+                        || msg.contains("other versions come with")
+                    {
+                        super::show_toast(cx, Toast::info(crate::links::UNKNOWN_TOAST).key("links.unknown"));
+                    } else {
+                        view.outcome = Some(Outcome { ok: false, lines: vec![msg], diff: Vec::new(), reload: false });
+                    }
+                }
+            }),
+            cx,
+        );
+        if self.link.is_none() {
+            self.plugins.fail_review(req_id);
+        }
+    }
+
     /// Open the install review for `id` and return to `from` once closed.
     pub fn review_plugin_from(&mut self, id: String, from: Page, cx: &mut Context<'_, Self>) {
         self.go(Page::Plugins, cx);
@@ -638,7 +860,7 @@ impl SettingsWindow {
                 api::Reply::Plan(p) => Some(p),
                 _ => None,
             },
-            Box::new(move |view, result, cx| match result {
+            Box::new(move |view, result: anyhow::Result<Box<Plan>>, cx| match result {
                 Ok(p) => {
                     if view.plugins.accept_review_plan(req_id, p) {
                         view.scroll.set_offset(gpui::point(px(0.), px(0.)));
@@ -2152,6 +2374,19 @@ mod tests {
         assert!(page.accept_review_plan(req, test_plan("new")));
         page.clear_review();
         assert_eq!(page.review_queue.len(), 1);
+
+        // Starting a link review while a queued update review is open returns
+        // the queued update to the front of the queue and clears `from_queue`.
+        assert!(page.show_next_review());
+        assert!(page.from_queue);
+        page.clear_review();
+        let link_req = page.begin_review(None);
+        assert!(!page.from_queue);
+        assert_eq!(page.review_queue.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["upd"]);
+        assert!(page.accept_review_plan(link_req, test_plan("linked")));
+        assert_eq!(page.review_position(), None);
+        assert_eq!(page.dismiss_plan(), Some(None));
+        assert_eq!(page.review_queue.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["upd"]);
     }
 
     #[test]
@@ -2176,5 +2411,114 @@ mod tests {
         };
         assert_eq!(page.update_state("eza"), Some(UpdateState::Queued));
         assert_eq!(page.update_state("bat"), None);
+    }
+
+    #[test]
+    fn resolves_plugin_links_against_catalog() {
+        let mut cat = Catalog::default();
+        cat.registries.push(api::RegistryStatus {
+            name: "official".into(),
+            url: "https://example.invalid/index.json".into(),
+            builtin: true,
+            sequence: Some(1),
+            fetched_unix: Some(1),
+            plugins: 2,
+            error: None,
+            keys: Vec::new(),
+        });
+        cat.installed.push(Installed {
+            id: "eza".into(),
+            version: "1.0.0".into(),
+            source: "official".into(),
+            verified: true,
+            manifest: goatty_plugin::manifest::parse(
+                "schema = 1\nid = \"eza\"\nname = \"eza\"\nversion = \"1.0.0\"\nsummary = \"ls\"\npublisher = \"goatty\"\n",
+                None,
+            )
+            .unwrap(),
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 1,
+            builtin: false,
+            packages: Vec::new(),
+            unavailable_commands: Vec::new(),
+            command_open_in: Default::default(),
+        });
+        cat.available.push(api::Available {
+            id: "eza".into(),
+            name: "eza".into(),
+            summary: "ls".into(),
+            publisher: "goatty".into(),
+            category: Category::Environment,
+            keywords: Vec::new(),
+            homepage: None,
+            registry: "official".into(),
+            version: "1.1.0".into(),
+            permissions: Vec::new(),
+            incompatible: None,
+            installed: Some("1.0.0".into()),
+        });
+        cat.available.push(api::Available {
+            id: "zoxide".into(),
+            name: "zoxide".into(),
+            summary: "cd".into(),
+            publisher: "goatty".into(),
+            category: Category::Environment,
+            keywords: Vec::new(),
+            homepage: None,
+            registry: "official".into(),
+            version: "0.9.8".into(),
+            permissions: Vec::new(),
+            incompatible: None,
+            installed: None,
+        });
+
+        // Already installed → detail page.
+        assert_eq!(
+            resolve_plugin_link(&cat, &PluginLink { id: "EZA".into(), version: None, registry: None }),
+            PluginLinkResolution::Detail("eza".into())
+        );
+        assert_eq!(
+            resolve_plugin_link(&cat, &PluginLink { id: "eza".into(), version: Some("1.0.0".into()), registry: Some("official".into()) }),
+            PluginLinkResolution::Detail("eza".into())
+        );
+
+        // Installed at another version → review with detail fallback.
+        assert_eq!(
+            resolve_plugin_link(&cat, &PluginLink { id: "eza".into(), version: Some("1.1.0".into()), registry: None }),
+            PluginLinkResolution::Review {
+                id: "eza".into(),
+                version: Some("1.1.0".into()),
+                registry: None,
+                fallback_detail: Some("eza".into()),
+            }
+        );
+
+        // Not installed, offered by known registry → review.
+        assert_eq!(
+            resolve_plugin_link(
+                &cat,
+                &PluginLink { id: "ZOXIDE".into(), version: Some("0.9.8".into()), registry: Some("Official".into()) }
+            ),
+            PluginLinkResolution::Review {
+                id: "zoxide".into(),
+                version: Some("0.9.8".into()),
+                registry: Some("official".into()),
+                fallback_detail: None,
+            }
+        );
+
+        // Unknown registry → never added, gets its own resolution.
+        assert_eq!(
+            resolve_plugin_link(&cat, &PluginLink { id: "zoxide".into(), version: None, registry: Some("untrusted".into()) }),
+            PluginLinkResolution::UnknownRegistry("untrusted".into())
+        );
+
+        // Unknown plugin → fallback to Plugins page with unknown-link toast.
+        assert_eq!(
+            resolve_plugin_link(&cat, &PluginLink { id: "does-not-exist".into(), version: None, registry: None }),
+            PluginLinkResolution::UnknownPlugin
+        );
     }
 }

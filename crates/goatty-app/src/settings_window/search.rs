@@ -46,6 +46,20 @@ pub fn entry_for(host: bool, key: &str) -> Option<&'static Entry> {
     INDEX.iter().find(|e| e.page.is_host() == host && e.keys.iter().any(|k| issue.concerns(k)))
 }
 
+/// The row on `page` that edits `key` (matched case-insensitively), if there is one.
+pub fn entry_for_page(page: Page, key: &str) -> Option<&'static Entry> {
+    let norm = key.to_ascii_lowercase();
+    let issue = goatty_config::Issue::new(&norm, "");
+    INDEX.iter().find(|e| e.page == page && e.keys.iter().any(|k| issue.concerns(k)))
+}
+
+/// The row on any page that edits `key` (matched case-insensitively), if there is one.
+pub fn entry_for_key(key: &str) -> Option<&'static Entry> {
+    let norm = key.to_ascii_lowercase();
+    let issue = goatty_config::Issue::new(&norm, "");
+    INDEX.iter().find(|e| e.keys.iter().any(|k| issue.concerns(k)))
+}
+
 pub const INDEX: &[Entry] = &[
     e(Page::Appearance, "Theme", "Follow the system", "theme light dark mode color scheme").keys(&[
         "theme.follow_system",
@@ -85,6 +99,7 @@ pub const INDEX: &[Entry] = &[
     e(Page::Terminal, "Clipboard", "When a program copies", "osc 52 osc52 copy clipboard remote ssh wl-copy xclip pbcopy toast")
         .keys(&["clipboard.programs"]),
     e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
+    e(Page::Terminal, "Mouse", "Wheel scrolls", "scroll speed wheel lines notch mouse scrolling fast slow").keys(&["mouse.scroll_lines"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),
     e(Page::Terminal, "Pasting", "Ask before pasting", "paste confirm protection bracketed multiline").keys(&["paste.confirm"]),
     e(Page::Terminal, "Keyboard", "Ctrl+Backspace", "ctrl backspace delete word kill backward bash ssh").keys(&["keyboard.ctrl_backspace"]),
@@ -385,6 +400,12 @@ mod tests {
         assert_eq!(entry_for(false, "ssh.hosts.2").map(|e| (e.page, e.label)), Some((Page::Hosts, "Your hosts")));
         assert!(entry_for(false, "keybindings.ctrl-k").is_none());
         assert!(entry_for(false, "").is_none());
+
+        // Case-insensitive lookups for `goatty://settings` links.
+        assert_eq!(entry_for_page(Page::Terminal, "LINKS.OPEN_ON").map(|e| e.label), Some("Open links"));
+        assert!(entry_for_page(Page::Appearance, "links.open_on").is_none());
+        assert_eq!(entry_for_key("Prompt.Style").map(|e| (e.page, e.label)), Some((Page::Prompt, "Style")));
+        assert!(entry_for_key("no.such.key").is_none());
     }
 
     #[test]
