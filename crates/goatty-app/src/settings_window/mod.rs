@@ -1491,6 +1491,16 @@ impl SettingsWindow {
                     Err(e) => {
                         view.host_error = Some(format!("{e:#}"));
                         view.applying = false;
+                        // Without the host's file there's nothing to put them back on: say which
+                        // machine values didn't make it, rather than holding on to them.
+                        if let Some((_, patch)) = view.pending_machine.take() {
+                            let names: Vec<String> = patch.iter().map(|(p, _)| goatty_config::shared::display_path(p)).collect();
+                            let line = format!("⚠ Not saved on this host: {}. Set them again once it answers.", names.join(", "));
+                            match view.outcome.as_mut() {
+                                Some(o) => o.lines.push(line),
+                                None => view.outcome = Some(Outcome { ok: false, lines: vec![line], diff: Vec::new(), reload: false }),
+                            }
+                        }
                     }
                 }
                 cx.notify();
@@ -1596,6 +1606,7 @@ impl SettingsWindow {
 
     pub fn discard(&mut self, cx: &mut Context<'_, Self>) {
         self.draft = None;
+        self.pending_machine = None;
         self.outcome = None;
         self.show_diff = false;
         self.imported_plugins.clear();

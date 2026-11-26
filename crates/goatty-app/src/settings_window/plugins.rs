@@ -559,6 +559,10 @@ impl SettingsWindow {
                 }
                 view.plugins.in_flight = view.plugins.in_flight.saturating_sub(1);
                 done(view, result, cx);
+                // The scope waits for plugin requests; the last one done may let it be picked now.
+                if view.plugins.in_flight == 0 && view.scope.is_none() {
+                    view.pick_scope(cx);
+                }
                 cx.notify();
             });
         })
