@@ -19,6 +19,17 @@ use crate::TermSize;
 /// `TERM_PROGRAM`) to tell whether it runs in goatty or elsewhere.
 pub const TTY_ENV: &str = "GOATTY_TTY";
 
+/// The terminal variables every goatty pane's shell gets. The diagnostics
+/// probe (`goatty_shell::doctor`) sets the same ones, so startup files that
+/// run `tput` don't complain about a missing `$TERM` when goattyd has none
+/// (#316).
+pub const TERMINAL_ENV: [(&str, &str); 4] = [
+    ("TERM", "xterm-256color"),
+    ("COLORTERM", "truecolor"),
+    ("TERM_PROGRAM", "goatty"),
+    ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
+];
+
 #[derive(Debug, Clone)]
 pub struct ShellCommand {
     pub program: String,
@@ -73,7 +84,7 @@ mod unix {
     use anyhow::{Context, Result};
     use portable_pty::{CommandBuilder, native_pty_system};
 
-    use super::{ShellCommand, TTY_ENV, pty_size};
+    use super::{ShellCommand, TERMINAL_ENV, TTY_ENV, pty_size};
     use crate::TermSize;
 
     /// Output reader returned by [`Pty::spawn`].
@@ -148,10 +159,9 @@ mod unix {
             if let Some(cwd) = &cmd.cwd {
                 b.cwd(cwd);
             }
-            b.env("TERM", "xterm-256color");
-            b.env("COLORTERM", "truecolor");
-            b.env("TERM_PROGRAM", "goatty");
-            b.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+            for (k, v) in TERMINAL_ENV {
+                b.env(k, v);
+            }
             // The pane's own terminal: goatty's shell sends goatty-only escape
             // codes only while `$TTY` is this one. Programs it starts inherit
             // the variable, but their shells (an IDE's, tmux panes) run on
@@ -509,12 +519,7 @@ mod windows {
             let vs = v.to_string_lossy().into_owned();
             map.insert(ks.to_ascii_lowercase(), (ks, vs));
         }
-        for (k, v) in [
-            ("TERM", "xterm-256color"),
-            ("COLORTERM", "truecolor"),
-            ("TERM_PROGRAM", "goatty"),
-            ("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
-        ] {
+        for (k, v) in super::TERMINAL_ENV {
             map.insert(k.to_ascii_lowercase(), (k.to_string(), v.to_string()));
         }
         for (k, v) in extra {
