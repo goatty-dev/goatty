@@ -691,8 +691,6 @@ impl Workspace {
             .tab_shell(&t, Axis::Row, cx)
             .flex_none()
             .w(px(width))
-            .pl(px(10.))
-            .pr(px(6.))
             .gap(px(if width < NARROW_TAB { 6. } else { 8. }))
             .text_size(px(text::LABEL))
             .child(icon)
@@ -704,10 +702,14 @@ impl Workspace {
             // Outlined in its group's color (continuing the group's line up
             // its flared corners and around it), else by the bar's seam; it
             // reaches down and merges into the panes.
+            // Its outline takes room: the padding gives it back, so the
+            // content sits where a background tab's does (#312).
             let (w, line) = outline(&t, c);
             shell
                 .h(px(MODERN_TAB_HEIGHT))
-                .pb(px(2.))
+                .pl(px(10. - w))
+                .pr(px(6. - w))
+                .pb(px(2. + w))
                 .rounded_t(px(10.))
                 .bg(c.terminal)
                 .border_t(px(w))
@@ -732,6 +734,8 @@ impl Workspace {
                 -2.
             };
             shell
+                .pl(px(10.))
+                .pr(px(6.))
                 .h(px(MODERN_BACK_HEIGHT))
                 .mb(px(MODERN_LIFT))
                 .rounded(px(radius::CONTROL - 2.))
@@ -759,7 +763,6 @@ impl Workspace {
         self.tab_shell(&t, Axis::Row, cx)
             .flex_none()
             .max_w(px(220.))
-            .px(px(10.))
             .gap(px(6.))
             .font_family(mono)
             .text_color(fg)
@@ -767,8 +770,12 @@ impl Workspace {
                 // Like the modern tab: outlined in its group's color (or by the
                 // seam) and merging into the panes.
                 // Inset from the window's top edge, so the outline's top shows.
+                // The padding gives back the room the inset and the outline
+                // take, so the content doesn't move when the tab activates (#312).
                 d.bg(c.terminal)
                     .mt(px(2.))
+                    .px(px(10. - w))
+                    .pb(px(2. + w))
                     .rounded_t(px(4.))
                     .border_t(px(w))
                     .border_l(px(w))
@@ -776,7 +783,7 @@ impl Workspace {
                     .border_color(line)
                     .font_weight(gpui::FontWeight::MEDIUM)
             })
-            .when(!t.active, |d| d.hover(|s| s.bg(c.hover).text_color(c.ui.text)))
+            .when(!t.active, |d| d.px(px(10.)).hover(|s| s.bg(c.hover).text_color(c.ui.text)))
             .when(waiting, |d| d.bg(c.ui.warning.opacity(0.16)).text_color(c.ui.text))
             .when(t.divider, |d| d.child(divider(hover_group, -0.5, c)))
             .child(div().flex_none().text_color(number_color).child(number))
@@ -847,9 +854,12 @@ impl Workspace {
             .text_color(fg)
             .map(|d| match (folded, g.local) {
                 (true, _) => d.bg(color.opacity(0.14)).border_1().border_color(color.opacity(0.45)).hover(|s| s.bg(color.opacity(0.22))),
-                (false, true) => {
-                    d.bg(c.ui.text.opacity(0.08)).border_1().border_color(c.ui.text.opacity(0.14)).hover(|s| s.bg(c.ui.text.opacity(0.14)))
-                }
+                // Opaque (blended onto the bar), like its group's line.
+                (false, true) => d
+                    .bg(c.bar.blend(c.ui.text.opacity(0.08)))
+                    .border_1()
+                    .border_color(c.bar.blend(c.ui.text.opacity(0.14)))
+                    .hover(|s| s.bg(c.bar.blend(c.ui.text.opacity(0.14)))),
                 (false, false) => d.bg(color).hover(|s| s.opacity(0.85)),
             })
             .tooltip(tooltip(tip))
@@ -948,8 +958,10 @@ pub(super) fn outline(t: &TabView, c: Colors) -> (f32, Hsla) {
 }
 
 /// The line between the bar and the panes, which the active tab opens.
+/// Opaque (blended onto the bar): it meets the active tab's outline and
+/// flared corners, where a translucent line would show darker overlaps.
 pub(super) fn seam(c: Colors) -> Hsla {
-    c.ui.text.opacity(if c.ui.dark { 0.1 } else { 0.12 })
+    c.bar.blend(c.ui.text.opacity(if c.ui.dark { 0.1 } else { 0.12 }))
 }
 
 /// The faint line between two background tabs, `left` px off the tab's
