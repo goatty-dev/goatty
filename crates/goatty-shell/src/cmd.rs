@@ -671,8 +671,23 @@ fn apply_edit(
         return Ok(());
     }
     let outcome = svc.set(&store::to_json(&loaded.value, &loaded.unknown), true)?;
+    if !outcome.applied {
+        for i in &outcome.issues {
+            eprintln!("{i}");
+        }
+        bail!("{key} wasn't applied");
+    }
     // On a host that follows the shared config, the change is its override.
-    let kept = if shared_key { svc.capture(&before, &loaded.value).unwrap_or(0) } else { 0 };
+    let kept = match shared_key.then(|| svc.capture(&before, &loaded.value)) {
+        Some(Ok(n)) => n,
+        Some(Err(e)) => {
+            eprintln!(
+                "warning: saved here, but couldn't keep it as this host's override in the shared config ({e:#}); a later shared update may undo it"
+            );
+            0
+        }
+        None => 0,
+    };
     match outcome.generation {
         Some(g) => println!("{key} = {value} (generation {g}; new sessions use it)"),
         None => println!("{key} = {value}"),

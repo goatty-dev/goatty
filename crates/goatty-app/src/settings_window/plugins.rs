@@ -440,7 +440,9 @@ impl SettingsWindow {
             return;
         };
         if let Some(why) = self.plugins_unavailable(cx) {
-            self.plugins.error = Some(why);
+            self.plugins.error = Some(why.clone());
+            // The caller's state (a followed install, a review) ends through its own path.
+            done(self, Err(anyhow::anyhow!(why)), cx);
             cx.notify();
             return;
         }

@@ -398,9 +398,32 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                 },
                 ClientMsg::GetHostSettings { req } => reply(crate::settings::get(&daemon, req)),
-                ClientMsg::SetHostSettings { req, json, apply } => reply(crate::settings::set(&daemon, req, &json, apply)),
+                // Both may wait for a shared-config apply (#313), which can
+                // take as long as a plugin install: off the reader thread, so
+                // input on this connection keeps flowing.
+                ClientMsg::SetHostSettings { req, json, apply } => {
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-settings")).spawn(move || {
+                        if let Ok(f) = encode(&crate::settings::set(&daemon, req, &json, apply)) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start applying the settings: {e}") });
+                    }
+                }
                 ClientMsg::ListGenerations { req } => reply(crate::settings::generations(&daemon, req)),
-                ClientMsg::Rollback { req, generation } => reply(crate::settings::rollback(&daemon, req, generation)),
+                ClientMsg::Rollback { req, generation } => {
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-rollback")).spawn(move || {
+                        if let Ok(f) = encode(&crate::settings::rollback(&daemon, req, generation)) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the rollback: {e}") });
+                    }
+                }
                 ClientMsg::ReloadShells { req } => match daemon.host.reload_shells() {
                     Ok(count) => reply(ServerMsg::ShellsReloaded { req, count: u32::try_from(count).unwrap_or(u32::MAX) }),
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),

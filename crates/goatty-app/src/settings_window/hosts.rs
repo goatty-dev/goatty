@@ -456,9 +456,19 @@ impl SettingsWindow {
                                 }),
                             ))
                             .children((!ignored).then(|| {
-                                button_with(("shared-ignore", hash(&u.device)), None, "Ignore", ButtonKind::Normal, ui, move |_, cx| {
-                                    shared_sync::ignore_device(d2.clone(), cx)
-                                })
+                                let trust_id = ("shared-trust", hash(&u.device));
+                                button_with(
+                                    ("shared-ignore", hash(&u.device)),
+                                    None,
+                                    "Ignore",
+                                    ButtonKind::Normal,
+                                    ui,
+                                    self.act_window(cx, move |v, window, cx| {
+                                        // The button goes once the device is ignored.
+                                        focus::hand_over(&v.focus, focus::Handover::Control(trust_id.into()), window, cx);
+                                        shared_sync::ignore_device(d2.clone(), cx)
+                                    }),
+                                )
                             })),
                     ),
             );

@@ -62,7 +62,15 @@ pub const DOC_VERSION: u32 = 1;
 
 /// The most entries a document takes (a misbehaving peer can't make every
 /// host store an unbounded amount).
-pub const MAX_ENTRIES: usize = 50_000;
+pub const MAX_ENTRIES: usize = 200_000;
+
+/// The most entries from devices a machine doesn't trust that it keeps
+/// ([`SharedDoc::merge_trusted`]): a host relaying junk under its own key
+/// can't crowd out the entries that count.
+pub const MAX_UNTRUSTED: usize = 10_000;
+
+/// The longest key an entry may have.
+pub const MAX_KEY_BYTES: usize = 1024;
 
 /// The largest value one entry may carry, as JSON.
 pub const MAX_VALUE_BYTES: usize = 64 << 10;
@@ -91,10 +99,15 @@ impl Hlc {
 
     /// `k` steps later: the counter carries into the milliseconds instead of
     /// stopping at its maximum, so a later clock is always later.
+    /// At the very end of the range it stays at the maximum (never earlier).
     pub fn plus(self, k: u64) -> Hlc {
-        let total = u64::from(self.n) + k;
         let span = u64::from(u32::MAX) + 1;
-        Hlc { ms: self.ms.saturating_add(total / span), n: u32::try_from(total % span).unwrap_or(0) }
+        let carry = k / span + (u64::from(self.n) + k % span) / span;
+        let n = u32::try_from((u64::from(self.n) + k % span) % span).unwrap_or(0);
+        match self.ms.checked_add(carry) {
+            Some(ms) => Hlc { ms, n },
+            None => Hlc { ms: u64::MAX, n: u32::MAX },
+        }
     }
 
     /// The wall time now, in milliseconds.
@@ -275,7 +288,11 @@ impl Entry {
 
     /// Well formed and signed by the device it names.
     pub fn verify(&self) -> bool {
-        if !is_device_id(&self.device) || Key::parse(&self.key).is_none() || (self.deleted && !self.value.is_null()) {
+        if !is_device_id(&self.device)
+            || self.key.len() > MAX_KEY_BYTES
+            || Key::parse(&self.key).is_none()
+            || (self.deleted && !self.value.is_null())
+        {
             return false;
         }
         if serde_json::to_string(&self.value).map_or(true, |s| s.len() > MAX_VALUE_BYTES) {
@@ -462,6 +479,29 @@ impl SharedDoc {
     /// [`insert`](Self::insert) each; returns how many changed something.
     pub fn merge(&mut self, entries: impl IntoIterator<Item = Entry>) -> usize {
         entries.into_iter().filter(|e| self.insert(e.clone())).count()
+    }
+
+    /// [`merge`](Self::merge) on a machine with this `trust`: entries that
+    /// count here are always taken (up to [`MAX_ENTRIES`]); ones from
+    /// devices it doesn't trust only while fewer than [`MAX_UNTRUSTED`] of
+    /// those are stored.
+    pub fn merge_trusted(&mut self, entries: impl IntoIterator<Item = Entry>, trust: &Trust) -> usize {
+        let mut untrusted = self.entries().filter(|e| !trust.accepts(e)).count();
+        let mut n = 0;
+        for e in entries {
+            let counts = trust.accepts(&e);
+            let known = self.entries.get(&e.key).is_some_and(|m| m.contains_key(&e.device));
+            if !counts && !known && untrusted >= MAX_UNTRUSTED {
+                continue;
+            }
+            if self.insert(e) {
+                n += 1;
+                if !counts && !known {
+                    untrusted += 1;
+                }
+            }
+        }
+        n
     }
 
     pub fn len(&self) -> usize {
@@ -1219,6 +1259,17 @@ mod tests {
         assert!(d.insert(good.clone()));
         assert!(!d.insert(good), "same entry twice");
         assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn untrusted_entries_cant_crowd_out_trusted_ones() {
+        let (me, junk) = (signer(1), signer(2));
+        let trust = trust_of(&[&me]);
+        let mut d = SharedDoc::default();
+        let flood: Vec<Entry> = (0..MAX_UNTRUSTED as u64 + 5).map(|i| set(&format!("aliases.j{i}"), Value::from(1), 1, &junk)).collect();
+        assert_eq!(d.merge_trusted(flood, &trust), MAX_UNTRUSTED);
+        assert_eq!(d.merge_trusted([set("history.size", Value::from(5), 2, &me)], &trust), 1);
+        assert_eq!(Hlc { ms: u64::MAX, n: u32::MAX }.plus(10), Hlc { ms: u64::MAX, n: u32::MAX });
     }
 
     #[test]

@@ -195,8 +195,9 @@ impl Outcome {
     /// At least one goattyd stored what this exchange pushed (or there was
     /// nothing to push).
     pub fn saved_anywhere(&self) -> bool {
+        let ok = |i: &usize| self.x.statuses[*i].is_some() && !self.x.errors.iter().any(|(j, _)| j == i);
         let pushed: Vec<usize> = (0..self.links.len()).filter(|i| self.x.pushed[*i] > 0).collect();
-        pushed.is_empty() || pushed.iter().any(|i| self.x.statuses[*i].is_some() && !self.x.errors.iter().any(|(j, _)| j == i))
+        if pushed.is_empty() { (0..self.links.len()).any(|i| ok(&i)) } else { pushed.iter().any(ok) }
     }
 
     fn index_of(&self, link: &HostLink) -> Option<usize> {
@@ -353,7 +354,8 @@ pub fn on_reconnect(link: HostLink, cx: &mut App) {
     let HostLink::Daemon(conn) = &link else { return };
     let key = conn.key();
     let recent = &mut cx.default_global::<Recent>().0;
-    recent.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
+    // Every pane of the connection reports the same reconnect within moments.
+    recent.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(2));
     if recent.iter().any(|(k, _)| *k == key) {
         return;
     }
@@ -509,12 +511,19 @@ fn local_view(hint: &HostLink) -> Result<(SharedDoc, Trust)> {
     let links = peers(Some(hint.clone()));
     let local = links.iter().find(|l| l.is_local()).context("this computer's goattyd isn't reachable")?;
     let st = host_shared::status(local)?;
-    let entries = match local.shared(host_shared::api::Request::Pull { have: Default::default() })? {
-        host_shared::api::Reply::Entries { entries, .. } => entries,
-        other => anyhow::bail!("unexpected reply {other:?}"),
-    };
     let mut doc = SharedDoc::default();
-    doc.merge(entries);
+    // Page by page, asking each time for what isn't merged yet.
+    for _ in 0..10_000 {
+        match local.shared(host_shared::api::Request::Pull { have: doc.version() })? {
+            host_shared::api::Reply::Entries { entries, more, .. } => {
+                let added = doc.merge(entries);
+                if !more || added == 0 {
+                    break;
+                }
+            }
+            other => anyhow::bail!("unexpected reply {other:?}"),
+        }
+    }
     let trust = doc.trust(&st.roots.iter().cloned().collect());
     Ok((doc, trust))
 }

@@ -287,7 +287,8 @@ impl HostService {
         let files = self.shared_files()?;
         let _guard = self.shared_lock()?;
         let mut doc = SharedDoc::load(&files.doc);
-        let n = doc.merge(entries);
+        let trust = doc.trust(&Roots::load(&files.roots).devices());
+        let n = doc.merge_trusted(entries, &trust);
         if n > 0 {
             doc.save(&files.doc).with_context(|| format!("save {}", files.doc.display()))?;
         }
@@ -433,7 +434,13 @@ impl HostService {
                     out.reload |= c.reload;
                     out.lines.push(c.lines.first().cloned().unwrap_or_else(|| format!("installed {id} {}", pin.version)));
                 }
-                Err(e) => out.review.push(Review { id: id.clone(), reason: format!("{e:#}") }),
+                // Not the plugin that was approved: a person has to look.
+                Err(Install::Review(reason)) => out.review.push(Review { id: id.clone(), reason }),
+                // A download or the host's plugin store failed: the next exchange tries again.
+                Err(Install::Failed(e)) => {
+                    out.failed = true;
+                    out.lines.push(format!("couldn't install {id} {}: {e:#}", pin.version));
+                }
             }
         }
         for id in removed {
@@ -457,7 +464,7 @@ impl HostService {
 
     /// Install `id` at the pinned version, if this host's plan is exactly
     /// that plugin (same signed registry and version, nothing else needed).
-    fn install_pinned(&self, id: &str, pin: &PluginPin) -> Result<plugin_api::Changed> {
+    fn install_pinned(&self, id: &str, pin: &PluginPin) -> Result<plugin_api::Changed, Install> {
         let plan = |refresh: bool| -> Result<plugin_api::Plan> {
             if refresh {
                 self.plugin_request(plugin_api::Request::Catalog { refresh: true })?;
@@ -467,7 +474,7 @@ impl HostService {
                 other => bail!("unexpected plugin reply {other:?}"),
             }
         };
-        let plan = plan(false).or_else(|_| plan(true))?;
+        let plan = plan(false).or_else(|_| plan(true)).map_err(Install::Failed)?;
         let step = crate::sync::PluginStep {
             id: id.to_owned(),
             name: plan.name.clone(),
@@ -475,10 +482,11 @@ impl HostService {
             registry: pin.registry.clone(),
             replaces: None,
         };
-        crate::sync::check_plan(&step, &plan)?;
-        match self.plugin_request(plugin_api::Request::Install { id: plan.id, version: Some(plan.version), approved: plan.digest })? {
-            plugin_api::Reply::Changed(c) => Ok(c),
-            other => bail!("unexpected plugin reply {other:?}"),
+        crate::sync::check_plan(&step, &plan).map_err(|e| Install::Review(format!("{e:#}")))?;
+        match self.plugin_request(plugin_api::Request::Install { id: plan.id, version: Some(plan.version), approved: plan.digest }) {
+            Ok(plugin_api::Reply::Changed(c)) => Ok(c),
+            Ok(other) => Err(Install::Failed(anyhow::anyhow!("unexpected plugin reply {other:?}"))),
+            Err(e) => Err(Install::Failed(e)),
         }
     }
 
@@ -559,6 +567,14 @@ impl HostService {
         file.lock().with_context(|| format!("lock {}", path.display()))?;
         Ok(SharedGuard { _mutex: mutex, _file: file })
     }
+}
+
+/// Why a shared plugin wasn't installed.
+enum Install {
+    /// The host offers something else than what was approved.
+    Review(String),
+    /// Something went wrong on the way (worth another try).
+    Failed(anyhow::Error),
 }
 
 /// Held while changing the shared files (the file lock goes with the file).
@@ -709,9 +725,12 @@ pub fn exchange(peers: &[&dyn Peer], me: &Device, extra: Vec<Entry>) -> Exchange
                 }
                 match p.shared(api::Request::Pull { have })? {
                     api::Reply::Entries { entries, more, .. } => {
-                        pulled.merge(entries);
+                        let added = pulled.merge(entries);
                         if !more {
                             break;
+                        }
+                        if added == 0 {
+                            bail!("{} keeps sending entries this computer already has (or refuses)", p.label());
                         }
                     }
                     other => bail!("unexpected reply {other:?}"),
@@ -733,6 +752,12 @@ pub fn exchange(peers: &[&dyn Peer], me: &Device, extra: Vec<Entry>) -> Exchange
         let Some(h) = &have[i] else { continue };
         let missing = out.doc.newer_than(h);
         if missing.is_empty() {
+            // Nothing new, but its last apply failed: an empty push makes it try again.
+            if out.statuses[i].as_ref().and_then(|s| s.last_apply.as_ref()).is_some_and(|a| !a.ok)
+                && let Ok(api::Reply::Status(s)) = p.shared(api::Request::Push { entries: Vec::new() })
+            {
+                out.statuses[i] = Some(*s);
+            }
             continue;
         }
         out.pushed[i] = missing.len();

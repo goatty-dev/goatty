@@ -67,7 +67,12 @@ impl SettingsWindow {
         if self.scope.as_ref() == Some(&scope) {
             return;
         }
-        if self.draft.is_some() || self.applying || self.plugins.follow.is_some() || self.plugins.batch.is_some() {
+        if self.draft.is_some()
+            || self.applying
+            || self.plugins.follow.is_some()
+            || self.plugins.batch.is_some()
+            || self.plugins.is_loading()
+        {
             let why = if self.draft.is_some() {
                 "Apply or discard the changes first, then pick other hosts."
             } else {
@@ -283,7 +288,6 @@ impl SettingsWindow {
         self.busy = true;
         self.applying = true;
         let link = self.link.clone();
-        let draft = self.draft.clone();
         let this = cx.entity().downgrade();
         shared_sync::publish(entries, cx, move |result, cx| {
             let machine = match (machine, link) {
@@ -327,6 +331,7 @@ impl SettingsWindow {
                 if let (true, Some((patch, link))) = (ok, machine) {
                     view.busy = true;
                     view.applying = true;
+                    let retry = patch.clone();
                     cx.spawn(async move |this, cx| {
                         // Only the machine values changed here, onto what the host has now.
                         let r = cx
@@ -347,16 +352,16 @@ impl SettingsWindow {
                         let _ = this.update(cx, |view, cx| {
                             view.busy = false;
                             view.applying = false;
+                            if r.is_err() {
+                                view.pending_machine = Some(retry);
+                            }
                             view.reload_scope(cx);
-                            if let Err(e) = r {
-                                if let Some(o) = view.outcome.as_mut() {
-                                    o.ok = false;
-                                    o.lines.push(format!(
-                                        "⚠ This host's own settings weren't applied: {e:#}. They're still here to apply again."
-                                    ));
-                                }
-                                // The shared part is in; what's left of the draft is the machine part.
-                                view.draft = draft;
+                            if let Err(e) = r
+                                && let Some(o) = view.outcome.as_mut()
+                            {
+                                o.ok = false;
+                                o.lines
+                                    .push(format!("⚠ This host's own settings weren't applied: {e:#}. They're still here to apply again."));
                             }
                         });
                     })

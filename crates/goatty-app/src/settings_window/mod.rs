@@ -431,6 +431,9 @@ pub struct SettingsWindow {
     /// The active tab's host's own settings (machine-only values for the
     /// other scopes).
     link_settings: Option<HostSettings>,
+    /// Machine-only values whose write failed after the shared part was
+    /// stored: they go back into the draft once the host's file is loaded.
+    pending_machine: Option<Vec<(String, Option<serde_json::Value>)>>,
 
     host_error: Option<String>,
     busy: bool,
@@ -646,6 +649,7 @@ impl SettingsWindow {
             draft: None,
             scope: None,
             link_settings: None,
+            pending_machine: None,
             host_error: None,
             busy: false,
             applying: false,
@@ -1329,6 +1333,18 @@ impl SettingsWindow {
                         if view.draft.as_ref() == Some(&loaded.value) {
                             view.draft = None;
                         }
+                        // Only the machine values that didn't make it are still to apply.
+                        if let Some(patch) = view.pending_machine.take() {
+                            let mut flat = goatty_config::shared::flatten(&goatty_config::shared::sparse(&loaded.value));
+                            for (p, v) in patch {
+                                match v {
+                                    Some(v) => flat.insert(p, v),
+                                    None => flat.remove(&p),
+                                };
+                            }
+                            let draft = store::parse::<HostSettings>(&goatty_config::shared::unflatten(&flat).to_string()).value;
+                            view.draft = (draft != loaded.value).then_some(draft);
+                        }
                         view.host = Some(HostView { loaded, issues, env_overrides: snap.env_overrides, generation: snap.generation });
                         if let Some(before) = before {
                             view.announce_host_issues(&before, cx);
@@ -1389,13 +1405,19 @@ impl SettingsWindow {
     }
 
     fn send_draft(&mut self, apply: bool, cx: &mut Context<'_, Self>) {
+        // One request at a time: a second would overwrite the first's outcome.
+        if self.applying {
+            toast::show(cx, Toast::info("Still working on the last request").body("Try again once it's done.").key("settings.busy"));
+            return;
+        }
         // Through the shared config, unless the scope is a host's own file.
         if apply && self.apply_scoped(cx) {
             return;
         }
         let (Some(link), Some(json)) = (self.link.clone(), self.draft_json()) else { return };
         self.busy = true;
-        self.applying = apply;
+        // Preview or Apply: either blocks a second request and edits until it's back.
+        self.applying = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { link.set(json, apply) }).await;
