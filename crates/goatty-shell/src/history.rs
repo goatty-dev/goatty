@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use goatty_config::shared::{self, Hlc, Key, PluginPin};
 use goatty_config::{HostSettings, store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -45,6 +46,123 @@ pub struct Changes {
     pub files: u32,
     /// The goatty version that built it, when the base was built by another.
     pub goatty: Option<String>,
+    /// Shared-config values from other devices that lost to a newer edit
+    /// when this generation was built (or arrived for it later, #323).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overridden: Vec<Overridden>,
+}
+
+/// A value from another device in the shared config that lost to a newer
+/// change (#323).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overridden {
+    /// The `SharedDoc` key (`set/<path>`, `host/<id>/<path>`, or `plugin/<id>`).
+    pub key: String,
+    /// The losing entry's value (`None`: a deletion / reset marker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// The device that signed it (64-hex ed25519 public key).
+    pub device: String,
+    /// That device's name at the time, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    /// When that device signed it (for ordering and deduplication).
+    #[serde(default)]
+    pub hlc: Hlc,
+}
+
+impl Overridden {
+    /// What setting or plugin it is about (`history.size`, `alias gs`,
+    /// `history.size (this host)`, `eza plugin`).
+    pub fn subject(&self) -> String {
+        match Key::parse(&self.key) {
+            Some(Key::Setting(path)) => setting_label(&shared::display_path(&path)),
+            Some(Key::Override { path, .. }) => format!("{} (this host)", setting_label(&shared::display_path(&path))),
+            Some(Key::Plugin(id)) => format!("{id} plugin"),
+            _ => self.key.clone(),
+        }
+    }
+
+    /// The losing value, shortened for a one-line display.
+    pub fn value_text(&self) -> String {
+        match Key::parse(&self.key) {
+            Some(Key::Plugin(_)) => match &self.value {
+                Some(v) => serde_json::from_value::<PluginPin>(v.clone()).map(|p| p.version).unwrap_or_else(|_| show(v)),
+                None => "removed".into(),
+            },
+            Some(Key::Override { .. }) if self.value == Some(Value::Null) => "removed".into(),
+            Some(Key::Override { .. }) if self.value.is_none() => "use shared value".into(),
+            Some(Key::Setting(ref path)) if self.value.is_none() => {
+                let shown = shared::display_path(path);
+                if shown.starts_with("aliases.") || shown.starts_with("snippets.") || shown.starts_with("expansions.") {
+                    "removed".into()
+                } else {
+                    "reset".into()
+                }
+            }
+            _ => match &self.value {
+                None => "reset".into(),
+                Some(v) => show_overridden_value(v),
+            },
+        }
+    }
+
+    /// Who signed the losing value: its name, or the short device id.
+    pub fn from_label(&self) -> String {
+        self.device_name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| shared::short_id(&self.device).to_owned())
+    }
+
+    /// `history.size = 5000 (from laptop)`, `alias gs removed (from desktop)`.
+    pub fn text(&self) -> String {
+        let subject = self.subject();
+        let val = self.value_text();
+        let from = self.from_label();
+        let parsed = Key::parse(&self.key);
+        let bare = self.value.is_none()
+            || matches!(parsed, Some(Key::Plugin(_)))
+            || (matches!(parsed, Some(Key::Override { .. })) && self.value == Some(Value::Null))
+            || match &parsed {
+                Some(Key::Setting(p) | Key::Override { path: p, .. }) => {
+                    let s = shared::display_path(p);
+                    s.starts_with("plugins.") && s.ends_with(".enabled")
+                }
+                _ => false,
+            };
+        if bare { format!("{subject} {val} (from {from})") } else { format!("{subject} = {val} (from {from})") }
+    }
+}
+
+fn setting_label(key: &str) -> String {
+    if let Some(rest) = key.strip_prefix("snippets.") {
+        return format!("snippet {rest}");
+    }
+    if let Some(rest) = key.strip_prefix("expansions.") {
+        return format!("expansion {rest}");
+    }
+    label(key)
+}
+
+fn truncate_value(s: String) -> String {
+    if s.chars().count() > VALUE_MAX { s.chars().take(VALUE_MAX - 1).collect::<String>() + "…" } else { s }
+}
+
+fn show_overridden_value(v: &Value) -> String {
+    if let Value::Object(m) = v {
+        if let Some(cmd) = m.get("command").and_then(Value::as_str) {
+            return truncate_value(cmd.to_owned());
+        }
+        if let Some(title) = m.get("title").and_then(Value::as_str) {
+            return truncate_value(title.to_owned());
+        }
+        if let (Some(say), Some(to)) = (m.get("say").and_then(Value::as_str), m.get("to").and_then(Value::as_str)) {
+            return truncate_value(format!("{say} → {to}"));
+        }
+    }
+    show(v)
 }
 
 /// One setting that differs, values as text. `None` on one side: it was
@@ -146,6 +264,10 @@ impl Changes {
         let lines = self.lines();
         let text = match lines.len() {
             0 if self.files > 0 => format!("{} generated file{} changed", self.files, plural(self.files as usize)),
+            0 if !self.overridden.is_empty() => {
+                let n = self.overridden.len();
+                format!("{n} replaced value{}", plural(n))
+            }
             0 => "Settings rewritten, nothing changed".into(),
             1 => lines[0].clone(),
             2 if lines[0].chars().count() + lines[1].chars().count() + 2 <= SHORT_MAX => lines.join(", "),
@@ -291,6 +413,7 @@ pub(crate) fn compare(base: &Generation, settings: &str, files: &Tree, version: 
         plugins_removed: old_ids.difference(&new_ids).cloned().collect(),
         files: u32::try_from(changed).unwrap_or(u32::MAX),
         goatty: (!base_version.is_empty() && base_version != version).then(|| version.to_owned()),
+        overridden: Vec::new(),
     }
 }
 
@@ -330,6 +453,37 @@ pub fn set_name(dirs: &Dirs, number: u32, name: Option<&str>) -> Result<()> {
     let mut info = generation::read_info(&g.path);
     info.name = name;
     generation::write_info(&g.path, &info)
+}
+
+/// Record shared-config values from other devices that lost to a newer
+/// change in generation `number`'s `info.json` (#323). Deduplicates by
+/// `(key, device, hlc)` so re-running apply never adds duplicates.
+pub fn record_overridden(dirs: &Dirs, number: u32, items: &[Overridden]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let _lock = generation::lock(dirs)?;
+    let all = generation::list(dirs);
+    let g = all.iter().find(|g| g.number == number).with_context(|| format!("no generation {number}"))?;
+    let mut info = generation::read_info(&g.path);
+    let changes = info.changes.get_or_insert_with(|| match base_of(g, &all) {
+        Some(base) => {
+            let settings = g.settings_json().unwrap_or_default();
+            compare(base, &settings, &tree(&g.shell_dir()), &info.goatty)
+        }
+        None => Changes::default(),
+    });
+    let mut added = false;
+    for item in items {
+        if !changes.overridden.iter().any(|o| o.key == item.key && o.device == item.device && o.hlc == item.hlc) {
+            changes.overridden.push(item.clone());
+            added = true;
+        }
+    }
+    if added {
+        generation::write_info(&g.path, &info)?;
+    }
+    Ok(())
 }
 
 /// The generated files that generation `number` changed, as unified diffs
@@ -495,5 +649,72 @@ mod tests {
         assert_eq!(list(&dirs)[0].changes, None);
         assert_eq!(list(&dirs)[1].summary(), "eza plugin added", "recorded when it was built");
         assert!(file_diff(&dirs, 2).is_err());
+    }
+
+    #[test]
+    fn overridden_values_format_and_deduplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::under(tmp.path());
+        generation::activate(&dirs, &files("a\n", None), "{}").unwrap();
+        generation::activate(&dirs, &files("b\n", None), r#"{"history": {"size": 8000}}"#).unwrap();
+
+        let dev = "1".repeat(64);
+        let items = [
+            Overridden {
+                key: "set/history.size".into(),
+                value: Some(Value::from(5000)),
+                device: dev.clone(),
+                device_name: Some("laptop".into()),
+                hlc: Hlc { ms: 100, n: 0 },
+            },
+            Overridden {
+                key: "set/aliases.gs".into(),
+                value: Some(serde_json::json!({"command": "git status -sb"})),
+                device: dev.clone(),
+                device_name: None,
+                hlc: Hlc { ms: 101, n: 0 },
+            },
+            Overridden {
+                key: "set/aliases.ll".into(),
+                value: None,
+                device: dev.clone(),
+                device_name: Some("desktop".into()),
+                hlc: Hlc { ms: 102, n: 0 },
+            },
+            Overridden {
+                key: "set/plugins.starship.enabled".into(),
+                value: Some(Value::Bool(false)),
+                device: dev.clone(),
+                device_name: Some("laptop".into()),
+                hlc: Hlc { ms: 103, n: 0 },
+            },
+            Overridden {
+                key: format!("host/{dev}/history.size"),
+                value: Some(Value::from(300)),
+                device: dev.clone(),
+                device_name: Some("pi".into()),
+                hlc: Hlc { ms: 104, n: 0 },
+            },
+            Overridden {
+                key: "plugin/eza".into(),
+                value: Some(serde_json::json!({"version": "1.2.0", "registry": "official"})),
+                device: dev.clone(),
+                device_name: Some("laptop".into()),
+                hlc: Hlc { ms: 105, n: 0 },
+            },
+        ];
+        assert_eq!(items[0].text(), "history.size = 5000 (from laptop)");
+        assert_eq!(items[1].text(), "alias gs = git status -sb (from 11111111)");
+        assert_eq!(items[2].text(), "alias ll removed (from desktop)");
+        assert_eq!(items[3].text(), "starship off (from laptop)");
+        assert_eq!(items[4].text(), "history.size (this host) = 300 (from pi)");
+        assert_eq!(items[5].text(), "eza plugin 1.2.0 (from laptop)");
+
+        record_overridden(&dirs, 2, &items[..2]).unwrap();
+        // Recording the same entries again doesn't duplicate them.
+        record_overridden(&dirs, 2, &items[..2]).unwrap();
+        let entry = list(&dirs).into_iter().find(|e| e.number == 2).unwrap();
+        assert_eq!(entry.changes.as_ref().unwrap().overridden, items[..2]);
+        assert!(record_overridden(&dirs, 99, &items[..1]).is_err());
     }
 }

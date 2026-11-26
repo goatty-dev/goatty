@@ -354,6 +354,10 @@ impl HostService {
         let mut lines = r.lines;
         self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).needs_review = r.review;
 
+        let applied_path = self.launcher.dirs().map(crate::Dirs::shared_applied);
+        let prev_applied = applied_path.as_deref().and_then(load_applied_state);
+        let (overridden, next_applied) = find_overridden(&doc, &trust, &host, prev_applied.as_ref());
+
         let current = self.settings().file;
         let mut resolved = doc.resolve(Some(&host), &trust, &current.value).value;
         keep_host_only_plugins(&doc, &trust, &host, &current.value, &mut resolved);
@@ -378,6 +382,28 @@ impl HostService {
                     ok = false;
                     lines.push(format!("the shared settings don't build here: {e:#}"));
                 }
+            }
+        }
+        if ok {
+            if !overridden.is_empty() {
+                if self.active_generation().is_none()
+                    && let Err(e) = self.launcher.apply(&self.settings())
+                {
+                    log::warn!("couldn't build a generation to record overridden shared values: {e:#}");
+                }
+                if let (Some(dirs), Some(gen_num)) = (self.launcher.dirs(), self.active_generation()) {
+                    match crate::history::record_overridden(dirs, gen_num, &overridden) {
+                        Ok(()) => {
+                            lines.push(format!("kept {} overridden value(s) from other devices in generation {gen_num}", overridden.len()));
+                        }
+                        Err(e) => log::warn!("couldn't record overridden shared values in generation {gen_num}: {e:#}"),
+                    }
+                }
+            }
+            if let Some(path) = &applied_path
+                && let Err(e) = save_applied_state(path, &next_applied)
+            {
+                log::warn!("couldn't save {}: {e:#}", path.display());
             }
         }
         if changed && let Err(e) = self.reload_shells() {
@@ -582,6 +608,119 @@ enum Install {
 struct SharedGuard<'a> {
     _mutex: std::sync::MutexGuard<'a, ()>,
     _file: std::fs::File,
+}
+
+/// Bookkeeping of what this host last applied from the shared config, so
+/// values from other devices that lost a concurrent edit can be recorded
+/// once in the generation history (#323). Local to this host; never synced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct AppliedState {
+    /// Newest accepted clock per device as of the last apply.
+    #[serde(default)]
+    seen: VersionVector,
+    /// Winning `(hlc, device)` per deciding key (`set/…`, `host/<this>/…`, `plugin/…`).
+    #[serde(default)]
+    winners: BTreeMap<String, (Hlc, String)>,
+}
+
+fn load_applied_state(path: &std::path::Path) -> Option<AppliedState> {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn save_applied_state(path: &std::path::Path, state: &AppliedState) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut text = serde_json::to_string_pretty(state)?;
+    text.push('\n');
+    store::write_text(path, &text).map(drop).with_context(|| format!("write {}", path.display()))
+}
+
+/// Find shared-config values from other devices that lost to the winning
+/// entry for this apply (#323), together with the new [`AppliedState`] to
+/// record once the apply succeeds.
+///
+/// On a host's very first apply (`prev` is `None`, e.g. a new machine
+/// joining an existing setup), no historical losers are emitted so months
+/// of old edits aren't dumped into its first generation.
+fn find_overridden(
+    doc: &SharedDoc,
+    trust: &Trust,
+    host: &str,
+    prev: Option<&AppliedState>,
+) -> (Vec<crate::history::Overridden>, AppliedState) {
+    let mut seen = VersionVector::new();
+    let mut all_keys = BTreeSet::new();
+    for e in doc.entries() {
+        all_keys.insert(e.key.as_str());
+        if trust.accepts(e) {
+            let t = seen.entry(e.device.clone()).or_default();
+            *t = (*t).max(e.hlc);
+        }
+    }
+
+    let mut overridden_paths = BTreeSet::new();
+    let mut deciding: Vec<(String, &Entry)> = Vec::new();
+    for &key in &all_keys {
+        if let Some(Key::Override { host: h, path }) = Key::parse(key)
+            && h == host
+            && HostSettings::scope(&path) == shared::Scope::Shared
+            && let Some(w) = doc.winner(key, trust)
+        {
+            if !w.deleted {
+                overridden_paths.insert(path);
+            }
+            deciding.push((key.to_owned(), w));
+        }
+    }
+    for &key in &all_keys {
+        match Key::parse(key) {
+            Some(Key::Setting(path)) if HostSettings::scope(&path) == shared::Scope::Shared && !overridden_paths.contains(&path) => {
+                if let Some(w) = doc.winner(key, trust) {
+                    deciding.push((key.to_owned(), w));
+                }
+            }
+            Some(Key::Plugin(_)) => {
+                if let Some(w) = doc.winner(key, trust) {
+                    deciding.push((key.to_owned(), w));
+                }
+            }
+            _ => {}
+        }
+    }
+    deciding.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let winners: BTreeMap<String, (Hlc, String)> = deciding.iter().map(|(k, w)| (k.clone(), (w.hlc, w.device.clone()))).collect();
+    let next = AppliedState { seen, winners };
+
+    let Some(prev) = prev else {
+        return (Vec::new(), next);
+    };
+
+    let mut out = Vec::new();
+    for (key, winner) in deciding {
+        let mut losers: Vec<&Entry> = doc
+            .all_for(&key)
+            .filter(|e| trust.accepts(e) && e.device != winner.device && e.value() != winner.value())
+            .filter(|e| {
+                let newly_accepted = prev.seen.get(&e.device).is_none_or(|t| e.hlc > *t);
+                let replaced_prev_winner =
+                    winner.device != host && prev.winners.get(&key).is_some_and(|(hlc, dev)| *hlc == e.hlc && dev == &e.device);
+                newly_accepted || replaced_prev_winner
+            })
+            .collect();
+        losers.sort_by(|a, b| (b.hlc, &b.device).cmp(&(a.hlc, &a.device)));
+        for e in losers {
+            out.push(crate::history::Overridden {
+                key: key.clone(),
+                value: e.value().cloned(),
+                device: e.device.clone(),
+                device_name: doc.name(&e.device, trust),
+                hlc: e.hlc,
+            });
+        }
+    }
+    (out, next)
 }
 
 /// The host's registry named like the pin's vouches for it the way the
@@ -862,6 +1001,18 @@ pub fn plugin_entries(doc: &SharedDoc, id: &str, pin: Option<PluginPin>, me: &De
     vec![Entry::new(&Key::Plugin(id.to_owned()), pin.map(|p| serde_json::to_value(p).expect("pin")), doc.next_hlc(), me)]
 }
 
+/// Sign an overridden value from the generation history again as a new
+/// shared entry, so it wins again (#323).
+pub fn restore_overridden_entry(doc: &SharedDoc, item: &crate::history::Overridden, me: &Device) -> Result<Entry> {
+    let key = Key::parse(&item.key).with_context(|| format!("invalid shared key {:?}", item.key))?;
+    match &key {
+        Key::Setting(p) | Key::Override { path: p, .. } if HostSettings::scope(p) == shared::Scope::Shared => {}
+        Key::Plugin(_) => {}
+        _ => bail!("can't restore {:?} from the generation history", item.key),
+    }
+    Ok(Entry::new(&key, item.value.clone(), doc.next_hlc(), me))
+}
+
 /// The settings `host` would use, and how its own differ from them (for
 /// the first-connect question's diff).
 pub fn join_diff(doc: &SharedDoc, trust: &Trust, own: &HostSettings) -> Vec<crate::history::SettingChange> {
@@ -1022,5 +1173,97 @@ mod tests {
         let st = status(&server.svc).unwrap();
         assert_eq!(st.member, Some(true));
         assert!(st.last_apply.is_some());
+    }
+
+    #[test]
+    fn concurrent_edit_losers_are_recorded_in_generation_history_and_restorable() {
+        let (laptop, desktop, server) = (host(), host(), host());
+        let (a, b) = (device_of(&laptop), device_of(&desktop));
+        let (a_id, b_id, s_id) = (a.device(), b.device(), device_of(&server).device());
+
+        // Set up laptop, desktop and server all following and trusting a + b.
+        let mut init = seed_entries(&HostSettings::default(), &BTreeMap::new(), &a_id, &a, Hlc { ms: 1, n: 0 });
+        init.push(Entry::new(&Key::Name(a_id.clone()), Some("laptop".into()), Hlc { ms: 2, n: 0 }, &a));
+        init.push(Entry::new(&Key::Trust(b_id.clone()), Some(true.into()), Hlc { ms: 3, n: 0 }, &a));
+        init.push(Entry::new(&Key::Member(b_id.clone()), Some(true.into()), Hlc { ms: 4, n: 0 }, &a));
+        init.push(Entry::new(&Key::Name(b_id.clone()), Some("desktop".into()), Hlc { ms: 5, n: 0 }, &a));
+        init.push(Entry::new(&Key::Member(s_id.clone()), Some(true.into()), Hlc { ms: 6, n: 0 }, &a));
+        exchange(&[&laptop.svc, &desktop.svc, &server.svc], &a, init);
+        // Desktop also trusts itself as a root and builds an initial generation.
+        exchange(&[&desktop.svc], &b, Vec::new());
+
+        // Offline concurrent edits to the same key: laptop sets 5000 (T=100), desktop sets 8000 (T=105).
+        let a_edit = vec![Entry::new(&Key::Setting("history.size".into()), Some(5000.into()), Hlc { ms: 100, n: 0 }, &a)];
+        exchange(&[&laptop.svc], &a, a_edit);
+        assert_eq!(laptop.svc.settings().file.value.history.size, 5000);
+
+        let b_edit = vec![Entry::new(&Key::Setting("history.size".into()), Some(8000.into()), Hlc { ms: 105, n: 0 }, &b)];
+        exchange(&[&desktop.svc], &b, b_edit);
+        assert_eq!(desktop.svc.settings().file.value.history.size, 8000);
+
+        // Now all three exchange: desktop's 8000 wins, laptop's 5000 loses.
+        exchange(&[&laptop.svc, &desktop.svc, &server.svc], &a, Vec::new());
+
+        // Laptop (losing machine), desktop (winning machine), and server (saw both at once)
+        // all record laptop's overridden 5000 on their active generation.
+        for (name, h) in [("laptop", &laptop), ("desktop", &desktop), ("server", &server)] {
+            assert_eq!(h.svc.settings().file.value.history.size, 8000, "{name}");
+            let gens = crate::history::list(h.svc.launcher.dirs().unwrap());
+            let active = gens.iter().find(|g| g.active).unwrap_or_else(|| panic!("{name} has no active generation"));
+            let overridden = &active.changes.as_ref().unwrap().overridden;
+            assert_eq!(overridden.len(), 1, "{name}: {overridden:?}");
+            assert_eq!(overridden[0].key, "set/history.size");
+            assert_eq!(overridden[0].value, Some(serde_json::Value::from(5000)));
+            assert_eq!(overridden[0].device, a_id);
+            assert_eq!(overridden[0].device_name.as_deref(), Some("laptop"));
+        }
+
+        // A later sequential edit by desktop (8000 -> 9000) does NOT re-record laptop's old 5000.
+        let b_next = vec![Entry::new(&Key::Setting("history.size".into()), Some(9000.into()), Hlc { ms: 200, n: 0 }, &b)];
+        exchange(&[&laptop.svc, &desktop.svc, &server.svc], &b, b_next);
+        for (name, h) in [("laptop", &laptop), ("desktop", &desktop), ("server", &server)] {
+            let gens = crate::history::list(h.svc.launcher.dirs().unwrap());
+            let active = gens.iter().find(|g| g.active).unwrap();
+            assert!(active.changes.as_ref().unwrap().overridden.is_empty(), "{name} shouldn't repeat stale loser");
+        }
+
+        // A brand-new host joining later doesn't dump historical losers into its first generation.
+        let fresh = host();
+        let fresh_id = device_of(&fresh).device();
+        let (doc, _, trust) = laptop.svc.shared_doc().unwrap();
+        let join = join_entries(&doc, &trust, &fresh_id, "fresh", None, &a);
+        exchange(&[&laptop.svc, &fresh.svc], &a, join);
+        let fresh_gens = crate::history::list(fresh.svc.launcher.dirs().unwrap());
+        assert!(fresh_gens.iter().all(|g| g.changes.as_ref().is_none_or(|c| c.overridden.is_empty())));
+
+        // Restoring the overridden value signs it as a new shared entry and wins everywhere.
+        let gens = crate::history::list(desktop.svc.launcher.dirs().unwrap());
+        let lost = gens.iter().flat_map(|g| g.changes.iter().flat_map(|c| c.overridden.iter())).next().unwrap().clone();
+        let (doc, ..) = desktop.svc.shared_doc().unwrap();
+        let restored = restore_overridden_entry(&doc, &lost, &b).unwrap();
+        exchange(&[&laptop.svc, &desktop.svc, &server.svc], &b, vec![restored]);
+        assert_eq!(laptop.svc.settings().file.value.history.size, 5000);
+        assert_eq!(desktop.svc.settings().file.value.history.size, 5000);
+        assert_eq!(server.svc.settings().file.value.history.size, 5000);
+    }
+
+    #[test]
+    fn restore_overridden_rejects_non_setting_and_machine_keys() {
+        let h = host();
+        let me = device_of(&h);
+        let doc = SharedDoc::default();
+        let item = |key: &str| crate::history::Overridden {
+            key: key.into(),
+            value: Some(true.into()),
+            device: me.device(),
+            device_name: None,
+            hlc: Hlc { ms: 1, n: 0 },
+        };
+        assert!(restore_overridden_entry(&doc, &item(&format!("trust/{}", me.device())), &me).is_err());
+        assert!(restore_overridden_entry(&doc, &item(&format!("member/{}", me.device())), &me).is_err());
+        assert!(restore_overridden_entry(&doc, &item("set/shell.program"), &me).is_err());
+        assert!(restore_overridden_entry(&doc, &item("set/history.size"), &me).is_ok());
+        assert!(restore_overridden_entry(&doc, &item(&format!("host/{}/history.size", me.device())), &me).is_ok());
+        assert!(restore_overridden_entry(&doc, &item("plugin/eza"), &me).is_ok());
     }
 }

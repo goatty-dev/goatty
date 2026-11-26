@@ -220,6 +220,12 @@ impl Dirs {
     pub fn offer_marker(&self) -> PathBuf {
         self.state.join("shell-setup-offered")
     }
+    /// Bookkeeping of the shared config state last applied on this host
+    /// (for spotting values from other devices that lost a concurrent edit,
+    /// #323). Local to this host; never synced.
+    pub fn shared_applied(&self) -> PathBuf {
+        self.state.join("shared-applied.json")
+    }
 }
 
 #[cfg(test)]

@@ -518,6 +518,11 @@ pub fn generations(launcher: &Launcher) -> Result<()> {
         };
         let name = g.name.as_deref().map(|n| format!("\"{n}\"  ")).unwrap_or_default();
         println!("{} {:>4}  {ago:<9} {name}{}", if g.active { "*" } else { " " }, g.number, g.summary());
+        if let Some(c) = &g.changes {
+            for o in &c.overridden {
+                println!("        replaced: {}", o.text());
+            }
+        }
     }
     Ok(())
 }
