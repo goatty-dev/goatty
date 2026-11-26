@@ -138,13 +138,17 @@ fn remote_command_failed(exit: Option<i32>) -> bool {
 }
 
 /// Shell snippet run on the remote host: use this build's installed
-/// goattyd, else one in `PATH`, `~/.local/bin` or `~/.cargo/bin`
-/// (non-interactive SSH often lacks those in PATH). Plain POSIX sh, since
-/// the user's login shell may be fish.
+/// goattyd, else an older goatty-installed one (`$HOME/{BIN_DIR}/goattyd`),
+/// else one in `PATH`, `~/.local/bin` or `~/.cargo/bin` (non-interactive SSH
+/// often lacks those in PATH). Plain POSIX sh, since the user's login shell
+/// may be fish.
 pub(crate) fn proxy_script(remote_daemon: Option<&str>) -> String {
     let candidates = match remote_daemon {
         Some(p) => sh_quote(p),
-        None => format!("\"$HOME/{BIN_DIR}/{}\" goattyd \"$HOME/.local/bin/goattyd\" \"$HOME/.cargo/bin/goattyd\"", binary_name()),
+        None => format!(
+            "\"$HOME/{BIN_DIR}/{}\" \"$HOME/{BIN_DIR}/goattyd\" goattyd \"$HOME/.local/bin/goattyd\" \"$HOME/.cargo/bin/goattyd\"",
+            binary_name()
+        ),
     };
     format!(
         "p=\"$(uname -s) $(uname -m)\"; \
@@ -355,12 +359,15 @@ pub fn stop_daemon(target: &SshTarget) -> Result<()> {
     Ok(())
 }
 
-/// Restart the host's goattyd with this build's installed one
-/// (`goattyd restart --force`): its sessions carry over when the running
-/// daemon can do that (protocol v10 on), else it's stopped and they end.
-pub fn restart_daemon(target: &SshTarget) -> Result<()> {
+/// Restart the host's goattyd with this build's installed one. Its sessions
+/// carry over when the running daemon can do that (protocol v10 on, Unix).
+/// With `force == false`, a daemon that can't keep its sessions is not
+/// stopped (safe for automatic updates); with `force == true` (`--force`),
+/// it is stopped and its sessions end.
+pub fn restart_daemon(target: &SshTarget, force: bool) -> Result<()> {
+    let args = if force { "restart --force" } else { "restart" };
     let out = target
-        .command(&daemon_command(target, "restart --force"))
+        .command(&daemon_command(target, args))
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("couldn't run {}", target.program))?;
@@ -368,6 +375,21 @@ pub fn restart_daemon(target: &SshTarget) -> Result<()> {
         bail!("restarting goattyd on {} failed: {}", target.host, last_words(&out.stderr, &out.stdout));
     }
     Ok(())
+}
+
+/// Whether `running` is a strictly older `major.minor.patch` version than
+/// `ours`. Unparseable or equal/newer versions return `false` so we never
+/// downgrade or loop on development/unknown versions.
+pub fn is_older_version(running: &str, ours: &str) -> bool {
+    let parse = |s: &str| -> Option<(u64, u64, u64)> {
+        let core = s.trim().split(['-', '+']).next()?;
+        let mut it = core.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next()?.parse().ok()?;
+        it.next().is_none().then_some((major, minor, patch))
+    };
+    matches!((parse(running), parse(ours)), (Some(r), Some(o)) if r < o)
 }
 
 /// This build's installed goattyd on the host with `args`.
@@ -757,5 +779,49 @@ mod tests {
         std::fs::write(bin.join("goattyd"), "mine").unwrap();
         run_install(dir.path());
         assert_eq!(std::fs::read_to_string(bin.join("goattyd")).unwrap(), "mine");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_script_finds_older_installed_goattyd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let sysbin = dir.path().join("sysbin");
+        let bin = home.join(BIN_DIR);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&sysbin).unwrap();
+        for tool in ["sh", "uname"] {
+            std::os::unix::fs::symlink(find_tool(tool), sysbin.join(tool)).unwrap();
+        }
+        let older = bin.join("goattyd-0.0.1-p1");
+        std::fs::write(&older, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&older, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("goattyd-0.0.1-p1", bin.join("goattyd")).unwrap();
+        let mut out = std::process::Command::new(sysbin.join("sh"))
+            .args(["-c", &proxy_script(None)])
+            .env("HOME", &home)
+            .env("PATH", &sysbin)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let err = drain(out.stderr.take().unwrap());
+        assert!(out.wait().unwrap().success());
+        let probe = parse_probe(&err.lines().map(String::from).collect::<Vec<_>>()).unwrap();
+        assert_eq!(probe.daemon.as_deref(), Some(bin.join("goattyd").to_str().unwrap()));
+        assert!(!probe.runs_ours());
+    }
+
+    #[test]
+    fn older_version_detection() {
+        assert!(is_older_version("0.3.0", "0.4.0"));
+        assert!(is_older_version("0.3.9", "0.4.0"));
+        assert!(is_older_version("0.4.0", "0.4.1"));
+        assert!(!is_older_version("0.4.0", "0.4.0"));
+        assert!(!is_older_version("0.4.1", "0.4.0"));
+        assert!(!is_older_version("0.4.0-rc.1", "0.4.0"));
+        assert!(!is_older_version("", "0.4.0"));
+        assert!(!is_older_version("unknown", "0.4.0"));
     }
 }

@@ -10,12 +10,14 @@
 
 use goatty_term::paste::{self, PasteRisk};
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, SharedString, Window, actions, div, prelude::*, px,
+    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent, SharedString, Window, actions, div,
+    prelude::*, px,
 };
 
 use crate::settings::AppSettings;
 use crate::terminal::PasteRequest;
 use crate::ui::controls::{ButtonKind, button};
+use crate::ui::focus::Stops;
 use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
 
@@ -25,11 +27,17 @@ const WIDTH: f32 = 640.;
 const PREVIEW_LINES: usize = 12;
 const PREVIEW_COLS: usize = 160;
 
-actions!(paste_confirm, [Confirm, Cancel]);
+actions!(paste_confirm, [Cancel, FocusNext, FocusPrev]);
 
 pub fn bindings() -> Vec<KeyBinding> {
     let c = Some(CONTEXT);
-    vec![KeyBinding::new("enter", Confirm, c), KeyBinding::new("escape", Cancel, c)]
+    vec![
+        KeyBinding::new("escape", Cancel, c),
+        KeyBinding::new("tab", FocusNext, c),
+        KeyBinding::new("right", FocusNext, c),
+        KeyBinding::new("shift-tab", FocusPrev, c),
+        KeyBinding::new("left", FocusPrev, c),
+    ]
 }
 
 pub enum PasteConfirmEvent {
@@ -40,6 +48,7 @@ pub enum PasteConfirmEvent {
 pub struct PasteConfirm {
     request: PasteRequest,
     focus: FocusHandle,
+    stops: Stops,
     /// Control or invisible characters that "Paste without them" removes.
     unsafe_chars: usize,
     lines: usize,
@@ -49,7 +58,7 @@ impl EventEmitter<PasteConfirmEvent> for PasteConfirm {}
 
 impl Focusable for PasteConfirm {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus.clone()
+        self.stops.last().cloned().unwrap_or_else(|| self.focus.clone())
     }
 }
 
@@ -138,10 +147,12 @@ pub fn preview(text: &str, max_lines: usize, max_cols: usize) -> (Vec<Vec<Piece>
 impl PasteConfirm {
     pub fn new(request: PasteRequest, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let focus = cx.focus_handle();
-        window.focus(&focus, cx);
         let unsafe_chars = request.text.chars().filter(|&c| paste::is_control(c) || paste::is_hidden(c)).count();
         let lines = paste::line_count(&request.text);
-        Self { request, focus, unsafe_chars, lines }
+        let count = 2 + usize::from(lines > 1) + usize::from(unsafe_chars > 0);
+        let stops = Stops::new(count, cx);
+        stops.focus(count - 1, window, cx);
+        Self { request, focus, stops, unsafe_chars, lines }
     }
 
     /// What Enter does: strip unsafe characters if there are any.
@@ -149,12 +160,25 @@ impl PasteConfirm {
         if self.unsafe_chars > 0 { paste::clean(&self.request.text) } else { self.request.text.clone() }
     }
 
-    fn confirm(&mut self, _: &Confirm, _window: &mut Window, cx: &mut Context<'_, Self>) {
-        cx.emit(PasteConfirmEvent::Done(Some(self.primary())));
-    }
-
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<'_, Self>) {
         cx.emit(PasteConfirmEvent::Done(None));
+    }
+
+    fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.stops.step(1, window, cx);
+    }
+
+    fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.stops.step(-1, window, cx);
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Focused buttons handle Enter and Space through GPUI's on_click;
+        // Enter here is only the fallback when focus sits on the dialog frame.
+        if ev.keystroke.key == "enter" && !ev.keystroke.modifiers.modified() && !self.stops.any_focused(window) {
+            cx.stop_propagation();
+            cx.emit(PasteConfirmEvent::Done(Some(self.primary())));
+        }
     }
 
     fn done(&self, cx: &mut Context<'_, Self>, text: Option<String>) -> impl Fn(&mut Window, &mut App) + 'static {
@@ -216,34 +240,43 @@ impl Render for PasteConfirm {
                 }))
             });
 
+        let mut idx = 0usize;
+        let mut next_btn = |btn| {
+            let i = idx;
+            idx += 1;
+            self.stops.wrap(i, btn, ui, ui.bg)
+        };
         let mut buttons = div()
             .flex()
             .items_center()
             .gap_2()
             .child(div().flex_1().text_xs().text_color(ui.muted).child("Settings → Terminal decides when goatty asks"));
-        buttons = buttons.child(button("paste-cancel", "Cancel", ButtonKind::Normal, ui, self.done(cx, None)));
+        buttons = buttons.child(next_btn(button("paste-cancel", "Cancel", ButtonKind::Normal, ui, self.done(cx, None))));
         if self.lines > 1 {
             let one = paste::join_lines(&paste::clean(&self.request.text));
-            buttons = buttons.child(button("paste-one-line", "Paste as one line", ButtonKind::Normal, ui, self.done(cx, Some(one))));
+            buttons =
+                buttons.child(next_btn(button("paste-one-line", "Paste as one line", ButtonKind::Normal, ui, self.done(cx, Some(one)))));
         }
         if self.unsafe_chars > 0 {
             let raw = Some(self.request.text.clone());
-            buttons = buttons.child(button("paste-raw", "Paste as is", ButtonKind::Danger, ui, self.done(cx, raw)));
+            buttons = buttons.child(next_btn(button("paste-raw", "Paste as is", ButtonKind::Danger, ui, self.done(cx, raw))));
             let label = if self.unsafe_chars == 1 {
                 "Remove 1 character and paste".to_string()
             } else {
                 format!("Remove {} characters and paste", self.unsafe_chars)
             };
-            buttons = buttons.child(button("paste-clean", label, ButtonKind::Primary, ui, self.done(cx, Some(self.primary()))));
+            buttons = buttons.child(next_btn(button("paste-clean", label, ButtonKind::Primary, ui, self.done(cx, Some(self.primary())))));
         } else {
-            buttons = buttons.child(button("paste-ok", "Paste", ButtonKind::Primary, ui, self.done(cx, Some(self.primary()))));
+            buttons = buttons.child(next_btn(button("paste-ok", "Paste", ButtonKind::Primary, ui, self.done(cx, Some(self.primary())))));
         }
 
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(PasteConfirmEvent::Done(None))))
             .occlude()
             .w(px(WIDTH))

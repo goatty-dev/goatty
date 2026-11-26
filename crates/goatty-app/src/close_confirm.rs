@@ -7,10 +7,13 @@
 //! shell) and shows a [`CloseConfirm`] over the window. It emits
 //! [`CloseConfirmEvent::Done`]; "Don't ask again" turns the setting off.
 
-use gpui::{App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, Window, actions, div, prelude::*, px};
+use gpui::{
+    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, KeyDownEvent, Window, actions, div, prelude::*, px,
+};
 
 use crate::settings::AppSettings;
 use crate::ui::controls::{ButtonKind, button, toggle};
+use crate::ui::focus::Stops;
 use crate::ui::icons::Icon;
 use crate::ui::style::Ui;
 
@@ -18,15 +21,20 @@ pub const CONTEXT: &str = "CloseConfirm";
 
 const WIDTH: f32 = 460.;
 
-actions!(close_confirm, [Confirm, Cancel, Detach]);
+actions!(close_confirm, [Cancel, Detach, FocusNext, FocusPrev]);
 
 pub fn bindings() -> Vec<KeyBinding> {
     let c = Some(CONTEXT);
     vec![
-        KeyBinding::new("enter", Confirm, c),
         KeyBinding::new("escape", Cancel, c),
         KeyBinding::new("d", Detach, c),
         KeyBinding::new("alt-d", Detach, c),
+        KeyBinding::new("tab", FocusNext, c),
+        KeyBinding::new("right", FocusNext, c),
+        KeyBinding::new("down", FocusNext, c),
+        KeyBinding::new("shift-tab", FocusPrev, c),
+        KeyBinding::new("left", FocusPrev, c),
+        KeyBinding::new("up", FocusPrev, c),
     ]
 }
 
@@ -66,13 +74,14 @@ pub struct CloseConfirm {
     can_detach: bool,
     dont_ask: bool,
     focus: FocusHandle,
+    stops: Stops,
 }
 
 impl EventEmitter<CloseConfirmEvent> for CloseConfirm {}
 
 impl Focusable for CloseConfirm {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus.clone()
+        self.stops.last().cloned().unwrap_or_else(|| self.focus.clone())
     }
 }
 
@@ -97,8 +106,9 @@ pub fn describe(closing: Closing, programs: &[String]) -> (String, String) {
 impl CloseConfirm {
     pub fn new(closing: Closing, programs: Vec<String>, can_detach: bool, window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let focus = cx.focus_handle();
-        window.focus(&focus, cx);
-        Self { closing, programs, can_detach, dont_ask: false, focus }
+        let stops = Stops::new(3 + usize::from(can_detach), cx);
+        stops.focus(stops.len() - 1, window, cx);
+        Self { closing, programs, can_detach, dont_ask: false, focus, stops }
     }
 
     fn finish(&mut self, choice: CloseChoice, cx: &mut Context<'_, Self>) {
@@ -108,10 +118,6 @@ impl CloseConfirm {
         cx.emit(CloseConfirmEvent::Done(choice));
     }
 
-    fn confirm(&mut self, _: &Confirm, _window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.finish(CloseChoice::Close, cx);
-    }
-
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<'_, Self>) {
         self.finish(CloseChoice::Cancel, cx);
     }
@@ -119,6 +125,23 @@ impl CloseConfirm {
     fn detach(&mut self, _: &Detach, _window: &mut Window, cx: &mut Context<'_, Self>) {
         if self.can_detach {
             self.finish(CloseChoice::Detach, cx);
+        }
+    }
+
+    fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.stops.step(1, window, cx);
+    }
+
+    fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.stops.step(-1, window, cx);
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<'_, Self>) {
+        // Focused controls handle Enter and Space through GPUI's on_click;
+        // Enter here is only the fallback when focus sits on the dialog frame.
+        if ev.keystroke.key == "enter" && !ev.keystroke.modifiers.modified() && !self.stops.any_focused(window) {
+            cx.stop_propagation();
+            self.finish(CloseChoice::Close, cx);
         }
     }
 
@@ -157,12 +180,16 @@ impl Render for CloseConfirm {
             });
         };
 
+        let close_idx = self.stops.len().saturating_sub(1);
+
         div()
             .key_context(CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::detach))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.finish(CloseChoice::Cancel, cx)))
             .occlude()
             .w(px(WIDTH))
@@ -193,7 +220,7 @@ impl Render for CloseConfirm {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(toggle("close-dont-ask", self.dont_ask, ui, flip).aria_label("Don't ask again"))
+                    .child(self.stops.wrap(0, toggle("close-dont-ask", self.dont_ask, ui, flip).aria_label("Don't ask again"), ui, ui.bg))
                     .child(div().text_xs().text_color(ui.muted).child("Don't ask again (Settings → Workspace)")),
             )
             .child(
@@ -201,11 +228,26 @@ impl Render for CloseConfirm {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(button("close-cancel", "Cancel", ButtonKind::Normal, ui, self.done(cx, CloseChoice::Cancel)))
+                    .child(self.stops.wrap(
+                        1,
+                        button("close-cancel", "Cancel", ButtonKind::Normal, ui, self.done(cx, CloseChoice::Cancel)),
+                        ui,
+                        ui.bg,
+                    ))
                     .when(self.can_detach, |d| {
-                        d.child(button("close-detach", detach_label, ButtonKind::Normal, ui, self.done(cx, CloseChoice::Detach)))
+                        d.child(self.stops.wrap(
+                            2,
+                            button("close-detach", detach_label, ButtonKind::Normal, ui, self.done(cx, CloseChoice::Detach)),
+                            ui,
+                            ui.bg,
+                        ))
                     })
-                    .child(button("close-ok", label, ButtonKind::Danger, ui, self.done(cx, CloseChoice::Close))),
+                    .child(self.stops.wrap(
+                        close_idx,
+                        button("close-ok", label, ButtonKind::Danger, ui, self.done(cx, CloseChoice::Close)),
+                        ui,
+                        ui.bg,
+                    )),
             )
     }
 }

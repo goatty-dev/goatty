@@ -15,8 +15,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    App, Bounds, BoxShadow, ElementId, FocusHandle, InteractiveElement, ParentElement, Pixels, ScrollHandle, Styled, Window, WindowId,
-    canvas, point, px,
+    App, Bounds, BoxShadow, ElementId, FocusHandle, Hsla, InteractiveElement, ParentElement, Pixels, ScrollHandle, Styled, Window,
+    WindowId, canvas, point, px,
 };
 
 use super::style::Ui;
@@ -361,4 +361,121 @@ fn reveal_in(scroll: &ScrollHandle, bounds: Bounds<Pixels>, bottom_margin: Pixel
     // GPUI doesn't clamp a set offset to the end: do it here.
     scroll.set_offset(point(offset.x, (offset.y + dy).clamp(-max, px(0.))));
     window.refresh();
+}
+
+/// Two-layer outer focus ring: a 2px `ui.accent` outline separated from the
+/// control by a 2px `surface` gap, so it stays visible even on accent-filled
+/// primary buttons and switches.
+pub fn ring_shadow(ui: Ui, surface: Hsla) -> Vec<BoxShadow> {
+    vec![
+        BoxShadow { color: ui.accent, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(4.), inset: false },
+        BoxShadow { color: surface, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: false },
+    ]
+}
+
+/// Attach `handle` to `el` with a keyboard-only outer focus ring over
+/// `surface`. For dialogs and views outside the settings window's focus pool.
+pub fn ring<E>(el: E, handle: &FocusHandle, ui: Ui, surface: Hsla) -> E
+where
+    E: InteractiveElement + Styled,
+{
+    el.track_focus(handle).focus_visible(move |s| s.shadow(ring_shadow(ui, surface)))
+}
+
+/// A fixed list of keyboard-navigable controls inside a dialog or modal that
+/// sits outside the settings window's focus pool (`begin`/`end`). Focus wraps
+/// around within the list so Tab never escapes behind the dialog.
+#[derive(Default)]
+pub struct Stops {
+    handles: Vec<FocusHandle>,
+}
+
+impl Stops {
+    pub fn new(count: usize, cx: &mut App) -> Self {
+        let mut s = Self::default();
+        s.resize(count, cx);
+        s
+    }
+
+    pub fn resize(&mut self, count: usize, cx: &mut App) {
+        self.handles.truncate(count);
+        while self.handles.len() < count {
+            self.handles.push(cx.focus_handle().tab_stop(true));
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.handles.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn last(&self) -> Option<&FocusHandle> {
+        self.handles.last()
+    }
+
+    pub fn focused_index(&self, window: &Window) -> Option<usize> {
+        self.handles.iter().position(|h| h.is_focused(window))
+    }
+
+    pub fn any_focused(&self, window: &Window) -> bool {
+        self.focused_index(window).is_some()
+    }
+
+    pub fn focus(&self, index: usize, window: &mut Window, cx: &mut App) {
+        if let Some(h) = self.handles.get(index) {
+            window.focus(h, cx);
+        }
+    }
+
+    /// Move focus forward (`delta > 0`) or backward (`delta < 0`), wrapping
+    /// around the dialog's controls.
+    pub fn step(&self, delta: isize, window: &mut Window, cx: &mut App) {
+        if let Some(next) = step_index(self.focused_index(window), self.handles.len(), delta) {
+            self.focus(next, window, cx);
+        }
+    }
+
+    /// Attach stop `index` and a keyboard-only focus ring over `surface`.
+    pub fn wrap<E>(&self, index: usize, el: E, ui: Ui, surface: Hsla) -> E
+    where
+        E: InteractiveElement + Styled,
+    {
+        match self.handles.get(index) {
+            Some(handle) => ring(el, handle, ui, surface),
+            None => el,
+        }
+    }
+}
+
+fn step_index(current: Option<usize>, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let next = match current {
+        Some(i) => (i as isize + delta).rem_euclid(len as isize) as usize,
+        None if delta > 0 => 0,
+        None => len - 1,
+    };
+    Some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn step_index_wraps_in_both_directions() {
+        assert_eq!(step_index(None, 0, 1), None);
+        assert_eq!(step_index(None, 3, 1), Some(0));
+        assert_eq!(step_index(None, 3, -1), Some(2));
+        assert_eq!(step_index(Some(0), 3, 1), Some(1));
+        assert_eq!(step_index(Some(2), 3, 1), Some(0));
+        assert_eq!(step_index(Some(0), 3, -1), Some(2));
+        assert_eq!(step_index(Some(2), 3, -1), Some(1));
+        assert_eq!(step_index(Some(0), 1, 1), Some(0));
+        assert_eq!(step_index(Some(0), 1, -1), Some(0));
+    }
 }
