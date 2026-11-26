@@ -121,3 +121,45 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace --no-fail-fast -- -q
+
+  # The one-line installers (scripts/get-goatty.sh, get-goatty.ps1) that the
+  # website links: each installs the latest published release and a pinned one.
+  installer-linux:
+    name: installer (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: shellcheck -s sh scripts/get-goatty.sh
+      - name: Install into a sandboxed HOME
+        run: |
+          export HOME="$RUNNER_TEMP/home" && unset XDG_DATA_HOME && mkdir -p "$HOME"
+          sh scripts/get-goatty.sh --version 0.4.0
+          test "$("$HOME/.local/bin/goattyd" --version)" = "goattyd 0.4.0"
+          sh scripts/get-goatty.sh
+          "$HOME/.local/bin/goattyd" --version
+          "$HOME/.local/lib/goatty/remote/goattyd-x86_64-linux" --version
+          test -f "$HOME/.local/share/applications/dev.goatty.goatty.desktop"
+          if sh scripts/get-goatty.sh --version 0.0.0; then exit 1; fi
+
+  installer-windows:
+    name: installer (windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install with irm | iex, then a pinned version
+        run: |
+          # What `irm <url> | iex` runs.
+          Get-Content -Raw scripts/get-goatty.ps1 | Invoke-Expression
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\goatty\goatty.exe'
+          & $exe --version | Out-String
+          & ([scriptblock]::Create((Get-Content -Raw scripts/get-goatty.ps1))) -Version 0.4.0 -Force
+          $got = (& $exe --version | Out-String).Trim()
+          if ($got -ne 'goatty 0.4.0') { throw "goatty.exe --version says '$got'" }
+      - name: Same in Windows PowerShell 5.1
+        shell: powershell
+        run: Get-Content -Raw scripts/get-goatty.ps1 | Invoke-Expression

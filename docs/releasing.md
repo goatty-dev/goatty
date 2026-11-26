@@ -35,6 +35,10 @@ Pushing a `v*` tag by hand also publishes, but only if the tag matches the versi
 
 On Windows, the MSI installs into `%LOCALAPPDATA%\Programs\goatty` without an Administrator prompt: `goatty.exe`, `goattyd.exe`, the static Linux goattyds in `remote\`, the licenses and the README. It adds that folder to the user's `PATH` and a Start Menu shortcut whose App User Model ID (`dev.goatty.goatty`) lets goatty show toast notifications. The `.zip` has the same files.
 
+## One-line installers
+
+`scripts/get-goatty.sh` (Linux, and macOS once a release has a macOS archive) and `scripts/get-goatty.ps1` (Windows) install a published release for the current user: they read the release's `SHA256SUMS`, download the archive (`goatty-<version>-<arch>-<os>.tar.gz`) or the MSI it lists for this platform, check its checksum and run the archive's `install.sh` or the MSI. They take the release from `releases/latest/download/`, so they need no GitHub API. The website's `/install.sh` and `/install.ps1` redirect to these files on `main` (goatty-website `public/_redirects`), so a change to them is live once merged and must keep working with every published release. CI (`installer-linux`, `installer-windows`) runs both against the published releases. A new platform needs no change to the shell script as long as its archive follows that name and contains an `install.sh`.
+
 goatty finds the remote goattyds in `remote/` or `../lib/goatty/remote/` next to its binary (`goatty_client::remote::find_bundled`).
 
 The `dist` profile is the release profile without debug info. The binary keeps its symbol names, so backtraces still name functions. On 2026-11-15 it shrank `goatty` from 327 MB to 66 MB (x86_64).
