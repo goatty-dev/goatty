@@ -47,9 +47,14 @@ function Msiexec($verb, $msi) {
     Write-Output "msiexec /$verb ${msi}: ok"
 }
 
+# Product codes of the installed MSIs with goatty's UpgradeCode. The
+# installer's StringList isn't a .NET collection, so through InvokeMember.
 function Installed-Products {
     $installer = New-Object -ComObject WindowsInstaller.Installer
-    @($installer.RelatedProducts($upgradeCode))
+    $get = { param($obj, $name, $arg) $obj.GetType().InvokeMember($name, "GetProperty", $null, $obj, $arg) }
+    $list = & $get $installer "RelatedProducts" @($upgradeCode)
+    $count = & $get $list "Count" $null
+    @(for ($i = 0; $i -lt $count; $i++) { & $get $list "Item" @($i) })
 }
 
 function Start-Goattyd {
@@ -90,6 +95,7 @@ Msiexec i $new
 if (-not $daemon.WaitForExit(10000)) { throw "the upgrade didn't stop the running goattyd" }
 $products = Installed-Products
 if ($products.Count -ne 1) { throw "expected one installed goatty, found $($products.Count): $products" }
+Write-Output "installed: $products"
 
 Step "installed files"
 Check-Version (Join-Path $dir "goatty.exe") goatty

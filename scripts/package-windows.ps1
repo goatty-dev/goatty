@@ -59,6 +59,8 @@ try {
         -ext WixToolset.Util.wixext -ext WixToolset.UI.wixext `
         -d "Version=$numeric" -d "Source=$dir" -d "Packaging=$root\packaging\windows" `
         -o (Join-Path $OutDir $msiName)
+    # The .wixpdb next to the MSI is debugging data, not a release asset.
+    Remove-Item (Join-Path $OutDir "*.wixpdb") -ErrorAction SilentlyContinue
     Write-Output (Join-Path $OutDir $msiName)
     if ($MsiVersion) { return }
 
@@ -70,8 +72,6 @@ try {
     $standalone = Join-Path $OutDir "goattyd-$arch-windows.exe"
     Copy-Item "$bin\goattyd.exe" $standalone
     Write-Output $standalone
-    # The .wixpdb next to the MSI is debugging data, not a release asset.
-    Remove-Item (Join-Path $OutDir "*.wixpdb") -ErrorAction SilentlyContinue
 }
 finally {
     Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
