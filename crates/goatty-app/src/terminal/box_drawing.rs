@@ -141,7 +141,7 @@ fn push_rect(out: &mut Vec<DpRect>, x0: i32, y0: i32, x1: i32, y1: i32, color: H
 /// (used to clip stroked glyphs so half-stroke overhangs never bleed into
 /// neighboring rows or columns).
 pub struct PathDraw {
-    pub path: Path<Pixels>,
+    pub path: Path,
     pub color: Hsla,
     pub clip: Option<Bounds<Pixels>>,
 }
@@ -781,7 +781,7 @@ fn dp_point(x: f32, y: f32, scale: f32) -> Point<Pixels> {
 
 fn stroke_builder(width_dp: f32, scale: f32) -> PathBuilder {
     let width = width_dp / scale;
-    PathBuilder::default().with_style(PathStyle::Stroke(StrokeOptions::default().with_line_width(width).with_miter_limit(1.5)))
+    PathBuilder::default().with_style(PathStyle::Stroke(StrokeOptions { line_width: width, miter_limit: 1.5, ..Default::default() }))
 }
 
 fn draw_rounded_corner(cp: u32, cell: CellRect, grid: &CellGrid, color: Hsla, paths: &mut Vec<PathDraw>) {
