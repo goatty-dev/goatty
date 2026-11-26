@@ -29,6 +29,7 @@ mod plugins;
 mod problems;
 mod profile;
 mod prompt;
+mod scope;
 mod search;
 mod shell;
 mod shortcuts;
@@ -285,6 +286,23 @@ pub fn open_link_plugin(cx: &mut App, id: String, version: Option<String>, regis
 }
 
 /// Open the settings window at `page` (or where it was).
+/// Open the settings at `page` with the shell pages on host `host` (a
+/// toast about that host, #313).
+/// Plugin operations reach the active tab's host only: for another host,
+/// say where to go instead.
+pub fn open_for_host(cx: &mut App, page: Option<Page>, host: String) {
+    open_at(cx, page);
+    let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) else { return };
+    let _ = handle.update(cx, |view, _, cx| {
+        if view.link_host_id(cx).as_deref() == Some(host.as_str()) {
+            view.set_scope(scope::Scope::Host(host), cx);
+        } else {
+            let label = crate::shared_sync::state(cx).map_or_else(|| "that host".to_string(), |s| s.label(&host));
+            toast::show(cx, Toast::info(format!("Open a tab on {label} to review its plugins")).key("settings.plugins.host"));
+        }
+    });
+}
+
 pub fn open_at(cx: &mut App, page: Option<Page>) {
     if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
         && handle
@@ -510,8 +528,20 @@ pub struct SettingsWindow {
     host: Option<HostView>,
     /// Edited host settings not yet applied (`None`: no changes).
     draft: Option<HostSettings>,
+    /// Which hosts the shell pages edit (#313); `None`: the active tab's
+    /// host's own file (no shared config there, or not known yet).
+    scope: Option<scope::Scope>,
+    /// The active tab's host's own settings (machine-only values for the
+    /// other scopes).
+    link_settings: Option<HostSettings>,
+    /// Machine-only values whose write failed after the shared part was
+    /// stored: they go back into the draft once the host's file is loaded.
+    pending_machine: Option<(HostLink, scope::MachinePatch)>,
+
     host_error: Option<String>,
     busy: bool,
+    /// An apply is on its way: edits now would be lost when it lands.
+    applying: bool,
     outcome: Option<Outcome>,
     show_diff: bool,
     generations: Vec<GenRow>,
@@ -725,8 +755,12 @@ impl SettingsWindow {
             link: cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone()),
             host: None,
             draft: None,
+            scope: None,
+            link_settings: None,
+            pending_machine: None,
             host_error: None,
             busy: false,
+            applying: false,
             outcome: None,
             show_diff: false,
             generations: Vec::new(),
@@ -794,6 +828,16 @@ impl SettingsWindow {
             toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
             _subs: {
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
+                // An exchange brought news: pick the scope once, show what changed.
+                subs.push(cx.observe_global::<crate::shared_sync::Shared>(|this, cx| {
+                    if this.scope.is_none() {
+                        this.pick_scope(cx);
+                    } else if this.draft.is_none() && !this.busy && this.page.is_host() {
+                        // The exchange may have changed what the shown host uses.
+                        this.reload_scope(cx);
+                    }
+                    cx.notify();
+                }));
                 subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
                     let canceled = this.sync_recording(cx);
                     if this.page == Page::Shortcuts || canceled {
@@ -821,7 +865,16 @@ impl SettingsWindow {
             (a, b) => a.is_none() && b.is_none(),
         };
         // An install in progress keeps its host until it's over.
-        if same || self.draft.is_some() || self.busy || self.plugins.follow.is_some() || self.plugins.batch.is_some() {
+        if same
+            || self.draft.is_some()
+            || self.busy
+            || self.applying
+            || self.plugins.follow.is_some()
+            || self.plugins.batch.is_some()
+            || self.plugins.is_loading()
+            // Machine values that still have to go to this host.
+            || self.pending_machine.is_some()
+        {
             return;
         }
         // Keep a pending plugin link only when picking up the first host on
@@ -830,6 +883,9 @@ impl SettingsWindow {
         let pending_link = if self.link.is_none() && link.is_some() { self.plugins.pending_link.take() } else { None };
         self.link = link;
         self.host = None;
+        self.scope = None;
+        self.link_settings = None;
+        self.pending_machine = None;
         self.host_error = None;
         self.outcome = None;
         self.imported_plugins.clear();
@@ -1386,10 +1442,41 @@ impl SettingsWindow {
                         let program = loaded.value.shell.program.clone().unwrap_or_default();
                         view.shell_path.update(cx, |input, cx| input.set_text(program, cx));
                         let before = view.host.as_ref().map(|h| h.issues.clone());
+                        view.link_settings = Some(loaded.value.clone());
+                        if !view.scope_is_link(cx) {
+                            // Another scope is shown: it only needed this host's machine values.
+                            if let Some(v) = view.scoped_view(cx) {
+                                view.host = Some(v);
+                            }
+                            view.generations = gens;
+                            view.host_error = None;
+                            view.sync_prompt_inputs(cx);
+                            cx.notify();
+                            return;
+                        }
                         if view.draft.as_ref() == Some(&loaded.value) {
                             view.draft = None;
                         }
+                        // Only the machine values that didn't make it are still to apply.
+                        // Only for the host it was meant for, and not over a newer draft.
+                        if let Some((for_link, patch)) = view.pending_machine.take()
+                            && view.link.as_ref().is_some_and(|l| l.same(&for_link))
+                            && view.draft.is_none()
+                        {
+                            let mut flat = goatty_config::shared::flatten(&goatty_config::shared::sparse(&loaded.value));
+                            for (p, v) in patch {
+                                match v {
+                                    Some(v) => flat.insert(p, v),
+                                    None => flat.remove(&p),
+                                };
+                            }
+                            let draft = store::parse::<HostSettings>(&goatty_config::shared::unflatten(&flat).to_string()).value;
+                            view.draft = (draft != loaded.value).then_some(draft);
+                        }
                         view.host = Some(HostView { loaded, issues, env_overrides: snap.env_overrides, generation: snap.generation });
+                        if view.pending_machine.is_none() && !view.busy {
+                            view.applying = false;
+                        }
                         if let Some(before) = before {
                             view.announce_host_issues(&before, cx);
                         }
@@ -1399,8 +1486,28 @@ impl SettingsWindow {
                         view.path_host_changed(cx);
                         view.dotfiles_host_changed(cx);
                         view.everywhere_host_changed(cx);
+                        view.pick_scope(cx);
                     }
-                    Err(e) => view.host_error = Some(format!("{e:#}")),
+                    Err(e) => {
+                        view.host_error = Some(format!("{e:#}"));
+                        view.applying = false;
+                        // Without the host's file there's nothing to put them back on: say which
+                        // machine values didn't make it, rather than holding on to them.
+                        if let Some((_, patch)) = view.pending_machine.take() {
+                            let values: Vec<String> = patch
+                                .iter()
+                                .map(|(p, v)| match v {
+                                    Some(v) => format!("{} = {v}", goatty_config::shared::display_path(p)),
+                                    None => format!("{} back to its default", goatty_config::shared::display_path(p)),
+                                })
+                                .collect();
+                            let line = format!("⚠ Not saved on this host: {}. Set them again once it answers.", values.join(", "));
+                            match view.outcome.as_mut() {
+                                Some(o) => o.lines.push(line),
+                                None => view.outcome = Some(Outcome { ok: false, lines: vec![line], diff: Vec::new(), reload: false }),
+                            }
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -1408,8 +1515,13 @@ impl SettingsWindow {
         .detach();
     }
 
-    /// Change the draft host settings.
+    /// Change the draft host settings (not while an apply is on its way:
+    /// that change would be lost when it lands).
     pub fn edit_host(&mut self, cx: &mut Context<'_, Self>, f: impl FnOnce(&mut HostSettings)) {
+        if self.applying {
+            toast::show(cx, Toast::info("Applying the last change…").body("Change more once it's done.").key("settings.busy"));
+            return;
+        }
         let Some(base) = self.host_value().cloned() else { return };
         let mut draft = base;
         f(&mut draft);
@@ -1429,6 +1541,11 @@ impl SettingsWindow {
 
     /// Ask the host what applying the draft would change.
     pub fn preview(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(why) = self.preview_unavailable(cx) {
+            self.outcome = Some(Outcome { ok: false, lines: vec![why], diff: Vec::new(), reload: false });
+            cx.notify();
+            return;
+        }
         self.send_draft(false, cx);
     }
 
@@ -1438,13 +1555,25 @@ impl SettingsWindow {
     }
 
     fn send_draft(&mut self, apply: bool, cx: &mut Context<'_, Self>) {
+        // One request at a time: a second would overwrite the first's outcome.
+        if self.applying {
+            toast::show(cx, Toast::info("Still working on the last request").body("Try again once it's done.").key("settings.busy"));
+            return;
+        }
+        // Through the shared config, unless the scope is a host's own file.
+        if apply && self.apply_scoped(cx) {
+            return;
+        }
         let (Some(link), Some(json)) = (self.link.clone(), self.draft_json()) else { return };
         self.busy = true;
+        // Preview or Apply: either blocks a second request and edits until it's back.
+        self.applying = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { link.set(json, apply) }).await;
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
+                view.applying = false;
                 match result {
                     Ok(a) => {
                         let mut lines = Vec::new();
@@ -1483,6 +1612,7 @@ impl SettingsWindow {
 
     pub fn discard(&mut self, cx: &mut Context<'_, Self>) {
         self.draft = None;
+        self.pending_machine = None;
         self.outcome = None;
         self.show_diff = false;
         self.imported_plugins.clear();

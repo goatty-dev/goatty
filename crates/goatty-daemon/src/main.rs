@@ -60,6 +60,9 @@ enum Cmd {
     /// This host's settings (host.json: shell, prompt, history).
     #[command(subcommand)]
     Settings(SettingsCmd),
+    /// The shared shell config on this host (one config on every host, with per-host overrides).
+    #[command(subcommand)]
+    Sync(SyncCmd),
     /// Plugins on this host: search, install (with a review of what they do), configure, remove.
     #[command(subcommand)]
     Plugin(PluginCmd),
@@ -274,9 +277,37 @@ enum SettingsCmd {
     /// Check host.json (or FILE); exit status 1 on problems.
     Validate { file: Option<std::path::PathBuf> },
     /// Set a dotted KEY (e.g. history.size 5000); builds and activates the shell configuration.
-    Set { key: String, value: String },
+    /// On a host that follows the shared config, the change is this host's override.
+    Set {
+        key: String,
+        value: String,
+        /// Change it in the shared config, for every host that follows it.
+        #[arg(long, conflicts_with = "host")]
+        shared: bool,
+        /// Only on this host (the default).
+        #[arg(long)]
+        host: bool,
+    },
     /// Reset KEY to its default.
-    Unset { key: String },
+    Unset {
+        key: String,
+        #[arg(long, conflicts_with = "host")]
+        shared: bool,
+        #[arg(long)]
+        host: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncCmd {
+    /// This host's view of the shared shell config: whether it follows it,
+    /// trusted devices, overrides, plugins that need a review.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve and apply the shared config now.
+    Apply,
 }
 
 #[derive(Subcommand)]
@@ -360,6 +391,10 @@ enum Everywhere {
 
 const CLIENT: &str = concat!("goattyd-cli ", env!("CARGO_PKG_VERSION"));
 
+fn edit_scope(shared: bool) -> goatty_shell::cmd::EditScope {
+    if shared { goatty_shell::cmd::EditScope::Shared } else { goatty_shell::cmd::EditScope::Host }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = cli.cmd.unwrap_or(Cmd::Serve { restore: None, log: None });
@@ -375,6 +410,7 @@ fn main() -> Result<()> {
             | Cmd::RestoreVersion
             | Cmd::Shell(_)
             | Cmd::Settings(_)
+            | Cmd::Sync(_)
             | Cmd::Plugin(_)
             | Cmd::Alias(_)
             | Cmd::Snippet(_)
@@ -487,8 +523,16 @@ fn main() -> Result<()> {
                 SettingsCmd::Path => cmd::settings_path(&svc),
                 SettingsCmd::Show { key, all } => cmd::settings_show(&svc, key.as_deref(), all),
                 SettingsCmd::Validate { file } => cmd::settings_validate(&svc, file.as_deref()),
-                SettingsCmd::Set { key, value } => cmd::settings_set(&svc, &key, &value),
-                SettingsCmd::Unset { key } => cmd::settings_unset(&svc, &key),
+                SettingsCmd::Set { key, value, shared, host: _ } => cmd::settings_set(&svc, &key, &value, edit_scope(shared)),
+                SettingsCmd::Unset { key, shared, host: _ } => cmd::settings_unset(&svc, &key, edit_scope(shared)),
+            }
+        }
+        Cmd::Sync(cmd) => {
+            use goatty_shell::cmd;
+            let svc = goatty_shell::HostService::from_env(std::env::current_exe().ok());
+            match cmd {
+                SyncCmd::Status { json } => cmd::sync_status(&svc, json),
+                SyncCmd::Apply => cmd::sync_apply(&svc),
             }
         }
         Cmd::Plugin(cmd) => {

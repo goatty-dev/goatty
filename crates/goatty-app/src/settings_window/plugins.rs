@@ -442,7 +442,23 @@ const LOSE_TRACK_AFTER: std::time::Duration = std::time::Duration::from_secs(15 
 
 /// The request failed because the connection did (it may come back), not
 /// because the host refused.
+/// A plugin request refused because the settings show another host (not
+/// sent at all, so not a lost connection).
+#[derive(Debug)]
+struct OtherHost(String);
+
+impl std::fmt::Display for OtherHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OtherHost {}
+
 fn connection_lost(link: &HostLink, e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<OtherHost>().is_some() {
+        return false;
+    }
     let m = format!("{e:#}");
     !link.is_connected() || m.contains("did not answer") || m.contains("not connected to goattyd")
 }
@@ -516,6 +532,13 @@ impl SettingsWindow {
             cx.notify();
             return;
         };
+        if let Some(why) = self.plugins_unavailable(cx) {
+            self.plugins.error = Some(why.clone());
+            // The caller's state (a followed install, a review) ends through its own path.
+            done(self, Err(OtherHost(why).into()), cx);
+            cx.notify();
+            return;
+        }
         self.plugins.in_flight += 1;
         cx.notify();
         let asked = link.clone();
@@ -536,6 +559,10 @@ impl SettingsWindow {
                 }
                 view.plugins.in_flight = view.plugins.in_flight.saturating_sub(1);
                 done(view, result, cx);
+                // The scope waits for plugin requests; the last one done may let it be picked now.
+                if view.plugins.in_flight == 0 && view.scope.is_none() {
+                    view.pick_scope(cx);
+                }
                 cx.notify();
             });
         })
@@ -1224,6 +1251,13 @@ impl SettingsWindow {
         cx: &mut Context<'_, Self>,
     ) {
         let first = ids.first().cloned();
+        // Installed or removed for every host that follows the shared config (#313).
+        if result.is_ok()
+            && self.scope == Some(super::scope::Scope::All)
+            && let Some(link) = self.link.clone()
+        {
+            crate::shared_sync::share_plugins(link, ids.clone(), installed, cx);
+        }
         match result {
             Ok(c) => {
                 for id in ids {

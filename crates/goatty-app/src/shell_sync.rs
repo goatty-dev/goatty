@@ -1,5 +1,6 @@
-//! Bringing this computer's shell setup to the hosts goatty connects to
-//! (#159): the same prompt, aliases, plugins and tools everywhere.
+//! Bringing this computer's shell setup to hosts whose goattyd predates
+//! the shared shell config (#159; protocol older than v18). Newer hosts
+//! take part in the shared config instead (`shared_sync`, #313).
 //!
 //! When a tab connects to another host's goattyd, goatty compares this
 //! computer's setup with the host's (`goatty_shell::sync`, off the UI
@@ -8,10 +9,11 @@
 //! now**. It asks once per change made here: the answer is kept with the
 //! setup's fingerprint (`goatty_config::sync_state`), so editing the setup
 //! here asks again, while a host whose setup was changed on purpose isn't
-//! nagged. Hosts set to always sync are synced without asking whenever the
+//! nagged. Hosts that follow the shared config (carried over from the old
+//! `ssh.sync` choices, `ClientState`) are synced without asking whenever the
 //! setup here changed since their last sync, and a host
 //! goatty just installed goattyd on gets the setup with it (the install
-//! question says so). "Never" leaves a host alone and falls back to the
+//! question says so). Hosts kept separate are left alone: only the
 //! plain offer of missing tools (`shell_setup`).
 //!
 //! The sync runs on the host through its goattyd: plugins (each plan checked
@@ -22,14 +24,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::Result;
-use goatty_config::SyncMode;
+use goatty_config::shared::ClientState;
 use goatty_config::sync_state::{self, SyncState};
 use goatty_shell::HostService;
 use goatty_shell::setup;
 use goatty_shell::sync::{self, LocalSetup, Plan};
 use gpui::{App, AsyncApp, Global};
 
-use crate::settings::AppSettings;
 use crate::settings_window::{self, HostLink, Page};
 use crate::shell_setup;
 use crate::toast::{self, Toast};
@@ -91,14 +92,44 @@ fn record(key: String, fingerprint: String, synced: bool, cx: &mut App) {
         .detach();
 }
 
-/// Bringing the setup to `key` as the settings say now (they may change
-/// while a host is being compared).
-fn mode(key: &str, cx: &App) -> SyncMode {
-    cx.global::<AppSettings>().file.value.ssh.sync_mode(key)
+/// Whether goatty brings the setup to a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncMode {
+    /// Ask once for each change made here.
+    Ask,
+    /// Without asking (the host follows the shared config).
+    Always,
+    /// Leave it alone (kept separate).
+    Never,
 }
 
-/// A tab connected to `link`'s host. For another host's goattyd: bring
-/// the setup there as `ssh.sync`/`ssh.hosts[].sync` say (`after_install`:
+/// Bringing the setup to `key` as the user chose (it may change while a
+/// host is being compared).
+fn mode(key: &str, _cx: &App) -> SyncMode {
+    match ClientState::file().map(|f| ClientState::load(&f)).unwrap_or_default().intent(key) {
+        Some(true) => SyncMode::Always,
+        Some(false) => SyncMode::Never,
+        None => SyncMode::Ask,
+    }
+}
+
+/// Remember that `key` follows (the old "Always sync this host").
+fn remember_follow(key: String, cx: &mut App) {
+    cx.background_executor()
+        .spawn(async move {
+            let Some(file) = ClientState::file() else { return };
+            let _guard = STATE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut s = ClientState::load(&file);
+            s.intents.insert(key, true);
+            if let Err(e) = s.save(&file) {
+                log::warn!("couldn't save {}: {e}", file.display());
+            }
+        })
+        .detach();
+}
+
+/// A tab connected to `link`'s host (an older goattyd). For another
+/// host's goattyd: bring the setup there as the user chose (`after_install`:
 /// goatty just installed goattyd there, and the question said the setup
 /// comes along). For this computer, or a host set to never sync: offer
 /// missing tools only.
@@ -208,7 +239,7 @@ fn show_offer(link: HostLink, key: String, plan: Plan, fingerprint: String, cx: 
         })
         .action("Always sync this host", move |_, cx| {
             let (l, k, p, f) = always_args.clone();
-            AppSettings::update(cx, |s| s.ssh.edit(&k, false, |h| h.sync = Some(SyncMode::Always)));
+            remember_follow(k.clone(), cx);
             start(l, k, p, f, cx);
         })
         .action("Not now", move |_, cx| record(not_now_key.clone(), fingerprint.clone(), false, cx));

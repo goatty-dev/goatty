@@ -193,6 +193,9 @@ pub struct Session {
     /// out first), so two views of different sizes don't take turns.
     size_owner: AtomicU64,
     pub exited: AtomicBool,
+    /// The connection came back after a drop (the view exchanges the shared
+    /// shell config again, #313).
+    pub reconnected: AtomicBool,
     exit_code: Mutex<Option<u32>>,
     pub bytes_in: AtomicU64,
     pub status: Mutex<LinkStatus>,
@@ -372,6 +375,7 @@ impl PaneSink for Sink {
             PaneEvent::Reconnected => {
                 s.predictor.lock().reset();
                 *s.status.lock() = LinkStatus::Connected;
+                s.reconnected.store(true, Ordering::Release);
                 // A daemon from before v14 says nothing about control: the
                 // pane sets the size again.
                 if s.connection().is_some_and(|c| !c.supports_size_control()) {
@@ -452,6 +456,7 @@ impl Session {
             ui_started: AtomicBool::new(false),
             size_owner: AtomicU64::new(0),
             exited: AtomicBool::new(false),
+            reconnected: AtomicBool::new(false),
             exit_code: Mutex::new(None),
             bytes_in: AtomicU64::new(0),
             status: Mutex::new(LinkStatus::Connected),

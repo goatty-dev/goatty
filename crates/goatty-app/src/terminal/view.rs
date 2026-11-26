@@ -619,6 +619,12 @@ impl TerminalView {
     fn on_wake(&mut self, cx: &mut Context<'_, Self>) {
         self.wake.clear();
         self.poke_cursor();
+        // Back after a drop: the host may have missed shared-config changes.
+        if self.session.reconnected.swap(false, Ordering::AcqRel)
+            && let Some(conn) = self.session.connection()
+        {
+            crate::shared_sync::on_reconnect(crate::settings_window::HostLink::Daemon(conn.clone()), cx);
+        }
         // Tabs fall back to the directory when there's no title.
         let cwd_gen = self.session.cwd_generation();
         let mut cwd_changed = cwd_gen != self.cwd_gen;

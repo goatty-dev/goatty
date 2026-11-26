@@ -276,3 +276,27 @@ impl goatty_shell::sync::Remote for HostLink {
         Ok(applied.applied)
     }
 }
+
+impl goatty_shell::shared::Peer for HostLink {
+    fn label(&self) -> String {
+        HostLink::label(self)
+    }
+
+    fn shared(&self, req: goatty_shell::shared::api::Request) -> Result<goatty_shell::shared::api::Reply> {
+        match self {
+            HostLink::Daemon(c) => Ok(serde_json::from_str(&c.shared(serde_json::to_string(&req)?)?)?),
+            HostLink::Local(s) => s.shared_request(req),
+        }
+    }
+}
+
+impl HostLink {
+    /// The host takes part in the shared shell config (#313): a goattyd
+    /// with protocol v18, or this process with `--local`.
+    pub fn shares_config(&self) -> bool {
+        match self {
+            HostLink::Daemon(c) => c.shares_config(),
+            HostLink::Local(_) => true,
+        }
+    }
+}

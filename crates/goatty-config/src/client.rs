@@ -1100,17 +1100,13 @@ pub struct SshSettings {
     pub hosts: Vec<SshHost>,
     /// Where a host picked in the palette or the settings opens.
     pub open_in: OpenIn,
-    /// Bringing this computer's shell setup (host settings, plugins,
-    /// tools) to a host goatty connects to, for hosts without their own
-    /// choice (`hosts[].sync`).
-    pub sync: SyncMode,
     /// Show typed characters before the host echoes them (#16).
     pub local_echo: LocalEcho,
 }
 
 impl Default for SshSettings {
     fn default() -> Self {
-        Self { discover: true, hosts: Vec::new(), open_in: OpenIn::Window, sync: SyncMode::Ask, local_echo: LocalEcho::Auto }
+        Self { discover: true, hosts: Vec::new(), open_in: OpenIn::Window, local_echo: LocalEcho::Auto }
     }
 }
 
@@ -1141,20 +1137,6 @@ impl LocalEcho {
             LocalEcho::Never => false,
         }
     }
-}
-
-/// Whether goatty copies this computer's shell setup to a host when it
-/// connects and the host's differs (#159).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncMode {
-    /// Ask once for each change made here.
-    #[default]
-    Ask,
-    /// Copy it without asking.
-    Always,
-    /// Leave the host's setup alone.
-    Never,
 }
 
 /// Where a connection to another host opens.
@@ -1188,12 +1170,6 @@ impl SshSettings {
         self.get(host).is_some_and(|h| h.plain)
     }
 
-    /// Whether to bring the shell setup to `host`: its own choice, else
-    /// the default.
-    pub fn sync_mode(&self, host: &str) -> SyncMode {
-        self.get(host).and_then(|h| h.sync).unwrap_or(self.sync)
-    }
-
     /// Change the entry for `host` (created if missing). An entry left
     /// without a name or a choice is removed when `keep` is false: hosts
     /// from `~/.ssh/config` need no entry of their own.
@@ -1206,7 +1182,7 @@ impl SshSettings {
             }
         };
         f(&mut self.hosts[i]);
-        if !keep && self.hosts[i].name.is_none() && !self.hosts[i].plain && self.hosts[i].sync.is_none() {
+        if !keep && self.hosts[i].name.is_none() && !self.hosts[i].plain {
             self.hosts.remove(i);
         }
     }
@@ -1223,9 +1199,6 @@ pub struct SshHost {
     /// Connect with plain SSH (`ssh host` in a local session) instead of
     /// goatty's daemon on the host. Nothing is installed there.
     pub plain: bool,
-    /// Bring this computer's shell setup here; `None`: `ssh.sync`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync: Option<SyncMode>,
 }
 
 impl SshHost {
@@ -1257,13 +1230,13 @@ pub struct DebugSettings {
 
 impl Document for ClientSettings {
     const NAME: &'static str = "settings";
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
     const OPEN_MAPS: &'static [&'static str] =
         &["keybindings", "commands.custom", "commands.open_in", "theme.overrides", "tabs.host_colors"];
     const LITERAL_KEY_MAPS: &'static [&'static str] = &["commands.open_in"];
 
     fn migrations() -> &'static [Migration] {
-        &[(1, global_theme_overrides_became_per_theme), (2, copy_on_select_became_auto_copy)]
+        &[(1, global_theme_overrides_became_per_theme), (2, copy_on_select_became_auto_copy), (3, push_sync_became_shared_config)]
     }
 
     fn default_version(user: &serde_json::Value) -> u32 {
@@ -1272,6 +1245,10 @@ impl Document for ClientSettings {
             1
         } else if user.pointer("/selection/copy_on_select").is_some() {
             2
+        } else if user.pointer("/ssh/sync").is_some()
+            || user.pointer("/ssh/hosts").and_then(serde_json::Value::as_array).is_some_and(|h| h.iter().any(|h| h.get("sync").is_some()))
+        {
+            3
         } else {
             Self::VERSION
         }
@@ -1450,6 +1427,24 @@ fn copy_on_select_became_auto_copy(doc: &mut serde_json::Value) {
     };
     selection.remove("copy_on_select");
     selection.entry(key).or_insert(Value::Bool(value));
+}
+
+/// Version 3 → 4 (#313): the push sync's `ssh.sync` (Ask / Always /
+/// Never) and `ssh.hosts[].sync` gave way to the shared shell config,
+/// where each host follows it or not. The app carries the old choices over
+/// once from the raw file (`goatty_config::shared::ClientState::migrate`)
+/// before they're dropped here.
+fn push_sync_became_shared_config(doc: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(ssh) = doc.as_object_mut().and_then(|m| m.get_mut("ssh")).and_then(Value::as_object_mut) else {
+        return;
+    };
+    ssh.remove("sync");
+    for h in ssh.get_mut("hosts").and_then(Value::as_array_mut).into_iter().flatten() {
+        if let Some(h) = h.as_object_mut() {
+            h.remove("sync");
+        }
+    }
 }
 
 /// Version 1 → 2 (#246): `theme.overrides` became a map keyed by theme id
@@ -1753,6 +1748,17 @@ mod tests {
         assert_eq!(edited.value.selection, SelectionSettings { auto_copy: true, clear_after_copy: true, primary: false });
     }
 
+    #[test]
+    fn version_3_push_sync_choices_are_dropped() {
+        let text = r#"{"version": 3, "ssh": {"sync": "always", "hosts": [{"host": "pi", "sync": "never", "plain": true}]}}"#;
+        let loaded = crate::store::parse::<ClientSettings>(text);
+        assert!(loaded.issues.is_empty() && loaded.unknown.is_empty(), "{:?} {:?}", loaded.issues, loaded.unknown);
+        assert!(loaded.value.ssh.plain("pi"));
+        // Unversioned files with the old keys take the migration too.
+        let loaded = crate::store::parse::<ClientSettings>(r#"{"ssh": {"sync": "never"}}"#);
+        assert!(loaded.issues.is_empty() && loaded.unknown.is_empty(), "{:?} {:?}", loaded.issues, loaded.unknown);
+    }
+
     fn with(vars: &[(&str, &str)]) -> ClientSettings {
         let mut s = ClientSettings::default();
         s.apply_env(|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string()));
@@ -1931,14 +1937,6 @@ mod tests {
         assert!(s.ssh.plain("nas"));
         s.ssh.edit("nas", false, |h| h.plain = false);
         assert!(s.ssh.get("nas").is_none());
-        // Syncing the shell setup: the host's own choice, else the default.
-        assert_eq!(s.ssh.sync_mode("nas"), SyncMode::Ask);
-        s.ssh.sync = SyncMode::Never;
-        s.ssh.edit("nas", false, |h| h.sync = Some(SyncMode::Always));
-        assert_eq!((s.ssh.sync_mode("nas"), s.ssh.sync_mode("other")), (SyncMode::Always, SyncMode::Never));
-        s.ssh.edit("nas", false, |h| h.sync = None);
-        assert!(s.ssh.get("nas").is_none());
-        s.ssh.sync = SyncMode::Ask;
         // A host added by hand stays.
         s.ssh.edit("box", true, |h| h.plain = false);
         assert!(s.ssh.get("box").is_some());

@@ -68,6 +68,14 @@ pub mod pool {
         live.iter().find(|(k, _)| *k == key).and_then(|(_, w)| w.upgrade())
     }
 
+    /// Every open, shared connection (the shared shell config relays
+    /// between them).
+    pub fn all() -> Vec<Arc<Connection>> {
+        let mut live = LIVE.lock();
+        live.retain(|(_, w)| w.strong_count() > 0);
+        live.iter().filter_map(|(_, w)| w.upgrade()).collect()
+    }
+
     /// One connection attempt in progress, shared by everyone asking for
     /// that host meanwhile (reopened windows connect to the same host at
     /// once): one login, one askpass prompt, one timeout.
@@ -546,7 +554,7 @@ mod tests {
         let mut s = ClientSettings::default();
         s.ssh.hosts = vec![
             SshHost { host: "pi@10.0.0.5".into(), name: Some("Pi".into()), ..Default::default() },
-            SshHost { host: "nas".into(), name: None, plain: true, ..Default::default() },
+            SshHost { host: "nas".into(), name: None, plain: true },
         ];
         let found = vec![
             ConfigHost { alias: "nas".into(), hostname: Some("192.168.1.2".into()), user: Some("admin".into()) },
