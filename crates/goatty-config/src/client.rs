@@ -1006,10 +1006,27 @@ impl RightClick {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MouseSettings {
     pub right_click: RightClick,
+    /// Lines one mouse-wheel notch scrolls (#310): scrollback, the arrow
+    /// keys sent to `less`/`man` in the alternate screen, and wheel reports
+    /// to programs that use the mouse. Touchpads scroll by distance and
+    /// aren't affected.
+    pub scroll_lines: u32,
+}
+
+impl MouseSettings {
+    pub const DEFAULT_SCROLL_LINES: u32 = 3;
+    pub const MIN_SCROLL_LINES: u32 = 1;
+    pub const MAX_SCROLL_LINES: u32 = 20;
+}
+
+impl Default for MouseSettings {
+    fn default() -> Self {
+        Self { right_click: RightClick::default(), scroll_lines: Self::DEFAULT_SCROLL_LINES }
+    }
 }
 
 /// What `Ctrl+Backspace` sends in legacy (non-kitty) mode.
@@ -1299,6 +1316,19 @@ impl Document for ClientSettings {
                 ),
             ));
             self.links.remote_max_size_mb = max_mb;
+        }
+        let lines = self.mouse.scroll_lines.clamp(MouseSettings::MIN_SCROLL_LINES, MouseSettings::MAX_SCROLL_LINES);
+        if lines != self.mouse.scroll_lines {
+            issues.push(Issue::new(
+                "mouse.scroll_lines",
+                format!(
+                    "{} is outside {}–{}; using {lines}",
+                    self.mouse.scroll_lines,
+                    MouseSettings::MIN_SCROLL_LINES,
+                    MouseSettings::MAX_SCROLL_LINES
+                ),
+            ));
+            self.mouse.scroll_lines = lines;
         }
         let mut seen = std::collections::HashSet::new();
         let mut i = 0;
@@ -2009,6 +2039,20 @@ mod tests {
         }
         let s: ClientSettings = serde_json::from_str(r#"{"mouse":{"right_click":"paste"}}"#).unwrap();
         assert_eq!(s.mouse.right_click, Paste);
+    }
+
+    #[test]
+    fn scroll_lines_defaults_to_three_and_is_clamped() {
+        use crate::store;
+        assert_eq!(ClientSettings::default().mouse.scroll_lines, 3);
+        let s = store::parse::<ClientSettings>(r#"{"mouse": {"scroll_lines": 5}}"#);
+        assert_eq!(s.value.mouse.scroll_lines, 5);
+        assert!(s.issues.is_empty(), "{:?}", s.issues);
+        for (json, want) in [(r#"{"mouse": {"scroll_lines": 0}}"#, 1), (r#"{"mouse": {"scroll_lines": 99}}"#, 20)] {
+            let s = store::parse::<ClientSettings>(json);
+            assert_eq!(s.value.mouse.scroll_lines, want, "{json}");
+            assert!(s.issues.iter().any(|i| i.path == "mouse.scroll_lines"), "{:?}", s.issues);
+        }
     }
 
     #[test]

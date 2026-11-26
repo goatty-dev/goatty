@@ -83,6 +83,7 @@ pub const INDEX: &[Entry] = &[
     e(Page::Terminal, "Selection", "Middle click pastes what you select", "primary selection middle click paste")
         .keys(&["selection.primary"]),
     e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
+    e(Page::Terminal, "Mouse", "Wheel scrolls", "scroll speed wheel lines notch mouse scrolling fast slow").keys(&["mouse.scroll_lines"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),
     e(Page::Terminal, "Pasting", "Ask before pasting", "paste confirm protection bracketed multiline").keys(&["paste.confirm"]),
     e(Page::Terminal, "Keyboard", "Ctrl+Backspace", "ctrl backspace delete word kill backward bash ssh").keys(&["keyboard.ctrl_backspace"]),
