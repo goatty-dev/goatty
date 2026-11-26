@@ -494,3 +494,60 @@ snippet-sources = "lists alpha and what you typed first, to test suggestions"
         assert!(matches!(request_msg(&d.sock, |req| ClientMsg::Plugin { req, request }), ServerMsg::Error { .. }));
     }
 }
+
+/// A goattyd over the socket, as an exchange of the shared config reaches it.
+struct SocketPeer(PathBuf);
+
+impl goatty_shell::shared::Peer for SocketPeer {
+    fn label(&self) -> String {
+        self.0.display().to_string()
+    }
+
+    fn shared(&self, req: goatty_shell::shared::api::Request) -> anyhow::Result<goatty_shell::shared::api::Reply> {
+        let reply = Control::connect(&self.0, "test")?.shared(serde_json::to_string(&req)?)?;
+        Ok(serde_json::from_str(&reply)?)
+    }
+}
+
+/// The shared shell config over the protocol (v18, #313): a GUI device
+/// seeds it on one goattyd, a second goattyd joins and applies it itself,
+/// and an edit made on that host directly becomes its own override.
+#[test]
+fn shared_config_over_the_protocol() {
+    use goatty_config::shared::Signer;
+    use goatty_shell::shared::{self, Peer};
+
+    let (laptop, server) = (start_daemon(), start_daemon());
+    let gui = tempfile::tempdir().unwrap();
+    let me = shared::Device::load(&goatty_shell::Dirs::under(gui.path())).unwrap();
+    let (lp, sp) = (SocketPeer(laptop.sock.clone()), SocketPeer(server.sock.clone()));
+
+    let mut mine = goatty_config::HostSettings::default();
+    mine.history.size = 5000;
+    let seed = shared::seed_entries(&mine, &Default::default(), &me.device(), &me, goatty_config::shared::Hlc { ms: 1, n: 0 });
+    let x = shared::exchange(&[&lp as &dyn Peer], &me, seed);
+    assert!(x.errors.is_empty(), "{:?}", x.errors);
+
+    // The server joins; it applies the shared settings itself.
+    let x = shared::exchange(&[&lp as &dyn Peer, &sp], &me, Vec::new());
+    let server_id = x.statuses[1].as_ref().unwrap().host.clone();
+    assert_eq!(x.statuses[1].as_ref().unwrap().member, None);
+    let join = shared::join_entries(&x.doc, &x.trust_of(0), &server_id, "server", None, &me);
+    let x = shared::exchange(&[&lp as &dyn Peer, &sp], &me, join);
+    assert!(x.errors.is_empty(), "{:?}", x.errors);
+    let st = x.statuses[1].as_ref().unwrap();
+    assert_eq!(st.member, Some(true));
+    assert!(st.trusted.contains(&me.device()), "the connecting device became a root there");
+    assert!(host_json(&server).contains("5000"), "{}", host_json(&server));
+
+    // A change made on the server directly is kept as its own override.
+    let (_, _, applied, _) = set(&server, r#"{"history": {"size": 300}}"#, true);
+    assert!(applied);
+    let st = shared::status(&sp).unwrap();
+    assert_eq!(st.local_changes, ["history.size"]);
+    let Ok(goatty_shell::shared::api::Reply::Status(st)) = sp.shared(goatty_shell::shared::api::Request::Apply) else { panic!() };
+    assert!(st.last_apply.is_some_and(|a| a.ok));
+    assert!(host_json(&server).contains("300"), "{}", host_json(&server));
+    // The laptop, which never followed, keeps its own file.
+    assert!(!host_json(&laptop).contains("5000"));
+}
