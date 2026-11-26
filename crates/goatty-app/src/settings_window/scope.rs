@@ -52,7 +52,8 @@ impl SettingsWindow {
     /// active tab's host when it doesn't follow it, else All synced hosts
     /// (a toast about one host opens on it: [`super::open_for_host`]).
     pub(super) fn pick_scope(&mut self, cx: &mut Context<'_, Self>) {
-        if self.scope.is_some() || self.draft.is_some() {
+        // A plugin request in flight decides on the scope it started in.
+        if self.scope.is_some() || self.draft.is_some() || self.plugins.is_loading() {
             return;
         }
         let Some(link_id) = self.link_host_id(cx) else { return };

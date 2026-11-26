@@ -764,6 +764,8 @@ impl SettingsWindow {
             || self.plugins.follow.is_some()
             || self.plugins.batch.is_some()
             || self.plugins.is_loading()
+            // Machine values that still have to go to this host.
+            || self.pending_machine.is_some()
         {
             return;
         }

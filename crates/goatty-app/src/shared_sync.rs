@@ -369,7 +369,8 @@ pub fn on_reconnect(link: HostLink, cx: &mut App) {
                 cx.update(|cx| {
                     cx.default_global::<Recent>().trailing.remove(&key);
                     if link.is_connected() {
-                        exchange(Vec::new(), Some(link), cx, |_, _| {});
+                        // The same path as a connection (an older goattyd gets the push sync).
+                        on_connect(link, false, cx);
                     }
                 });
             })
