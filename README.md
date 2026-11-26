@@ -42,6 +42,22 @@ cargo build --release --workspace
 
 To try reattaching: run something in goatty, close the window, start `goatty` again. Over `--ssh`, the client also reconnects by itself when the link drops (title shows `(reconnecting…)`).
 
+## Install with one command
+
+On Linux (x86_64, glibc 2.35+), without root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/goatty-dev/goatty/main/scripts/get-goatty.sh | sh
+```
+
+On Windows 10/11, in PowerShell, without administrator rights:
+
+```powershell
+irm https://raw.githubusercontent.com/goatty-dev/goatty/main/scripts/get-goatty.ps1 | iex
+```
+
+Both download the latest release, check it against the release's `SHA256SUMS` and install it for your user: on Linux the release archive's `install.sh` (below), on Windows the MSI. Run them again to upgrade. Pick a release with `sh -s -- --version 0.4.0` (Linux) or `& ([scriptblock]::Create((irm <url>))) -Version 0.4.0` (Windows).
+
 ## Install a Linux release
 
 [Releases](https://github.com/goatty-dev/goatty/releases) have packages for x86_64. Each release page lists the exact install commands:
