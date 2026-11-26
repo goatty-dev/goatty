@@ -47,14 +47,11 @@ function Msiexec($verb, $msi) {
     Write-Output "msiexec /$verb ${msi}: ok"
 }
 
-# Product codes of the installed MSIs with goatty's UpgradeCode. The
-# installer's StringList isn't a .NET collection, so through InvokeMember.
+# Product codes of the installed MSIs with goatty's UpgradeCode. PowerShell
+# unrolls what a function returns, so callers wrap it in @().
 function Installed-Products {
     $installer = New-Object -ComObject WindowsInstaller.Installer
-    $get = { param($obj, $name, $arg) $obj.GetType().InvokeMember($name, "GetProperty", $null, $obj, $arg) }
-    $list = & $get $installer "RelatedProducts" @($upgradeCode)
-    $count = & $get $list "Count" $null
-    @(for ($i = 0; $i -lt $count; $i++) { & $get $list "Item" @($i) })
+    $installer.RelatedProducts($upgradeCode)
 }
 
 function Start-Goattyd {
@@ -93,7 +90,7 @@ $daemon = Start-Goattyd
 Step "upgrade"
 Msiexec i $new
 if (-not $daemon.WaitForExit(10000)) { throw "the upgrade didn't stop the running goattyd" }
-$products = Installed-Products
+$products = @(Installed-Products)
 if ($products.Count -ne 1) { throw "expected one installed goatty, found $($products.Count): $products" }
 Write-Output "installed: $products"
 
@@ -125,5 +122,5 @@ if (Test-Path $dir) { throw "$dir is still there: $(Get-ChildItem -Recurse $dir)
 if (Test-Path $shortcut) { throw "the Start Menu shortcut is still there" }
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 if ($userPath -and ($userPath -split ";" | Where-Object { $_.TrimEnd("\") -eq $dir })) { throw "$dir is still on the user's PATH" }
-if ((Installed-Products).Count -ne 0) { throw "goatty is still registered as installed" }
+if (@(Installed-Products).Count -ne 0) { throw "goatty is still registered as installed" }
 Write-Output "`nall good"
