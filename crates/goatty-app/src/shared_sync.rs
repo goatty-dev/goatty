@@ -904,3 +904,23 @@ pub fn resolve(host: Option<&str>, machine: &HostSettings, cx: &App) -> Option<H
     let s = state(cx)?;
     Some(s.doc.resolve(host, &s.trust, machine).value)
 }
+
+/// Sign an overridden value from the generation history again as a new
+/// shared entry and exchange it with every reachable host (#323).
+pub fn restore_overridden(
+    item: &goatty_shell::history::Overridden,
+    cx: &mut App,
+    done: impl FnOnce(Result<Arc<Outcome>>, &mut App) + 'static,
+) {
+    let doc = state(cx).map(|s| s.doc.clone()).unwrap_or_default();
+    match device().and_then(|me| host_shared::restore_overridden_entry(&doc, item, &me)) {
+        Ok(entry) => publish(vec![entry], cx, done),
+        Err(e) => done(Err(e), cx),
+    }
+}
+
+/// Whether `item`'s value is already the winning value in the shared config.
+pub fn is_current_overridden(item: &goatty_shell::history::Overridden, cx: &App) -> bool {
+    let Some(s) = state(cx) else { return false };
+    s.doc.winner(&item.key, &s.trust).is_some_and(|w| w.value() == item.value.as_ref())
+}

@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use goatty_config::{ClientSettings, HostSettings, ThemeSettings};
 use goatty_plugin::api::Catalog;
-use goatty_shell::history::{Entry, NAME_MAX};
+use goatty_shell::history::{Entry, NAME_MAX, Overridden};
 use gpui::{
-    AnyElement, ClipboardItem, Context, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div,
-    px,
+    AnyElement, ClipboardItem, Context, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::host::GenRow;
@@ -66,7 +66,15 @@ fn gen_desc(e: &Entry) -> String {
         parts.push(format!("Generation {}", e.number));
     }
     parts.push(ago(e.created_unix));
-    parts.extend(Some(e.summary()).filter(|s| !s.is_empty()));
+    let summary = e.summary();
+    if !summary.is_empty() {
+        parts.push(summary);
+    }
+    if let Some(n) = e.changes.as_ref().map(|c| c.overridden.len()).filter(|&n| n > 0)
+        && !parts.last().is_some_and(|s| s.contains("replaced value"))
+    {
+        parts.push(format!("{n} replaced value{}", if n == 1 { "" } else { "s" }));
+    }
     parts.join(" · ")
 }
 
@@ -220,6 +228,63 @@ impl SettingsWindow {
         .detach();
     }
 
+    /// Sign an overridden value from the generation history again as a new
+    /// shared entry so it wins again (#323).
+    fn restore_overridden(&mut self, item: Overridden, cx: &mut Context<'_, Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        let subject = item.subject();
+        let this = cx.entity().downgrade();
+        crate::shared_sync::restore_overridden(&item, cx, move |result, cx| {
+            let _ = this.update(cx, |view, cx| {
+                view.busy = false;
+                match result {
+                    Ok(o) if o.saved_anywhere() => {
+                        let failed: Vec<String> =
+                            o.x.statuses
+                                .iter()
+                                .flatten()
+                                .filter_map(|s| s.last_apply.as_ref())
+                                .filter(|a| !a.ok)
+                                .flat_map(|a| a.lines.clone())
+                                .collect();
+                        let toast = if failed.is_empty() && o.x.errors.is_empty() {
+                            Toast::success(format!("Restored {subject}"))
+                                .body("Signed as a new shared entry; synced hosts apply it automatically.")
+                        } else {
+                            let mut lines = failed;
+                            lines.extend(o.x.errors.iter().map(|(i, e)| format!("{}: {e}", o.links[*i].label())));
+                            Toast::warning(format!("Restored {subject} on some hosts")).body(lines.join("\n"))
+                        };
+                        toast::show(cx, toast.key("generation-restore"));
+                        view.load_host(cx);
+                        crate::plugin_commands::refresh(cx);
+                        crate::snippets::refresh(cx);
+                    }
+                    Ok(o) => {
+                        let why = o.x.errors.iter().map(|(i, e)| format!("{}: {e}", o.links[*i].label())).collect::<Vec<_>>().join("\n");
+                        toast::show(
+                            cx,
+                            Toast::error(format!("Couldn't restore {subject}"))
+                                .body(if why.is_empty() { "No goatty host stored the change.".into() } else { why })
+                                .key("generation-restore"),
+                        );
+                    }
+                    Err(e) => {
+                        toast::show(
+                            cx,
+                            Toast::error(format!("Couldn't restore {subject}")).body(format!("{e:#}")).key("generation-restore"),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
     /// Under an open generation: every change, its name, its file changes.
     fn generation_details(&self, ui: Ui, g: &GenRow, cx: &Context<'_, Self>) -> AnyElement {
         let n = g.entry.number;
@@ -234,12 +299,69 @@ impl SettingsWindow {
                 if total > CHANGE_LINES {
                     changes = changes.child(line(format!("and {} more", total - CHANGE_LINES)));
                 }
-                if total == 0 && c.files == 0 {
+                if total == 0 && c.files == 0 && c.overridden.is_empty() {
                     changes = changes.child(line("No setting and no generated file changed".into()));
                 }
             }
             None => changes = changes.child(line("Nothing to compare: the generation before it is gone".into())),
         }
+        let shares_config = self.link.as_ref().is_some_and(super::host::HostLink::shares_config);
+        let overridden = g.entry.changes.as_ref().filter(|c| !c.overridden.is_empty()).map(|c| {
+            let mut list = div().flex().flex_col().gap(px(6.)).child(
+                div()
+                    .text_size(px(text::SMALL))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(ui.muted)
+                    .child("Replaced values from other devices"),
+            );
+            for (i, item) in c.overridden.iter().enumerate() {
+                let current = crate::shared_sync::is_current_overridden(item, cx);
+                let right = if current {
+                    badge("Current", Tone::Success, ui).into_any_element()
+                } else if shares_config {
+                    let restore = item.clone();
+                    let gen_id: ElementId = ("gen-open", n as usize).into();
+                    button_with(
+                        SharedString::from(format!("gen-restore-{n}-{i}")),
+                        Some(Icon::RotateCcw),
+                        "Restore",
+                        ButtonKind::Ghost,
+                        ui,
+                        self.act_window(cx, move |v, window, cx| {
+                            // Once restored the button becomes a badge: keep keyboard focus on the generation row.
+                            focus::hand_over(&v.focus, focus::Handover::Control(gen_id.clone()), window, cx);
+                            v.restore_overridden(restore.clone(), cx);
+                        }),
+                    )
+                    .aria_label(SharedString::from(format!("Restore {}", item.subject())))
+                    .into_any_element()
+                } else {
+                    div().into_any_element()
+                };
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(6.))
+                        .rounded(px(8.))
+                        .bg(ui.field)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(text::SMALL))
+                                .text_color(ui.text)
+                                .truncate()
+                                .child(SharedString::from(item.text())),
+                        )
+                        .child(right),
+                );
+            }
+            list
+        });
         let files = g.entry.changes.as_ref().map_or(0, |c| c.files);
         let diff_open = self.gen_diff.as_ref().filter(|(d, _)| *d == n);
         let diff_button = (files > 0 || g.entry.changes.as_ref().is_some_and(|c| c.base.is_none())).then(|| {
@@ -280,6 +402,7 @@ impl SettingsWindow {
             .gap(px(12.))
             .pl(px(50.))
             .child(changes)
+            .children(overridden)
             .children(diff_button.map(|b| div().flex().child(b)))
             .children(diff)
             .child(name)
