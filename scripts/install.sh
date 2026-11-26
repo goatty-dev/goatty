@@ -45,11 +45,12 @@ Version=1.0
 Type=Application
 Name=Goatty
 Comment=A GPU-rendered terminal with persistent sessions
-Exec="$desktop_exec"
+Exec="$desktop_exec" %U
 Icon=goatty
 Terminal=false
 Categories=System;TerminalEmulator;
 StartupWMClass=dev.goatty.goatty
+MimeType=x-scheme-handler/goatty;
 EOF
 
 echo "Installed Goatty. The launcher is at $desktop_file"

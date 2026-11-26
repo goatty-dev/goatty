@@ -1181,7 +1181,7 @@ impl Workspace {
         let plan = ConnectPlan {
             endpoint: conn.endpoint().clone(),
             mode,
-            open_settings: None,
+            initial_links: Vec::new(),
             plain: false,
             conn: Some(conn.clone()),
             join: None,
@@ -1237,7 +1237,7 @@ impl Workspace {
                 let plan = ConnectPlan {
                     endpoint: conn.endpoint().clone(),
                     mode: AttachMode::Join(None),
-                    open_settings: None,
+                    initial_links: Vec::new(),
                     plain: false,
                     conn: Some(conn.clone()),
                     join: None,
@@ -1699,7 +1699,7 @@ impl Workspace {
             let plan = ConnectPlan {
                 endpoint: conn.endpoint().clone(),
                 mode: AttachMode::Join(Some(next)),
-                open_settings: None,
+                initial_links: Vec::new(),
                 plain: false,
                 conn: Some(conn.clone()),
                 join: None,

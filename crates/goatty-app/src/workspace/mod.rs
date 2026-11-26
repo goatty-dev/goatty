@@ -451,7 +451,7 @@ impl Workspace {
                 }
             }
             Initial::Connect(plan) => this.open_connect_tab(plan, window, cx),
-            Initial::Reopen(record, open_settings) => this.reopen(record, open_settings, window, cx),
+            Initial::Reopen(record, initial_links) => this.reopen(record, initial_links, window, cx),
         }
         this
     }
@@ -473,7 +473,13 @@ impl Workspace {
     /// Open a window from the last run (#252): a connecting tab per host
     /// that joins the workspace this window showed there, in the order of
     /// their tabs.
-    fn reopen(&mut self, record: reopen::WindowRecord, mut open_settings: Option<String>, window: &mut Window, cx: &mut Context<'_, Self>) {
+    fn reopen(
+        &mut self,
+        record: reopen::WindowRecord,
+        mut initial_links: Vec<crate::links::Link>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
         if let Some(w) = record.window {
             w.apply(window);
             self.window = w;
@@ -486,8 +492,8 @@ impl Workspace {
             let plan = ConnectPlan {
                 endpoint: h.host.host_ref().endpoint(),
                 mode: AttachMode::Restore(h.workspace),
-                // `--settings`: once the active tab's host is there.
-                open_settings: if i == active_host { open_settings.take() } else { None },
+                // Initial links (`--settings`, `goatty open`): once the active tab's host is there.
+                initial_links: if i == active_host { std::mem::take(&mut initial_links) } else { Vec::new() },
                 plain: false,
                 conn: None,
                 join: None,
@@ -563,6 +569,7 @@ impl Workspace {
 
     fn window_activated(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         cx.set_global(crate::hosts::LastWorkspace(window.window_handle()));
+        crate::links::mark_active(cx);
         // A connecting tab has no host yet: clear the link rather than keep
         // the previous tab's, so "sync", "reload shells" and the settings
         // window never act on a host the user isn't looking at.
@@ -864,12 +871,12 @@ impl Workspace {
             ConnectEvent::Cancelled => self.remove_tab(index, window, cx),
             ConnectEvent::Ready => {
                 let Some((view, _)) = &self.tabs[index].connecting else { return };
-                let (ready, settings, installed, active_tab) =
-                    view.update(cx, |v, _| (v.take_ready(), v.take_open_settings(), v.take_installed(), v.active_tab()));
+                let (ready, initial_links, installed, active_tab) =
+                    view.update(cx, |v, _| (v.take_ready(), v.take_initial_links(), v.take_installed(), v.active_tab()));
                 let Some((startup, spawner)) = ready else { return };
                 self.connected(index, startup, spawner, installed, active_tab, window, cx);
-                if let Some(page) = settings {
-                    crate::settings_window::open_at(cx, crate::settings_window::Page::from_name(&page));
+                for link in initial_links {
+                    crate::links::apply(cx, link);
                 }
             }
         }
@@ -1395,7 +1402,7 @@ impl Workspace {
             let plan = ConnectPlan {
                 endpoint: conn.endpoint().clone(),
                 mode: AttachMode::Join(Some(id)),
-                open_settings: None,
+                initial_links: Vec::new(),
                 plain: false,
                 conn: Some(conn),
                 join: None,
@@ -1655,7 +1662,7 @@ impl Workspace {
                     let plan = ConnectPlan {
                         endpoint: conn.endpoint().clone(),
                         mode,
-                        open_settings: None,
+                        initial_links: Vec::new(),
                         plain: false,
                         conn: Some(conn),
                         join: None,
@@ -2239,7 +2246,7 @@ impl Workspace {
                             let plan = ConnectPlan {
                                 endpoint: conn.endpoint().clone(),
                                 mode,
-                                open_settings: None,
+                                initial_links: Vec::new(),
                                 plain: false,
                                 conn: Some(conn),
                                 join: None,
@@ -2280,13 +2287,13 @@ impl Workspace {
             let plan = ConnectPlan {
                 endpoint: sh.conn.endpoint().clone(),
                 mode: AttachMode::Join(Some(sh.id)),
-                open_settings: None,
+                initial_links: Vec::new(),
                 plain: false,
                 conn: Some(sh.conn.clone()),
                 join: None,
                 active_tab: self.active_tab().map(|t| t.id),
             };
-            cx.defer(move |cx| crate::app::open_terminal_window(cx, Initial::Connect(plan), None));
+            cx.defer(move |cx| crate::app::open_terminal_window(cx, Initial::Connect(plan), Vec::new()));
             return;
         }
         self.new_window_with_shell(window, cx);
@@ -2300,13 +2307,13 @@ impl Workspace {
             let plan = ConnectPlan {
                 endpoint: goatty_client::Endpoint::Local,
                 mode: AttachMode::New,
-                open_settings: None,
+                initial_links: Vec::new(),
                 plain: false,
                 conn: None,
                 join: None,
                 active_tab: None,
             };
-            cx.defer(move |cx| crate::app::open_terminal_window(cx, Initial::Connect(plan), None));
+            cx.defer(move |cx| crate::app::open_terminal_window(cx, Initial::Connect(plan), Vec::new()));
             return;
         };
         // The shell starts where the focused pane is, like a new tab.
@@ -2326,7 +2333,9 @@ impl Workspace {
         cx.spawn(async move |_, cx| {
             let result = task.await;
             cx.update(|cx| match result {
-                Ok(session) => crate::app::open_terminal_window(cx, Initial::Ready { startup: Startup::Session(session), spawner }, None),
+                Ok(session) => {
+                    crate::app::open_terminal_window(cx, Initial::Ready { startup: Startup::Session(session), spawner }, Vec::new())
+                }
                 Err(e) => {
                     toast::show(cx, Toast::error("Couldn't open a window").body(format!("{e:#}")).key("workspace.spawn"));
                 }
@@ -2351,7 +2360,7 @@ impl Workspace {
         let plan = ConnectPlan {
             endpoint: host.endpoint(),
             mode: AttachMode::New,
-            open_settings: None,
+            initial_links: Vec::new(),
             plain,
             conn: None,
             join: None,
