@@ -182,14 +182,17 @@ pub fn open_host_color(cx: &mut App, host: &str) {
 }
 
 /// Show a toast in the open settings window, falling back to the app-wide
-/// router if the window isn't open.
+/// router if the window isn't open. Deferred so callbacks running inside an
+/// active `SettingsWindow` entity update never re-enter it.
 pub(super) fn show_toast(cx: &mut App, t: Toast) {
-    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
-        && handle.update(cx, |_, window, cx| toast::show_in(window, cx, t.clone())).is_ok()
-    {
-        return;
-    }
-    toast::show(cx, t);
+    cx.defer(move |cx| {
+        if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
+            && handle.update(cx, |_, window, cx| toast::show_in(window, cx, t.clone())).is_ok()
+        {
+            return;
+        }
+        toast::show(cx, t);
+    });
 }
 
 /// Open a `goatty://settings[/<page>][?setting=<key>]` link (#305).

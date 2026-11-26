@@ -518,6 +518,7 @@ impl SettingsWindow {
         };
         self.plugins.in_flight += 1;
         cx.notify();
+        let asked = link.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -527,6 +528,12 @@ impl SettingsWindow {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                // Ignore replies from a host the window no longer follows so
+                // stale responses never corrupt the new host's catalog,
+                // in-flight count, or pending link.
+                if !view.link.as_ref().is_some_and(|l| l.same(&asked)) {
+                    return;
+                }
                 view.plugins.in_flight = view.plugins.in_flight.saturating_sub(1);
                 done(view, result, cx);
                 cx.notify();
@@ -772,6 +779,9 @@ impl SettingsWindow {
         fallback_detail: Option<String>,
         cx: &mut Context<'_, Self>,
     ) {
+        // Return any open queued update review back to the queue and clear
+        // `from_queue` before starting the link's own review.
+        self.plugins.clear_review();
         let req_id = self.plugins.begin_review(None);
         let asked_version = version.is_some();
         self.plugin_call(
@@ -2364,6 +2374,19 @@ mod tests {
         assert!(page.accept_review_plan(req, test_plan("new")));
         page.clear_review();
         assert_eq!(page.review_queue.len(), 1);
+
+        // Starting a link review while a queued update review is open returns
+        // the queued update to the front of the queue and clears `from_queue`.
+        assert!(page.show_next_review());
+        assert!(page.from_queue);
+        page.clear_review();
+        let link_req = page.begin_review(None);
+        assert!(!page.from_queue);
+        assert_eq!(page.review_queue.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["upd"]);
+        assert!(page.accept_review_plan(link_req, test_plan("linked")));
+        assert_eq!(page.review_position(), None);
+        assert_eq!(page.dismiss_plan(), Some(None));
+        assert_eq!(page.review_queue.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["upd"]);
     }
 
     #[test]
