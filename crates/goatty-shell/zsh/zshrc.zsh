@@ -733,6 +733,85 @@ goatty-reload() {
   ZDOTDIR=$_goatty_dir builtin exec "${commands[zsh]:-zsh}" -l
 }
 
+# Copy stdin, or the files named, to the clipboard of the computer you're
+# looking at, even in a shell on a remote host: `cat log | copy`,
+# `copy notes.txt` (#307). wl-copy and xclip can't: they talk to the display
+# server of the host they run on. This sends OSC 52 to the terminal, which
+# goatty (and most terminals) turn into a clipboard write on your side;
+# inside tmux it goes through tmux's buffer (tmux 3.2+ passes it on).
+# -p: the primary selection instead (Linux).
+goatty-copy() {
+  emulate -L zsh
+  local kind=c
+  while (( $# )); do
+    case $1 in
+      (-p|--primary) kind=p; shift ;;
+      (-h|--help)
+        builtin print -r -- "usage: copy [-p] [file...]    or pipe into it: cat log | copy"
+        builtin print -r -- "Puts the text on the clipboard of the computer you're looking at, even on a remote host."
+        builtin print -r -- "  -p, --primary   the primary selection (Linux) instead of the clipboard"
+        return 0 ;;
+      (--) shift; break ;;
+      (-?*) builtin print -ru2 -- "copy: unknown option $1 (copy --help)"; return 2 ;;
+      (*) break ;;
+    esac
+  done
+  if (( ! $# )) && [[ -t 0 ]]; then
+    builtin print -ru2 -- "copy: pipe text into it (cat log | copy) or name files (copy notes.txt)"
+    return 2
+  fi
+  # Bytes, not characters, from here on.
+  local LC_ALL=C data shown
+  # The x keeps trailing newlines that $(…) would drop.
+  data=$(command cat -- "$@" && builtin print -n x) || return 1
+  data=${data%x}
+  local -i size=${#data} max=$(( 8 * 1024 * 1024 ))
+  if (( size < 1024 )); then
+    shown="$size bytes"
+  elif (( size < 1024 * 1024 )); then
+    builtin printf -v shown '%.1f KiB' $(( size / 1024.0 ))
+  else
+    builtin printf -v shown '%.1f MiB' $(( size / 1048576.0 ))
+  fi
+  if (( size == 0 )); then
+    builtin print -ru2 -- "copy: nothing to copy"
+    return 1
+  fi
+  # It travels through the terminal (and the network, from a remote host),
+  # and every window showing the session decodes it.
+  if (( size > max )); then
+    builtin print -ru2 -- "copy: $shown is too much to send through the terminal (the limit is 8 MiB)"
+    return 1
+  fi
+  if [[ -n ${TMUX-} ]] && (( ${+commands[tmux]} )); then
+    if ! builtin print -rn -- "$data" | command tmux load-buffer -w - 2>/dev/null; then
+      builtin print -ru2 -- "copy: tmux didn't take it (load-buffer -w needs tmux 3.2 or newer)"
+      return 1
+    fi
+  else
+    if (( ! ${+commands[base64]} )); then
+      builtin print -ru2 -- "copy: needs the base64 command (coreutils)"
+      return 1
+    fi
+    local b64
+    b64=$(builtin print -rn -- "$data" | command base64 | command tr -d '\r\n') || return 1
+    if ! { builtin print -rn -- $'\e]52;'"$kind;$b64"$'\a' > /dev/tty } 2>/dev/null; then
+      builtin print -ru2 -- "copy: no terminal to send it to"
+      return 1
+    fi
+  fi
+  # In goatty's panes a toast says so (Settings → Terminal → Clipboard).
+  (( ${_goatty_inside:-0} )) || [[ ! -t 2 ]] ||
+    builtin print -ru2 -- "copy: sent $shown to your terminal's clipboard (if it supports OSC 52)"
+  return 0
+}
+# `copy` too, unless that name is already yours.
+if (( ! ${+commands[copy]} && ! ${+aliases[copy]} && ! ${+functions[copy]} && ! ${+builtins[copy]} )); then
+  copy() { goatty-copy "$@" }
+  (( ${+functions[compdef]} )) && compdef _files copy
+fi
+(( ${+functions[compdef]} )) && compdef _files goatty-copy
+
 # --- Reload on request -------------------------------------------------------
 # After host settings change, goatty can ask running shells to pick up the
 # new configuration: it sends SIGURG (ignored by default, so other programs

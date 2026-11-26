@@ -1,9 +1,9 @@
-//! The Terminal page (links, selection, mouse, pasting) and the Workspace page
+//! The Terminal page (links, selection, clipboard, mouse, pasting) and the Workspace page
 //! (startup, tabs, panes, notifications).
 
 use goatty_config::{
     CtrlBackspace, CtrlDelete, LinkClick, LinkSettings, MiddleClick, MouseSettings, NotifyWhen, OnLaunch, PaneSettings, PasteConfirm,
-    RemoteFileOpen, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
+    ProgramCopy, RemoteFileOpen, RightClick, TabActivity, TabBarShow, TabSettings, TabStyle,
 };
 use gpui::{AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
 
@@ -122,6 +122,21 @@ impl SettingsWindow {
                     .into_any_element()
             });
 
+        let clipboard = section(ui, "Clipboard")
+            .child(row(ui, "When a program copies").desc("goatty's copy command, vim, tmux: here or on a remote host").control(self.select(
+                "clipboard-programs",
+                "When a program copies",
+                opts(&[
+                    (ProgramCopy::Notify, "Copy and say so", "A toast shows how much and from which host"),
+                    (ProgramCopy::Quiet, "Copy quietly", ""),
+                    (ProgramCopy::Deny, "Don't copy", "A toast says a program tried"),
+                ]),
+                &s.clipboard.programs,
+                cx,
+                |v, _, cx| AppSettings::update(cx, |s| s.clipboard.programs = v),
+            )))
+            .footer("Pipe into copy (cat file | copy) to put text on this computer's clipboard, even on a remote host. Programs can never read the clipboard.");
+
         let mouse = section(ui, "Mouse")
             .child(row(ui, "Right click").desc("Shift+right-click does the other thing").control(self.select(
                 "right-click",
@@ -212,7 +227,17 @@ impl SettingsWindow {
             )
             .footer("Applies to local and SSH sessions alike. Programs that enable the kitty keyboard protocol still receive Ctrl+Backspace and Ctrl+Delete directly.");
 
-        div().flex().flex_col().gap(px(28.)).child(links).child(selection).child(mouse).child(pasting).child(keyboard).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(28.))
+            .child(links)
+            .child(selection)
+            .child(clipboard)
+            .child(mouse)
+            .child(pasting)
+            .child(keyboard)
+            .into_any_element()
     }
 
     fn tab_style_cards(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {

@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use goatty_client::RemotePathInfo;
 use goatty_config::{
-    ClientSettings, CtrlBackspace, CtrlDelete, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, RemoteFileOpen, Renderer,
-    RightClick,
+    ClientSettings, CtrlBackspace, CtrlDelete, CursorShape, FontSettings, LinkClick, MiddleClick, PasteConfirm, ProgramCopy,
+    RemoteFileOpen, Renderer, RightClick,
 };
 use goatty_plugin::commands::{KeyName, Stroke};
 use goatty_term::input::{
@@ -639,7 +639,7 @@ impl TerminalView {
             match ev {
                 UiEvent::Title(t) => self.app_title = t,
                 UiEvent::ResetTitle => self.app_title = DEFAULT_TITLE.into(),
-                UiEvent::ClipboardStore(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+                UiEvent::ClipboardStore { primary, text } => self.program_copied(primary, text, cx),
                 UiEvent::CwdChanged => cwd_changed = true,
                 UiEvent::Bell => cx.emit(TerminalEvent::Activity(Activity::Bell)),
                 UiEvent::CommandFinished { exit } => {
@@ -769,6 +769,35 @@ impl TerminalView {
                 true
             }
             None => false,
+        }
+    }
+
+    /// A program set the clipboard or the primary selection (OSC 52:
+    /// `copy`, vim, tmux, on this host or a remote one; #307). Any program
+    /// can, so by default a toast says so (`clipboard.programs`).
+    fn program_copied(&mut self, primary: bool, text: String, cx: &mut Context<'_, Self>) {
+        let mode = cx.global::<AppSettings>().client.clipboard.programs;
+        let host = self.session.host_label.clone();
+        let from = match &host {
+            Some(host) => format!("a program on {host}"),
+            None => "a program".to_string(),
+        };
+        if mode == ProgramCopy::Deny {
+            let body = format!("Blocked {from}. Settings → Terminal → Clipboard allows it.");
+            toast::show(cx, Toast::info("A program tried to copy").body(body).key("terminal.program-copy"));
+            return;
+        }
+        let size = links::format_bytes(text.len() as u64);
+        let item = ClipboardItem::new_string(text);
+        let title = if primary && PRIMARY_SELECTION {
+            write_primary(cx, item);
+            "Copied to the primary selection"
+        } else {
+            cx.write_to_clipboard(item);
+            "Copied to clipboard"
+        };
+        if mode == ProgramCopy::Notify {
+            toast::show(cx, Toast::success(title).body(format!("{size} from {from}")).key("terminal.program-copy"));
         }
     }
 
@@ -2424,6 +2453,9 @@ fn read_primary(cx: &App) -> Option<ClipboardItem> {
 fn copied_toast(chars: usize) -> Toast {
     Toast::success("Copied to clipboard").body(if chars == 1 { "1 character".into() } else { format!("{chars} characters") })
 }
+
+/// Linux and FreeBSD have a primary selection.
+const PRIMARY_SELECTION: bool = cfg!(any(target_os = "linux", target_os = "freebsd"));
 
 /// Set the primary selection where there is one.
 fn write_primary(cx: &App, item: ClipboardItem) {

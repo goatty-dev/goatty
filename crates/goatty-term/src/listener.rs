@@ -17,8 +17,13 @@ pub enum UiEvent {
     Title(String),
     ResetTitle,
     Bell,
-    /// OSC 52 clipboard write from the application.
-    ClipboardStore(String),
+    /// OSC 52 clipboard write from the application (untrusted: any program,
+    /// on any host, can send it). `primary`: it asked for the primary
+    /// selection (`p` or `s`) rather than the clipboard (`c`).
+    ClipboardStore {
+        primary: bool,
+        text: String,
+    },
     CwdChanged,
     /// The shell reported that a command finished (OSC 133;D), with its
     /// exit status when known. Needs shell integration.
@@ -88,8 +93,9 @@ impl EventListener for Listener {
             }
             // OSC 52 reads are a data-exfiltration vector; deny by default.
             RioEvent::ClipboardLoad(..) => {}
-            RioEvent::ClipboardStore(_, text) => {
-                let _ = self.ui.send(UiEvent::ClipboardStore(text));
+            RioEvent::ClipboardStore(kind, text) => {
+                let primary = matches!(kind, rio_vt::clipboard::ClipboardType::Selection);
+                let _ = self.ui.send(UiEvent::ClipboardStore { primary, text });
             }
             RioEvent::Title(_, t) => {
                 let _ = self.ui.send(UiEvent::Title(t));
@@ -128,5 +134,39 @@ impl EventListener for Listener {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::UiEvent;
+
+    fn stores(answer_queries: bool, bytes: &[u8]) -> (Vec<(bool, String)>, usize) {
+        let (t, ch) = crate::Terminal::new(crate::TermSize::new(40, 5), answer_queries, std::sync::Arc::new(crate::Palette::default()));
+        t.feed(bytes);
+        let got = ch
+            .ui
+            .try_iter()
+            .filter_map(|e| match e {
+                UiEvent::ClipboardStore { primary, text } => Some((primary, text)),
+                _ => None,
+            })
+            .collect();
+        (got, ch.replies.try_iter().count())
+    }
+
+    /// The GUI's mirror (which answers no queries) still sees OSC 52 writes:
+    /// that's how `copy` on a remote host reaches the local clipboard.
+    #[test]
+    fn osc52_writes_reach_the_mirror_with_their_kind() {
+        let (got, _) = stores(false, b"\x1b]52;c;aGVsbG8=\x07\x1b]52;p;d29ybGQ=\x1b\\\x1b]52;s;eA==\x07");
+        assert_eq!(got, [(false, "hello".into()), (true, "world".into()), (true, "x".into())]);
+    }
+
+    #[test]
+    fn osc52_reads_are_denied() {
+        let (got, replies) = stores(true, b"\x1b]52;c;?\x07");
+        assert!(got.is_empty());
+        assert_eq!(replies, 0, "no clipboard contents go back to the program");
     }
 }

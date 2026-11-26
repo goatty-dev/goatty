@@ -25,6 +25,7 @@ fn zsh() -> Option<String> {
 
 const BASIC_UTILS: &[&str] = &[
     "awk",
+    "base64",
     "basename",
     "cat",
     "chmod",
@@ -410,6 +411,33 @@ fn integration_marks_prompts_and_reports_cwd() {
     assert!(out.contains("\x1b]7;file://") && out.contains(&cwd), "OSC 7 with a percent-encoded path; got:\n{out:?}");
     // fzf-tab is missing and the hint isn't dismissed.
     assert!(out.contains("goatty-setup"), "missing-tools hint");
+}
+
+/// `copy` (#307) sends what it's given to the terminal as OSC 52, which
+/// is how text from a shell on a remote host reaches the local clipboard.
+#[test]
+fn copy_sends_osc52_to_the_terminal() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    sb.file("in.txt", "h\u{e9}llo\n\n");
+    let launch = sb.launch(ZshSettings::default(), None);
+    let out = pty_session(&sb, &launch, &["cat in.txt | copy", "goatty-copy -p in.txt", "copy </dev/null; print -r -- empty=$?"]);
+    // Trailing newlines and non-ASCII bytes kept: base64 of "héllo\n\n".
+    assert!(out.contains("\x1b]52;c;aMOpbGxvCgo=\x07"), "{out:?}");
+    assert!(out.contains("\x1b]52;p;aMOpbGxvCgo=\x07"), "{out:?}");
+    assert!(out.contains("copy: nothing to copy") && out.contains("empty=1"), "{out:?}");
+}
+
+/// `copy` stays yours when you have one; `goatty-copy` is always there.
+#[test]
+fn copy_leaves_your_own_copy_alone() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    std::fs::create_dir_all(sb.dirs.user_zshrc().parent().unwrap()).unwrap();
+    std::fs::write(sb.dirs.user_zshrc(), "alias copy='print -r -- mine'\n").unwrap();
+    let launch = sb.launch(ZshSettings::default(), None);
+    let out = sb.run(&launch, "print -r -- \"alias=$aliases[copy] fn=${+functions[copy]} goatty=${+functions[goatty-copy]}\"");
+    assert!(stdout(&out).contains("alias=print -r -- mine fn=0 goatty=1"), "{}", stdout(&out));
 }
 
 #[test]

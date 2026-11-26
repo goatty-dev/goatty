@@ -47,11 +47,11 @@ pub mod themes;
 use std::path::PathBuf;
 
 pub use client::{
-    ClientSettings, CommandOpenIn, CommandSettings, CtrlBackspace, CtrlDelete, CursorShape, DebugSettings, FontSettings, HostColor,
-    KeyboardSettings, LinkClick, LinkSettings, LocalEcho, MiddleClick, MouseSettings, NotificationSettings, NotifyWhen, OnLaunch, OpenIn,
-    Padding, PaneSettings, PasteConfirm, PasteSettings, PluginNotifySettings, RemoteFileOpen, Renderer, RightClick, SelectionSettings,
-    SshHost, SshSettings, TabActivity, TabBarShow, TabSettings, TabStyle, TailnetSettings, TerminalSettings, TitleBar, UserCommand,
-    WindowSettings, WorkspaceSettings, split_command_words, ssh_host_problem,
+    ClientSettings, ClipboardSettings, CommandOpenIn, CommandSettings, CtrlBackspace, CtrlDelete, CursorShape, DebugSettings, FontSettings,
+    HostColor, KeyboardSettings, LinkClick, LinkSettings, LocalEcho, MiddleClick, MouseSettings, NotificationSettings, NotifyWhen,
+    OnLaunch, OpenIn, Padding, PaneSettings, PasteConfirm, PasteSettings, PluginNotifySettings, ProgramCopy, RemoteFileOpen, Renderer,
+    RightClick, SelectionSettings, SshHost, SshSettings, TabActivity, TabBarShow, TabSettings, TabStyle, TailnetSettings, TerminalSettings,
+    TitleBar, UserCommand, WindowSettings, WorkspaceSettings, split_command_words, ssh_host_problem,
 };
 pub use color_history::ColorHistory;
 pub use colorspace::ColorFormat;
