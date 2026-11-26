@@ -25,7 +25,7 @@ daemon *args:
 
 # Unit and daemon end-to-end tests; extra arguments go to `cargo test`.
 test *args:
-    cargo test --workspace {{args}}
+    TERM=xterm-256color cargo test --workspace {{args}}
 
 # Format all code.
 fmt:
@@ -43,7 +43,7 @@ clippy:
 ci:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
-    cargo test --workspace --locked
+    TERM=xterm-256color cargo test --workspace --locked
 
 # Headless VT parse throughput.
 bench-vt:
