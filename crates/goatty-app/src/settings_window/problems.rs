@@ -95,9 +95,13 @@ impl SettingsWindow {
     }
 
     /// What each row of the current page should say, by label.
-    pub(super) fn row_notes(&self, cx: &App) -> HashMap<SharedString, RowNote> {
+    pub(super) fn row_notes(&self, cx: &Context<'_, Self>) -> HashMap<SharedString, RowNote> {
         let (issues, overrides) = self.page_problems(self.page, cx);
-        notes(self.page, &issues, &overrides)
+        let mut out = notes(self.page, &issues, &overrides);
+        if self.page.is_host() {
+            self.scope_notes(self.page, &mut out, cx);
+        }
+        out
     }
 
     /// The host's problems and overrides that no row of `page` shows: for
@@ -208,7 +212,7 @@ fn notes(page: Page, issues: &[Issue], overrides: &Overrides) -> HashMap<SharedS
         let overridden_by =
             overrides.iter().find(|(_, replaced)| replaced.iter().any(|k| e.keys.contains(k))).map(|(v, _)| v.clone().into());
         if !problems.is_empty() || overridden_by.is_some() {
-            out.insert(SharedString::from(e.label), RowNote { problems, overridden_by });
+            out.insert(SharedString::from(e.label), RowNote { problems, overridden_by, scope: None });
         }
     }
     out

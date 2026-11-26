@@ -9,7 +9,7 @@ How the code is laid out and where new work goes. For the product's goals and de
                    ▲        ▲   ▲
                    │        │   │   goatty-plugin  (plugin format, permissions, signed registry index; bin goatty-plugin)
                    │        │   │      ▲
-                   │        │   goatty-shell    (managed zsh: generated ZDOTDIR, tool installs, plugins on a host, diagnostics)
+                   │        │   goatty-shell    (managed zsh: generated ZDOTDIR, tool installs, plugins on a host, diagnostics, the shared config; uses goatty-net's device key)
                    │        │      ▲      ▲
 goatty-term ◄──────┼────────┼──────┼──────┼─┐   (the only crate that touches rio-vt)
    ▲               │        │      │      │ │
@@ -30,6 +30,7 @@ Rules:
 - **`goatty-proto` has no I/O beyond framing.** Transports live in `goatty-client`.
 - **`goatty-client` has no UI dependencies.** The app, the daemon's CLI, tests and benchmarks all use it.
 - **Which shell a session runs is `goatty-shell`'s decision** (`Launcher::launch`). goattyd and `goatty --local` both use it; `goatty-term` only spawns what it's given. `goatty-shell` has no rio-vt or UI dependency.
+- **The shared shell config** (#313, [`profiles.md`](profiles.md)): host settings resolve as defaults ← shared ← this host's override. Each daemon keeps the signed document (`shared.json`) and applies it itself; daemons never talk to each other, clients relay. Trust is per machine: a machine counts only entries signed by devices it trusts, so a host can't change another machine's shell. `goatty-shell` uses `goatty-net` only for the device key.
 - **Client vs host settings** (#14): `ClientSettings` (`settings.json`) is read by the app; `HostSettings` (`host.json`) by goattyd/`HostService` on its own host. The GUI edits host settings through the protocol, never by writing a remote file. See [`profiles.md`](profiles.md).
 - **`goatty-plugin` knows the format, not the host.** Manifests, settings schema, templates, permissions, zsh rendering, the signed index and the JSON API live there with no knowledge of `Dirs`; `goatty-shell::plugins` decides where things go. The `goatty-plugin` CLI depends on nothing else in the workspace, so registry CI builds it quickly. See [`plugins.md`](plugins.md).
 - **Settings come from `goatty-config`.** Don't read `GOATTY_*` variables elsewhere (the exceptions: `GOATTY_SOCKET` in `goatty_proto::socket_path`; `GOATTY_ASKPASS` in `goatty_client::askpass`).
@@ -55,7 +56,7 @@ Threads per session: a PTY reader and a reply thread (query answers → PTY). Pe
 
 ## Shell environment (`crates/goatty-shell`)
 
-One module per concern: `launch` (`Launcher`), `zsh` (renders `settings.zsh`, plugin slot files and the static startup files in `zsh/`), `starship`, `builtins` and `plugins` (the built-in tools are plugins compiled in; `plugins/` is registry, lock, install and load order), `packages` and `install` (tool downloads), `completions`, `doctor` and `setup` (diagnostics as JSON), `import` (the user's own shell setup, harvested without a terminal), `everywhere` (goatty's shell in every terminal, #283), `path_report`, `generation` and `history` (build, validate with `zsh -n`, activate, roll back, diff), `sync` (bringing a setup to another host, #159), `snippets`, `service` (`HostService`), `cmd` (`goattyd shell|plugin|snippet …`), `dirs`.
+One module per concern: `launch` (`Launcher`), `zsh` (renders `settings.zsh`, plugin slot files and the static startup files in `zsh/`), `starship`, `builtins` and `plugins` (the built-in tools are plugins compiled in; `plugins/` is registry, lock, install and load order), `packages` and `install` (tool downloads), `completions`, `doctor` and `setup` (diagnostics as JSON), `import` (the user's own shell setup, harvested without a terminal), `everywhere` (goatty's shell in every terminal, #283), `path_report`, `generation` and `history` (build, validate with `zsh -n`, activate, roll back, diff), `shared` (the shared shell config on a host: storage, the `Shared` API, applying it, plugin reconciling, relaying between hosts, #313), `sync` (the push sync for older goattyds, #159), `snippets`, `service` (`HostService`), `cmd` (`goattyd shell|plugin|snippet …`), `dirs`.
 
 Design and startup sequence: [`managed-zsh.md`](managed-zsh.md). The zsh behaviour is tested against real zsh in `tests/zsh_startup.rs` (sandboxed `$HOME`, PTY for OSC 133/7).
 
@@ -75,7 +76,7 @@ Design and startup sequence: [`managed-zsh.md`](managed-zsh.md). The zsh behavio
 | `toast/` | notifications: per-window stacks, a layer, a history of the last 50 |
 | `ui/` | widgets: controls, text input, color picker, context menu, icons, theme-derived colors, the prompt preview |
 | `snippets/`, `plugin_commands.rs`, `custom_commands.rs`, `typing.rs` | snippets picker, plugin and user commands, and which pane goatty may type a command into |
-| `shell_setup.rs`, `shell_sync.rs`, `shell_path.rs`, `welcome.rs`, `pickers.rs`, `close_confirm.rs`, `paste_confirm.rs`, `agent/`, `fonts.rs` | first-run setup and tool installs, syncing the shell setup to a host, PATH commands, the welcome window, pick-from-list commands, the two confirmation dialogs, coding agents, the bundled Nerd Font |
+| `shell_setup.rs`, `shared_sync.rs`, `shell_sync.rs`, `shell_path.rs`, `welcome.rs`, `pickers.rs`, `close_confirm.rs`, `paste_confirm.rs`, `agent/`, `fonts.rs` | first-run setup and tool installs, the shared shell config (exchanges, membership and trust questions), the push sync for older goattyds, PATH commands, the welcome window, pick-from-list commands, the two confirmation dialogs, coding agents, the bundled Nerd Font |
 
 View tree: `Workspace` → tab bar (or, vertical, the sidebar beside the panes card) + the active tab's panes (`TerminalView`s, absolutely positioned from `layout::Node::layout`). A `TerminalView` never touches the window directly: it emits `TerminalEvent`s and the workspace decides what they mean.
 
@@ -105,7 +106,8 @@ View tree: `Workspace` → tab bar (or, vertical, the sidebar beside the panes c
 | Shell integration, terminal side | `goatty-term`'s listener (OSC 7), `marks.rs` (OSC 133), `transcript.rs`; the zsh side is `goatty-shell/zsh/integration.zsh` |
 | Output viewer | `output_view/`; what counts as a command's output: `goatty-term/src/transcript.rs` |
 | Managed zsh, tool versions | `goatty-shell/zsh/zshrc.zsh` (load order matters, see `managed-zsh.md`); tools are built-in plugins: `goatty-shell/plugins/<id>/plugin.toml` (+ `builtins.rs`) |
-| Syncing the shell setup to hosts | `goatty-shell/src/sync.rs`; when goatty asks: `shell_sync.rs`; per-host choice: `SshSettings::sync_mode` |
+| The shared shell config (#313) | model, merge, signatures, resolve: `goatty-config/src/shared.rs` (`scope = machine`: `HostSettings::MACHINE`); on a host (storage, `Shared` API, apply, plugins, relay): `goatty-shell/src/shared.rs`; the GUI (exchange on connect, membership and trust questions): `shared_sync.rs`; the scope picker and row markers: `settings_window/scope.rs`; Hosts page: `settings_window/hosts.rs`. See `profiles.md` |
+| The push sync for older goattyds (#159) | `goatty-shell/src/sync.rs`; when goatty asks: `shell_sync.rs` |
 | First-run setup, diagnostics | host side: `goatty-shell/src/setup.rs` (new operations go in its `Request`/`Reply`, no protocol bump); GUI: `welcome.rs`, `shell_setup.rs`, `settings_window/diagnostics.rs` |
 | Bash/Fish adapters | `goatty-shell`: a sibling of `zsh.rs` + its startup files; `Launcher::launch` picks by program |
 | New client setting | field in `goatty-config/src/client.rs` (+ `validate`), a `kit::row` on its page in `settings_window/` (+ `search.rs`), apply in `TerminalView::apply_settings` |

@@ -26,6 +26,7 @@ mod plugin_updates;
 mod session;
 mod settings;
 mod settings_window;
+mod shared_sync;
 mod shell_path;
 mod shell_setup;
 mod shell_sync;
@@ -102,6 +103,13 @@ fn main() -> Result<()> {
                 let top_daemon = cli.remote.remote_daemon;
                 let Some(cli::Command::Net(c)) = cli.cmd else { unreachable!() };
                 return commands::net(c, top_ssh, top_daemon);
+            }
+            Some(cli::Command::Sync { .. }) => {
+                if remote {
+                    anyhow::bail!("give the hosts to `goatty sync` as arguments: `goatty sync HOST…`");
+                }
+                let Some(cli::Command::Sync { hosts, join, keep, separate, trust }) = cli.cmd else { unreachable!() };
+                return commands::sync(hosts, join, keep, separate, trust);
             }
             Some(cli::Command::Completions { shell }) => {
                 if remote {

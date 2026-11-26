@@ -1002,6 +1002,13 @@ impl SettingsWindow {
         cx: &mut Context<'_, Self>,
     ) {
         let first = ids.first().cloned();
+        // Installed or removed for every host that follows the shared config (#313).
+        if result.is_ok()
+            && self.scope == Some(super::scope::Scope::All)
+            && let Some(link) = self.link.clone()
+        {
+            crate::shared_sync::share_plugins(link, ids.clone(), installed, cx);
+        }
         match result {
             Ok(c) => {
                 for id in ids {

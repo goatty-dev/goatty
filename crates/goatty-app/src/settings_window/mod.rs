@@ -29,6 +29,7 @@ mod plugins;
 mod problems;
 mod profile;
 mod prompt;
+mod scope;
 mod search;
 mod shell;
 mod shortcuts;
@@ -182,6 +183,15 @@ pub fn open_host_color(cx: &mut App, host: &str) {
 }
 
 /// Open the settings window at `page` (or where it was).
+/// Open the settings at `page` with the shell pages on host `host` (a
+/// toast about that host, #313).
+pub fn open_for_host(cx: &mut App, page: Option<Page>, host: String) {
+    open_at(cx, page);
+    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        let _ = handle.update(cx, |view, _, cx| view.set_scope(scope::Scope::Host(host), cx));
+    }
+}
+
 pub fn open_at(cx: &mut App, page: Option<Page>) {
     if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
         && handle
@@ -407,6 +417,13 @@ pub struct SettingsWindow {
     host: Option<HostView>,
     /// Edited host settings not yet applied (`None`: no changes).
     draft: Option<HostSettings>,
+    /// Which hosts the shell pages edit (#313); `None`: the active tab's
+    /// host's own file (no shared config there, or not known yet).
+    scope: Option<scope::Scope>,
+    /// The active tab's host's own settings (machine-only values for the
+    /// other scopes).
+    link_settings: Option<HostSettings>,
+
     host_error: Option<String>,
     busy: bool,
     outcome: Option<Outcome>,
@@ -617,6 +634,8 @@ impl SettingsWindow {
             link: cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone()),
             host: None,
             draft: None,
+            scope: None,
+            link_settings: None,
             host_error: None,
             busy: false,
             outcome: None,
@@ -686,6 +705,15 @@ impl SettingsWindow {
             toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
             _subs: {
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
+                // An exchange brought news: pick the scope once, show what changed.
+                subs.push(cx.observe_global::<crate::shared_sync::Shared>(|this, cx| {
+                    if this.scope.is_none() {
+                        this.pick_scope(cx);
+                    } else if this.draft.is_none() && !this.busy && !this.scope_is_link(cx) {
+                        this.reload_scope(cx);
+                    }
+                    cx.notify();
+                }));
                 subs.push(cx.observe_global::<crate::command_palette::CommandRegistry>(|this, cx| {
                     let canceled = this.sync_recording(cx);
                     if this.page == Page::Shortcuts || canceled {
@@ -718,6 +746,8 @@ impl SettingsWindow {
         }
         self.link = link;
         self.host = None;
+        self.scope = None;
+        self.link_settings = None;
         self.host_error = None;
         self.outcome = None;
         self.imported_plugins.clear();
@@ -1272,6 +1302,18 @@ impl SettingsWindow {
                         let program = loaded.value.shell.program.clone().unwrap_or_default();
                         view.shell_path.update(cx, |input, cx| input.set_text(program, cx));
                         let before = view.host.as_ref().map(|h| h.issues.clone());
+                        view.link_settings = Some(loaded.value.clone());
+                        if !view.scope_is_link(cx) {
+                            // Another scope is shown: it only needed this host's machine values.
+                            if let Some(v) = view.scoped_view(cx) {
+                                view.host = Some(v);
+                            }
+                            view.generations = gens;
+                            view.host_error = None;
+                            view.sync_prompt_inputs(cx);
+                            cx.notify();
+                            return;
+                        }
                         if view.draft.as_ref() == Some(&loaded.value) {
                             view.draft = None;
                         }
@@ -1285,6 +1327,7 @@ impl SettingsWindow {
                         view.path_host_changed(cx);
                         view.dotfiles_host_changed(cx);
                         view.everywhere_host_changed(cx);
+                        view.pick_scope(cx);
                     }
                     Err(e) => view.host_error = Some(format!("{e:#}")),
                 }
@@ -1324,6 +1367,10 @@ impl SettingsWindow {
     }
 
     fn send_draft(&mut self, apply: bool, cx: &mut Context<'_, Self>) {
+        // Through the shared config, unless the scope is a host's own file.
+        if apply && self.apply_scoped(cx) {
+            return;
+        }
         let (Some(link), Some(json)) = (self.link.clone(), self.draft_json()) else { return };
         self.busy = true;
         cx.notify();

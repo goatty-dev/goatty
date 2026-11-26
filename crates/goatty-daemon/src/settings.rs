@@ -19,8 +19,11 @@ pub(crate) fn get(daemon: &Daemon, req: ReqId) -> ServerMsg {
     snapshot_msg(req, daemon.host.snapshot())
 }
 
+/// On a host that follows the shared config, an applied change to a shared
+/// setting becomes this host's override (#313): an older GUI, or one
+/// editing only this host, keeps what it set.
 pub(crate) fn set(daemon: &Daemon, req: ReqId, json: &str, apply: bool) -> ServerMsg {
-    match daemon.host.set(json, apply) {
+    match daemon.host.set_captured(json, apply) {
         Ok(o) => ServerMsg::HostSettingsApplied {
             req,
             issues: o.issues,
@@ -43,7 +46,14 @@ pub(crate) fn generations(daemon: &Daemon, req: ReqId) -> ServerMsg {
 }
 
 pub(crate) fn rollback(daemon: &Daemon, req: ReqId, to: Option<u32>) -> ServerMsg {
-    match daemon.host.rollback(to) {
+    let before = daemon.host.settings().file.value;
+    let result = daemon.host.rollback(to);
+    if result.is_ok()
+        && let Err(e) = daemon.host.capture(&before)
+    {
+        log::warn!("couldn't keep the rollback in the shared config: {e:#}");
+    }
+    match result {
         Ok(s) => snapshot_msg(req, s),
         Err(e) => error(req, e),
     }
@@ -71,6 +81,19 @@ pub(crate) fn shell(daemon: &Daemon, req: ReqId, request: &str) -> ServerMsg {
     };
     match result.and_then(|r| serde_json::to_string(&r).map_err(Into::into)) {
         Ok(reply) => ServerMsg::Shell { req, reply },
+        Err(e) => error(req, e),
+    }
+}
+
+/// A shared-config operation: JSON in, JSON out (`goatty_shell::shared::api`, v18).
+pub(crate) fn shared(daemon: &Daemon, req: ReqId, request: &str) -> ServerMsg {
+    let parsed: Result<goatty_shell::shared::api::Request, _> = serde_json::from_str(request);
+    let result = match parsed {
+        Ok(r) => daemon.host.shared_request(r),
+        Err(e) => Err(anyhow::anyhow!("unknown shared-config request ({e}); is goattyd older than this goatty?")),
+    };
+    match result.and_then(|r| serde_json::to_string(&r).map_err(Into::into)) {
+        Ok(reply) => ServerMsg::Shared { req, reply },
         Err(e) => error(req, e),
     }
 }

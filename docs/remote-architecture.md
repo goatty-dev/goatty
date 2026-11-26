@@ -138,6 +138,10 @@ A session has one size, the PTY's, and one **controlling** client sets it (`Sess
 
 Covered by `crates/goatty-daemon/tests/size_control.rs`.
 
+## 4d. The shared shell config (v18, #313)
+
+`ClientMsg::Shared` / `ServerMsg::Shared` carry `goatty_shell::shared::api` JSON (status, pull, push, trust, apply), so new operations need no version bump. A client exchanges on every connection: it pulls from each daemon it reaches what it lacks (by version vector), then pushes to each what that daemon lacks; an exchange with nothing new costs a version vector each way. Daemons still never talk to each other or open a network socket (D5). Entries are signed per device and verified by every receiver, so relaying through a host gives it no way to change another machine's settings. Clients don't send `Shared` to a daemon that agreed on v17 or older; those get the push sync (#159). Details: [`profiles.md`](profiles.md).
+
 ## 5. Transports
 
 ### Local

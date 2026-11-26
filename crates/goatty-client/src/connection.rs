@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use goatty_proto::{
     ClientMsg, FLOW_CONTROL_SINCE, FileDiff, Frame, GenerationInfo, HISTORY_SINCE, HostInfo, NET_SINCE, PROTOCOL_VERSION,
-    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHELL_SINCE, SIZE_CONTROL_SINCE, SaveOutcome, ServerMsg, SessionId, SessionInfo,
-    StreamOpts, ViewId, WinSize, WorkspaceId, WorkspaceInfo, WorkspaceLayout, encode, read_msg,
+    REMOTE_FILES_SINCE, RUN_SINCE, RemotePathInfo, ReqId, SHARED_SINCE, SHELL_SINCE, SIZE_CONTROL_SINCE, SaveOutcome, ServerMsg, SessionId,
+    SessionInfo, StreamOpts, ViewId, WinSize, WorkspaceId, WorkspaceInfo, WorkspaceLayout, encode, read_msg,
 };
 use parking_lot::Mutex;
 
@@ -909,6 +909,28 @@ impl Connection {
         }
     }
 
+    /// An operation on the host's shared shell config
+    /// (`goatty_shell::shared::api::Request` as JSON, #313); returns the
+    /// reply JSON. Applying a change builds a generation and may install
+    /// plugins, so this waits up to [`PLUGIN_TIMEOUT`]. Needs a daemon with
+    /// protocol v18 ([`Connection::shares_config`]). Blocks: call off the UI
+    /// thread.
+    pub fn shared(&self, request: String) -> Result<String> {
+        let version = self.protocol_version();
+        if version < SHARED_SINCE {
+            bail!("goattyd via {} is too old for the shared shell config (protocol v{version})", self.endpoint().label());
+        }
+        match self.request_within(PLUGIN_TIMEOUT, Pending::Reply, |req| ClientMsg::Shared { req, request })? {
+            ServerMsg::Shared { reply, .. } => Ok(reply),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
+    /// The daemon takes part in the shared shell config (protocol v18).
+    pub fn shares_config(&self) -> bool {
+        self.protocol_version() >= SHARED_SINCE
+    }
+
     /// This connection's identity, as [`WorkspaceSink`]s hear it.
     pub fn key(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize
@@ -1616,6 +1638,7 @@ fn dispatch(s: &Shared, msg: ServerMsg) {
         | ServerMsg::WorkspaceLayout { req, .. }
         | ServerMsg::Shell { req, .. }
         | ServerMsg::Net { req, .. }
+        | ServerMsg::Shared { req, .. }
         | ServerMsg::PathStat { req, .. }
         | ServerMsg::FileData { req, .. } => match take_pending(s, req) {
             Some(Pending::Reply(tx)) => {

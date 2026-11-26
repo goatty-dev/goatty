@@ -628,29 +628,128 @@ pub fn settings_validate(svc: &crate::HostService, file: Option<&Path>) -> Resul
     bail!("{} problem(s); goatty uses fallbacks for them", loaded.issues.len())
 }
 
-fn apply_edit(svc: &crate::HostService, key: &str, loaded: goatty_config::Loaded<HostSettings>) -> Result<()> {
-    let outcome = svc.set(&store::to_json(&loaded.value, &loaded.unknown), true)?;
+/// Where `goattyd settings set|unset` puts a change on a host that follows
+/// the shared config (#313).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditScope {
+    /// This host only: its override (the default).
+    #[default]
+    Host,
+    /// Every host: a shared entry signed by this host. It counts wherever
+    /// this host's device is trusted (a GUI computer's own goattyd).
+    Shared,
+}
+
+/// Apply `edit` (of a settings document's text) to this host's settings,
+/// or with [`EditScope::Shared`] on a following host, to the shared config.
+fn apply_edit(
+    svc: &crate::HostService,
+    key: &str,
+    edit: impl Fn(&str) -> Result<goatty_config::Loaded<HostSettings>>,
+    scope: EditScope,
+) -> Result<()> {
+    use goatty_config::shared::{self, Signer};
+    let before = svc.settings().file.value;
+    let loaded = edit(&read_or_empty(host_path(svc)?)?)?;
     let value = store::get_key(&loaded.value, key).map(|v| v.to_string()).unwrap_or_default();
+    let shared_key = shared::Scope::Shared == HostSettings::scope(key);
+    if scope == EditScope::Shared && shared_key {
+        let (doc, _, trust) = svc.shared_doc()?;
+        let me = svc.device()?.device();
+        if doc.member(&me, &trust) != Some(true) {
+            bail!("this host doesn't follow the shared config (choose that from goatty when you connect); leave out --shared");
+        }
+        let shared_before = doc.resolve(None, &trust, &before).value;
+        let shared_after = edit(&store::to_json(&shared_before, &[]))?.value;
+        let n = svc.publish(|_, _, hlc, device| shared::shared_entries(&shared_before, &shared_after, hlc, device))?;
+        println!("{key} = {value} (in the shared config; {n} change(s))");
+        if !svc.shared_doc()?.2.contains(&me) {
+            println!(
+                "This host isn't trusted to change the shared config yet: it applies once a goatty computer you use trusts it (Settings → Hosts)."
+            );
+        }
+        return Ok(());
+    }
+    let outcome = svc.set(&store::to_json(&loaded.value, &loaded.unknown), true)?;
+    // On a host that follows the shared config, the change is its override.
+    let kept = if shared_key { svc.capture(&before).unwrap_or(0) } else { 0 };
     match outcome.generation {
         Some(g) => println!("{key} = {value} (generation {g}; new sessions use it)"),
         None => println!("{key} = {value}"),
+    }
+    if kept > 0 {
+        println!("This host follows the shared config: kept as its own override. Use --shared to change it on every host.");
     }
     Ok(())
 }
 
 /// `goattyd settings set KEY VALUE`: validated, built and activated like
 /// an Apply in the settings window.
-pub fn settings_set(svc: &crate::HostService, key: &str, value: &str) -> Result<()> {
-    let text = read_or_empty(host_path(svc)?)?;
-    let loaded = store::set_key::<HostSettings>(&text, key, value).map_err(anyhow::Error::msg)?;
-    apply_edit(svc, key, loaded)
+pub fn settings_set(svc: &crate::HostService, key: &str, value: &str, scope: EditScope) -> Result<()> {
+    apply_edit(svc, key, |text| store::set_key::<HostSettings>(text, key, value).map_err(anyhow::Error::msg), scope)
 }
 
 /// `goattyd settings unset KEY`: back to the default.
-pub fn settings_unset(svc: &crate::HostService, key: &str) -> Result<()> {
-    let text = read_or_empty(host_path(svc)?)?;
-    let loaded = store::unset_key::<HostSettings>(&text, key).map_err(anyhow::Error::msg)?;
-    apply_edit(svc, key, loaded)
+pub fn settings_unset(svc: &crate::HostService, key: &str, scope: EditScope) -> Result<()> {
+    apply_edit(svc, key, |text| store::unset_key::<HostSettings>(text, key).map_err(anyhow::Error::msg), scope)
+}
+
+/// `goattyd sync status`: this host's view of the shared config (#313).
+pub fn sync_status(svc: &crate::HostService, json: bool) -> Result<()> {
+    let st = svc.shared_status()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st)?);
+        return Ok(());
+    }
+    let (doc, _, trust) = svc.shared_doc()?;
+    let short = goatty_config::shared::short_id;
+    println!("host        {} ({})", st.name, short(&st.host));
+    println!(
+        "follows     {}",
+        match st.member {
+            Some(true) => "yes: this host uses the shared config, with its overrides",
+            Some(false) => "no: this host keeps its own settings",
+            None => "not decided yet (connect from goatty to choose)",
+        }
+    );
+    println!("entries     {} from {} device(s)", st.entries, st.have.len());
+    let label = |d: &str| doc.name(d, &trust).map_or_else(|| short(d).to_owned(), |n| format!("{n} ({})", short(d)));
+    println!("trusted     {}", st.trusted.iter().map(|d| label(d)).collect::<Vec<_>>().join(", "));
+    for u in &st.untrusted {
+        println!("untrusted   {}: {} change(s) waiting until a trusted device vouches for it", label(&u.device), u.entries);
+    }
+    if !st.local_changes.is_empty() {
+        let paths: Vec<String> = st.local_changes.iter().map(|p| goatty_config::shared::display_path(p)).collect();
+        println!("local       changed here only: {} (share or keep them from goatty's Hosts settings)", paths.join(", "));
+    }
+    let overrides = doc.overrides(&st.host, &trust);
+    if !overrides.is_empty() {
+        println!("overrides   {}", overrides.keys().map(|p| goatty_config::shared::display_path(p)).collect::<Vec<_>>().join(", "));
+    }
+    for r in &st.needs_review {
+        println!("review      {}: {}", r.id, r.reason);
+    }
+    if let Some(a) = &st.last_apply {
+        println!("last apply  {} ({})", if a.ok { "ok" } else { "failed" }, a.lines.join("; "));
+    }
+    Ok(())
+}
+
+/// `goattyd sync apply`: resolve and apply the shared config now.
+pub fn sync_apply(svc: &crate::HostService) -> Result<()> {
+    match svc.apply_shared() {
+        None => println!("This host doesn't follow the shared config; nothing to apply."),
+        Some(a) if a.lines.is_empty() => println!("Up to date with the shared config."),
+        Some(a) => {
+            for l in &a.lines {
+                println!("{l}");
+            }
+            if !a.ok {
+                bail!("the shared config wasn't applied completely");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `goattyd shell everywhere [status|on|off]`: goatty's shell in every

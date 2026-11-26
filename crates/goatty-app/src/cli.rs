@@ -79,6 +79,24 @@ pub enum Command {
     /// Pair with and manage remote computers on your tailnet (client side).
     #[command(subcommand)]
     Net(NetCmd),
+    /// Sync the shared shell config between this computer's goattyd and the
+    /// goattyd on each HOST (ssh destinations), the way connecting does.
+    Sync {
+        /// SSH hosts to sync with (goattyd must be installed there).
+        hosts: Vec<String>,
+        /// Make each HOST follow the shared config.
+        #[arg(long, conflicts_with = "separate")]
+        join: bool,
+        /// With --join: keep each host's own differences as its overrides.
+        #[arg(long, requires = "join")]
+        keep: bool,
+        /// Each HOST keeps its own settings.
+        #[arg(long)]
+        separate: bool,
+        /// Trust the changes of DEVICE (a device id, as `goattyd sync status` shows it).
+        #[arg(long, value_name = "DEVICE")]
+        trust: Vec<String>,
+    },
     /// Print the completion script for SHELL (goatty's managed zsh has it already).
     Completions {
         #[arg(value_enum)]
@@ -292,6 +310,10 @@ mod tests {
             cli.endpoint().unwrap(),
             Some(Endpoint::Ssh(t)) if t.host == "prod" && t.remote_daemon.as_deref() == Some("/opt/goattyd")
         ));
+        // `goatty sync HOST… --join [--keep]`.
+        let sync = Cli::try_parse_from(["goatty", "sync", "pi", "box", "--join", "--keep"]).unwrap();
+        assert!(matches!(sync.cmd, Some(Command::Sync { ref hosts, join: true, keep: true, separate: false, .. }) if hosts.len() == 2));
+        assert!(Cli::try_parse_from(["goatty", "sync", "pi", "--keep"]).is_err());
 
         let cli = Cli::parse_from(["goatty", "--ssh", "prod", "settings", "export", "-", "--remote-daemon", "/opt/goattyd"]);
         assert!(matches!(cli.cmd, Some(Command::Settings(SettingsCmd::Export { .. }))));

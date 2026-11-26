@@ -1,7 +1,7 @@
 //! Shareable profiles: client + host settings in one JSON file.
 //!
-//! Exports leave out machine-specific values (the shell's path, debug
-//! switches), so a profile can be shared without leaking local details.
+//! Exports leave out machine-specific values (the host's machine-only
+//! settings, `HostSettings::MACHINE`, and debug switches), so a profile can be shared without leaking local details.
 //! Importing goes through the same lenient parser as the settings files.
 
 use serde_json::{Map, Value};
@@ -12,15 +12,16 @@ use crate::store::{self, Loaded};
 
 pub const PROFILE_VERSION: u32 = 1;
 
-/// Paths (`section.dotted.path`) never exported.
-const PRIVATE: &[&str] = &["host.shell.program", "client.debug"];
+/// Client paths (dotted) never exported. The host's are the machine-only
+/// settings ([`HostSettings::MACHINE`], `scope = machine`).
+const PRIVATE_CLIENT: &[&str] = &["debug"];
 
 fn section(json: &str, name: &str) -> Value {
     let mut v: Value = serde_json::from_str(json).expect("our own JSON");
+    let private = if name == "host" { HostSettings::MACHINE } else { PRIVATE_CLIENT };
     if let Value::Object(m) = &mut v {
-        for p in PRIVATE {
-            let Some(rest) = p.strip_prefix(name).and_then(|r| r.strip_prefix('.')) else { continue };
-            let parts: Vec<&str> = rest.split('.').collect();
+        for p in private {
+            let parts: Vec<&str> = p.split('.').collect();
             remove_path(m, &parts);
         }
     }

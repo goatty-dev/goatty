@@ -793,6 +793,100 @@ pub fn net(cmd: NetCmd, top_ssh: Option<String>, top_remote_daemon: Option<Strin
     }
 }
 
+/// `goatty sync [HOST…]`: exchange the shared shell config (#313) between
+/// this computer's goattyd and each host's, the way connecting does, and
+/// record the choices given (`--join [--keep]`, `--separate`, `--trust`).
+pub fn sync(hosts: Vec<String>, join: bool, keep: bool, separate: bool, trust: Vec<String>) -> Result<()> {
+    use goatty_config::shared::{self, Signer};
+    use goatty_config::{HostSettings, store};
+    use goatty_shell::shared as host_shared;
+
+    use crate::settings_window::HostLink;
+
+    let me = crate::shared_sync::this_device()?;
+    let local = match Connection::open_once(Endpoint::Local, CLIENT, None) {
+        Ok(c) if c.shares_config() => HostLink::Daemon(c),
+        Ok(_) => anyhow::bail!("this computer's goattyd is older than the shared shell config: restart it (`goattyd restart`)"),
+        Err(_) => HostLink::Local(std::sync::Arc::new(HostService::from_env(None))),
+    };
+    let mut links = vec![local];
+    for h in &hosts {
+        let c = Connection::open_once(Endpoint::ssh(h, None), CLIENT, None)
+            .map_err(|e| anyhow::anyhow!("{h}: {}", sanitize_terminal(&format!("{e:#}"))))?;
+        anyhow::ensure!(c.shares_config(), "{h}: its goattyd is older than the shared shell config; update it with `goatty --ssh {h}`");
+        links.push(HostLink::Daemon(c));
+    }
+    let run = |extra: Vec<shared::Entry>| {
+        let refs: Vec<&dyn host_shared::Peer> = links.iter().map(|l| l as &dyn host_shared::Peer).collect();
+        host_shared::exchange(&refs, &me, extra)
+    };
+    let mut x = run(Vec::new());
+    let mut extra = Vec::new();
+    // This computer seeds the shared config the first time.
+    if x.statuses[0].as_ref().is_some_and(|s| s.member.is_none()) {
+        extra.extend(crate::shared_sync::seed_entries_for(&links[0], &me, &me.device())?);
+    }
+    let local_trust = x.trust_of(0);
+    for d in &trust {
+        anyhow::ensure!(shared::is_device_id(d), "{d:?} isn't a device id (64 hex digits; see `goattyd sync status`)");
+        extra.extend(host_shared::trust_entries(&x.doc, d, true, &me));
+    }
+    if join || separate {
+        for (i, h) in hosts.iter().enumerate() {
+            let Some(st) = x.statuses[i + 1].clone() else { continue };
+            if separate {
+                extra.extend(host_shared::leave_entries(&x.doc, &st.host, h, &me));
+            } else {
+                let own = if keep { Some(store::parse::<HostSettings>(&links[i + 1].get()?.json).value) } else { None };
+                extra.extend(host_shared::join_entries(&x.doc, &local_trust, &st.host, h, own.as_ref(), &me));
+            }
+        }
+    }
+    if !extra.is_empty() {
+        x = run(extra);
+    }
+    let mut failed = false;
+    for i in 0..links.len() {
+        let label = if i == 0 { "this computer".to_string() } else { hosts[i - 1].clone() };
+        if let Some((_, e)) = x.errors.iter().find(|(j, _)| *j == i) {
+            eprintln!("{label}: {}", sanitize_terminal(e));
+            failed = true;
+            continue;
+        }
+        let Some(st) = &x.statuses[i] else { continue };
+        let follows = match st.member {
+            Some(true) => "follows the shared config",
+            Some(false) => "keeps its own settings",
+            None => "hasn't decided (use --join or --separate)",
+        };
+        println!("{label}: {follows}; {} change(s) passed on", x.pushed[i]);
+        if let Some(a) = st.last_apply.as_ref().filter(|a| !a.lines.is_empty()) {
+            for l in &a.lines {
+                println!("  {}", sanitize_terminal(l));
+            }
+        }
+        for r in &st.needs_review {
+            println!("  needs review: {}: {}", r.id, sanitize_terminal(&r.reason));
+        }
+        if i == 0 {
+            for u in &st.untrusted {
+                let name = u.name.clone().unwrap_or_default();
+                println!(
+                    "  {} change(s) from an untrusted device {} {}: `goatty sync --trust {}` if it's yours",
+                    u.entries,
+                    sanitize_terminal(&name),
+                    shared::short_id(&u.device),
+                    u.device
+                );
+            }
+        }
+    }
+    if failed {
+        anyhow::bail!("couldn't sync with every host");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

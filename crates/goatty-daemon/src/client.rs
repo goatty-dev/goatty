@@ -429,6 +429,19 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
                         reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the shell operation: {e}") });
                     }
                 }
+                ClientMsg::Shared { req, request } => {
+                    // Applying builds a generation and may install plugins: off the reader thread.
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-shared")).spawn(move || {
+                        let msg = crate::settings::shared(&daemon, req, &request);
+                        if let Ok(f) = encode(&msg) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the shared-config operation: {e}") });
+                    }
+                }
                 ClientMsg::Net { req, request } => {
                     // Runs `tailscale`: off the reader thread.
                     let (daemon, tx) = (daemon.clone(), tx.clone());

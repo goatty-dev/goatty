@@ -357,23 +357,27 @@ impl SettingsWindow {
                     .child(div().flex().items_center().gap(px(8.)).text_size(px(text::LABEL)).text_color(ui.muted).child(summary).when(
                         self.page.is_host() && !searching,
                         |d| {
-                            d.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.))
-                                    .h(px(22.))
-                                    .px(px(8.))
-                                    .rounded_full()
-                                    .bg(ui.card)
-                                    .border_1()
-                                    .border_color(ui.divider)
-                                    .text_size(px(text::CAPTION))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(ui.text)
-                                    .child(Icon::Server.svg().size(px(12.)).text_color(ui.muted))
-                                    .child(SharedString::from(self.host_label())),
-                            )
+                            match self.scope_picker(cx) {
+                                // The shared config: which hosts these pages edit (#313).
+                                Some(picker) => d.child(div().min_w(px(180.)).child(picker)),
+                                None => d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .h(px(22.))
+                                        .px(px(8.))
+                                        .rounded_full()
+                                        .bg(ui.card)
+                                        .border_1()
+                                        .border_color(ui.divider)
+                                        .text_size(px(text::CAPTION))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ui.text)
+                                        .child(Icon::Server.svg().size(px(12.)).text_color(ui.muted))
+                                        .child(SharedString::from(self.host_label())),
+                                ),
+                            }
                         },
                     )),
             )

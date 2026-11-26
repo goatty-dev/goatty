@@ -53,6 +53,7 @@ pub mod plugins;
 pub mod powershell;
 pub mod service;
 pub mod setup;
+pub mod shared;
 pub mod snippet_cmd;
 pub mod snippets;
 pub mod starship;

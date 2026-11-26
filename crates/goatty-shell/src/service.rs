@@ -51,6 +51,12 @@ pub struct HostService {
     registries: Vec<Source>,
     /// Plugin installs, running and recently finished. Shared between clones.
     installs: Jobs,
+    /// What applying the shared config did last (#313). Shared between clones.
+    pub(crate) shared_state: Arc<Mutex<crate::shared::State>>,
+    /// One apply of the shared config at a time.
+    pub(crate) shared_apply: Arc<Mutex<()>>,
+    /// One change to `shared.json` / `shared-trust.json` at a time.
+    pub(crate) shared_files_lock: Arc<Mutex<()>>,
 }
 
 impl HostService {
@@ -63,6 +69,9 @@ impl HostService {
             fetch: Arc::new(goatty_plugin::fetch::Curl { cache }),
             registries: vec![Source::official()],
             installs: Jobs::default(),
+            shared_state: Arc::default(),
+            shared_apply: Arc::default(),
+            shared_files_lock: Arc::default(),
         }
     }
 

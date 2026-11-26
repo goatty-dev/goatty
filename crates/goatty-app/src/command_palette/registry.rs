@@ -394,7 +394,7 @@ pub fn builtins() -> Vec<Command> {
         ]),
         Command::handler("shell.install_tool", "Shell", "Install a built-in tool…", crate::pickers::install_tool)
             .keywords(&["fzf", "starship", "zoxide", "eza", "bat", "managed", "download", "update", "missing"]),
-        Command::handler("shell.sync", "Shell", "Sync shell setup to this host", |_, cx| crate::shell_sync::sync_now(cx))
+        Command::handler("shell.sync", "Shell", "Sync the shared shell config now", |_, cx| crate::shared_sync::sync_now(cx))
             .keywords(&["copy", "mirror", "remote", "plugins", "aliases", "prompt", "dotfiles", "same"]),
         Command::action("terminal.copy", "Terminal", "Copy the selection", "copy").keywords(&["clipboard"]),
         Command::action("terminal.paste", "Terminal", "Paste", "paste").keywords(&["clipboard"]),

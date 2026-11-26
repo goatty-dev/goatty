@@ -3,17 +3,17 @@
 //! `~/.ssh/config` are client settings (`ssh` in `settings.json`), saved
 //! right away.
 
-use goatty_config::{Color, HostColor, Issue, LocalEcho, OpenIn, SshHost, SyncMode, ssh_host_problem};
+use goatty_config::{Color, HostColor, Issue, LocalEcho, OpenIn, SshHost, ssh_host_problem};
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Subscription, div, prelude::*, px,
 };
 
 use super::SettingsWindow;
-use super::kit::{self, card, divider, field, opt, row, section};
+use super::kit::{self, card, divider, field, row, section};
 use crate::hosts::{self, HostEntry, HostList};
 use crate::settings::AppSettings;
 use crate::ui::color_picker::{ColorPicker, ColorPickerEvent};
-use crate::ui::controls::{ButtonKind, Tone, banner, button_with, icon_button, segmented, toggle, tooltip};
+use crate::ui::controls::{ButtonKind, Tone, badge, banner, button_with, icon_button, segmented, toggle, tooltip};
 use crate::ui::focus::{self, Ring, Scroller};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, text};
@@ -223,39 +223,8 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    /// The choices for bringing the shell setup to hosts; `default` adds
-    /// "As set above" for a host's own choice.
-    fn sync_options(default: Option<SyncMode>) -> Vec<kit::Opt<Option<SyncMode>>> {
-        let name = |m: SyncMode| match m {
-            SyncMode::Ask => "Ask",
-            SyncMode::Always => "Always",
-            SyncMode::Never => "Never",
-        };
-        let mut out = Vec::new();
-        if let Some(d) = default {
-            out.push(opt(None, format!("Default ({})", name(d))).desc("Whatever “Bring your shell setup” above says"));
-        }
-        out.push(opt(Some(SyncMode::Ask), "Ask").desc("When it differs from this computer's, once for each change made here"));
-        out.push(opt(Some(SyncMode::Always), "Always").desc("Copy it without asking whenever the setup here changed"));
-        out.push(opt(Some(SyncMode::Never), "Never").desc("Leave the host's shell setup alone; only offer missing tools"));
-        out
-    }
-
     fn host_row(&self, ui: Ui, e: &HostEntry, cx: &Context<'_, Self>) -> AnyElement {
         let (host, discovered, plain) = (e.host.clone(), e.discovered, e.plain);
-        let ssh = &cx.global::<AppSettings>().file.value.ssh;
-        let own_sync = ssh.get(&e.host).and_then(|h| h.sync);
-        let sync_select = (!plain).then(|| {
-            let host = host.clone();
-            div().w(px(150.)).min_w(px(110.)).flex_shrink(1.).child(self.select(
-                &format!("host-sync-{}", hash(&e.host)),
-                &format!("Bring the shell setup to {}", e.label),
-                Self::sync_options(Some(ssh.sync)),
-                &own_sync,
-                cx,
-                move |v, _, cx| AppSettings::update(cx, |s| s.ssh.edit(&host, !discovered, |h| h.sync = v)),
-            ))
-        });
         let gid = SharedString::from(format!("host-row-{}", hash(&e.host)));
         let mut detail: Vec<String> = Vec::new();
         if e.label != e.host {
@@ -329,7 +298,6 @@ impl SettingsWindow {
                     }),
             )
             .child(color_button)
-            .children(sync_select)
             .child(plain_toggle)
             .child(connect)
             .when(!discovered, |d| {
@@ -352,6 +320,136 @@ impl SettingsWindow {
             });
         let editor = (self.hosts.editing.as_deref() == Some(e.host.as_str())).then(|| self.host_color_editor(ui, &e.host, cx));
         div().flex().flex_col().child(row).children(editor).into_any_element()
+    }
+
+    /// The shared shell config (#313): every host goatty met or the shared
+    /// config names, whether it follows it, how it stands; devices waiting
+    /// to be trusted; changes made on a host without a GUI.
+    fn shared_section(&self, ui: Ui, cx: &Context<'_, Self>) -> kit::Section {
+        use crate::shared_sync::{self, Standing};
+        let mut sec =
+            section(ui, "Shared shell config").desc("One shell config on every host that follows it, with per-host overrides").action(
+                button_with("shared-sync-now", Some(Icon::Refresh), "Sync now", ButtonKind::Normal, ui, |_, cx| shared_sync::sync_now(cx)),
+            );
+        let Some(state) = shared_sync::state(cx) else {
+            return sec
+                .child(kit::empty(ui, Icon::Loader, "Not synced yet", "goatty syncs the shared config with each host it connects to."))
+                .footer(SHARED_FOOTER);
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        for id in state.listed() {
+            let known = state.hosts.get(&id);
+            let standing = state.standing(&id);
+            let member = state.member(&id) == Some(true);
+            let mut detail = vec![standing.label().to_string()];
+            if let Some(t) = known.and_then(|k| k.synced_unix) {
+                detail.push(format!("last sync {}", ago(now.saturating_sub(t))));
+            }
+            if let Some(st) = known.and_then(|k| k.status.as_ref()) {
+                let pending = state.doc.newer_than(&st.have).len();
+                if pending > 0 {
+                    detail.push(format!("{pending} change(s) waiting"));
+                }
+                if !st.needs_review.is_empty() {
+                    let ids: Vec<&str> = st.needs_review.iter().map(|r| r.id.as_str()).collect();
+                    detail.push(format!("needs review: {}", ids.join(", ")));
+                }
+                if let Some(a) = st.last_apply.as_ref().filter(|a| !a.ok) {
+                    detail.push(format!("last apply failed: {}", a.lines.first().cloned().unwrap_or_default()));
+                }
+            }
+            if let Some(e) = known.and_then(|k| k.error.as_ref()) {
+                detail.push(format!("couldn't sync: {e}"));
+            }
+            let overrides = state.doc.overrides(&id, &state.trust).len();
+            if overrides > 0 {
+                detail.push(format!("{overrides} override(s)"));
+            }
+            let label = state.label(&id);
+            let local = state.doc.local_changes(&id, &state.trust);
+            let tone = match standing {
+                Standing::Synced => Tone::Success,
+                Standing::Waiting => Tone::Warning,
+                Standing::NotSynced | Standing::Offline => Tone::Neutral,
+            };
+            let host = id.clone();
+            let mut r = row(ui, label.clone())
+                .icon(if state.me.as_deref() == Some(id.as_str()) { Icon::Monitor } else { Icon::Server })
+                .desc(detail.join(" · "))
+                .control(
+                    div().flex().items_center().gap(px(10.)).child(badge(standing.label(), tone, ui)).child(
+                        toggle(("shared-member", hash(&id)), member, ui, move |_, cx| shared_sync::set_member(host.clone(), !member, cx))
+                            .aria_label(SharedString::from(format!("{label} follows the shared config"))),
+                    ),
+                );
+            if !local.is_empty() {
+                let paths: Vec<String> = local.iter().map(|p| goatty_config::shared::display_path(p)).collect();
+                let (h1, h2) = (id.clone(), id.clone());
+                r = r.below(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .text_size(px(text::SMALL))
+                                .text_color(ui.muted)
+                                .child(SharedString::from(format!("Changed on {label} itself: {}", paths.join(", ")))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.))
+                                .child(button_with(("shared-share", hash(&id)), None, "Share", ButtonKind::Normal, ui, move |_, cx| {
+                                    shared_sync::adopt_local_changes(h1.clone(), true, cx)
+                                }))
+                                .child(button_with(
+                                    ("shared-keep", hash(&id)),
+                                    None,
+                                    format!("Keep on {label} only"),
+                                    ButtonKind::Normal,
+                                    ui,
+                                    move |_, cx| shared_sync::adopt_local_changes(h2.clone(), false, cx),
+                                )),
+                        ),
+                );
+            }
+            sec = sec.child(r);
+        }
+        // Devices whose changes wait to be trusted (this computer's view).
+        let me = state.me.clone().unwrap_or_default();
+        let untrusted = state.hosts.get(&me).and_then(|k| k.status.as_ref()).map(|s| s.untrusted.clone()).unwrap_or_default();
+        for u in untrusted {
+            let name = u.name.clone().unwrap_or_else(|| goatty_config::shared::short_id(&u.device).to_owned());
+            let (d1, d2) = (u.device.clone(), u.device.clone());
+            sec = sec.child(
+                row(ui, format!("Changes from {name}"))
+                    .icon(Icon::TriangleAlert)
+                    .desc(format!(
+                        "{} change(s) signed by {} ({}) don't apply until you trust it",
+                        u.entries,
+                        name,
+                        goatty_config::shared::short_id(&u.device)
+                    ))
+                    .control(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(button_with(("shared-trust", hash(&u.device)), None, "Trust", ButtonKind::Primary, ui, move |_, cx| {
+                                shared_sync::trust_device(d1.clone(), true, cx)
+                            }))
+                            .child(button_with(
+                                ("shared-ignore", hash(&u.device)),
+                                None,
+                                "Ignore",
+                                ButtonKind::Normal,
+                                ui,
+                                move |_, cx| shared_sync::ignore_device(d2.clone(), cx),
+                            )),
+                    ),
+            );
+        }
+        sec.footer(SHARED_FOOTER)
     }
 
     fn host_list(&self, ui: Ui, entries: &[&HostEntry], cx: &Context<'_, Self>) -> gpui::Div {
@@ -393,7 +491,7 @@ impl SettingsWindow {
 
     pub(super) fn hosts_page(&self, ui: Ui, cx: &Context<'_, Self>) -> AnyElement {
         let settings = &cx.global::<AppSettings>().file.value.ssh;
-        let (discover, open_in, sync, local_echo) = (settings.discover, settings.open_in, settings.sync, settings.local_echo);
+        let (discover, open_in, local_echo) = (settings.discover, settings.open_in, settings.local_echo);
         let entries = hosts::current(cx);
         let (added, found): (Vec<&HostEntry>, Vec<&HostEntry>) = entries.iter().partition(|e| !e.discovered);
 
@@ -421,22 +519,7 @@ impl SettingsWindow {
                  disconnects; it asks before copying it there (to ~/.local/share/goatty, no sudo).",
             );
 
-        let setup = section(ui, "Shell setup")
-            .child(row(ui, "Bring your shell setup").desc("To hosts goatty connects to, unless a host below says otherwise").control(
-                self.select("ssh-sync", "Bring your shell setup", Self::sync_options(None), &Some(sync), cx, |v, _, cx| {
-                    AppSettings::update(cx, |s| s.ssh.sync = v.unwrap_or_default())
-                }),
-            ))
-            .child(row(ui, "Sync the active tab's host now").desc("Compare it with this computer and copy what differs").control(
-                button_with("ssh-sync-now", Some(Icon::Refresh), "Sync now", ButtonKind::Normal, ui, |_, cx| {
-                    crate::shell_sync::sync_now(cx)
-                }),
-            ))
-            .footer(
-                "This computer's prompt, aliases, plugins with their settings, and goatty's tools go to the host, so its shell \
-                 feels like this one. Plugins come from the same signed registry at the same version (never downgraded); \
-                 nothing is uninstalled there, and the host keeps its own shell program.",
-            );
+        let setup = self.shared_section(ui, cx);
 
         let form = card(ui)
             .p(px(16.))
@@ -481,6 +564,21 @@ impl SettingsWindow {
             };
         }
         div().flex().flex_col().gap(px(28.)).child(connecting).child(setup).child(yours).child(config).into_any_element()
+    }
+}
+
+const SHARED_FOOTER: &str = "Hosts that follow get your prompt, aliases, plugins and their settings, and apply changes \
+     themselves; set a value for one host only from the scope picker on the Shell pages. Changes are signed by the goatty \
+     computer that made them, and a host only accepts them from devices you trust, so a server can't change this computer's \
+     shell.";
+
+/// "5 min ago".
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => "just now".into(),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} h ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86400),
     }
 }
 

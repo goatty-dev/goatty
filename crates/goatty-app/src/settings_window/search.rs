@@ -122,9 +122,12 @@ pub const INDEX: &[Entry] = &[
     e(Page::Hosts, "Connecting", "Open hosts in", "ssh window tab remote").keys(&["ssh.open_in"]),
     e(Page::Hosts, "Connecting", "Show typing before the host echoes it", "local echo prediction latency lag slow mosh remote")
         .keys(&["ssh.local_echo"]),
-    e(Page::Hosts, "Shell setup", "Bring your shell setup", "sync copy mirror plugins aliases prompt remote same everywhere")
-        .keys(&["ssh.sync"]),
-    e(Page::Hosts, "Shell setup", "Sync the active tab's host now", "sync copy mirror plugins aliases prompt remote"),
+    e(
+        Page::Hosts,
+        "Shared shell config",
+        "Shared shell config",
+        "sync copy mirror plugins aliases prompt remote same everywhere follow member override trust device",
+    ),
     e(Page::Hosts, "From ~/.ssh/config", "List these hosts too", "ssh config discover").keys(&["ssh.discover"]),
     e(
         Page::Network,
