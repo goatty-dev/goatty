@@ -4,8 +4,8 @@
 //! matches, the selection), the shaped rows, line numbers and scrollbars.
 
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, Entity, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point,
-    ShapedLine, Style, Window, fill, relative,
+    App, Bounds, ContentMask, Element, ElementId, Entity, GlobalElementId, Hsla, InspectorElementId, LayoutId, Pixels, Point, ShapedLine,
+    Style, Window, fill, relative,
 };
 
 use super::OutputView;
@@ -28,13 +28,6 @@ pub struct Paint {
     /// Scrollbar tracks and thumbs, unclipped.
     pub bars: Vec<(Bounds<Pixels>, Hsla, Pixels)>,
     pub line_height: Pixels,
-}
-
-impl IntoElement for TextArea {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
 }
 
 impl Element for TextArea {
