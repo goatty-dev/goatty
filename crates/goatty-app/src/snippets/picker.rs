@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use goatty_config::CommandHistory;
 use goatty_plugin::api::{HostSnippet, SnippetList};
+use goatty_plugin::snippets::Safety;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyBinding, ScrollStrategy, SharedString, StyledText,
     Subscription, UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
@@ -29,7 +30,7 @@ use crate::ui::text_input::{TextInput, TextInputEvent};
 pub const CONTEXT: &str = "SnippetPicker";
 
 const WIDTH: f32 = 720.;
-const ROW_HEIGHT: f32 = 50.;
+const ROW_HEIGHT: f32 = 48.;
 const MAX_VISIBLE_ROWS: usize = 8;
 /// Topic chips shown (the most used tags).
 const MAX_TAGS: usize = 7;
@@ -296,10 +297,19 @@ impl SnippetPicker {
         } else if !s.snippet.description.is_empty() {
             div().child(s.snippet.description.clone()).into_any_element()
         } else {
-            div().font_family(mono.clone()).child(s.snippet.line.clone()).into_any_element()
+            // No description: the command itself, with its blanks named.
+            let line: String = s.snippet.preview(&Default::default(), None).iter().map(|seg| seg.text()).collect();
+            div().font_family(mono.clone()).child(line).into_any_element()
         };
-        let safety = s.snippet.safety();
-        let tags: Vec<String> = s.snippet.tags.iter().take(2).cloned().collect();
+        let destructive = s.snippet.safety() == Safety::Destructive;
+        // Where it comes from, unless it's one of the built-in basics.
+        let source = if s.origin.mine() {
+            Some(SharedString::from("Yours"))
+        } else if s.origin.owner != "basics" {
+            Some(s.origin.name.clone().into())
+        } else {
+            None
+        };
         Some(
             div()
                 .id(("snippet", ix))
@@ -321,51 +331,49 @@ impl SnippetPicker {
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap_0p5()
-                        .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(ui.text).child(title))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .min_w_0()
+                                .line_height(px(19.))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(ui.text)
+                                        .child(title),
+                                )
+                                .when(destructive, |d| d.child(deletes_icon(("deletes", ix), ui))),
+                        )
                         .child(
                             div()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
                                 .text_ellipsis()
+                                .line_height(px(17.))
                                 .text_size(px(text::SMALL))
                                 .text_color(ui.muted)
                                 .child(second),
                         ),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .gap_1()
-                        .children(tags.into_iter().map(|t| {
-                            div()
-                                .px_1p5()
-                                .rounded(px(radius::SMALL))
-                                .bg(ui.field)
-                                .text_color(ui.muted)
-                                .text_size(px(text::CAPTION))
-                                .child(t)
-                        }))
-                        .when(!s.origin.mine() && s.origin.owner != "basics", |d| {
-                            d.child(div().text_size(px(text::CAPTION)).text_color(ui.faint).child(s.origin.name.clone()))
-                        })
-                        .when(s.origin.mine(), |d| {
-                            d.child(
-                                div()
-                                    .px_1p5()
-                                    .rounded(px(radius::SMALL))
-                                    .bg(ui.accent_soft)
-                                    .text_color(ui.accent_text)
-                                    .text_size(px(text::CAPTION))
-                                    .child("yours"),
-                            )
-                        })
-                        .when(safety != goatty_plugin::snippets::Safety::Safe, |d| {
-                            d.child(crate::command_palette::badge(&super::safety_badge(safety), ui))
-                        }),
-                )
+                .when_some(source, |d, src| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(140.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(text::CAPTION))
+                            .text_color(ui.faint)
+                            .child(src),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -376,16 +384,17 @@ impl SnippetPicker {
         let values: goatty_plugin::snippets::Answers =
             s.snippet.inputs.iter().filter_map(|i| i.default.clone().map(|d| (i.id.clone(), d))).collect();
         let segs = s.snippet.preview(&values, None);
-        let safety = s.snippet.safety();
-        let blanks = s.snippet.inputs.len();
-        let what = match blanks {
-            0 => "Enter puts it on your prompt".to_string(),
-            1 => "Enter: fill in 1 blank".to_string(),
-            n => format!("Enter: fill in {n} blanks"),
+        let destructive = s.snippet.safety() == Safety::Destructive;
+        let what = match s.snippet.inputs.len() {
+            0 => "Goes straight onto your prompt".to_string(),
+            1 => "1 blank to fill in".to_string(),
+            n => format!("{n} blanks to fill in"),
         };
+        let source = if s.origin.mine() { "Your snippet".to_string() } else { format!("From {}", s.origin.name) };
         div()
-            .px_4()
-            .py_2()
+            .px_3()
+            .pt_2()
+            .pb_2p5()
             .flex()
             .flex_col()
             .gap_1p5()
@@ -394,21 +403,52 @@ impl SnippetPicker {
             .child(crate::command_palette::preview_line(&segs, ui, mono))
             .child(
                 div()
+                    .px_1()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .text_size(px(text::SMALL))
+                    .text_size(px(text::CAPTION))
                     .text_color(ui.muted)
                     .child(
-                        div().flex().items_center().gap_2().child(crate::command_palette::badge(&super::safety_badge(safety), ui)).child(
-                            div().child(if s.origin.mine() { "Your snippet".to_string() } else { format!("From {}", s.origin.name) }),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .when(destructive, |d| {
+                                d.text_color(ui.danger)
+                                    .child(Icon::Trash.svg().flex_none().size(px(12.)).text_color(ui.danger))
+                                    .child(div().flex_none().child("Deletes data, there's no undo"))
+                                    .child(div().flex_none().text_color(ui.faint).child("·"))
+                            })
+                            .child(
+                                div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_color(ui.muted).child(source),
+                            ),
                     )
-                    .child(what),
+                    .child(div().flex_none().child(what)),
             )
             .into_any_element()
     }
+}
+
+/// The quiet marker on a snippet that deletes or overwrites something.
+fn deletes_icon(id: impl Into<gpui::ElementId>, ui: Ui) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .tooltip(crate::ui::controls::tooltip(format!("{}: {}", Safety::Destructive.label(), Safety::Destructive.meaning())))
+        .child(Icon::Trash.svg().size(px(12.)).text_color(ui.danger))
+}
+
+/// A key and what it does, for the hint line at the bottom.
+fn hint(key: &'static str, does: &'static str, ui: Ui) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(div().px_1().min_w(px(16.)).flex().justify_center().rounded(px(4.)).bg(ui.field).text_color(ui.text).child(key))
+        .child(does)
 }
 
 impl Render for SnippetPicker {
@@ -429,13 +469,12 @@ impl Render for SnippetPicker {
                 .items_center()
                 .gap_1()
                 .h(px(24.))
-                .px_2()
-                .rounded(px(radius::SMALL))
-                .border_1()
+                .px_2p5()
+                .rounded_full()
                 .text_size(px(text::CAPTION))
                 .cursor_pointer()
-                .when(on, |d| d.bg(ui.accent_soft).border_color(ui.accent_soft).text_color(ui.accent_text))
-                .when(!on, |d| d.border_color(ui.border).text_color(ui.muted).hover(|s| s.bg(ui.field).text_color(ui.text)))
+                .when(on, |d| d.bg(ui.accent_soft).text_color(ui.accent_text))
+                .when(!on, |d| d.bg(ui.field).text_color(ui.muted).hover(|s| s.bg(ui.field_hover).text_color(ui.text)))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_filter(f.clone(), cx)))
                 .child(label)
                 .child(div().text_color(if on { ui.accent_text } else { ui.faint }).child(count.to_string()))
@@ -568,12 +607,18 @@ impl Render for SnippetPicker {
             .child(
                 div()
                     .px_4()
-                    .py_1()
+                    .py_1p5()
                     .border_t_1()
                     .border_color(ui.border)
-                    .text_xs()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_size(px(text::CAPTION))
                     .text_color(ui.muted)
-                    .child("↑↓: pick · Enter: fill in · Tab: next topic · Esc: close"),
+                    .child(hint("↑↓", "pick", ui))
+                    .child(hint("Enter", "fill in", ui))
+                    .child(hint("Tab", "topic", ui))
+                    .child(hint("Esc", "close", ui)),
             )
     }
 }

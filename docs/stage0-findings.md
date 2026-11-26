@@ -50,7 +50,7 @@ These are single runs, so expect about ±15% noise. The other terminals run the 
 
 ### Frame cost during the flood (`GOATTY_STATS=1`)
 
-(Measured on gpui 0.2.2/blade. After the switch to gpui git/wgpu, throughput was re-checked at 113 MB/s; fps still needs a focused re-run.)
+(Measured on gpui 0.2.2/blade. After the switch to gpui git/wgpu, throughput was re-checked at 113 MB/s; on gpui-pre 0.3.14 (2026-11-26, `--local`, 52 MB colored flood) it was 122–132 MB/s. fps still needs a focused re-run.)
 
 | Renderer | Prepaint | Paint | fps while ingesting 60–90 MB/s |
 |---|---|---|---|
@@ -97,5 +97,5 @@ One reader thread per session and one per connection is simple and fast. tokio a
 
 ## Notes from the spike
 
-- crates.io gpui 0.2.2 (blade renderer) never recreated the Vulkan swapchain after `VK_ERROR_OUT_OF_DATE_KHR`, so the window froze under niri. That is why gpui comes from Zed's git repo at a pinned rev (`gpui_wgpu` renderer); bump it on purpose (see `CLAUDE.md`).
+- crates.io gpui 0.2.2 (blade renderer) never recreated the Vulkan swapchain after `VK_ERROR_OUT_OF_DATE_KHR`, so the window froze under niri. That is why gpui comes from a recent Zed `main` (`gpui_wgpu` renderer): first a pinned git rev, now Longbridge's `gpui-pre` crates.io snapshots, pinned exactly; bump it on purpose (see `CLAUDE.md`).
 - rio-vt's `contents_formatted()` covers only the visible screen and drops combining marks, so goatty's snapshot adds scrollback and modes. The hidden primary screen under the alt screen can't be restored (rio keeps it private).

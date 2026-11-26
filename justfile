@@ -61,6 +61,6 @@ deps:
 bump version:
     scripts/bump-version.sh {{version}}
 
-# Bump the pinned Zed revision: edit `rev` in Cargo.toml first, then run this.
+# Bump the pinned gpui-pre snapshot: edit both versions in Cargo.toml first, then run this.
 update-gpui:
-    cargo update -p gpui
+    cargo update -p gpui-pre -p gpui-pre-platform

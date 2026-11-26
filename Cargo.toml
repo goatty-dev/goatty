@@ -13,11 +13,13 @@ publish = false
 # Terminal core — pinned exactly; API still evolving (see docs/goatty-project-plan.md).
 rio-vt = { version = "=0.5.29", default-features = false }
 portable-pty = "0.9.0"
-# GPUI from Zed main, pinned. Bump deliberately: `ZED_REV` below + `cargo update -p gpui`.
+# GPUI: Longbridge's weekly crates.io snapshots of Zed main (`gpui-pre`),
+# pinned exactly. Bump deliberately: change both versions, then `just update-gpui`.
 # (crates.io gpui 0.2.2 never recreates its Vulkan swapchain after
-# VK_ERROR_OUT_OF_DATE_KHR, which froze the window on niri/Wayland.)
-gpui = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "b5cd310b3b54dfc659fcc06453e6358843dfe216", features = ["wayland", "x11"] }
+# VK_ERROR_OUT_OF_DATE_KHR, which froze the window on niri/Wayland. If the
+# snapshots stop, fall back to a git dep on zed-industries/zed at a pinned rev.)
+gpui = { package = "gpui-pre", version = "=0.3.14" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.14", features = ["wayland", "x11"] }
 parking_lot = "0.13"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -73,7 +75,7 @@ flate2 = "1"
 tar = "0.4"
 # Plugin packages in other formats (goatty-plugin `archive`): .zip and .tar.xz,
 # both pure Rust (the static goattyd build has no C toolchain to spare).
-zip = { version = "~9.7", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "~9.8", default-features = false, features = ["deflate-flate2"] }
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 # Plugins (goatty-plugin): TOML manifests, version requirements, signed registry indexes.
 toml = "1.1"

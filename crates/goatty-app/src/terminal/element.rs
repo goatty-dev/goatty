@@ -19,8 +19,8 @@ use std::time::Instant;
 use goatty_term::{CellFlags, CursorKind, Frame, LinkSpan, Rgb, TermSize};
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
-    Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun,
-    UnderlineStyle, Window, fill, point, px, relative, size,
+    Hsla, InspectorElementId, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun, UnderlineStyle,
+    Window, fill, point, px, relative, size,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -172,13 +172,6 @@ pub struct Layout {
     /// which may be smaller or larger than the pane. Painting is clipped to
     /// the pane and the space around the grid is shaded.
     letterbox: Option<Bounds<Pixels>>,
-}
-
-impl IntoElement for TerminalElement {
-    type Element = Self;
-    fn into_element(self) -> Self {
-        self
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]

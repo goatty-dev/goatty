@@ -68,7 +68,7 @@ const TRAP_STEPS: usize = 2048;
 /// (letting go of the mouse or pressing Enter saves right away).
 const COLOR_SAVE_DELAY: Duration = Duration::from_millis(600);
 
-actions!(settings_window, [CloseSettings, FocusNextControl, FocusPrevControl, NextPage, PrevPage]);
+actions!(settings_window, [CloseSettings, FocusNextControl, FocusPrevControl, FocusSearch, NextPage, PrevPage]);
 
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
@@ -80,6 +80,9 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-tab", FocusPrevControl, Some(NAVIGATING)),
         KeyBinding::new("ctrl-pagedown", NextPage, Some(NAVIGATING)),
         KeyBinding::new("ctrl-pageup", PrevPage, Some(NAVIGATING)),
+        // `/` jumps to search, except where it's text: in a text field it types a slash.
+        KeyBinding::new("/", FocusSearch, Some("SettingsWindow && !recording && !TextInput")),
+        KeyBinding::new("ctrl-f", FocusSearch, Some(NAVIGATING)),
     ]
 }
 
@@ -329,8 +332,10 @@ pub fn open_at(cx: &mut App, page: Option<Page>) {
             window.set_window_title("goatty settings");
             cx.new(|cx| {
                 let mut w = SettingsWindow::new(window, cx);
-                if let Some(p) = page {
-                    w.go(p, cx);
+                match page {
+                    Some(p) => w.go(p, cx),
+                    // Opened plainly (not to show one setting): start in search.
+                    None => w.focus_search_on_open = true,
                 }
                 w
             })
@@ -636,6 +641,9 @@ pub struct SettingsWindow {
     /// Profile: a generation's file changes (`None`: loading).
     gen_diff: Option<(u32, Option<GenDiff>)>,
     toasts: Entity<ToastLayer>,
+    /// Focus the search field on the first frame (once its width is known:
+    /// a narrow window has it in the closed drawer, so the page keeps focus).
+    focus_search_on_open: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -826,6 +834,7 @@ impl SettingsWindow {
             gen_name,
             gen_diff: None,
             toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
+            focus_search_on_open: false,
             _subs: {
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
                 // An exchange brought news: pick the scope once, show what changed.
@@ -1389,16 +1398,33 @@ impl SettingsWindow {
         }
     }
 
-    /// Ctrl+PageDown / Ctrl+PageUp: the next or previous page.
-    fn step_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
-        // The page behind a dialog isn't reachable.
-        if self.create_theme_open
+    /// A dialog is open: the page and sidebar behind it aren't reachable.
+    fn dialog_open(&self) -> bool {
+        self.create_theme_open
             || self.aliases_modal_open()
             || self.snippets_modal_open()
             || self.prompt_modal_open()
             || self.shortcuts_modal_open()
             || self.everywhere_modal_open()
-        {
+    }
+
+    /// `/` or Ctrl+F: focus the settings search, with its text selected so
+    /// typing starts a new query. In a narrow window it opens the drawer.
+    fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.menu.is_some() || self.dialog_open() {
+            return;
+        }
+        if f32::from(window.viewport_size().width) < chrome::RAIL_BELOW {
+            self.drawer = true;
+        }
+        window.focus(&self.search.focus_handle(cx), cx);
+        self.search.update(cx, |i, cx| i.select_all_text(cx));
+        cx.notify();
+    }
+
+    /// Ctrl+PageDown / Ctrl+PageUp: the next or previous page.
+    fn step_page(&mut self, delta: isize, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.dialog_open() {
             return;
         }
         let at = Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0);

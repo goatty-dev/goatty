@@ -116,7 +116,7 @@ jobs:
           file "$f"
           file "$f" | grep -Eq 'static(ally|-pie) linked'
           mkdir -p out && cp "$f" "out/goattyd-${{ matrix.name }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: goattyd-${{ matrix.name }}
           path: out/goattyd-${{ matrix.name }}
@@ -147,7 +147,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/bin" nfpm
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
       - run: cargo build --profile dist --locked -p goatty-app -p goatty-daemon
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: goattyd-*
           path: remote
@@ -160,7 +160,7 @@ jobs:
           ls -l dist
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages
           path: dist/*
@@ -190,7 +190,7 @@ jobs:
             # vulkan-swrast provides vulkan-driver without pulling in a GPU driver.
             install: pacman -Syu --noconfirm vulkan-swrast && pacman -U --noconfirm ./goatty-*.pkg.tar.zst
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
       - name: Install
@@ -218,7 +218,7 @@ jobs:
       # vulkan-swrast provides vulkan-driver without pulling in a GPU driver.
       - run: pacman -Syu --noconfirm --needed base-devel git namcap vulkan-swrast
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: packages
@@ -272,7 +272,7 @@ jobs:
             Write-Output $deps
             if ($deps -match '(?i)vcruntime|msvcp') { throw "$b.exe needs the Visual C++ runtime" }
           }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: goattyd-*-linux
           path: remote
@@ -288,12 +288,12 @@ jobs:
           # The same installer as an older version, for test-windows' upgrade test.
           scripts/package-windows.ps1 -OutDir upgrade-test -MsiVersion 0.0.1
           Get-ChildItem dist, upgrade-test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-packages
           path: dist/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-upgrade-test
           path: upgrade-test/*.msi
@@ -311,11 +311,11 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-packages
           path: packages
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-upgrade-test
           path: upgrade-test
@@ -336,16 +336,16 @@ jobs:
       PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
       # Not windows-upgrade-test: that's only for test-windows.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: goattyd-*
           path: assets
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: assets
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-packages
           path: assets
