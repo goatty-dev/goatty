@@ -93,6 +93,40 @@ pub struct Version {
     pub goatty: String,
     #[serde(default)]
     pub yanked: bool,
+    /// `compat.os`: the OSes it supports; empty: any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// The shells it integrates with (`compat.shells`, with its default
+    /// `["zsh"]` spelled out). Empty in indexes built before goatty wrote
+    /// it: unknown, so the install plan decides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
+}
+
+impl Version {
+    /// Why this version can't be installed with goatty `goatty_version` on
+    /// `target` (`x86_64-windows`), judged from the index alone; `None`
+    /// when it looks installable (the install plan checks the manifest).
+    pub fn incompatible(&self, goatty_version: &str, target: &str) -> Option<String> {
+        let platform = manifest::Platform::of_target(target);
+        if !self.os.is_empty() && !self.os.contains(&platform.os) {
+            return Some(format!("supports {} only", self.os.join(", ")));
+        }
+        if !self.shells.is_empty() && !self.shells.iter().any(|s| s == platform.shell) {
+            return Some(format!("integrates with {} only; goatty's managed shell here is {}", self.shells.join(", "), platform.shell));
+        }
+        let fallback = manifest::fallback_target(target);
+        if !self.targets.is_empty() && !self.targets.iter().any(|t| t == target || t == "any" || Some(t.as_str()) == fallback) {
+            return Some(format!("no build for {target}"));
+        }
+        if !self.goatty.is_empty()
+            && let (Ok(req), Ok(v)) = (semver::VersionReq::parse(&self.goatty), semver::Version::parse(goatty_version))
+            && !req.matches(&v)
+        {
+            return Some(format!("needs goatty {}", self.goatty));
+        }
+        None
+    }
 }
 
 impl Index {
@@ -167,7 +201,15 @@ pub fn version_entry(m: &Manifest, files: BTreeMap<String, String>, yanked: bool
     let mut targets: Vec<String> = m.packages.iter().flat_map(|p| p.assets.iter().map(|a| a.target.clone())).collect();
     targets.sort();
     targets.dedup();
-    Version { files, permissions: permissions::all(m), targets, goatty: m.compat.goatty.clone(), yanked }
+    Version {
+        files,
+        permissions: permissions::all(m),
+        targets,
+        goatty: m.compat.goatty.clone(),
+        yanked,
+        os: m.compat.os.clone(),
+        shells: m.shells().into_iter().map(str::to_owned).collect(),
+    }
 }
 
 /// Validate every plugin in the registry and build its index. The
@@ -379,6 +421,28 @@ pub(crate) mod tests {
         assert!(!old.expired(u64::MAX));
         std::fs::write(dir.join(INDEX), old.to_bytes()).unwrap();
         assert_eq!(build(dir).unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn versions_say_where_they_install() {
+        let m = manifest::parse(EXAMPLE, None).unwrap();
+        let v = version_entry(&m, BTreeMap::new(), false);
+        assert_eq!(v.shells, ["zsh"], "the default is spelled out");
+        assert_eq!(v.incompatible("0.1.0", "x86_64-linux"), None);
+        assert!(v.incompatible("0.1.0", "x86_64-windows").unwrap().contains("integrates with zsh only"));
+        assert!(v.incompatible("0.1.0", "aarch64-linux").unwrap().contains("no build"));
+
+        let win =
+            Version { os: vec!["windows".into()], shells: vec!["powershell".into()], targets: vec!["x86_64-windows".into()], ..v.clone() };
+        assert_eq!(win.incompatible("0.1.0", "aarch64-windows"), None, "x64 builds run on Windows on ARM");
+        assert!(win.incompatible("0.1.0", "x86_64-linux").unwrap().contains("supports windows only"));
+        // An index from before `shells` was written: the plan decides.
+        let old = Version { shells: Vec::new(), targets: vec!["any".into()], ..v.clone() };
+        assert_eq!(old.incompatible("0.1.0", "x86_64-windows"), None);
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("os").is_none() && json.get("shells").is_none(), "{json}");
+        let newer = Version { goatty: ">=9".into(), ..v };
+        assert!(newer.incompatible("0.1.0", "x86_64-linux").unwrap().contains("needs goatty"));
     }
 
     #[test]

@@ -37,7 +37,7 @@ use goatty_plugin::api::{
     Available, Catalog, Download, Installed, PackageState, PackageStatus, Plan, Previous, PreviousPackage, RegistryStatus, Step, Update,
 };
 use goatty_plugin::fetch::Fetch;
-use goatty_plugin::manifest::{self, Load, Manifest};
+use goatty_plugin::manifest::{self, Load, Manifest, Platform};
 use goatty_plugin::schema::{self, Values};
 use goatty_plugin::{GOATTY_VERSION, current_target, permissions, template};
 
@@ -385,13 +385,14 @@ impl Plugins<'_> {
         let path = std::env::var("PATH").ok();
         let managed_bin = self.dirs.bin_dir();
         let on_path = |exe: &str| packages::which(exe, path.as_deref(), &managed_bin);
-        let managed_shell = builtins::host_managed_shell();
-        let downloads = m
+        // What this host uses of it: its OS's and shell's parts.
+        let view = m.for_platform(&Platform::host());
+        let mut warnings = Vec::new();
+        let downloads = view
             .packages
             .iter()
-            .filter(|p| p.applies_to_shell(managed_shell))
             .map(|p| {
-                let names: Vec<String> = p.bin.iter().map(|b| manifest::bin_name(b).to_owned()).collect();
+                let names: Vec<String> = p.bin.iter().map(|b| manifest::bin_name(b).to_owned()).chain(p.applets.iter().cloned()).collect();
                 let system = match packages::locate(self.dirs, p, path.as_deref()) {
                     Location::System(found) => Some(found.display().to_string()),
                     _ => None,
@@ -400,6 +401,12 @@ impl Plugins<'_> {
                 let a = p.asset_for(&target);
                 if a.is_none() && system.is_none() && !current {
                     bail!("{} has no goatty-managed build for {target}: install it with your package manager", p.id);
+                }
+                if let Some(a) = a.filter(|a| system.is_none() && a.target != target && a.target != "any") {
+                    warnings.push(format!(
+                        "{} has no build for {target}: goatty installs the {} build, which this computer runs emulated (slower).",
+                        p.id, a.target
+                    ));
                 }
                 Ok(Download {
                     package: p.id.clone(),
@@ -415,9 +422,9 @@ impl Plugins<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (aliases, env) = shell_additions(m, settings);
-        let files = m.files.iter().map(|f| f.name.clone()).collect();
-        let init_file = if cfg!(windows) { &m.powershell.init } else { &m.zsh.init };
+        let (aliases, env) = shell_additions(&view, settings);
+        let files = view.files.iter().map(|f| f.name.clone()).collect();
+        let init_file = if cfg!(windows) { &view.powershell.init } else { &view.zsh.init };
         let shell_code = match init_file {
             Some(init) => {
                 let bytes = c.read(init)?;
@@ -428,9 +435,8 @@ impl Plugins<'_> {
             }
             None => None,
         };
-        let requires = required_commands(m, &on_path);
+        let requires = required_commands(&view, &on_path);
 
-        let mut warnings = Vec::new();
         // (One installed along with it gets turned on.)
         let installed = |d: &str| lock.plugins.contains_key(d) || builtins::get(d).is_some();
         for dep in m.requires.plugins.iter().filter(|d| installed(d) && settings.plugins.get(*d).is_some_and(|p| !p.enabled)) {
@@ -442,8 +448,15 @@ impl Plugins<'_> {
                     .into(),
             );
         }
-        for a in &m.aliases {
-            if on_path(&a.name).is_some() {
+        let mut warned = BTreeSet::new();
+        for a in view.aliases.iter().filter(|a| warned.insert(a.name.as_str())) {
+            let builtin = if cfg!(windows) { goatty_plugin::powershell::builtin_alias(&a.name) } else { None };
+            if let Some(runs) = builtin {
+                warnings.push(format!(
+                    "`{}` is PowerShell's own alias for {runs}; in goatty shells the plugin's `{}` replaces it (turn it off in the plugin's settings, or remove the function in %APPDATA%\\goatty\\profile.ps1).",
+                    a.name, a.name
+                ));
+            } else if on_path(&a.name).is_some() {
                 if cfg!(windows) {
                     warnings.push(format!(
                         "`{}` is an existing command; in goatty shells the alias replaces it (turn it off in the plugin's settings, or remove the function in %APPDATA%\\goatty\\profile.ps1).",
@@ -457,6 +470,12 @@ impl Plugins<'_> {
                 }
             }
         }
+        for (applet, found) in view.packages.iter().flat_map(|p| &p.applets).filter_map(|a| on_path(a).map(|f| (a, f))) {
+            warnings.push(format!(
+                "`{applet}` is also {}: in goatty shells, and in the programs they start, goatty's `{applet}` comes first on PATH.",
+                found.display()
+            ));
+        }
         let other_aliases: BTreeMap<String, String> = lock
             .plugins
             .iter()
@@ -464,7 +483,7 @@ impl Plugins<'_> {
             .filter_map(|(id, e)| lock::manifest_of(self.dirs, id, e).ok().map(|om| (id.clone(), om)))
             .flat_map(|(id, om)| om.aliases.into_iter().map(move |a| (a.name, id.clone())))
             .collect();
-        for a in &m.aliases {
+        for a in view.aliases.iter().filter(|a| warned.remove(a.name.as_str())) {
             if let Some(other) = other_aliases.get(&a.name) {
                 warnings.push(format!("The {other} plugin also defines `{}`; the one loaded last wins.", a.name));
             }
@@ -487,7 +506,7 @@ impl Plugins<'_> {
             builtin: c.builtin.is_some(),
             replaces,
             downloads,
-            permissions: permissions::describe(m),
+            permissions: permissions::describe(&view),
             aliases,
             env,
             files,
@@ -512,6 +531,7 @@ impl Plugins<'_> {
     fn previous(&self, id: &str, lock: &Lock, settings: &HostSettings, on_path: &dyn Fn(&str) -> Option<PathBuf>) -> Option<Previous> {
         let e = lock.plugins.get(id)?;
         let m = lock::manifest_of(self.dirs, id, e).map_err(|err| log::info!("plan: can't read installed {id}: {err:#}")).ok()?;
+        let m = m.for_platform(&Platform::host());
         let init_file = if cfg!(windows) { &m.powershell.init } else { &m.zsh.init };
         let shell_code = match init_file {
             Some(init) => {
@@ -601,9 +621,9 @@ impl Plugins<'_> {
         let staging = self.dirs.installed_dir().join(format!(".{}.partial-{}", m.id, std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         let mut spool = Spool(vec![staging.clone()]);
-        let managed_shell = builtins::host_managed_shell();
+        let view = m.for_platform(&Platform::host());
         let mut fetched: Vec<Option<PathBuf>> = Vec::new();
-        for (p, d) in m.packages.iter().filter(|p| p.applies_to_shell(managed_shell)).zip(&plan.downloads) {
+        for (p, d) in view.packages.iter().zip(&plan.downloads) {
             if !d.fetches() {
                 fetched.push(None);
                 continue;
@@ -633,9 +653,9 @@ impl Plugins<'_> {
         let previous = lock.plugins.get(&m.id).cloned();
         let mut packages = Vec::new();
         let mut fresh: Vec<(String, Vec<String>)> = Vec::new();
-        let managed_shell = builtins::host_managed_shell();
+        let view = m.for_platform(&Platform::host());
         let result = (|| -> Result<()> {
-            for ((p, d), bytes) in m.packages.iter().filter(|p| p.applies_to_shell(managed_shell)).zip(&plan.downloads).zip(fetched) {
+            for ((p, d), bytes) in view.packages.iter().zip(&plan.downloads).zip(fetched) {
                 if let Some(sys) = &d.system {
                     packages.push(lock::Package {
                         id: p.id.clone(),
@@ -645,6 +665,9 @@ impl Plugins<'_> {
                     });
                     continue;
                 }
+                // The lock lists every name goatty links: the programs and their applets.
+                let bins: Vec<String> = p.bin.iter().chain(&p.applets).cloned().collect();
+                let completions = p.completions.for_shell(builtins::host_managed_shell()).unwrap_or_default();
                 if let Some(file) = bytes {
                     let bytes = std::fs::read(&file).with_context(|| format!("read the download of {}", p.id))?;
                     let a = p.asset_for(&target).context("no build for this host")?;
@@ -655,13 +678,14 @@ impl Plugins<'_> {
                         format: a.format,
                         root: &a.root,
                         bins: &p.bin,
+                        applets: &p.applets,
                         source: p.source.as_deref(),
-                        completions: &p.completions,
+                        completions: &completions,
                     };
                     install::install_package(&pi, &bytes, self.dirs).with_context(|| format!("install {} {}", p.id, p.version))?;
-                    fresh.push((p.id.clone(), p.bin.clone()));
+                    fresh.push((p.id.clone(), bins.clone()));
                 }
-                packages.push(lock::Package { id: p.id.clone(), version: p.version.clone(), bins: p.bin.clone(), system: None });
+                packages.push(lock::Package { id: p.id.clone(), version: p.version.clone(), bins, system: None });
             }
             if c.builtin.is_some() {
                 // Its files are part of goatty: nothing to copy.
@@ -869,16 +893,7 @@ impl Plugins<'_> {
                     continue;
                 }
                 let Some((v, ver)) = s.index.latest(id) else { continue };
-                let incompatible = if !ver.targets.is_empty() && !ver.targets.iter().any(|t| *t == target || t == "any") {
-                    Some(format!("no build for {target}"))
-                } else if !ver.goatty.is_empty()
-                    && semver::VersionReq::parse(&ver.goatty)
-                        .is_ok_and(|r| !r.matches(&semver::Version::parse(GOATTY_VERSION).expect("semver")))
-                {
-                    Some(format!("needs goatty {}", ver.goatty))
-                } else {
-                    None
-                };
+                let incompatible = ver.incompatible(GOATTY_VERSION, &target);
                 available.push(Available {
                     id: id.clone(),
                     name: entry.name.clone(),
@@ -896,8 +911,28 @@ impl Plugins<'_> {
             }
         }
         available.sort_by_key(|a| a.name.to_lowercase());
-        issues.extend(active(self.dirs, settings).1);
+        // Settings of a plugin that isn't for this host (the shared shell
+        // config carries them from the hosts that use it) aren't a problem here.
+        let not_for_here: BTreeSet<&str> = available.iter().filter(|a| a.incompatible.is_some()).map(|a| a.id.as_str()).collect();
+        issues.extend(
+            active(self.dirs, settings).1.into_iter().filter(|i| !missing_plugin_issue(i).is_some_and(|id| not_for_here.contains(id))),
+        );
         Catalog { installed, available, registries, issues }
+    }
+
+    /// The registry plugins that, by the stored registry snapshots (nothing
+    /// is fetched), can't be installed here: another OS or shell, no build.
+    pub fn not_for_this_host(&self) -> BTreeSet<String> {
+        let target = current_target();
+        let mut out = BTreeSet::new();
+        for snap in self.sources().0.iter().filter_map(|s| registry::load(self.dirs, s).ok().flatten()) {
+            for id in snap.index.plugins.keys() {
+                if snap.index.latest(id).is_some_and(|(_, v)| v.incompatible(GOATTY_VERSION, &target).is_some()) {
+                    out.insert(id.clone());
+                }
+            }
+        }
+        out
     }
 
     fn load_lock(&self, issues: &mut Vec<String>) -> Lock {
@@ -973,9 +1008,13 @@ impl Plugins<'_> {
         ];
 
         let target = current_target();
-        let managed_shell = builtins::host_managed_shell();
+        let platform = Platform::host();
         let is_shell_builtin = |prog: &str| {
-            if cfg!(windows) { PS_BUILTINS.iter().any(|b| b.eq_ignore_ascii_case(prog)) } else { ZSH_BUILTINS.contains(&prog) }
+            if cfg!(windows) {
+                PS_BUILTINS.iter().any(|b| b.eq_ignore_ascii_case(prog)) || goatty_plugin::powershell::builtin_alias(prog).is_some()
+            } else {
+                ZSH_BUILTINS.contains(&prog)
+            }
         };
         let managed_path = std::cell::OnceCell::new();
         let mut found: BTreeMap<String, bool> = BTreeMap::new();
@@ -1009,7 +1048,6 @@ impl Plugins<'_> {
         let package_status = |m: &Manifest| -> Vec<PackageStatus> {
             m.packages
                 .iter()
-                .filter(|p| p.applies_to_shell(managed_shell))
                 .map(|p| PackageStatus {
                     id: p.id.clone(),
                     version: p.version.clone(),
@@ -1024,7 +1062,7 @@ impl Plugins<'_> {
         };
         let mut installed = Vec::new();
         for b in builtins::BUILTINS {
-            let m = b.manifest().clone();
+            let m = b.manifest().for_platform(&platform);
             installed.push(Installed {
                 id: b.id.into(),
                 version: m.version.clone(),
@@ -1036,7 +1074,7 @@ impl Plugins<'_> {
                 unavailable_commands: unavailable_of(&m),
                 command_open_in: Installed::command_open_in_map(&m),
                 builtin: true,
-                manifest: m,
+                manifest: for_clients(m),
                 update: None,
                 installed_unix: 0,
             });
@@ -1049,6 +1087,8 @@ impl Plugins<'_> {
                     continue;
                 }
             };
+            let incompatible = m.compatible(GOATTY_VERSION, &target).err();
+            let m = m.for_platform(&platform);
             let update = snaps
                 .iter()
                 .find(|s| s.source.name == e.source)
@@ -1061,18 +1101,35 @@ impl Plugins<'_> {
                 source: e.source.clone(),
                 verified: e.verified,
                 enabled: settings.plugins.get(id).is_none_or(|c| c.enabled),
-                incompatible: m.compatible(GOATTY_VERSION, &target).err(),
+                incompatible,
                 packages: package_status(&m),
                 unavailable_commands: unavailable_of(&m),
                 command_open_in: Installed::command_open_in_map(&m),
                 builtin: false,
-                manifest: m,
+                manifest: for_clients(m),
                 update,
                 installed_unix: e.installed,
             });
         }
         installed
     }
+}
+
+/// A manifest as [`Installed`] hands it to clients: this host's view
+/// ([`Manifest::for_platform`]) without what only the host needs and older
+/// clients can't read (a package's `applets`: the permissions list them).
+fn for_clients(mut m: Manifest) -> Manifest {
+    for p in &mut m.packages {
+        p.applets.clear();
+    }
+    m
+}
+
+/// The plugin id of [`active`]'s issue about settings of a plugin that
+/// isn't installed here.
+pub fn missing_plugin_issue(issue: &str) -> Option<&str> {
+    let (id, msg) = issue.strip_prefix("plugins.")?.split_once(": ")?;
+    msg.starts_with("not installed on this host").then_some(id)
 }
 
 /// A plugin's aliases and variables as the plan shows them, with the
@@ -1097,7 +1154,8 @@ fn shell_additions(m: &Manifest, settings: &HostSettings) -> (Vec<String>, Vec<S
         .env
         .iter()
         .map(|e| {
-            let value = template::expand_inline(&e.value, m, &values, None);
+            let value =
+                template::expand_inline_in(template::Quoting::for_shell(builtins::host_managed_shell()), &e.value, m, &values, None);
             let mut s = if value.is_empty() { format!("{} (not set while empty)", e.name) } else { format!("{}={value}", e.name) };
             if let Some(w) = &e.when {
                 s.push_str(&format!("  (when {w}: {})", if manifest::applies(&e.when, &values) { "on now" } else { "off now" }));
@@ -1227,11 +1285,14 @@ impl Active {
 pub fn active(dirs: &Dirs, settings: &HostSettings) -> (Vec<Active>, Vec<String>) {
     let mut out = Vec::new();
     let mut issues = Vec::new();
-    let resolve = |m: &mut Manifest, issues: &mut Vec<String>| {
+    let platform = Platform::host();
+    // `full`: the whole manifest; `m`: this host's view of it, which is what renders.
+    let resolve = |full: &Manifest, m: &mut Manifest, issues: &mut Vec<String>| {
         let config = settings.plugins.get(&m.id);
         let stored = config.map(|c| c.settings.clone()).unwrap_or_default();
         let (values, problems) = schema::resolve(m, &stored);
-        for (k, msg) in problems {
+        // A value for a setting of another OS or shell stays for the hosts that use it.
+        for (k, msg) in problems.into_iter().filter(|(k, _)| m.setting(k).is_some() || full.setting(k).is_none()) {
             issues.push(format!("plugins.{}.settings.{k}: {msg}", m.id));
         }
         // Aliases the user switched off stay out of the shell (#88).
@@ -1242,8 +1303,8 @@ pub fn active(dirs: &Dirs, settings: &HostSettings) -> (Vec<Active>, Vec<String>
     };
     let enabled = |id: &str| settings.plugins.get(id).is_none_or(|c| c.enabled);
     for b in builtins::BUILTINS.iter().filter(|b| enabled(b.id)) {
-        let mut m = b.manifest().clone();
-        let values = resolve(&mut m, &mut issues);
+        let mut m = b.manifest().for_platform(&platform);
+        let values = resolve(b.manifest(), &mut m, &mut issues);
         out.push(Active { manifest: m, values, origin: Origin::Builtin(b), label: b.label() });
     }
     let lock = match Lock::load(dirs) {
@@ -1258,17 +1319,18 @@ pub fn active(dirs: &Dirs, settings: &HostSettings) -> (Vec<Active>, Vec<String>
     }
     let target = current_target();
     for (id, entry) in lock.plugins.iter().filter(|(id, _)| builtins::get(id).is_none() && enabled(id)) {
-        let mut m = match lock::manifest_of(dirs, id, entry) {
+        let full = match lock::manifest_of(dirs, id, entry) {
             Ok(m) => m,
             Err(e) => {
                 issues.push(format!("{e:#}"));
                 continue;
             }
         };
-        if let Err(why) = m.compatible(GOATTY_VERSION, &target) {
+        if let Err(why) = full.compatible(GOATTY_VERSION, &target) {
             issues.push(format!("plugin {id} is off: {why}"));
             continue;
         }
+        let mut m = full.for_platform(&platform);
         let label = format!("{} {} ({})", m.id, m.version, entry.source);
         let a = Active { manifest: m.clone(), values: Values::new(), origin: Origin::Installed(entry.clone()), label };
         // Everything the shell will source must still be what was approved.
@@ -1276,7 +1338,7 @@ pub fn active(dirs: &Dirs, settings: &HostSettings) -> (Vec<Active>, Vec<String>
             issues.push(format!("plugin {id} is off: {e:#}"));
             continue;
         }
-        let values = resolve(&mut m, &mut issues);
+        let values = resolve(&full, &mut m, &mut issues);
         out.push(Active { manifest: m, values, ..a });
     }
     (load_order(out), issues)

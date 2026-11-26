@@ -37,11 +37,15 @@ pub struct PackageInstall<'a> {
     pub root: &'a str,
     /// Paths of the executables relative to `root`; linked as `bin/<file name>`.
     pub bins: &'a [String],
-    /// A zsh script relative to `root`: the package directory is linked as
+    /// More names for the one executable (`[[package]] applets`), each
+    /// linked to it as `bin/<name>` (`<name>.exe` on Windows).
+    pub applets: &'a [String],
+    /// A shell script relative to `root`: the package directory is linked as
     /// `plugins/<id>`.
     pub source: Option<&'a str>,
-    /// The command that prints the tool's zsh completions (`[[package]]
-    /// completions`); empty for none.
+    /// The command that prints the tool's completions for this host's
+    /// managed shell ([`Completions::for_shell`](goatty_plugin::manifest::Completions::for_shell));
+    /// empty for none.
     pub completions: &'a [String],
 }
 
@@ -111,8 +115,12 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
         bail!("checksum mismatch for {} {}: expected {}, got {got}; not installing", p.id, p.version, p.sha256);
     }
     let names: Vec<String> = p.bins.iter().map(|b| bin_file_name(b)).collect();
+    let applets: Vec<String> = p.applets.iter().map(|a| bin_file_name(a)).collect();
+    if !applets.is_empty() && names.len() != 1 {
+        bail!("{}: applets need exactly one program to link to", p.id);
+    }
     let tool_dir = dirs.tools_dir().join(p.id);
-    for name in &names {
+    for name in names.iter().chain(&applets) {
         if let Some(owner) = link_owner(dirs, name)
             && owner != p.id
         {
@@ -162,7 +170,9 @@ pub fn install_package(p: &PackageInstall<'_>, archive: &[u8], dirs: &Dirs) -> R
     }
     std::fs::rename(&staging, &version_dir)?;
     let mut links = Vec::new();
-    for (rel, name) in extracted_rel.iter().zip(&names) {
+    // Each applet is another name for the one program.
+    let applet_links = extracted_rel.first().into_iter().flat_map(|rel| applets.iter().map(move |a| (rel, a)));
+    for (rel, name) in extracted_rel.iter().zip(&names).chain(applet_links) {
         let link = dirs.bin_dir().join(name);
         let target = version_dir.join(rel);
         #[cfg(unix)]
@@ -350,6 +360,7 @@ mod tests {
             format: AssetFormat::Zip,
             root: "",
             bins: &bins,
+            applets: &[],
             source: None,
             completions: &[],
         };
@@ -389,6 +400,7 @@ mod tests {
             format: AssetFormat::TarGz,
             root: "p-1",
             bins: &[],
+            applets: &[],
             source: Some("demo.zsh"),
             completions: &[],
         };
@@ -422,6 +434,7 @@ mod tests {
             format: AssetFormat::TarGz,
             root: "t",
             bins: &bins,
+            applets: &[],
             source: None,
             completions: &completions,
         };
@@ -452,6 +465,7 @@ mod tests {
             format: AssetFormat::TarGz,
             root: "",
             bins: &bins,
+            applets: &[],
             source: None,
             completions: &[],
         };
@@ -477,6 +491,7 @@ mod tests {
             format: AssetFormat::Binary,
             root: "",
             bins: &bins_raw,
+            applets: &[],
             source: None,
             completions: &[],
         };
@@ -513,6 +528,7 @@ mod tests {
             format: AssetFormat::TarGz,
             root: "t",
             bins: &bins,
+            applets: &[],
             source: None,
             completions: &[],
         };
@@ -564,6 +580,7 @@ mod windows_tests {
             format: AssetFormat::Zip,
             root: "",
             bins: &bins,
+            applets: &[],
             source: None,
             completions: &[],
         };

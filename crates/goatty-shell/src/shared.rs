@@ -456,6 +456,12 @@ impl HostService {
                 out.review.push(Review { id: id.clone(), reason });
                 continue;
             }
+            // A plugin for another OS or shell (a Linux-only tool shared from
+            // a Linux host to a Windows one): nothing to install or review here.
+            if let Some(why) = not_for_this_host(&catalog, id, pin) {
+                log::info!("shared config: {id} {} isn't for this host ({why}); skipped", pin.version);
+                continue;
+            }
             match self.install_pinned(id, pin) {
                 Ok(c) => {
                     out.reload |= c.reload;
@@ -721,6 +727,16 @@ fn find_overridden(
         }
     }
     (out, next)
+}
+
+/// Why the pinned plugin can't be installed on this host (another OS or
+/// shell, no build for it, a newer goatty), as its registry says.
+fn not_for_this_host<'c>(catalog: &'c plugin_api::Catalog, id: &str, pin: &PluginPin) -> Option<&'c str> {
+    catalog
+        .available
+        .iter()
+        .find(|a| a.id == id && a.registry == pin.registry && a.version == pin.version)
+        .and_then(|a| a.incompatible.as_deref())
 }
 
 /// The host's registry named like the pin's vouches for it the way the
@@ -1173,6 +1189,35 @@ mod tests {
         let st = status(&server.svc).unwrap();
         assert_eq!(st.member, Some(true));
         assert!(st.last_apply.is_some());
+    }
+
+    /// A Linux-only plugin shared to a Windows host (or the other way) is
+    /// skipped there, not retried as a failed install (#333).
+    #[test]
+    fn shared_plugins_for_other_platforms_are_skipped() {
+        let available = |version: &str, incompatible: Option<&str>| plugin_api::Available {
+            id: "btop".into(),
+            name: "btop".into(),
+            summary: String::new(),
+            publisher: String::new(),
+            category: goatty_plugin::manifest::Category::Environment,
+            keywords: Vec::new(),
+            homepage: None,
+            registry: "official".into(),
+            version: version.into(),
+            permissions: Vec::new(),
+            incompatible: incompatible.map(str::to_owned),
+            installed: None,
+        };
+        let pin = PluginPin { version: "1.0.0".into(), registry: "official".into(), keys: Vec::new(), builtin: true };
+        let cat = plugin_api::Catalog { available: vec![available("1.0.0", Some("supports linux only"))], ..Default::default() };
+        assert_eq!(not_for_this_host(&cat, "btop", &pin), Some("supports linux only"));
+        assert_eq!(not_for_this_host(&cat, "htop", &pin), None);
+        // The catalog describes another version: the plan decides.
+        let cat = plugin_api::Catalog { available: vec![available("2.0.0", Some("supports linux only"))], ..Default::default() };
+        assert_eq!(not_for_this_host(&cat, "btop", &pin), None);
+        let cat = plugin_api::Catalog { available: vec![available("1.0.0", None)], ..Default::default() };
+        assert_eq!(not_for_this_host(&cat, "btop", &pin), None);
     }
 
     #[test]

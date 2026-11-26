@@ -111,7 +111,7 @@ pub struct Compat {
     /// Semver requirement on the goatty version, e.g. `">=0.1"`. Empty: any.
     #[serde(default)]
     pub goatty: String,
-    /// `linux`, `macos`. Empty: wherever its packages have a build.
+    /// `linux`, `macos`, `windows`. Empty: wherever its packages have a build.
     #[serde(default)]
     pub os: Vec<String>,
     /// Shells it integrates with. Empty: `["zsh"]`.
@@ -144,10 +144,19 @@ pub struct Package {
     /// for a package that only has a [`source`](Self::source) script.
     #[serde(default)]
     pub bin: Vec<String>,
-    /// A zsh script in the package (relative to the asset's `root`) that
-    /// goatty sources at the plugin's place in the load order, after its
-    /// `zsh.init` ran: a zsh plugin like zsh-autosuggestions. The package
-    /// directory is linked as `plugins/<id>/`.
+    /// More names for the package's one executable, for a multi-call
+    /// program that acts on the name it's started as (busybox, Microsoft's
+    /// coreutils): each is linked to it in `bin/` (`bin/ls` → `coreutils`;
+    /// a hard link `ls.exe` on Windows), so other programs (`xargs`,
+    /// `find -exec`) find them on `PATH` too, not only the shell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applets: Vec<String>,
+    /// A shell script in the package (relative to the asset's `root`) that
+    /// goatty loads at the plugin's place in the load order, after its
+    /// shell code ran: a `.zsh` file for zsh (a zsh plugin like
+    /// zsh-autosuggestions, sourced), a `.ps1` (dot-sourced) or `.psm1`
+    /// (imported as a module) for PowerShell. The package only applies to
+    /// that shell. The package directory is linked as `plugins/<id>/`.
     #[serde(default)]
     pub source: Option<String>,
     /// Where distributions put that script (absolute paths under `/usr/`,
@@ -158,20 +167,102 @@ pub struct Package {
     /// Use a copy that's already on `PATH` instead of downloading one.
     #[serde(default = "yes")]
     pub prefer_system: bool,
-    /// A command that prints the tool's zsh completion function, like
-    /// `["starship", "completions", "zsh"]`: the first word is one of the
-    /// package's executables (its name, as in `bin/`), the rest its
-    /// arguments. goatty runs it after installing its own copy and keeps the
-    /// output as `_<name>` on the managed shell's `fpath`. Copies on the
-    /// system come with their own completions, so it doesn't run for them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub completions: Vec<String>,
+    /// A command that prints the tool's completions ([`Completions`]), like
+    /// `["starship", "completions", "zsh"]`, or one per shell. goatty runs
+    /// it after installing its own copy and keeps the output (zsh: `_<name>`
+    /// on the managed shell's `fpath`; PowerShell: a script dot-sourced at
+    /// startup). Copies on the system come with their own completions, so
+    /// it doesn't run for them.
+    #[serde(default, skip_serializing_if = "Completions::is_empty")]
+    pub completions: Completions,
     #[serde(rename = "asset")]
     pub assets: Vec<Asset>,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// How a package prints its completions (`[[package]] completions`).
+///
+/// * A list: one command for every shell, written for zsh
+///   (`["fd", "--gen-completions", "zsh"]`). For PowerShell goatty swaps the
+///   shell's name in the arguments: `zsh` → `powershell`, `complete-zsh` →
+///   `complete-powershell`, `--shell=zsh` → `--shell=powershell`.
+/// * A table, for tools that name shells their own way or need other
+///   arguments: `{ zsh = ["bat", "--completion", "zsh"], powershell = ["bat",
+///   "--completion", "ps1"] }`. A shell that isn't listed gets none.
+///
+/// The first word is one of the package's executables (its name, as in
+/// `bin/`), the rest its arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Completions {
+    Command(Vec<String>),
+    PerShell(BTreeMap<String, Vec<String>>),
+}
+
+impl Default for Completions {
+    fn default() -> Self {
+        Completions::Command(Vec::new())
+    }
+}
+
+impl From<Vec<String>> for Completions {
+    fn from(v: Vec<String>) -> Self {
+        Completions::Command(v)
+    }
+}
+
+impl Completions {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Completions::Command(v) => v.is_empty(),
+            Completions::PerShell(m) => m.values().all(Vec::is_empty),
+        }
+    }
+
+    /// Every command it can run (for validation and the install plan).
+    pub fn commands(&self) -> Vec<(&str, &[String])> {
+        match self {
+            Completions::Command(v) if v.is_empty() => Vec::new(),
+            Completions::Command(v) => vec![("", v.as_slice())],
+            Completions::PerShell(m) => m.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.as_str(), v.as_slice())).collect(),
+        }
+    }
+
+    /// The command for `shell` (`"zsh"`, `"powershell"`); `None`: no completions there.
+    pub fn for_shell(&self, shell: &str) -> Option<Vec<String>> {
+        match self {
+            Completions::Command(v) if v.is_empty() => None,
+            Completions::Command(v) if shell == "zsh" => Some(v.clone()),
+            Completions::Command(v) => Some(v.iter().map(|a| swap_shell_name(a, shell)).collect()),
+            Completions::PerShell(m) => m.get(shell).filter(|v| !v.is_empty()).cloned(),
+        }
+    }
+
+    /// As the install plan shows it: `fd --gen-completions zsh`, or one per shell.
+    pub fn describe(&self) -> String {
+        match self {
+            Completions::Command(v) => v.join(" "),
+            Completions::PerShell(m) => {
+                m.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k}: {}", v.join(" "))).collect::<Vec<_>>().join("; ")
+            }
+        }
+    }
+}
+
+/// `zsh`, `complete-zsh`, `--shell=zsh` with `shell` in place of `zsh`.
+fn swap_shell_name(arg: &str, shell: &str) -> String {
+    if arg == "zsh" {
+        return shell.to_owned();
+    }
+    for sep in ['-', '='] {
+        if let Some(head) = arg.strip_suffix("zsh").filter(|h| h.ends_with(sep)) {
+            return format!("{head}{shell}");
+        }
+    }
+    arg.to_owned()
 }
 
 /// One downloadable build of a package.
@@ -289,7 +380,9 @@ pub struct Setting {
     /// `string`, `path`, `list`: hint shown in an empty field.
     #[serde(default)]
     pub placeholder: Option<String>,
-    /// `list`: how `{id}` joins the entries (default `" "`).
+    /// `list`: how `{id}` joins the entries (default `" "`). `"path"`: the
+    /// host's path-list separator (`:`, or `;` on Windows, where `:` is part
+    /// of `C:\`), for variables like `_ZO_EXCLUDE_DIRS`.
     #[serde(default)]
     pub separator: Option<String>,
     /// The command-line argument this setting adds (`{id.arg}`, `{args}`).
@@ -300,7 +393,16 @@ pub struct Setting {
     /// `bool`: the argument when off.
     #[serde(default)]
     pub arg_off: Option<String>,
+    /// Only on these OSes ([`Platform`]); empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// Only with these managed shells; empty: every shell the plugin supports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
+
+/// [`Setting::separator`] that means the host's path-list separator.
+pub const PATH_SEPARATOR: &str = "path";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -354,6 +456,12 @@ pub struct Alias {
     /// Shown in the install plan and the settings window.
     #[serde(default)]
     pub description: String,
+    /// Only on these OSes; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// Only with these managed shells; empty: every shell the plugin supports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 /// An exported environment variable.
@@ -365,6 +473,12 @@ pub struct EnvVar {
     pub value: String,
     #[serde(default)]
     pub when: Option<String>,
+    /// Only on these OSes; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// Only with these managed shells; empty: every shell the plugin supports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 /// A config file goatty generates from the settings (into the shell
@@ -387,6 +501,12 @@ pub struct ConfigFile {
     pub env: Option<String>,
     #[serde(default)]
     pub when: Option<String>,
+    /// Only on these OSes; empty: everywhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// Only with these managed shells; empty: every shell the plugin supports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -505,6 +625,44 @@ impl Load {
     }
 }
 
+/// Where a plugin is used: a host's OS and its managed shell.
+/// [`Manifest::for_platform`] narrows a manifest to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Platform {
+    /// `linux`, `macos`, `windows` (the OS part of a target).
+    pub os: String,
+    /// `zsh` or `powershell`.
+    pub shell: &'static str,
+}
+
+impl Platform {
+    /// The platform of download target `target` (`x86_64-windows`).
+    pub fn of_target(target: &str) -> Platform {
+        Platform { os: target.rsplit('-').next().unwrap_or("").to_owned(), shell: Manifest::managed_shell_for(target) }
+    }
+
+    /// This build's platform.
+    pub fn host() -> Platform {
+        Self::of_target(&crate::current_target())
+    }
+
+    /// What separates the entries of a path list (`PATH`) here.
+    pub fn path_separator(&self) -> &'static str {
+        if self.os == "windows" { ";" } else { ":" }
+    }
+
+    /// Whether an item limited to `os` and `shells` (empty: no limit) is used here.
+    pub fn allows(&self, os: &[String], shells: &[String]) -> bool {
+        (os.is_empty() || os.contains(&self.os)) && (shells.is_empty() || shells.iter().any(|s| s == self.shell))
+    }
+}
+
+/// A target whose builds goatty also takes when a package has none of its
+/// own: Windows on ARM runs x64 programs (emulated).
+pub fn fallback_target(target: &str) -> Option<&'static str> {
+    (target == "aarch64-windows").then_some("x86_64-windows")
+}
+
 impl Manifest {
     pub fn setting(&self, id: &str) -> Option<&Setting> {
         self.settings.iter().find(|s| s.id == id)
@@ -514,14 +672,20 @@ impl Manifest {
         semver::Version::parse(&self.version).ok()
     }
 
-    /// Every executable the plugin's packages put on `PATH`.
+    /// Every executable the plugin's packages put on `PATH` (their
+    /// programs and applets).
     pub fn executables(&self) -> impl Iterator<Item = &str> {
-        self.packages.iter().flat_map(|p| p.bin.iter().map(|b| bin_name(b)))
+        self.packages.iter().flat_map(|p| p.bin.iter().map(|b| bin_name(b)).chain(p.applets.iter().map(String::as_str)))
     }
 
-    /// The packages' zsh scripts goatty sources: (package, script).
+    /// The packages' shell scripts goatty loads: (package, script).
     pub fn sources(&self) -> impl Iterator<Item = (&Package, &str)> {
         self.packages.iter().filter_map(|p| p.source.as_deref().map(|s| (p, s)))
+    }
+
+    /// The packages' scripts for `shell` (by their extension, [`script_shell`]).
+    pub fn sources_for<'a>(&'a self, shell: &'a str) -> impl Iterator<Item = (&'a Package, &'a str)> {
+        self.sources().filter(move |(_, src)| script_shell(src) == Some(shell))
     }
 
     /// The shells it integrates with (default zsh).
@@ -561,17 +725,80 @@ impl Manifest {
         }
         Ok(())
     }
+
+    /// The manifest as a host on `p` uses it: settings, aliases, variables,
+    /// files, palette commands and snippets limited to other OSes or shells
+    /// (`os`, `shells`) are left out, and so is anything whose `when` tests
+    /// a setting that was left out; packages of another shell are left out;
+    /// a list's `separator = "path"` becomes the host's separator and
+    /// `completions` the host shell's command.
+    ///
+    /// goattyd renders this, plans with it and hands it to clients, so a
+    /// GUI shows the settings of the host it looks at whatever it runs on
+    /// itself. The result has no `os`/`shells` limits and no per-shell
+    /// completions left, which also keeps it readable for older clients.
+    /// Stored values of the settings that were left out stay as they are
+    /// (the shared shell config carries them to the hosts that use them).
+    pub fn for_platform(&self, p: &Platform) -> Manifest {
+        let mut m = self.clone();
+        let dropped: BTreeSet<String> = m.settings.iter().filter(|s| !p.allows(&s.os, &s.shells)).map(|s| s.id.clone()).collect();
+        m.settings.retain(|s| !dropped.contains(&s.id));
+        for s in &mut m.settings {
+            s.os.clear();
+            s.shells.clear();
+            if s.separator.as_deref() == Some(PATH_SEPARATOR) {
+                s.separator = Some(p.path_separator().to_owned());
+            }
+        }
+        let tests_dropped =
+            |when: &Option<String>| when.as_deref().and_then(|w| Condition::parse(w).ok()).is_some_and(|c| dropped.contains(c.setting()));
+        let keep = |os: &mut Vec<String>, shells: &mut Vec<String>, when: &Option<String>| {
+            let kept = p.allows(os, shells) && !tests_dropped(when);
+            os.clear();
+            shells.clear();
+            kept
+        };
+        m.aliases.retain_mut(|a| keep(&mut a.os, &mut a.shells, &a.when));
+        m.env.retain_mut(|e| keep(&mut e.os, &mut e.shells, &e.when));
+        m.files.retain_mut(|f| keep(&mut f.os, &mut f.shells, &f.when));
+        m.commands.retain_mut(|c| keep(&mut c.os, &mut c.shells, &c.when));
+        m.snippets.retain_mut(|s| keep(&mut s.os, &mut s.shells, &None));
+        m.packages.retain(|pk| pk.applies_to_shell(p.shell));
+        for pk in &mut m.packages {
+            pk.completions = Completions::Command(pk.completions.for_shell(p.shell).unwrap_or_default());
+        }
+        m
+    }
 }
 
 impl Package {
+    /// The build for `target`: its own, else the [`fallback_target`]'s,
+    /// else one for `any`.
     pub fn asset_for(&self, target: &str) -> Option<&Asset> {
-        self.assets.iter().find(|a| a.target == target).or_else(|| self.assets.iter().find(|a| a.target == "any"))
+        let find = |t: &str| self.assets.iter().find(|a| a.target == t);
+        find(target).or_else(|| fallback_target(target).and_then(find)).or_else(|| find("any"))
     }
 
     /// Whether this package is used by `shell` (`"zsh"` or `"powershell"`).
-    /// Packages that only ship a `.zsh` `source` script (no `bin`) are zsh-only.
+    /// A package that only ships a [`source`](Self::source) script (no
+    /// `bin`) is for the shell of that script: `.zsh` for zsh, `.ps1` or
+    /// `.psm1` for PowerShell.
     pub fn applies_to_shell(&self, shell: &str) -> bool {
-        if self.bin.is_empty() && self.source.is_some() { shell == "zsh" } else { true }
+        match (&self.source, self.bin.is_empty()) {
+            (Some(src), true) => script_shell(src) == Some(shell),
+            _ => true,
+        }
+    }
+}
+
+/// The shell a package script is for, by its extension.
+pub fn script_shell(path: &str) -> Option<&'static str> {
+    if path.ends_with(".zsh") {
+        Some("zsh")
+    } else if path.ends_with(".ps1") || path.ends_with(".psm1") {
+        Some("powershell")
+    } else {
+        None
     }
 }
 
@@ -716,6 +943,28 @@ pub fn is_bundle_path(s: &str) -> bool {
     !s.is_empty() && !s.starts_with('/') && s.split('/').all(is_plain)
 }
 
+/// Problems with an item's `os`/`shells` limits: (field, message). Each
+/// must be one the plugin itself supports (`compat`).
+fn scope_problems(m: &Manifest, os: &[String], shells: &[String]) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    for o in os {
+        if !OSES.contains(&o.as_str()) {
+            out.push(("os", format!("unknown OS {o:?} ({})", OSES.join(", "))));
+        } else if !m.compat.os.is_empty() && !m.compat.os.contains(o) {
+            out.push(("os", format!("{o:?} isn't in compat.os")));
+        }
+    }
+    for sh in shells {
+        if !m.shells().contains(&sh.as_str()) {
+            out.push(("shells", format!("{sh:?} isn't one of the shells the plugin supports ({})", m.shells().join(", "))));
+        }
+    }
+    out
+}
+
+/// The OSes `compat.os` and the `os` limits name.
+pub const OSES: &[&str] = &["linux", "macos", "windows"];
+
 fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_section: bool) -> Vec<Problem> {
     let mut out = Vec::new();
     let mut err = |path: String, message: String| out.push(Problem { path, message });
@@ -747,8 +996,8 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
         err("compat.goatty".into(), format!("{:?} is not a version requirement (like \">=0.1\")", m.compat.goatty));
     }
     for os in &m.compat.os {
-        if !["linux", "macos", "windows"].contains(&os.as_str()) {
-            err("compat.os".into(), format!("unknown OS {os:?} (linux, macos, windows)"));
+        if !OSES.contains(&os.as_str()) {
+            err("compat.os".into(), format!("unknown OS {os:?} ({})", OSES.join(", ")));
         }
     }
     for sh in &m.compat.shells {
@@ -785,15 +1034,19 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
             err(format!("{at}.version"), format!("{:?} is not a plain version string", p.version));
         }
         if p.bin.is_empty() && p.source.is_none() {
-            err(format!("{at}.bin"), "list the executables to put on PATH (or a `source` script for a zsh plugin)".into());
+            err(format!("{at}.bin"), "list the executables to put on PATH (or a `source` script for a shell plugin)".into());
         }
-        if let Some(src) = &p.source
-            && (!is_bundle_path(src) || !src.ends_with(".zsh"))
-        {
-            err(format!("{at}.source"), format!("{src:?}: a .zsh file inside the archive"));
+        if let Some(src) = &p.source {
+            match script_shell(src).filter(|_| is_bundle_path(src)) {
+                None => err(format!("{at}.source"), format!("{src:?}: a .zsh, .ps1 or .psm1 file inside the archive")),
+                Some(sh) if !m.shells().contains(&sh) => {
+                    err(format!("{at}.source"), format!("{src:?} is for {sh}: include \"{sh}\" in compat.shells"))
+                }
+                Some(_) => {}
+            }
         }
-        if !p.system_paths.is_empty() && p.source.is_none() {
-            err(format!("{at}.system_paths"), "only for a package with a `source` script (programs are found on PATH)".into());
+        if !p.system_paths.is_empty() && p.source.as_deref().and_then(script_shell) != Some("zsh") {
+            err(format!("{at}.system_paths"), "only for a package with a .zsh `source` script (programs are found on PATH)".into());
         }
         for sp in &p.system_paths {
             if !is_system_path(sp) {
@@ -810,12 +1063,28 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
                 err(format!("{at}.bin"), format!("{:?} is provided twice", bin_name(b)));
             }
         }
-        if let Some(first) = p.completions.first() {
-            if !p.bin.iter().any(|b| bin_name(b) == first || command_name(b) == first) {
-                err(format!("{at}.completions"), format!("{first:?} is not one of the package's executables"));
+        if !p.applets.is_empty() && p.bin.len() != 1 {
+            err(format!("{at}.applets"), "applets are more names for one program: list exactly one bin".into());
+        }
+        for a in &p.applets {
+            if !is_alias_name(a) || a.contains('/') {
+                err(format!("{at}.applets"), format!("{a:?} is not a command name"));
+            } else if !exes.insert(command_name(a).to_string()) {
+                err(format!("{at}.applets"), format!("{a:?} is provided twice"));
             }
-            if p.completions.iter().any(|a| a.is_empty() || a.contains('\0')) {
-                err(format!("{at}.completions"), "empty or invalid argument".into());
+        }
+        for (shell, cmd) in p.completions.commands() {
+            let at = if shell.is_empty() { format!("{at}.completions") } else { format!("{at}.completions.{shell}") };
+            if !shell.is_empty() && !m.shells().contains(&shell) {
+                err(at.clone(), format!("{shell:?} isn't one of the shells the plugin supports ({})", m.shells().join(", ")));
+            }
+            if let Some(first) = cmd.first()
+                && !p.bin.iter().any(|b| bin_name(b) == first || command_name(b) == first)
+            {
+                err(at.clone(), format!("{first:?} is not one of the package's executables"));
+            }
+            if cmd.iter().any(|a| a.is_empty() || a.contains('\0')) {
+                err(at, "empty or invalid argument".into());
             }
         }
         if p.assets.is_empty() {
@@ -869,6 +1138,9 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
         for e in crate::schema::check_definition(s) {
             err(format!("{at}.{}", e.0), e.1);
         }
+        for (field, msg) in scope_problems(m, &s.os, &s.shells) {
+            err(format!("{at}.{field}"), msg);
+        }
         for (field, t) in [("arg", &s.arg), ("arg_off", &s.arg_off)] {
             if let Some(t) = t
                 && let Err(e) = crate::template::check_inline(t, m, true)
@@ -885,6 +1157,11 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
         .chain(m.packages.iter().flat_map(|p| p.bin.iter().map(|b| bin_name(b))))
         .chain(m.requires.commands.iter().map(String::as_str))
         .collect();
+    let scope = |at: &str, os: &[String], shells: &[String], out: &mut Vec<Problem>| {
+        for (field, message) in scope_problems(m, os, shells) {
+            out.push(Problem { path: format!("{at}.{field}"), message });
+        }
+    };
     let cond = |path: String, when: &Option<String>, out: &mut Vec<Problem>| {
         if let Some(w) = when
             && let Err(e) = Condition::parse(w).and_then(|c| c.check(m))
@@ -898,7 +1175,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
         if !is_alias_name(&a.name) {
             out.push(Problem { path: format!("{at}.name"), message: format!("{:?} is not a usable alias name", a.name) });
         }
-        if !alias_names.insert((&a.name, &a.when)) {
+        if !alias_names.insert((&a.name, &a.when, &a.os, &a.shells)) {
             out.push(Problem { path: format!("{at}.name"), message: format!("{:?} is defined twice for the same condition", a.name) });
         }
         if !commands.contains(a.command.as_str()) {
@@ -913,6 +1190,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
             }
         }
         cond(format!("{at}.when"), &a.when, &mut out);
+        scope(&at, &a.os, &a.shells, &mut out);
     }
     for (i, e) in m.env.iter().enumerate() {
         let at = format!("env[{i}]");
@@ -925,6 +1203,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
             out.push(Problem { path: format!("{at}.value"), message: msg });
         }
         cond(format!("{at}.when"), &e.when, &mut out);
+        scope(&at, &e.os, &e.shells, &mut out);
     }
     let mut file_names = BTreeSet::new();
     for (i, f) in m.files.iter().enumerate() {
@@ -969,6 +1248,7 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
             out.push(Problem { path: format!("{at}.env"), message: format!("{env:?} can't be set by a plugin") });
         }
         cond(format!("{at}.when"), &f.when, &mut out);
+        scope(&at, &f.os, &f.shells, &mut out);
     }
     if let Some(init) = &m.zsh.init {
         if !is_bundle_path(init) || !init.ends_with(".zsh") {
@@ -1011,7 +1291,13 @@ fn validate(m: &Manifest, files: Option<&BTreeSet<String>>, has_powershell_secti
     }
 
     out.extend(crate::commands::check(m, &commands));
+    for (i, c) in m.commands.iter().enumerate() {
+        scope(&format!("command[{i}]"), &c.os, &c.shells, &mut out);
+    }
     out.extend(crate::snippets::check(m, &commands));
+    for (i, sn) in m.snippets.iter().enumerate() {
+        scope(&format!("snippet[{i}]"), &sn.os, &sn.shells, &mut out);
+    }
     for p in crate::permissions::check(m) {
         out.push(p);
     }
@@ -1067,13 +1353,16 @@ impl Condition {
         }
     }
 
+    /// Whether it holds for `values`. A setting without a value (one
+    /// [`Manifest::for_platform`] left out on this host) makes any
+    /// condition on it false: what depends on it isn't there either.
     pub fn eval(&self, values: &crate::schema::Values) -> bool {
-        let get = |k: &str| values.get(k);
+        let Some(x) = values.get(self.setting()) else { return false };
         match self {
-            Condition::On(k) => get(k).and_then(Value::as_bool).unwrap_or(false),
-            Condition::Off(k) => !get(k).and_then(Value::as_bool).unwrap_or(false),
-            Condition::Is(k, v) => get(k).is_some_and(|x| crate::schema::plain_string(x) == *v),
-            Condition::IsNot(k, v) => !get(k).is_some_and(|x| crate::schema::plain_string(x) == *v),
+            Condition::On(_) => x.as_bool().unwrap_or(false),
+            Condition::Off(_) => !x.as_bool().unwrap_or(false),
+            Condition::Is(_, v) => crate::schema::plain_string(x) == *v,
+            Condition::IsNot(_, v) => crate::schema::plain_string(x) != *v,
         }
     }
 }
@@ -1222,7 +1511,7 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
     fn completions_run_a_package_executable() {
         let ok = EXAMPLE.replace("bin = [\"eza\"]", "bin = [\"eza\"]\ncompletions = [\"eza\", \"--completions\", \"zsh\"]");
         let m = parse(&ok, None).unwrap();
-        assert_eq!(m.packages[0].completions, ["eza", "--completions", "zsh"]);
+        assert_eq!(m.packages[0].completions, Completions::Command(vec!["eza".into(), "--completions".into(), "zsh".into()]));
         let p = problems(&EXAMPLE.replace("bin = [\"eza\"]", "bin = [\"eza\"]\ncompletions = [\"sh\", \"-c\", \"x\"]"));
         assert!(p.iter().any(|p| p.contains("package[0].completions") && p.contains("not one of the package's executables")), "{p:?}");
     }
@@ -1297,7 +1586,9 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
         assert_eq!(m.powershell.init.as_deref(), Some("pwsh/init.ps1"));
         assert!(m.compatible("0.1.0", "x86_64-windows").is_ok());
         assert!(m.compatible("0.1.0", "x86_64-linux").unwrap_err().contains("supports windows only"));
-        assert!(m.compatible("0.1.0", "aarch64-windows").unwrap_err().contains("no build"));
+        // Windows on ARM takes the x64 build (emulated); Linux on ARM doesn't.
+        assert!(m.compatible("0.1.0", "aarch64-windows").is_ok());
+        assert_eq!(m.packages[0].asset_for("aarch64-windows").map(|a| a.target.as_str()), Some("x86_64-windows"));
 
         // Non-.ps1 init is rejected.
         let bad = text.replace("pwsh/init.ps1", "pwsh/init.zsh");
@@ -1316,6 +1607,179 @@ binaries = "eza is a program: goatty downloads it from its GitHub releases."
         assert_eq!(command_name("bin/eza.exe"), "eza");
         assert_eq!(command_name("bin/EZA.EXE"), "EZA");
         assert_eq!(command_name("starship"), "starship");
+    }
+
+    /// A plugin for zsh and PowerShell with Unix-only parts.
+    const CROSS: &str = r#"
+schema = 1
+id = "bat"
+name = "bat"
+version = "1.0.0"
+summary = "cat with wings"
+publisher = "goatty"
+
+[compat]
+shells = ["zsh", "powershell"]
+
+[[package]]
+id = "bat"
+version = "0.26.1"
+bin = ["bat"]
+completions = { zsh = ["bat", "--completion", "zsh"], powershell = ["bat", "--completion", "ps1"] }
+[[package.asset]]
+target = "x86_64-linux"
+url = "https://example.com/bat.tar.gz"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 100
+[[package.asset]]
+target = "x86_64-windows"
+url = "https://example.com/bat.zip"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+size = 100
+format = "zip"
+
+[[setting]]
+id = "man_pages"
+label = "Man pages"
+type = "bool"
+default = true
+os = ["linux", "macos"]
+
+[[setting]]
+id = "exclude"
+label = "Exclude"
+type = "list"
+separator = "path"
+
+[[alias]]
+name = "cat"
+command = "bat"
+
+[[env]]
+name = "MANPAGER"
+value = "sh -c 'col -bx | bat -l man -p'"
+when = "man_pages"
+
+[[env]]
+name = "BAT_EXCLUDE"
+value = "{exclude}"
+
+[[env]]
+name = "BAT_PAGER"
+value = "less -R"
+os = ["linux", "macos"]
+
+[[command]]
+id = "pager"
+title = "Page a file"
+run = ["bat", "--paging=always"]
+shells = ["zsh"]
+
+[[snippet]]
+id = "plain"
+title = "Print plainly"
+line = "bat -p"
+shells = ["powershell"]
+
+[permissions]
+binaries = "bat is a program: goatty downloads it from its GitHub releases."
+"#;
+
+    #[test]
+    fn narrows_to_a_platform() {
+        let m = parse(CROSS, None).unwrap_or_else(|e| panic!("{e}"));
+        let win = m.for_platform(&Platform::of_target("x86_64-windows"));
+        assert_eq!(win.settings.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["exclude"]);
+        assert_eq!(win.setting("exclude").unwrap().separator.as_deref(), Some(";"));
+        assert_eq!(win.env.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["BAT_EXCLUDE"], "MANPAGER tests a Unix-only setting");
+        assert!(win.commands.is_empty());
+        assert_eq!(win.snippets.len(), 1);
+        assert_eq!(win.packages[0].completions, Completions::Command(vec!["bat".into(), "--completion".into(), "ps1".into()]));
+        assert!(win.snippets.iter().all(|s| s.shells.is_empty() && s.os.is_empty()), "no limits left for older clients");
+
+        let linux = m.for_platform(&Platform::of_target("x86_64-linux"));
+        assert_eq!(linux.settings.len(), 2);
+        assert_eq!(linux.setting("exclude").unwrap().separator.as_deref(), Some(":"));
+        assert_eq!(linux.env.len(), 3);
+        assert_eq!(linux.commands.len(), 1);
+        assert!(linux.snippets.is_empty());
+        assert!(linux.settings.iter().all(|s| s.os.is_empty()));
+
+        // What's left serializes without the new fields.
+        let json = serde_json::to_string(&win).unwrap();
+        assert_eq!(json.matches("\"shells\"").count(), 1, "only compat.shells: {json}");
+        assert!(!json.contains("\"os\":[\"linux"), "{json}");
+        assert!(!json.contains("\"powershell\":["), "no per-shell completions: {json}");
+        assert!(!json.contains("\"man_pages\""), "{json}");
+
+        // A setting a host doesn't have makes conditions on it false.
+        let values = crate::schema::resolve(&win, &BTreeMap::new()).0;
+        assert!(!applies(&Some("man_pages".into()), &values));
+        assert!(!applies(&Some("!man_pages".into()), &values));
+    }
+
+    #[test]
+    fn completions_per_shell() {
+        let list = |v: &[&str]| Completions::Command(v.iter().map(|s| (*s).to_owned()).collect());
+        assert_eq!(list(&["fd", "--gen-completions", "zsh"]).for_shell("powershell").unwrap(), ["fd", "--gen-completions", "powershell"]);
+        assert_eq!(
+            list(&["rg", "--generate", "complete-zsh"]).for_shell("powershell").unwrap(),
+            ["rg", "--generate", "complete-powershell"]
+        );
+        assert_eq!(list(&["x", "--shell=zsh"]).for_shell("powershell").unwrap(), ["x", "--shell=powershell"]);
+        assert_eq!(list(&["x", "zshrc", "nozsh"]).for_shell("powershell").unwrap(), ["x", "zshrc", "nozsh"]);
+        assert_eq!(list(&["rg", "--generate", "complete-zsh"]).for_shell("zsh").unwrap(), ["rg", "--generate", "complete-zsh"]);
+        assert_eq!(list(&[]).for_shell("zsh"), None);
+        let m = parse(CROSS, None).unwrap();
+        assert_eq!(m.packages[0].completions.for_shell("zsh").unwrap(), ["bat", "--completion", "zsh"]);
+
+        let p = problems(&CROSS.replace("powershell = [\"bat\"", "fish = [\"bat\""));
+        assert!(p.iter().any(|p| p.contains("completions.fish") && p.contains("isn't one of the shells")), "{p:?}");
+        let p = problems(&CROSS.replace("powershell = [\"bat\", \"--completion\"", "powershell = [\"cat\", \"--completion\""));
+        assert!(p.iter().any(|p| p.contains("completions.powershell") && p.contains("not one of the package's executables")), "{p:?}");
+    }
+
+    #[test]
+    fn scopes_must_be_ones_the_plugin_supports() {
+        let p = problems(&CROSS.replace("os = [\"linux\", \"macos\"]\n\n[[setting]]", "os = [\"bsd\"]\n\n[[setting]]"));
+        assert!(p.iter().any(|p| p.contains("setting.man_pages.os") && p.contains("unknown OS")), "{p:?}");
+        let p = problems(&CROSS.replace("shells = [\"zsh\"]\n\n[[snippet]]", "shells = [\"fish\"]\n\n[[snippet]]"));
+        assert!(p.iter().any(|p| p.contains("command[0].shells")), "{p:?}");
+        let p = problems(&CROSS.replace("shells = [\"zsh\", \"powershell\"]", "os = [\"windows\"]\nshells = [\"zsh\", \"powershell\"]"));
+        assert!(p.iter().any(|p| p.contains("setting.man_pages.os") && p.contains("isn't in compat.os")), "{p:?}");
+        // The same alias name for different OSes is fine.
+        let twice = CROSS.replace(
+            "[[alias]]\nname = \"cat\"\ncommand = \"bat\"\n",
+            "[[alias]]\nname = \"cat\"\ncommand = \"bat\"\nos = [\"windows\"]\n\n[[alias]]\nname = \"cat\"\ncommand = \"bat\"\nos = [\"linux\"]\n",
+        );
+        assert!(parse(&twice, None).is_ok(), "{:?}", parse(&twice, None));
+    }
+
+    #[test]
+    fn applets_and_powershell_scripts() {
+        let text = CROSS.replace("bin = [\"bat\"]", "bin = [\"bat\"]\napplets = [\"cat\", \"less\"]");
+        let m = parse(&text, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(m.executables().collect::<Vec<_>>(), ["bat", "cat", "less"]);
+        let p = problems(&text.replace("bin = [\"bat\"]", "bin = [\"bat\", \"batman\"]"));
+        assert!(p.iter().any(|p| p.contains("applets") && p.contains("exactly one bin")), "{p:?}");
+        let p = problems(&text.replace("\"less\"]", "\"bat\"]"));
+        assert!(p.iter().any(|p| p.contains("applets") && p.contains("provided twice")), "{p:?}");
+        let p = problems(&text.replace("\"less\"]", "\"a/b\"]"));
+        assert!(p.iter().any(|p| p.contains("applets") && p.contains("not a command name")), "{p:?}");
+
+        // A PowerShell script package is PowerShell's only.
+        let script = EXAMPLE
+            .replace("bin = [\"eza\"]", "source = \"tips.psm1\"")
+            .replace("[[alias]]\nname = \"ls\"\ncommand = \"eza\"\nargs = [\"{args}\"]\nwhen = \"replace_ls\"\n", "");
+        let p = problems(&script);
+        assert!(p.iter().any(|p| p.contains("source") && p.contains("include \"powershell\"")), "{p:?}");
+        let ok = script.replace("[permissions]", "[compat]\nshells = [\"zsh\", \"powershell\"]\n\n[permissions]");
+        let m = parse(&ok, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(m.packages[0].applies_to_shell("powershell") && !m.packages[0].applies_to_shell("zsh"));
+        assert_eq!(m.sources_for("zsh").count(), 0);
+        assert!(m.for_platform(&Platform::of_target("x86_64-linux")).packages.is_empty());
+        let p = problems(&ok.replace("source = \"tips.psm1\"", "source = \"tips.psm1\"\nsystem_paths = [\"/usr/share/tips.psm1\"]"));
+        assert!(p.iter().any(|p| p.contains("system_paths")), "{p:?}");
     }
 
     #[test]

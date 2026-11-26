@@ -121,6 +121,8 @@ pub fn add(svc: &HostService, title: &str, line: &str, description: Option<&str>
                 SnippetInput::text(n, &label)
             })
             .collect(),
+        os: Vec::new(),
+        shells: Vec::new(),
     };
     if let Some(p) = snippets::check_snippet(&s, &format!("snippets.{id}"), Owner::User).first() {
         bail!("{p}");

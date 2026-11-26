@@ -8,16 +8,18 @@
 //! * **main** (in the file of the plugin's [`Load`] slot, e.g.
 //!   `plugins.ps1`): aliases (as `global:` functions, removing any built-in
 //!   PowerShell alias of the same name), the plugin's `[powershell].init`
-//!   script, guarded on its required commands being installed.
+//!   script and its packages' `.ps1`/`.psm1` scripts, guarded on its
+//!   required commands and scripts being installed.
 //!
 //! Everything goatty writes is quoted with [`quote`]; the only code a plugin
-//! brings is its reviewed `[powershell].init` file (`shell-code` permission).
+//! brings is its reviewed `[powershell].init` file (`shell-code` permission)
+//! and its packages' scripts (`binaries`, checked like programs).
 
 use serde_json::Value;
 
 use crate::manifest::{FileFormat, Load, Manifest, SettingKind, applies, command_name};
 use crate::schema::{Values, plain_string};
-use crate::template::{expand_inline, expand_list};
+use crate::template::{Quoting, expand_inline_in, expand_list_in};
 
 /// Characters that PowerShell's parser treats as single-quote delimiters in
 /// addition to ASCII `'` (Unicode left/right/low/reversed single quotes).
@@ -176,6 +178,9 @@ pub struct Ctx<'a> {
     pub label: String,
     /// The key in `goatty-status` (`plugin:eza`; built-in plugins use their id).
     pub feature: String,
+    /// PowerShell expression for the directory holding goatty's copies of
+    /// script packages (`plugins/<package>/`), e.g. `$_goatty_packages`.
+    pub packages: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -215,6 +220,96 @@ pub fn expand_home(m: &Manifest, values: &mut Values, home: Option<&str>) {
             _ => {}
         }
     }
+}
+
+/// PowerShell's own aliases and functions that a plugin's `[[alias]]` of
+/// the same name replaces in goatty's shells ([`render_alias_fn`] removes
+/// the alias first): name → what it runs. Windows PowerShell 5.1's and
+/// PowerShell 7's defaults on Windows (5.1 also has `curl`, `wget`, `sc`
+/// and `ac`). Built-in aliases aren't programs on `PATH`, so a plan can't
+/// find them there.
+pub const BUILTIN_ALIASES: &[(&str, &str)] = &[
+    ("ac", "Add-Content"),
+    ("cat", "Get-Content"),
+    ("cd", "Set-Location"),
+    ("chdir", "Set-Location"),
+    ("clc", "Clear-Content"),
+    ("clear", "Clear-Host"),
+    ("cls", "Clear-Host"),
+    ("compare", "Compare-Object"),
+    ("copy", "Copy-Item"),
+    ("cp", "Copy-Item"),
+    ("cpi", "Copy-Item"),
+    ("curl", "Invoke-WebRequest"),
+    ("del", "Remove-Item"),
+    ("diff", "Compare-Object"),
+    ("dir", "Get-ChildItem"),
+    ("echo", "Write-Output"),
+    ("erase", "Remove-Item"),
+    ("fc", "Format-Custom"),
+    ("fl", "Format-List"),
+    ("foreach", "ForEach-Object"),
+    ("ft", "Format-Table"),
+    ("gc", "Get-Content"),
+    ("gci", "Get-ChildItem"),
+    ("gcm", "Get-Command"),
+    ("gi", "Get-Item"),
+    ("gl", "Get-Location"),
+    ("gm", "Get-Member"),
+    ("gps", "Get-Process"),
+    ("group", "Group-Object"),
+    ("gsv", "Get-Service"),
+    ("gu", "Get-Unique"),
+    ("h", "Get-History"),
+    ("history", "Get-History"),
+    ("iex", "Invoke-Expression"),
+    ("ii", "Invoke-Item"),
+    ("irm", "Invoke-RestMethod"),
+    ("iwr", "Invoke-WebRequest"),
+    ("kill", "Stop-Process"),
+    ("ls", "Get-ChildItem"),
+    ("man", "help"),
+    ("md", "mkdir"),
+    ("measure", "Measure-Object"),
+    ("mi", "Move-Item"),
+    ("mkdir", "New-Item -ItemType Directory"),
+    ("more", "Out-Host -Paging"),
+    ("mount", "New-PSDrive"),
+    ("move", "Move-Item"),
+    ("mv", "Move-Item"),
+    ("ni", "New-Item"),
+    ("popd", "Pop-Location"),
+    ("ps", "Get-Process"),
+    ("pushd", "Push-Location"),
+    ("pwd", "Get-Location"),
+    ("r", "Invoke-History"),
+    ("rd", "Remove-Item"),
+    ("ren", "Rename-Item"),
+    ("ri", "Remove-Item"),
+    ("rm", "Remove-Item"),
+    ("rmdir", "Remove-Item"),
+    ("rni", "Rename-Item"),
+    ("rvpa", "Resolve-Path"),
+    ("sc", "Set-Content"),
+    ("select", "Select-Object"),
+    ("set", "Set-Variable"),
+    ("si", "Set-Item"),
+    ("sl", "Set-Location"),
+    ("sleep", "Start-Sleep"),
+    ("sls", "Select-String"),
+    ("sort", "Sort-Object"),
+    ("start", "Start-Process"),
+    ("tee", "Tee-Object"),
+    ("type", "Get-Content"),
+    ("wget", "Invoke-WebRequest"),
+    ("where", "Where-Object"),
+    ("write", "Write-Output"),
+];
+
+/// What PowerShell's own alias or function `name` runs ([`BUILTIN_ALIASES`]),
+/// ignoring case like PowerShell does.
+pub fn builtin_alias(name: &str) -> Option<&'static str> {
+    BUILTIN_ALIASES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, t)| *t)
 }
 
 /// Whether `name` is safe as an unquoted PowerShell function identifier after `global:`.
@@ -265,9 +360,10 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
     let mut r = Rendered::default();
 
     // --- early: environment variables and generated config files ------------
+    let q = Quoting::PowerShell;
     let mut early = Vec::new();
     for e in m.env.iter().filter(|e| applies(&e.when, values)) {
-        let v = expand_inline(&e.value, m, values, None);
+        let v = expand_inline_in(q, &e.value, m, values, None);
         if !v.is_empty() {
             early.push(format!("Set-Item -Path {} -Value {}", quote(&format!("Env:{}", e.name)), quote(&v)));
         }
@@ -275,11 +371,11 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
     for f in m.files.iter().filter(|f| applies(&f.when, values)) {
         let contents = match f.format {
             FileFormat::Lines => {
-                let mut s = expand_list(&f.lines, m, values).join("\n");
+                let mut s = expand_list_in(q, &f.lines, m, values).join("\n");
                 s.push('\n');
                 s
             }
-            FileFormat::Text => expand_inline(f.template.as_deref().unwrap_or_default(), m, values, None),
+            FileFormat::Text => expand_inline_in(q, f.template.as_deref().unwrap_or_default(), m, values, None),
         };
         r.files.push((f.name.clone(), contents));
         if let Some(var) = &f.env {
@@ -301,9 +397,14 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
         .chain(m.requires.commands.iter().map(String::as_str))
         .collect();
 
+    // Each package script, as goatty's copy has it (`system_paths` are Unix paths).
+    let sources: Vec<(String, bool)> = m
+        .sources_for("powershell")
+        .map(|(p, src)| (format!("(Join-Path {} {})", ctx.packages, quote(&format!("{}/{src}", p.id))), src.ends_with(".psm1")))
+        .collect();
     let mut body = Vec::new();
     for a in m.aliases.iter().filter(|a| applies(&a.when, values)) {
-        let expanded = expand_list(&a.args, m, values);
+        let expanded = expand_list_in(q, &a.args, m, values);
         for line in render_alias_fn(&a.name, &a.command, &expanded).lines() {
             body.push(line.to_owned());
         }
@@ -320,23 +421,34 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
         body.push("Remove-Variable -Name goatty_settings, goatty_plugin_dir -ErrorAction SilentlyContinue".into());
         r.uses_init = Some(init.clone());
     }
+    for (path, module) in &sources {
+        if *module {
+            body.push(format!("Import-Module -Name {path} -Global -DisableNameChecking"));
+        } else {
+            body.push(format!(". {path}"));
+        }
+    }
     if r.load == Load::Prompt {
         body.push(format!("$_goatty_prompt = {}", quote(&m.id)));
     }
-    let detail = match commands.first() {
-        Some(cmd) => format!("(Get-Command -Name {} -ErrorAction SilentlyContinue | Select-Object -First 1).Source", quote(cmd)),
-        None => quote(&m.version),
+    let detail = match (sources.first(), commands.first()) {
+        (Some((path, _)), _) => path.clone(),
+        (None, Some(cmd)) => format!("(Get-Command -Name {} -ErrorAction SilentlyContinue | Select-Object -First 1).Source", quote(cmd)),
+        (None, None) => quote(&m.version),
     };
     // Only fill default ok status if init didn't already set a custom detail.
     body.push(format!("if (-not $_goatty_state.Contains({feature_q})) {{ $_goatty_state[{feature_q}] = \"ok`t\" + ({detail}) }}"));
 
     let mut main = format!("# --- {} ---\n", ctx.label);
-    if commands.is_empty() {
+    let tests: Vec<String> = commands
+        .iter()
+        .map(|c| format!("(Get-Command -Name {} -ErrorAction SilentlyContinue)", quote(c)))
+        .chain(sources.iter().map(|(path, _)| format!("(Test-Path -LiteralPath {path} -PathType Leaf)")))
+        .collect();
+    if tests.is_empty() {
         main.push_str(&body.join("\n"));
         main.push('\n');
     } else {
-        let tests: Vec<String> =
-            commands.iter().map(|c| format!("(Get-Command -Name {} -ErrorAction SilentlyContinue)", quote(c))).collect();
         main.push_str(&format!("if ({}) {{\n", tests.join(" -and ")));
         for line in &body {
             main.push_str(&format!("  {line}\n"));
@@ -361,6 +473,7 @@ mod tests {
             home: Some(r"C:\Users\u"),
             label: "eza 1.0.0".into(),
             feature: crate::zsh::feature("eza"),
+            packages: "$_goatty_packages".into(),
         }
     }
 
@@ -399,6 +512,40 @@ mod tests {
         assert!(r.main.contains(". (Join-Path $goatty_plugin_dir 'pwsh/init.ps1')"), "{}", r.main);
         assert!(r.main.contains("$_goatty_state['plugin:eza'] = 'missing'"), "{}", r.main);
         assert_eq!(r.uses_init.as_deref(), Some("pwsh/init.ps1"));
+    }
+
+    #[test]
+    fn script_packages_load_on_their_shell_only() {
+        let text = EXAMPLE
+            .replace("bin = [\"eza\"]", "source = \"tips.psm1\"")
+            .replace("[[alias]]\nname = \"ls\"\ncommand = \"eza\"\nargs = [\"{args}\"]\nwhen = \"replace_ls\"\n", "")
+            .replace("[permissions]", "[compat]\nshells = [\"powershell\"]\n\n[permissions]");
+        let m = parse(&text, None).unwrap_or_else(|e| panic!("{e}"));
+        let (v, _) = resolve(&m, &BTreeMap::new());
+        let r = render(&m, &v, &ctx());
+        assert!(
+            r.main.contains("if ((Test-Path -LiteralPath (Join-Path $_goatty_packages 'eza/tips.psm1') -PathType Leaf)) {"),
+            "{}",
+            r.main
+        );
+        assert!(r.main.contains("Import-Module -Name (Join-Path $_goatty_packages 'eza/tips.psm1') -Global"), "{}", r.main);
+        let zsh = crate::zsh::render(&m, &v, &crate::zsh::tests::ctx());
+        assert!(!zsh.main.contains("tips.psm1"), "{}", zsh.main);
+
+        let ps1 = parse(&text.replace("tips.psm1", "tips.ps1"), None).unwrap();
+        let r = render(&ps1, &v, &ctx());
+        assert!(r.main.contains("  . (Join-Path $_goatty_packages 'eza/tips.ps1')\n"), "{}", r.main);
+    }
+
+    #[test]
+    fn joined_arguments_use_powershell_quoting() {
+        let text =
+            EXAMPLE.replace("value = \"2\"", "value = \"eza {args}\"").replace("arg = \"--icons={value}\"", "arg = \"--icons=@{value}\"");
+        let m = parse(&text, None).unwrap();
+        let (v, _) = resolve(&m, &BTreeMap::new());
+        let r = render(&m, &v, &ctx());
+        assert!(r.early.contains("-Value 'eza ''--icons=@auto''"), "{}", r.early);
+        assert!(crate::zsh::render(&m, &v, &crate::zsh::tests::ctx()).early.contains("'eza --icons=@auto'"));
     }
 
     #[test]

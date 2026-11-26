@@ -96,6 +96,7 @@ fn render_plugins(cfg: &PowerShellConfig<'_>) -> Vec<GeneratedFile> {
             home: home.as_deref(),
             label: a.label.clone(),
             feature: a.feature(),
+            packages: "$_goatty_packages".into(),
         };
         let r = ps::render(&a.manifest, &a.values, &ctx);
         if !r.early.is_empty() {
@@ -139,6 +140,7 @@ fn render_settings(cfg: &PowerShellConfig<'_>) -> String {
     scalar(&mut out, "_goatty_dir", &d.pwsh_dir().to_string_lossy());
     scalar(&mut out, "_goatty_bin", &d.bin_dir().to_string_lossy());
     scalar(&mut out, "_goatty_tools", &d.tools_dir().to_string_lossy());
+    scalar(&mut out, "_goatty_packages", &d.plugins_dir().to_string_lossy());
     scalar(&mut out, "_goatty_completions", &d.pwsh_completions_dir().to_string_lossy());
     scalar(&mut out, "_goatty_cache", &d.cache.to_string_lossy());
     scalar(&mut out, "_goatty_user_additions", &d.user_ps_profile().to_string_lossy());

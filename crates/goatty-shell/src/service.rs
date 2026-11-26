@@ -115,7 +115,15 @@ impl HostService {
     fn environment_issues(&self, value: &HostSettings) -> Vec<String> {
         let mut issues = Vec::new();
         if let Some(dirs) = self.launcher.dirs() {
-            issues.extend(crate::plugins::active(dirs, value).1);
+            let mut found = crate::plugins::active(dirs, value).1;
+            // Settings the shared shell config brings for a plugin that isn't
+            // for this host (another OS or shell) aren't a problem here.
+            if found.iter().any(|i| crate::plugins::missing_plugin_issue(i).is_some())
+                && let Ok(foreign) = self.plugins(|p| Ok(p.not_for_this_host()))
+            {
+                found.retain(|i| crate::plugins::missing_plugin_issue(i).is_none_or(|id| !foreign.contains(id)));
+            }
+            issues.extend(found);
         }
         if cfg!(windows) {
             issues.extend(crate::aliases::powershell_issues(value));

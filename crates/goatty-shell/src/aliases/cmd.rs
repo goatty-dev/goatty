@@ -27,7 +27,7 @@ fn installed(svc: &HostService, settings: &HostSettings) -> Vec<(Manifest, bool)
     lock.plugins
         .iter()
         .filter_map(|(id, e)| match lock::manifest_of(dirs, id, e) {
-            Ok(m) => Some((m, settings.plugins.get(id).is_none_or(|c| c.enabled))),
+            Ok(m) => Some((m.for_platform(&goatty_plugin::manifest::Platform::host()), settings.plugins.get(id).is_none_or(|c| c.enabled))),
             Err(e) => {
                 log::warn!("{e:#}");
                 None

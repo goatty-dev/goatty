@@ -139,7 +139,7 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
     let commands: Vec<&str> = m.executables().chain(m.requires.commands.iter().map(String::as_str)).collect();
     // Each package script: the first of the system's copies and goatty's own.
     let mut find = Vec::new();
-    for (p, src) in m.sources() {
+    for (p, src) in m.sources_for("zsh") {
         let mut candidates: Vec<String> = if p.prefer_system { p.system_paths.iter().map(|s| quote(s)).collect() } else { Vec::new() };
         candidates.push(format!("\"{}/{}/{src}\"", ctx.packages, p.id));
         find.push(format!("_goatty_find {} && _goatty_src[{}]=$REPLY", candidates.join(" "), p.id));
@@ -157,13 +157,13 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
         body.push("builtin unset goatty_settings goatty_plugin_dir".into());
         r.uses_init = Some(init.clone());
     }
-    for (p, _) in m.sources() {
+    for (p, _) in m.sources_for("zsh") {
         body.push(format!("builtin source -- \"${{_goatty_src[{}]}}\"", p.id));
     }
     if m.zsh.load == Load::Prompt {
         body.push(format!("typeset -g _goatty_prompt={}", m.id));
     }
-    let detail = match (m.sources().next(), commands.first()) {
+    let detail = match (m.sources_for("zsh").next(), commands.first()) {
         (Some((p, _)), _) => format!("\"${{_goatty_src[{}]}}\"", p.id),
         (None, Some(cmd)) => format!("\"$commands[{cmd}]\""),
         (None, None) => quote(&m.version),
@@ -177,7 +177,7 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
     let tests: Vec<String> = commands
         .iter()
         .map(|c| format!("$+commands[{c}]"))
-        .chain(m.sources().map(|(p, _)| format!("${{+_goatty_src[{}]}}", p.id)))
+        .chain(m.sources_for("zsh").map(|(p, _)| format!("${{+_goatty_src[{}]}}", p.id)))
         .collect();
     if tests.is_empty() {
         main.push_str(&body.join("\n"));
@@ -194,14 +194,14 @@ pub fn render(m: &Manifest, values: &Values, ctx: &Ctx<'_>) -> Rendered {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
     use crate::manifest::{parse, tests::EXAMPLE};
     use crate::schema::resolve;
 
-    fn ctx() -> Ctx<'static> {
+    pub(crate) fn ctx() -> Ctx<'static> {
         Ctx {
             dir: "$_goatty_dir/plugins/eza".into(),
             home: Some("/home/u"),

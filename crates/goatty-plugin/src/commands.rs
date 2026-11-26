@@ -130,6 +130,12 @@ pub struct PaletteCommand {
     /// Also in the terminal's right-click menu.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<CommandMenu>,
+    /// Only on these OSes; empty: everywhere ([`Manifest::for_platform`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// Only with these managed shells; empty: every shell the plugin supports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 /// Where a palette command opens when run (#241).
@@ -1422,6 +1428,8 @@ choices = [{ value = "q" }, { value = "wq" }, { value = "q!" }]
             pane: None,
             inputs: Vec::new(),
             when: None,
+            os: Vec::new(),
+            shells: Vec::new(),
             open_in: OpenIn::Current,
             menu: None,
         };
@@ -1560,6 +1568,8 @@ optional = true
             when: None,
             open_in: OpenIn::Current,
             menu: None,
+            os: Vec::new(),
+            shells: Vec::new(),
         };
         let mut v = BTreeMap::new();
         v.insert("depth".into(), "2".into());

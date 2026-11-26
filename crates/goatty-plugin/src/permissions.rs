@@ -75,7 +75,7 @@ impl Permission {
 
     pub fn title(self) -> &'static str {
         match self {
-            Permission::Binaries => "Installs and runs programs or zsh plugins",
+            Permission::Binaries => "Installs and runs programs or shell plugins",
             Permission::ShellCode => "Runs its own shell code in every goatty shell",
             Permission::Network => "The tool uses the network",
             Permission::Aliases => "Adds aliases",
@@ -91,7 +91,7 @@ impl Permission {
     pub fn meaning(self) -> &'static str {
         match self {
             Permission::Binaries => {
-                "Downloaded programs and zsh plugins run with your permissions: they can read and change your files. goatty checks every download against the checksum in the manifest."
+                "Downloaded programs and shell plugins run with your permissions: they can read and change your files. goatty checks every download against the checksum in the manifest."
             }
             Permission::ShellCode => {
                 "This code runs every time a goatty shell starts, with your permissions. Read it below before installing."
@@ -237,9 +237,12 @@ pub fn describe(m: &Manifest) -> Vec<Granted> {
                     .iter()
                     .map(|pk| {
                         let mut what: Vec<String> = pk.bin.iter().map(|b| bin_name(b).to_owned()).collect();
-                        what.extend(pk.source.as_ref().map(|s| format!("{} (sourced by the shell)", bin_name(s))));
+                        if !pk.applets.is_empty() {
+                            what.push(format!("also on PATH as {}", pk.applets.join(", ")));
+                        }
+                        what.extend(pk.source.as_ref().map(|s| format!("{} (loaded by the shell)", bin_name(s))));
                         if !pk.completions.is_empty() {
-                            what.push(format!("`{}` once after the download (zsh completions)", pk.completions.join(" ")));
+                            what.push(format!("`{}` once after the download (shell completions)", pk.completions.describe()));
                         }
                         format!("{} {}: {}", pk.id, pk.version, what.join(", "))
                     })
@@ -305,6 +308,21 @@ mod tests {
         assert_eq!(d[0].details, ["eza 0.23.4: eza"]);
         assert!(d[0].reason.contains("GitHub"));
         assert_eq!(d[1].details, ["ls → eza"]);
+    }
+
+    #[test]
+    fn describes_applets_and_completions() {
+        let text = EXAMPLE
+            .replace(
+                "bin = [\"eza\"]",
+                "bin = [\"eza\"]\napplets = [\"exa\"]\ncompletions = { zsh = [\"eza\", \"zsh\"], powershell = [\"eza\", \"ps1\"] }",
+            )
+            .replace("[permissions]", "[compat]\nshells = [\"zsh\", \"powershell\"]\n\n[permissions]");
+        let m = parse(&text, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            describe(&m)[0].details,
+            ["eza 0.23.4: eza, also on PATH as exa, `powershell: eza ps1; zsh: eza zsh` once after the download (shell completions)"]
+        );
     }
 
     #[test]
