@@ -1,6 +1,9 @@
-//! The bundled JetBrainsMono Nerd Font (`assets/fonts`): registered at start
-//! so Nerd Font symbols (prompt, tab icons) work without installing a font.
-//! Also finds the installed monospace families for the font picker.
+//! The bundled fonts (`assets/fonts`), registered at start: JetBrainsMono
+//! Nerd Font, so Nerd Font symbols (prompt, tab icons) work without
+//! installing a font, and Inter, the UI font, as static faces so its weights
+//! show (GPUI on Linux draws a variable font at weight 400 whatever weight is
+//! asked for, zed#64783). Also finds the installed monospace families for
+//! the font picker.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -17,6 +20,14 @@ const FACES: &[&[u8]] = &[
     include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-BoldItalic.ttf"),
 ];
 
+/// The UI font's faces (regular, medium, semibold, bold: the weights the UI uses).
+const UI_FACES: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+];
+
 /// Register the bundled faces. Returns the font families installed on the
 /// system, read before registering (font resolution prefers an installed
 /// Nerd Font over the bundled one).
@@ -25,13 +36,16 @@ pub fn register(cx: &App) -> Vec<String> {
     if let Err(e) = cx.text_system().add_fonts(FACES.iter().map(|f| Cow::Borrowed(*f)).collect()) {
         log::error!("couldn't load the bundled {}: {e:#}", FontSettings::BUNDLED);
     }
+    if let Err(e) = cx.text_system().add_fonts(UI_FACES.iter().map(|f| Cow::Borrowed(*f)).collect()) {
+        log::error!("couldn't load the bundled {}: {e:#}", FontSettings::BUNDLED_UI);
+    }
     system
 }
 
 /// The font families goatty can use, found without a window (for
 /// `goatty settings validate`): installed ones (every family name each face
 /// declares, matching both fontconfig on Linux and DirectWrite on Windows),
-/// plus the bundled one. Reads every font file's header, so it takes a moment.
+/// plus the bundled ones. Reads every font file's header, so it takes a moment.
 /// Empty when no font is found, so font checks are skipped rather than
 /// reporting every family missing.
 pub fn installed_families() -> Vec<String> {
@@ -42,6 +56,7 @@ pub fn installed_families() -> Vec<String> {
         return names;
     }
     names.push(FontSettings::BUNDLED.to_string());
+    names.push(FontSettings::BUNDLED_UI.to_string());
     names.sort_unstable();
     names.dedup();
     names
@@ -130,6 +145,27 @@ pub mod tests {
                 .and_then(|n| n.to_string());
             assert_eq!(typographic.as_deref().unwrap_or(&family), FontSettings::BUNDLED);
         }
+    }
+
+    /// The UI font's faces are static faces of one family at the weights
+    /// the UI asks for, so GPUI picks each by weight.
+    #[test]
+    fn bundled_ui_faces() {
+        let mut weights = Vec::new();
+        for data in UI_FACES {
+            let face = ttf_parser::Face::parse(data, 0).expect("bundled UI font parses");
+            assert!(!face.is_variable(), "a variable face renders at 400 only");
+            let family = face
+                .names()
+                .into_iter()
+                .find(|n| n.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY && n.is_unicode())
+                .or_else(|| face.names().into_iter().find(|n| n.name_id == ttf_parser::name_id::FAMILY && n.is_unicode()))
+                .and_then(|n| n.to_string())
+                .expect("family name");
+            assert_eq!(family, FontSettings::BUNDLED_UI);
+            weights.push(face.weight().to_number());
+        }
+        assert_eq!(weights, [400, 500, 600, 700]);
     }
 
     /// Every bundled face measures as monospace.

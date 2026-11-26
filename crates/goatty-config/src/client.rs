@@ -302,6 +302,11 @@ impl FontSettings {
     /// `assets/fonts`): Nerd Font icons work without installing anything.
     pub const BUNDLED: &str = "JetBrainsMono Nerd Font";
 
+    /// The UI font goatty ships (static Regular, Medium, SemiBold and Bold
+    /// faces in `assets/fonts`): its weights work everywhere, which a
+    /// variable font's don't in GPUI on Linux (zed#64783).
+    pub const BUNDLED_UI: &str = "Inter";
+
     /// Default proportional families for goatty's own windows.
     pub const DEFAULT_UI_FALLBACKS: &'static [&'static str] =
         &["Inter", "Segoe UI Variable", "Segoe UI", "Cantarell", "Noto Sans", "Ubuntu", "Open Sans", "DejaVu Sans", "Liberation Sans"];
@@ -329,17 +334,18 @@ impl FontSettings {
     /// The proportional family for goatty's own windows, given the
     /// installed fonts:
     /// 1. the explicit `ui_family`;
-    /// 2. the first of `ui_fallbacks` that is installed;
-    /// 3. `"sans-serif"`.
+    /// 2. the first of `ui_fallbacks` that is installed, counting
+    ///    [`Self::BUNDLED_UI`] as installed;
+    /// 3. [`Self::BUNDLED_UI`].
     pub fn resolve_ui_family(&self, fonts: &[String]) -> String {
-        let installed = |f: &&String| fonts.iter().any(|i| i == *f);
+        let installed = |f: &&String| fonts.iter().any(|i| i == *f) || *f == Self::BUNDLED_UI;
         self.ui_family
             .as_deref()
             .map(str::trim)
             .filter(|f| !f.is_empty())
             .map(String::from)
             .or_else(|| self.ui_fallbacks.iter().find(installed).cloned())
-            .unwrap_or_else(|| "sans-serif".into())
+            .unwrap_or_else(|| Self::BUNDLED_UI.into())
     }
 }
 
@@ -1543,7 +1549,10 @@ impl ClientSettings {
                 && custom_ui_fallbacks
                 && !self.font.ui_fallbacks.iter().any(|f| fallback_installed(f)) =>
             {
-                issues.push(Issue::new("font.ui_fallbacks", "none of these fonts is installed; using sans-serif"));
+                issues.push(Issue::new(
+                    "font.ui_fallbacks",
+                    format!("none of these fonts is installed; using the bundled {}", FontSettings::BUNDLED_UI),
+                ));
             }
             _ => {}
         }
@@ -1765,9 +1774,13 @@ mod tests {
         assert_eq!(explicit.resolve_family(&[]), "Iosevka");
         assert!(is_nerd_font("Hack NF") && is_nerd_font("JetBrainsMono Nerd Font Mono") && !is_nerd_font("Fira Code"));
 
-        // UI font: explicit family, then first installed fallback, then sans-serif.
-        assert_eq!(f.resolve_ui_family(&[]), "sans-serif");
-        assert_eq!(f.resolve_ui_family(&system(&["Noto Sans", "Inter"])), "Inter");
+        // UI font: explicit family, then first installed fallback (the
+        // bundled one counts), then the bundled one.
+        assert_eq!(f.resolve_ui_family(&[]), FontSettings::BUNDLED_UI, "bundled, so always there");
+        assert_eq!(f.resolve_ui_family(&system(&["Noto Sans", "Cantarell"])), FontSettings::BUNDLED_UI, "first in the defaults");
+        let ui_plain = FontSettings { ui_fallbacks: system(&["Cantarell", "Noto Sans"]), ..f.clone() };
+        assert_eq!(ui_plain.resolve_ui_family(&system(&["Noto Sans"])), "Noto Sans");
+        assert_eq!(ui_plain.resolve_ui_family(&system(&["Ubuntu"])), FontSettings::BUNDLED_UI);
         let ui_explicit = FontSettings { ui_family: Some("Atkinson Hyperlegible".into()), ..f };
         assert_eq!(ui_explicit.resolve_ui_family(&[]), "Atkinson Hyperlegible");
     }
