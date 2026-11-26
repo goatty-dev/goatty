@@ -36,12 +36,12 @@ impl WakeListener {
 /// Wakes every view of a session (two windows of this process can show the
 /// same one: a workspace shown in both, #215), each at most once per frame.
 #[derive(Default)]
-struct Waker {
+pub(crate) struct Waker {
     listeners: Mutex<Vec<std::sync::Weak<WakeListener>>>,
 }
 
 impl Waker {
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         let mut listeners = self.listeners.lock();
         listeners.retain(|l| match l.upgrade() {
             Some(l) => {
@@ -56,7 +56,7 @@ impl Waker {
 
     /// A new view's wake-ups. It's woken once right away, for what
     /// happened before it existed (the session may even have ended).
-    fn subscribe(&self) -> (Arc<WakeListener>, flume::Receiver<()>) {
+    pub(crate) fn subscribe(&self) -> (Arc<WakeListener>, flume::Receiver<()>) {
         let (tx, rx) = flume::unbounded();
         let _ = tx.send(());
         let l = Arc::new(WakeListener { pending: AtomicBool::new(true), tx });

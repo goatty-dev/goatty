@@ -18,6 +18,7 @@ mod connect;
 mod custom_commands;
 mod fonts;
 mod hosts;
+mod links;
 mod output_view;
 mod paste_confirm;
 mod pickers;
@@ -70,13 +71,25 @@ fn main() -> Result<()> {
     let parent_console = attach_parent_console();
     let cli = Cli::parse();
     // Subcommands work without a window (and without a display).
-    if cli.cmd.is_some() {
+    // `goatty open <URL>` and bare `goatty goatty://…` hand off to a running
+    // GUI if one is reachable, or fall through to start the GUI normally.
+    let mut pending_urls: Vec<String> = Vec::new();
+    if let Some(cmd) = cli.cmd.as_ref() {
         if cli.plain {
             anyhow::bail!("--plain only applies when opening a terminal window");
         }
         let remote = !cli.remote.is_empty();
-        match &cli.cmd {
-            Some(cli::Command::Settings(c)) => {
+        match cmd {
+            cli::Command::Open { url } => {
+                if remote {
+                    anyhow::bail!("--ssh, --via, and --tailnet don't apply to `open`");
+                }
+                if !cli.urls.is_empty() {
+                    anyhow::bail!("pass one URL to `goatty open <URL>`");
+                }
+                pending_urls.push(url.clone());
+            }
+            cli::Command::Settings(c) => {
                 if remote && !matches!(c, cli::SettingsCmd::Export { .. } | cli::SettingsCmd::Import { .. }) {
                     anyhow::bail!(
                         "--ssh and --via only apply to `settings export` and `settings import` (run `goattyd settings` on the host for its host.json)"
@@ -86,14 +99,14 @@ fn main() -> Result<()> {
                 let Some(cli::Command::Settings(c)) = cli.cmd else { unreachable!() };
                 return commands::settings(c, endpoint);
             }
-            Some(cli::Command::Theme(_)) => {
+            cli::Command::Theme(_) => {
                 if remote {
                     anyhow::bail!("--ssh and --via don't apply to `theme`");
                 }
                 let Some(cli::Command::Theme(c)) = cli.cmd else { unreachable!() };
                 return commands::theme(c);
             }
-            Some(cli::Command::Net(c)) => {
+            cli::Command::Net(c) => {
                 let is_pair = matches!(c, cli::NetCmd::Pair { .. });
                 if remote && (!is_pair || cli.remote.via.is_some() || cli.remote.tailnet.is_some()) {
                     anyhow::bail!("--ssh, --via, and --tailnet don't apply here (use `goatty net pair --ssh HOST`)");
@@ -103,16 +116,50 @@ fn main() -> Result<()> {
                 let Some(cli::Command::Net(c)) = cli.cmd else { unreachable!() };
                 return commands::net(c, top_ssh, top_daemon);
             }
-            Some(cli::Command::Completions { shell }) => {
+            cli::Command::Completions { shell } => {
                 if remote {
                     anyhow::bail!("--ssh and --via don't apply to `completions`");
                 }
                 print!("{}", cli::completion_script(*shell));
                 return Ok(());
             }
-            None => unreachable!(),
         }
+    } else if !cli.urls.is_empty() {
+        if cli.plain || !cli.remote.is_empty() {
+            anyhow::bail!("--ssh, --via, --tailnet, and --plain don't apply when opening a goatty:// link");
+        }
+        pending_urls = cli.urls.clone();
     }
+
+    let mut initial_links: Vec<links::Link> = Vec::new();
+    if !pending_urls.is_empty() {
+        // Validate every URL strictly before attempting handoff or launch.
+        let parsed: Vec<(String, links::Link)> = pending_urls
+            .into_iter()
+            .map(|raw| links::parse(&raw).map(|link| (raw, link)).map_err(anyhow::Error::from))
+            .collect::<Result<_>>()?;
+        // Try handing off to a running GUI process first.
+        let mut all_delivered = true;
+        let mut undelivered = Vec::new();
+        for (raw, link) in parsed {
+            match links::send_to_running(&raw)? {
+                links::SendOutcome::Delivered => {}
+                links::SendOutcome::NoRunningApp => {
+                    all_delivered = false;
+                    undelivered.push(link);
+                }
+            }
+        }
+        if all_delivered {
+            return Ok(());
+        }
+        initial_links.extend(undelivered);
+    }
+    if let Some(page) = &cli.settings {
+        initial_links
+            .push(links::Link::Settings { page: settings_window::Page::from_name(page).map(links::PageTarget::Known), setting: None });
+    }
+
     #[cfg(windows)]
     if parent_console {
         detach_parent_console();
@@ -133,7 +180,6 @@ fn main() -> Result<()> {
     let on_launch = client.workspace.on_launch;
 
     let mode = cli.attach_mode(on_launch == OnLaunch::New);
-    let open_settings = cli.settings.clone();
     let endpoint = cli.endpoint()?;
     // Plain `goatty`: every window of the last run, with its tabs on every
     // host (#252). `--ssh`, `--new` and `--attach` ask for something else.
@@ -146,8 +192,8 @@ fn main() -> Result<()> {
         Vec::new()
     };
     if !reopen.is_empty() {
-        let first = Initial::Reopen(reopen.remove(0), None);
-        app::run(first, reopen.into_iter().map(|r| Initial::Reopen(r, None)).collect(), open_settings);
+        let first = Initial::Reopen(reopen.remove(0), Vec::new());
+        app::run(first, reopen.into_iter().map(|r| Initial::Reopen(r, Vec::new())).collect(), initial_links);
         return Ok(());
     }
     let initial = match endpoint {
@@ -174,10 +220,10 @@ fn main() -> Result<()> {
                 _ => false,
             };
             log::info!("backend: goattyd via {}", endpoint.label());
-            Initial::Connect(ConnectPlan { endpoint, mode, open_settings: None, plain, conn: None, join: None, active_tab: None })
+            Initial::Connect(ConnectPlan { endpoint, mode, initial_links: Vec::new(), plain, conn: None, join: None, active_tab: None })
         }
     };
-    app::run(initial, Vec::new(), open_settings);
+    app::run(initial, Vec::new(), initial_links);
     Ok(())
 }
 

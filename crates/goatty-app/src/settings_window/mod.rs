@@ -181,6 +181,109 @@ pub fn open_host_color(cx: &mut App, host: &str) {
     }
 }
 
+/// Show a toast in the open settings window, falling back to the app-wide
+/// router if the window isn't open. Deferred so callbacks running inside an
+/// active `SettingsWindow` entity update never re-enter it.
+pub(super) fn show_toast(cx: &mut App, t: Toast) {
+    cx.defer(move |cx| {
+        if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
+            && handle.update(cx, |_, window, cx| toast::show_in(window, cx, t.clone())).is_ok()
+        {
+            return;
+        }
+        toast::show(cx, t);
+    });
+}
+
+/// Open a `goatty://settings[/<page>][?setting=<key>]` link (#305).
+pub fn open_link_settings(cx: &mut App, page: Option<crate::links::PageTarget>, setting: Option<String>) {
+    use crate::links::PageTarget;
+    match (page, setting) {
+        (None, None) => {
+            open_at(cx, None);
+            if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+                let _ = handle.update(cx, |view, _, cx| {
+                    view.search.update(cx, |i, cx| i.set_text("", cx));
+                });
+            }
+        }
+        (Some(PageTarget::Known(p)), None) => {
+            open_at(cx, Some(p));
+            if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+                let _ = handle.update(cx, |view, _, cx| {
+                    view.search.update(cx, |i, cx| i.set_text("", cx));
+                });
+            }
+        }
+        (Some(PageTarget::Known(p)), Some(key)) => {
+            let entry = search::entry_for_page(p, &key);
+            open_at(cx, Some(p));
+            if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+                let _ = handle.update(cx, |view, window, cx| match entry {
+                    Some(e) => view.open_hit(&search::Hit::Setting(e), cx),
+                    None => {
+                        view.search.update(cx, |i, cx| i.set_text("", cx));
+                        toast::show_in(window, cx, Toast::info(crate::links::UNKNOWN_TOAST).key("links.unknown"));
+                    }
+                });
+            }
+        }
+        (None, Some(key)) => {
+            let entry = search::entry_for_key(&key);
+            open_at(cx, entry.map(|e| e.page));
+            if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+                let _ = handle.update(cx, |view, window, cx| match entry {
+                    Some(e) => view.open_hit(&search::Hit::Setting(e), cx),
+                    None => {
+                        view.search.update(cx, |i, cx| i.set_text("", cx));
+                        toast::show_in(window, cx, Toast::info(crate::links::UNKNOWN_TOAST).key("links.unknown"));
+                    }
+                });
+            }
+        }
+        (Some(PageTarget::Unknown(_)), _) => {
+            open_at(cx, None);
+            if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+                let _ = handle.update(cx, |view, window, cx| {
+                    view.search.update(cx, |i, cx| i.set_text("", cx));
+                    toast::show_in(window, cx, Toast::info(crate::links::UNKNOWN_TOAST).key("links.unknown"));
+                });
+            }
+        }
+    }
+}
+
+/// Open `goatty://plugins`: Settings → Plugins → Browse (#305).
+pub fn open_link_plugins_browse(cx: &mut App) {
+    open_at(cx, Some(Page::Plugins));
+    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        let _ = handle.update(cx, |view, _, cx| {
+            view.search.update(cx, |i, cx| i.set_text("", cx));
+            view.plugins.clear_filter(cx);
+            view.plugins.detail = None;
+            view.plugins.clear_review();
+            view.plugins.pending_link = None;
+            view.plugins.tab = plugins::Tab::Browse;
+            view.scroll.set_offset(gpui::point(px(0.), px(0.)));
+            view.load_plugins(false, cx);
+            cx.notify();
+        });
+    }
+}
+
+/// Open `goatty://plugins/<id>[?version=<v>&registry=<name>]`: the plugin's
+/// install review, or its detail page if already installed (#305).
+pub fn open_link_plugin(cx: &mut App, id: String, version: Option<String>, registry: Option<String>) {
+    open_at(cx, Some(Page::Plugins));
+    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
+        let _ = handle.update(cx, |view, window, cx| {
+            view.search.update(cx, |i, cx| i.set_text("", cx));
+            view.plugins.clear_filter(cx);
+            view.open_plugin_link(plugins::PluginLink { id, version, registry }, window, cx);
+        });
+    }
+}
+
 /// Open the settings window at `page` (or where it was).
 pub fn open_at(cx: &mut App, page: Option<Page>) {
     if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
@@ -536,6 +639,11 @@ impl SettingsWindow {
         let gen_name = cx.new(|cx| TextInput::new("before trying fish", "", cx).label("Name for this version"));
         let net = network::NetPage::new(cx);
         let mut subs = vec![
+            cx.observe_window_activation(window, |_, window, cx| {
+                if window.is_window_active() {
+                    crate::links::mark_active(cx);
+                }
+            }),
             cx.subscribe(&gen_name, |this, _, ev: &TextInputEvent, cx| {
                 if let TextInputEvent::Submitted(_) = ev {
                     this.save_generation_name(cx);
@@ -716,6 +824,10 @@ impl SettingsWindow {
         if same || self.draft.is_some() || self.busy || self.plugins.follow.is_some() || self.plugins.batch.is_some() {
             return;
         }
+        // Keep a pending plugin link only when picking up the first host on
+        // startup (`None -> Some`); switching between real hosts drops it so a
+        // link never hops hosts on its own.
+        let pending_link = if self.link.is_none() && link.is_some() { self.plugins.pending_link.take() } else { None };
         self.link = link;
         self.host = None;
         self.host_error = None;
@@ -725,6 +837,7 @@ impl SettingsWindow {
         self.gen_open = None;
         self.gen_diff = None;
         self.plugins = plugins::PluginsPage::default();
+        self.plugins.pending_link = pending_link;
         self.diag = diagnostics::DiagPage::default();
         self.net.reset();
         self.path.reset();
@@ -749,6 +862,7 @@ impl SettingsWindow {
             self.scroll.set_offset(gpui::point(px(0.), px(0.)));
             self.plugins.detail = None;
             self.plugins.clear_review();
+            self.plugins.pending_link = None;
             self.prompt.modules_open = false;
             self.prompt.dialog = None;
             self.everywhere.dialog = false;

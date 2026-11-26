@@ -421,13 +421,13 @@ impl Workspace {
         let plan = crate::connect::ConnectPlan {
             endpoint: conn.endpoint().clone(),
             mode: crate::session::AttachMode::Join(Some(id)),
-            open_settings: None,
+            initial_links: Vec::new(),
             plain: false,
             conn: Some(conn.clone()),
             join: None,
             active_tab: None,
         };
-        cx.defer(move |cx| crate::app::open_terminal_window(cx, crate::app::Initial::Connect(plan), None));
+        cx.defer(move |cx| crate::app::open_terminal_window(cx, crate::app::Initial::Connect(plan), Vec::new()));
     }
 
     /// The chip that names the active host's workspace and opens the
