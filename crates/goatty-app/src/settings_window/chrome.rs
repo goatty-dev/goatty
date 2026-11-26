@@ -11,6 +11,7 @@ use gpui::{
 use super::kit::{self, search_field};
 use super::{Page, SettingsWindow};
 use crate::settings::AppSettings;
+use crate::ui::brand;
 use crate::ui::controls::{ButtonKind, Tone, banner, button, button_with, icon_button, keycap};
 use crate::ui::focus::{self, Ring};
 use crate::ui::icons::Icon;
@@ -284,16 +285,7 @@ impl SettingsWindow {
                             .items_center()
                             .gap(px(10.))
                             .px(px(6.))
-                            .child(
-                                div()
-                                    .size(px(30.))
-                                    .rounded(px(9.))
-                                    .bg(ui.accent)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(Icon::Terminal.svg().size(px(17.)).text_color(ui.on_accent)),
-                            )
+                            .child(brand::logo(34., &cx.global::<AppSettings>().colors))
                             .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child("Settings")),
                     )
                     .child({

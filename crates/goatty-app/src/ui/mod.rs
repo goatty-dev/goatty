@@ -1,6 +1,7 @@
 //! goatty's own UI pieces (outside the terminal grid): colors derived from
 //! the terminal theme, basic controls, a text field, a color picker, icons.
 
+pub mod brand;
 pub mod color_picker;
 pub mod context_menu;
 pub mod controls;

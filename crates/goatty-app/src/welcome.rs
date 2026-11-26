@@ -32,6 +32,7 @@ use crate::settings::AppSettings;
 use crate::settings_window::kit::{choice_card as choice, row as settings_row, section as settings_section};
 use crate::settings_window::{self, HostLink, HostLinkGlobal, Page};
 use crate::shell_setup::{self, Progress};
+use crate::ui::brand;
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button, button_with, keycaps, stepper, toggle};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
@@ -1043,16 +1044,7 @@ impl Render for Welcome {
                     .px(px(28.))
                     .pt(px(20.))
                     .pb(px(12.))
-                    .child(
-                        div()
-                            .size(px(30.))
-                            .rounded(px(9.))
-                            .bg(ui.accent)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::Terminal.svg().size(px(17.)).text_color(ui.on_accent)),
-                    )
+                    .child(brand::logo(34., &cx.global::<AppSettings>().colors))
                     .child(div().flex_1())
                     .child(self.steps(ui)),
             )
