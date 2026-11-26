@@ -52,6 +52,10 @@ To try reattaching: run something in goatty, close the window, start `goatty` ag
 
 The packages install into `/usr`, with a launcher, an icon and shell completions. On any other distro, or without root, download and extract the release archive (`goatty-<version>-x86_64-linux.tar.gz`), then run `./install.sh` from its directory. It installs `goatty` and `goattyd` into `~/.local/bin`, the bundled remote daemons into `~/.local/lib/goatty/remote`, and a Goatty launcher and SVG icon in your XDG data directory. The launcher should appear in your desktop application menu. Add `~/.local/bin` to `PATH` to start Goatty from a terminal.
 
+## Install on Windows (preview)
+
+Releases also have Windows 10/11 x86_64 builds. `goatty-<version>-x86_64-windows.msi` installs goatty for your user only, without administrator rights: into `%LOCALAPPDATA%\Programs\goatty`, on your `PATH`, and in the Start Menu. Uninstall it from *Settings → Apps*. Or extract `goatty-<version>-x86_64-windows.zip` anywhere and run `goatty.exe`. The builds aren't code-signed yet, so SmartScreen may warn about the installer (*More info → Run anyway*).
+
 Environment variables: `GOATTY_FONT`, `GOATTY_FONT_SIZE`, `GOATTY_SHELL`, `GOATTY_SOCKET`, `GOATTY_STATS=1` (prints per-second frame stats to stderr), `GOATTY_RENDER=shaped` (ligature-capable line shaping instead of the glyph cache).
 
 Keys: `Ctrl+C` copies when text is selected and sends an interrupt otherwise. `Ctrl+V` / `Ctrl+Shift+V` paste, `Ctrl+Shift+C` copies, `Shift+PgUp/PgDn` scroll back, `Ctrl` with `+`/`-` (with or without Shift, on US and German layouts) changes the font size, `Ctrl+0` resets it. `Ctrl+Shift+P` opens the command palette (fuzzy search over every command), `Ctrl+,` opens settings.

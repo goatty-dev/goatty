@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  goatty's Windows installer: a per-user MSI (WiX v5), built by
+  scripts/package-windows.ps1 (release.yml). No Administrator prompt: it
+  installs into %LOCALAPPDATA%\Programs\goatty, adds that folder to the user's
+  PATH and a Start Menu shortcut, and removes all three on uninstall.
+  goatty's settings and logs (%APPDATA%\goatty, %LOCALAPPDATA%\goatty) stay.
+
+  Variables (wix build -d): Version (numeric, e.g. 0.3.0), Source (the folder
+  staged by the packaging script), Packaging (this folder).
+
+  Never change the UpgradeCode: it ties every release to the ones before it,
+  so installing a new MSI replaces the old version instead of adding a second.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="goatty"
+           Manufacturer="goatty"
+           Version="$(Version)"
+           UpgradeCode="DCFDA8F6-615A-4ABF-9125-1EE2ABE2A257"
+           Scope="perUser"
+           InstallerVersion="500"
+           Compressed="yes">
+    <!-- Pre-releases share their numeric version with the release (0.3.0-rc.1
+         and 0.3.0 are both 0.3.0), so the same version must upgrade too. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of goatty is already installed. Uninstall it first to install this one." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="goatty.ico" SourceFile="$(Packaging)\goatty.ico" />
+    <Property Id="ARPPRODUCTICON" Value="goatty.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/goatty-dev/goatty" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/goatty-dev/goatty/issues" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(Packaging)\license.rtf" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="goatty">
+          <!-- Static goattyds that goatty uploads to Linux hosts over SSH
+               (goatty_client::remote::find_bundled). -->
+          <Directory Id="RemoteDir" Name="remote" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <!-- Per-user components need a registry key path (ICE38) and must remove
+         the folders they create (ICE64). -->
+    <Component Id="Main" Directory="INSTALLFOLDER" Guid="C3E8DA21-6CB3-4EB9-900A-FF3A14DF1A5F">
+      <RegistryValue Root="HKCU" Key="Software\goatty" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+      <File Id="goatty.exe" Source="$(Source)\goatty.exe" />
+      <File Id="goattyd.exe" Source="$(Source)\goattyd.exe" />
+      <File Id="README.md" Source="$(Source)\README.md" />
+      <File Id="LICENSE_MIT" Source="$(Source)\LICENSE-MIT" />
+      <File Id="LICENSE_APACHE" Source="$(Source)\LICENSE-APACHE" />
+      <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="no" Permanent="no" />
+      <RemoveFolder Id="RemoveINSTALLFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveProgramsDir" Directory="ProgramsDir" On="uninstall" />
+    </Component>
+
+    <Component Id="Remote" Directory="RemoteDir" Guid="2CDB98AC-A450-4FDE-84E0-C9E1EF2485E6">
+      <RegistryValue Root="HKCU" Key="Software\goatty" Name="Remote" Type="integer" Value="1" KeyPath="yes" />
+      <File Id="goattyd_x86_64_linux" Source="$(Source)\remote\goattyd-x86_64-linux" />
+      <File Id="goattyd_aarch64_linux" Source="$(Source)\remote\goattyd-aarch64-linux" />
+      <RemoveFolder Id="RemoveRemoteDir" On="uninstall" />
+    </Component>
+
+    <!-- The App User Model ID must match the one goatty registers
+         (cx.set_app_identity in agent/notify.rs): Windows shows toast
+         notifications only for apps with a Start Menu shortcut carrying it. -->
+    <Component Id="StartMenu" Directory="ProgramMenuFolder" Guid="2B99E439-E9B3-4ED9-925E-9C17F39BD2C2">
+      <Shortcut Id="GoattyShortcut" Name="goatty" Description="GPU-rendered terminal" Target="[INSTALLFOLDER]goatty.exe">
+        <ShortcutProperty Key="System.AppUserModel.ID" Value="dev.goatty.goatty" />
+      </Shortcut>
+      <RegistryValue Root="HKCU" Key="Software\goatty" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- Windows can't replace a running goattyd.exe. Before an upgrade or an
+         uninstall replaces or removes the files, stop the installed goattyd
+         (its sessions end: ConPTY sessions can't outlive their daemon on
+         Windows). Runs before InstallValidate, so Windows Installer doesn't
+         count it as a file in use. On uninstall, also remove the Scheduled
+         Task that `goattyd service install` may have created. Errors are
+         ignored: nothing may be running, or the task may not exist. -->
+    <SetProperty Action="SetStopGoattydCmd" Id="WixQuietExecCmdLine"
+                 Value="&quot;[INSTALLFOLDER]goattyd.exe&quot; stop --force"
+                 After="CostFinalize" Sequence="execute"
+                 Condition="WIX_UPGRADE_DETECTED OR REMOVE~=&quot;ALL&quot;" />
+    <CustomAction Id="StopGoattyd" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="immediate" Return="ignore" />
+    <SetProperty Action="SetRemoveServiceCmd" Id="WixQuietExecCmdLine"
+                 Value="&quot;[INSTALLFOLDER]goattyd.exe&quot; service uninstall"
+                 After="StopGoattyd" Sequence="execute"
+                 Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="RemoveGoattydService" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec" Execute="immediate" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="StopGoattyd" After="SetStopGoattydCmd" Condition="WIX_UPGRADE_DETECTED OR REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveGoattydService" After="SetRemoveServiceCmd" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
