@@ -31,7 +31,6 @@
     <Property Id="ARPPRODUCTICON" Value="goatty.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/goatty-dev/goatty" />
     <Property Id="ARPHELPLINK" Value="https://github.com/goatty-dev/goatty/issues" />
-    <Property Id="ARPNOMODIFY" Value="1" />
     <Property Id="ARPNOREPAIR" Value="1" />
 
     <ui:WixUI Id="WixUI_Minimal" />
