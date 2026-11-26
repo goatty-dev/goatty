@@ -373,7 +373,13 @@ impl SettingsWindow {
                 Standing::NotSynced | Standing::Offline => Tone::Neutral,
             };
             let host = id.clone();
+            // Joining keeps a host's own differences only when goatty can read them.
+            let offline_join = !member && known.and_then(|k| k.link.as_ref()).is_none() && state.me.as_deref() != Some(id.as_str());
+            if offline_join {
+                detail.push("connect to it to make it follow".into());
+            }
             let mut r = row(ui, label.clone())
+                .disabled(offline_join)
                 .icon(if state.me.as_deref() == Some(id.as_str()) { Icon::Monitor } else { Icon::Server })
                 .desc(detail.join(" · "))
                 .control(
@@ -422,30 +428,38 @@ impl SettingsWindow {
         for u in untrusted {
             let name = u.name.clone().unwrap_or_else(|| goatty_config::shared::short_id(&u.device).to_owned());
             let (d1, d2) = (u.device.clone(), u.device.clone());
+            let ignored = state.ignored.contains(&u.device);
             sec = sec.child(
                 row(ui, format!("Changes from {name}"))
                     .icon(Icon::TriangleAlert)
                     .desc(format!(
-                        "{} change(s) signed by {} ({}) don't apply until you trust it",
+                        "{} change(s) signed by {} ({}) don't apply until you trust it{}",
                         u.entries,
                         name,
-                        goatty_config::shared::short_id(&u.device)
+                        goatty_config::shared::short_id(&u.device),
+                        if ignored { " · ignored: goatty doesn't ask about it" } else { "" }
                     ))
                     .control(
                         div()
                             .flex()
                             .gap(px(8.))
-                            .child(button_with(("shared-trust", hash(&u.device)), None, "Trust", ButtonKind::Primary, ui, move |_, cx| {
-                                shared_sync::trust_device(d1.clone(), true, cx)
-                            }))
                             .child(button_with(
-                                ("shared-ignore", hash(&u.device)),
+                                ("shared-trust", hash(&u.device)),
                                 None,
-                                "Ignore",
-                                ButtonKind::Normal,
+                                "Trust",
+                                ButtonKind::Primary,
                                 ui,
-                                move |_, cx| shared_sync::ignore_device(d2.clone(), cx),
-                            )),
+                                self.act_window(cx, move |v, window, cx| {
+                                    // The row goes once the device is trusted.
+                                    focus::hand_over(&v.focus, focus::Handover::Control("shared-sync-now".into()), window, cx);
+                                    shared_sync::trust_device(d1.clone(), true, cx)
+                                }),
+                            ))
+                            .children((!ignored).then(|| {
+                                button_with(("shared-ignore", hash(&u.device)), None, "Ignore", ButtonKind::Normal, ui, move |_, cx| {
+                                    shared_sync::ignore_device(d2.clone(), cx)
+                                })
+                            })),
                     ),
             );
         }
@@ -519,7 +533,8 @@ impl SettingsWindow {
                  disconnects; it asks before copying it there (to ~/.local/share/goatty, no sudo).",
             );
 
-        let setup = self.shared_section(ui, cx);
+        // Search's "Shared shell config" lands here.
+        let setup = kit::focus_target(ui, "Shared shell config", div().child(self.shared_section(ui, cx)));
 
         let form = card(ui)
             .p(px(16.))

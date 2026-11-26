@@ -552,7 +552,7 @@ impl SettingsWindow {
                                     .text_size(px(text::CAPTION))
                                     .text_color(ui.muted)
                                     .truncate()
-                                    .child(SharedString::from(format!("For new sessions on {}", self.host_label()))),
+                                    .child(SharedString::from(format!("For new sessions on {}", self.draft_target(cx)))),
                             ),
                     )
                     .when(self.busy, |d| d.child(div().text_size(px(text::SMALL)).text_color(ui.muted).child("Working…")))

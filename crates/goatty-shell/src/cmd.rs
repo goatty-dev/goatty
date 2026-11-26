@@ -672,7 +672,7 @@ fn apply_edit(
     }
     let outcome = svc.set(&store::to_json(&loaded.value, &loaded.unknown), true)?;
     // On a host that follows the shared config, the change is its override.
-    let kept = if shared_key { svc.capture(&before).unwrap_or(0) } else { 0 };
+    let kept = if shared_key { svc.capture(&before, &loaded.value).unwrap_or(0) } else { 0 };
     match outcome.generation {
         Some(g) => println!("{key} = {value} (generation {g}; new sessions use it)"),
         None => println!("{key} = {value}"),

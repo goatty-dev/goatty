@@ -1222,6 +1222,10 @@ impl Document for ClientSettings {
             1
         } else if user.pointer("/selection/copy_on_select").is_some() {
             2
+        } else if user.pointer("/ssh/sync").is_some()
+            || user.pointer("/ssh/hosts").and_then(serde_json::Value::as_array).is_some_and(|h| h.iter().any(|h| h.get("sync").is_some()))
+        {
+            3
         } else {
             Self::VERSION
         }
@@ -1715,6 +1719,9 @@ mod tests {
         let loaded = crate::store::parse::<ClientSettings>(text);
         assert!(loaded.issues.is_empty() && loaded.unknown.is_empty(), "{:?} {:?}", loaded.issues, loaded.unknown);
         assert!(loaded.value.ssh.plain("pi"));
+        // Unversioned files with the old keys take the migration too.
+        let loaded = crate::store::parse::<ClientSettings>(r#"{"ssh": {"sync": "never"}}"#);
+        assert!(loaded.issues.is_empty() && loaded.unknown.is_empty(), "{:?} {:?}", loaded.issues, loaded.unknown);
     }
 
     fn with(vars: &[(&str, &str)]) -> ClientSettings {

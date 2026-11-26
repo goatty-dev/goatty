@@ -47,11 +47,14 @@ pub(crate) fn generations(daemon: &Daemon, req: ReqId) -> ServerMsg {
 
 pub(crate) fn rollback(daemon: &Daemon, req: ReqId, to: Option<u32>) -> ServerMsg {
     let before = daemon.host.settings().file.value;
-    let result = daemon.host.rollback(to);
-    if result.is_ok()
-        && let Err(e) = daemon.host.capture(&before)
+    let mut result = daemon.host.rollback(to);
+    if let Ok(snap) = &mut result
+        && let Err(e) = daemon.host.capture(&before, &goatty_config::store::parse::<goatty_config::HostSettings>(&snap.json).value)
     {
         log::warn!("couldn't keep the rollback in the shared config: {e:#}");
+        snap.issues.push(format!(
+            "rolled back on this host, but couldn't keep it as this host's override in the shared config ({e:#}); the next shared update may undo it"
+        ));
     }
     match result {
         Ok(s) => snapshot_msg(req, s),

@@ -61,9 +61,20 @@ pub mod api {
     #[serde(tag = "kind", rename_all = "snake_case")]
     pub enum Reply {
         Status(Box<Status>),
-        Entries { entries: Vec<Entry>, have: VersionVector },
+        /// One page of what the client lacks (oldest first per device);
+        /// `more`: pull again with the new version vector for the rest.
+        Entries {
+            entries: Vec<Entry>,
+            have: VersionVector,
+            #[serde(default)]
+            more: bool,
+        },
         Done,
     }
+
+    /// How much entry JSON one `Pull` reply or `Push` request carries at
+    /// most (a frame is at most 64 MiB).
+    pub const PAGE_BYTES: usize = 16 << 20;
 
     /// A host's view of the shared config.
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -186,6 +197,20 @@ impl Files {
 pub struct State {
     pub last_apply: Option<Applied>,
     pub needs_review: Vec<Review>,
+    /// The last apply didn't complete: the next push applies again even
+    /// when it brings nothing new.
+    pub retry: bool,
+}
+
+/// What reconciling the shared plugins did.
+#[derive(Debug, Default)]
+struct Reconciled {
+    lines: Vec<String>,
+    review: Vec<Review>,
+    /// Something went wrong (not just "needs review").
+    failed: bool,
+    /// The shell configuration changed (shells should reload).
+    reload: bool,
 }
 
 fn now_unix() -> u64 {
@@ -221,10 +246,12 @@ impl HostService {
             api::Request::Status => Ok(api::Reply::Status(Box::new(self.shared_status()?))),
             api::Request::Pull { have } => {
                 let (doc, ..) = self.shared_doc()?;
-                Ok(api::Reply::Entries { entries: doc.newer_than(&have), have: doc.version() })
+                let (entries, more) = doc.newer_than_page(&have, api::PAGE_BYTES);
+                Ok(api::Reply::Entries { entries, have: doc.version(), more })
             }
             api::Request::Push { entries } => {
-                if self.merge_shared(entries)? > 0 {
+                let retry = self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).retry;
+                if self.merge_shared(entries)? > 0 || retry {
                     self.apply_shared();
                 }
                 Ok(api::Reply::Status(Box::new(self.shared_status()?)))
@@ -234,7 +261,7 @@ impl HostService {
                     bail!("not a device key: {device:?}");
                 }
                 let files = self.shared_files()?;
-                let _guard = self.shared_lock();
+                let _guard = self.shared_lock()?;
                 let mut roots = Roots::load(&files.roots);
                 if roots.add(&device, &name) {
                     roots.save(&files.roots).with_context(|| format!("save {}", files.roots.display()))?;
@@ -258,7 +285,7 @@ impl HostService {
             return Ok(0);
         }
         let files = self.shared_files()?;
-        let _guard = self.shared_lock();
+        let _guard = self.shared_lock()?;
         let mut doc = SharedDoc::load(&files.doc);
         let n = doc.merge(entries);
         if n > 0 {
@@ -295,9 +322,13 @@ impl HostService {
     /// install switches its plugin on), then the settings as one generation,
     /// then a reload of idle shells. The outcome goes to
     /// [`Status::last_apply`]; nothing here fails the request that caused it.
+    ///
+    /// The whole apply holds the shared-files lock (also against goattyd's
+    /// CLI in another process), so an older document can't be committed
+    /// after a newer one.
     pub fn apply_shared(&self) -> Option<Applied> {
         let _guard = self.shared_apply.lock().unwrap_or_else(|e| e.into_inner());
-        let outcome = match self.apply_shared_inner() {
+        let outcome = match self.shared_lock().and_then(|_files| self.apply_shared_inner()) {
             Ok(None) => return None,
             Ok(Some(a)) => a,
             Err(e) => {
@@ -305,7 +336,9 @@ impl HostService {
                 Applied { unix: now_unix(), ok: false, lines: vec![format!("{e:#}")], generation: self.active_generation(), changed: false }
             }
         };
-        self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).last_apply = Some(outcome.clone());
+        let mut state = self.shared_state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retry = !outcome.ok;
+        state.last_apply = Some(outcome.clone());
         Some(outcome)
     }
 
@@ -315,21 +348,21 @@ impl HostService {
         if doc.member(&host, &trust) != Some(true) {
             return Ok(None);
         }
-        let mut lines = Vec::new();
-        let (plugin_lines, review) = self.reconcile_plugins(&doc, &trust);
-        lines.extend(plugin_lines);
-        self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).needs_review = review;
+        let r = self.reconcile_plugins(&doc, &trust);
+        let mut lines = r.lines;
+        self.shared_state.lock().unwrap_or_else(|e| e.into_inner()).needs_review = r.review;
 
         let current = self.settings().file;
         let mut resolved = doc.resolve(Some(&host), &trust, &current.value).value;
-        keep_host_only_plugins(&doc, &current.value, &mut resolved);
-        let mut changed = false;
-        let mut ok = true;
+        keep_host_only_plugins(&doc, &trust, &host, &current.value, &mut resolved);
+        // An install or uninstall may have built a generation already.
+        let mut changed = r.reload;
+        let mut ok = !r.failed;
         if resolved != current.value {
             let before = current.value.clone();
             match self.set(&store::to_json(&resolved, &current.unknown), true) {
                 Ok(o) if o.applied => {
-                    changed = !o.diff.is_empty();
+                    changed |= !o.diff.is_empty();
                     let n = shared::changes(&before, &resolved).len();
                     lines.push(format!("applied {n} setting change(s) from the shared config"));
                     lines.extend(o.issues.iter().map(|i| format!("⚠ {i}")));
@@ -357,37 +390,50 @@ impl HostService {
     /// Install or update the shared plugins this host's registries vouch
     /// for, and uninstall the ones the shared config removed. Returns what
     /// happened and what needs a review on this host.
-    fn reconcile_plugins(&self, doc: &SharedDoc, trust: &Trust) -> (Vec<String>, Vec<Review>) {
-        let mut lines = Vec::new();
-        let mut review = Vec::new();
+    fn reconcile_plugins(&self, doc: &SharedDoc, trust: &Trust) -> Reconciled {
+        let mut out = Reconciled::default();
         let pins = doc.plugins(trust);
         let removed = doc.removed_plugins(trust);
         if pins.is_empty() && removed.is_empty() {
-            return (lines, review);
+            return out;
         }
         let catalog = match self.plugin_request(plugin_api::Request::Catalog { refresh: false }) {
             Ok(plugin_api::Reply::Catalog(c)) => c,
-            Ok(_) => return (lines, review),
+            Ok(other) => {
+                out.failed = true;
+                out.lines.push(format!("unexpected plugin reply {other:?}"));
+                return out;
+            }
             Err(e) => {
-                lines.push(format!("couldn't read the plugins here: {e:#}"));
-                return (lines, review);
+                out.failed = true;
+                out.lines.push(format!("couldn't read the plugins here: {e:#}"));
+                return out;
             }
         };
         let installed: BTreeMap<&str, &plugin_api::Installed> =
             catalog.installed.iter().filter(|i| !i.builtin).map(|i| (i.id.as_str(), i)).collect();
         for (id, pin) in &pins {
-            if let Some(i) = installed.get(id.as_str())
-                && (i.version == pin.version || crate::plugins::newer(&i.version, &pin.version))
-            {
-                continue;
+            if let Some(i) = installed.get(id.as_str()) {
+                if i.source != pin.registry {
+                    // Not the plugin the shared config means: don't replace it unasked.
+                    let reason = format!("installed here from {}; the shared config has it from {}", i.source, pin.registry);
+                    out.review.push(Review { id: id.clone(), reason });
+                    continue;
+                }
+                if i.version == pin.version || crate::plugins::newer(&i.version, &pin.version) {
+                    continue;
+                }
             }
             if let Err(reason) = registry_vouches(&catalog, pin) {
-                review.push(Review { id: id.clone(), reason });
+                out.review.push(Review { id: id.clone(), reason });
                 continue;
             }
             match self.install_pinned(id, pin) {
-                Ok(line) => lines.push(line),
-                Err(e) => review.push(Review { id: id.clone(), reason: format!("{e:#}") }),
+                Ok(c) => {
+                    out.reload |= c.reload;
+                    out.lines.push(c.lines.first().cloned().unwrap_or_else(|| format!("installed {id} {}", pin.version)));
+                }
+                Err(e) => out.review.push(Review { id: id.clone(), reason: format!("{e:#}") }),
             }
         }
         for id in removed {
@@ -396,16 +442,22 @@ impl HostService {
                 continue;
             }
             match self.uninstall_plugin(&id) {
-                Ok(_) => lines.push(format!("uninstalled {id} (removed from the shared config)")),
-                Err(e) => lines.push(format!("couldn't uninstall {id}: {e:#}")),
+                Ok(c) => {
+                    out.reload |= c.reload;
+                    out.lines.push(format!("uninstalled {id} (removed from the shared config)"));
+                }
+                Err(e) => {
+                    out.failed = true;
+                    out.lines.push(format!("couldn't uninstall {id}: {e:#}"));
+                }
             }
         }
-        (lines, review)
+        out
     }
 
     /// Install `id` at the pinned version, if this host's plan is exactly
     /// that plugin (same signed registry and version, nothing else needed).
-    fn install_pinned(&self, id: &str, pin: &PluginPin) -> Result<String> {
+    fn install_pinned(&self, id: &str, pin: &PluginPin) -> Result<plugin_api::Changed> {
         let plan = |refresh: bool| -> Result<plugin_api::Plan> {
             if refresh {
                 self.plugin_request(plugin_api::Request::Catalog { refresh: true })?;
@@ -425,7 +477,7 @@ impl HostService {
         };
         crate::sync::check_plan(&step, &plan)?;
         match self.plugin_request(plugin_api::Request::Install { id: plan.id, version: Some(plan.version), approved: plan.digest })? {
-            plugin_api::Reply::Changed(c) => Ok(c.lines.first().cloned().unwrap_or_else(|| format!("installed {id} {}", pin.version))),
+            plugin_api::Reply::Changed(c) => Ok(c),
             other => bail!("unexpected plugin reply {other:?}"),
         }
     }
@@ -434,16 +486,18 @@ impl HostService {
     /// settings now stored) into overrides signed by this host, so the next
     /// apply keeps them. Machine-only values aren't touched. Does nothing
     /// on a host that doesn't follow the shared config.
-    pub fn capture(&self, before: &HostSettings) -> Result<usize> {
+    ///
+    /// `after` is what the edit committed (not a later read, which could
+    /// include a shared apply that ran in between).
+    pub fn capture(&self, before: &HostSettings, after: &HostSettings) -> Result<usize> {
         let (doc, _, trust) = self.shared_doc()?;
         let device = self.device()?;
         let host = device.device();
         if doc.member(&host, &trust) != Some(true) {
             return Ok(0);
         }
-        let after = self.settings().file.value;
         let existing = doc.overrides(&host, &trust);
-        let entries: Vec<Entry> = shared::override_entries(&doc, &trust, &host, before, &after, doc.next_hlc(), &device)
+        let entries: Vec<Entry> = shared::override_entries(&doc, &trust, &host, before, after, doc.next_hlc(), &device)
             .into_iter()
             // Removing an override that isn't there changes nothing.
             .filter(|e| !e.deleted || matches!(e.parsed_key(), Some(Key::Override { path, .. }) if existing.contains_key(&path)))
@@ -457,14 +511,20 @@ impl HostService {
 
     /// [`set`](Self::set), keeping the change on a host that follows the
     /// shared config (as its overrides, [`capture`](Self::capture)).
+    ///
+    /// When the edit is saved but can't be kept in the shared config, the
+    /// outcome says so (the next shared update may undo it).
     pub fn set_captured(&self, json: &str, apply: bool) -> Result<crate::service::ApplyOutcome> {
         let before = self.settings().file.value;
-        let outcome = self.set(json, apply)?;
+        let mut outcome = self.set(json, apply)?;
         if apply
             && outcome.applied
-            && let Err(e) = self.capture(&before)
+            && let Err(e) = self.capture(&before, &store::parse::<HostSettings>(json).value)
         {
             log::warn!("couldn't keep the change in the shared config: {e:#}");
+            outcome.issues.push(format!(
+                "saved on this host, but couldn't keep it as this host's override in the shared config ({e:#}); the next shared update may undo it"
+            ));
         }
         Ok(outcome)
     }
@@ -484,23 +544,27 @@ impl HostService {
 
     /// One change to the shared files at a time: in this process, and
     /// against goattyd's CLI in another (`shared.lock`).
-    fn shared_lock(&self) -> SharedGuard<'_> {
+    fn shared_lock(&self) -> Result<SharedGuard<'_>> {
         let mutex = self.shared_files_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let file = self.shared_files().ok().and_then(|f| {
-            let path = f.doc.with_file_name("shared.lock");
-            std::fs::create_dir_all(path.parent()?).ok()?;
-            let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
-            file.lock().ok()?;
-            Some(file)
-        });
-        SharedGuard { _mutex: mutex, _file: file }
+        let path = self.shared_files()?.doc.with_file_name("shared.lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.lock().with_context(|| format!("lock {}", path.display()))?;
+        Ok(SharedGuard { _mutex: mutex, _file: file })
     }
 }
 
 /// Held while changing the shared files (the file lock goes with the file).
 struct SharedGuard<'a> {
     _mutex: std::sync::MutexGuard<'a, ()>,
-    _file: Option<std::fs::File>,
+    _file: std::fs::File,
 }
 
 /// The host's registry named like the pin's vouches for it the way the
@@ -518,11 +582,16 @@ fn registry_vouches(catalog: &plugin_api::Catalog, pin: &PluginPin) -> Result<()
 
 /// Plugins the shared config doesn't mention keep this host's entries
 /// (a plugin only this host has, installed from a folder).
-fn keep_host_only_plugins(doc: &SharedDoc, current: &HostSettings, resolved: &mut HostSettings) {
+///
+/// Only entries that count for this host mention a plugin (the same rule
+/// [`SharedDoc::resolve`] uses): trusted ones, and overrides of this host.
+fn keep_host_only_plugins(doc: &SharedDoc, trust: &Trust, host: &str, current: &HostSettings, resolved: &mut HostSettings) {
     let mentioned: BTreeSet<String> = doc
         .entries()
+        .filter(|e| trust.accepts(e))
         .filter_map(|e| match e.parsed_key()? {
             Key::Plugin(id) => Some(id),
+            Key::Override { host: h, .. } if h != host => None,
             Key::Setting(p) | Key::Override { path: p, .. } => {
                 let segs = shared::split_path(&p);
                 (segs.first().map(String::as_str) == Some("plugins")).then(|| segs.get(1).cloned()).flatten()
@@ -630,15 +699,29 @@ pub fn exchange(peers: &[&dyn Peer], me: &Device, extra: Vec<Entry>) -> Exchange
     let mut have: Vec<Option<VersionVector>> = vec![None; peers.len()];
     for (i, p) in peers.iter().enumerate() {
         let r = p.shared(api::Request::Trust { device: me.device(), name: me.name.clone() }).and_then(|_| status(*p)).and_then(|s| {
-            let pulled = match p.shared(api::Request::Pull { have: out.doc.version() })? {
-                api::Reply::Entries { entries, .. } => entries,
-                other => bail!("unexpected reply {other:?}"),
-            };
+            // Page by page: each pull asks for what's still missing.
+            let mut pulled = SharedDoc::default();
+            for _ in 0..10_000 {
+                let mut have = out.doc.version();
+                for (d, t) in pulled.version() {
+                    let e = have.entry(d).or_default();
+                    *e = (*e).max(t);
+                }
+                match p.shared(api::Request::Pull { have })? {
+                    api::Reply::Entries { entries, more, .. } => {
+                        pulled.merge(entries);
+                        if !more {
+                            break;
+                        }
+                    }
+                    other => bail!("unexpected reply {other:?}"),
+                }
+            }
             Ok((s, pulled))
         });
         match r {
             Ok((s, pulled)) => {
-                out.doc.merge(pulled);
+                out.doc.merge(pulled.entries().cloned());
                 have[i] = Some(s.have.clone());
                 out.statuses[i] = Some(s);
             }
@@ -653,10 +736,18 @@ pub fn exchange(peers: &[&dyn Peer], me: &Device, extra: Vec<Entry>) -> Exchange
             continue;
         }
         out.pushed[i] = missing.len();
-        match p.shared(api::Request::Push { entries: missing }) {
-            Ok(api::Reply::Status(s)) => out.statuses[i] = Some(*s),
-            Ok(other) => out.errors.push((i, format!("unexpected reply {other:?}"))),
-            Err(e) => out.errors.push((i, format!("{e:#}"))),
+        for chunk in shared::pages(missing, api::PAGE_BYTES) {
+            match p.shared(api::Request::Push { entries: chunk }) {
+                Ok(api::Reply::Status(s)) => out.statuses[i] = Some(*s),
+                Ok(other) => {
+                    out.errors.push((i, format!("unexpected reply {other:?}")));
+                    break;
+                }
+                Err(e) => {
+                    out.errors.push((i, format!("{e:#}")));
+                    break;
+                }
+            }
         }
     }
     out
@@ -847,7 +938,10 @@ mod tests {
         let mut forged = Entry::new(&Key::Setting("history.size".into()), Some(1.into()), Hlc { ms: u64::MAX / 2, n: 0 }, &evil);
         forged.device = me.device();
         let mut doc = SharedDoc::load(&server.svc.shared_files().unwrap().doc);
-        doc.insert(forged.clone());
+        assert!(!doc.insert(forged.clone()), "a forged signature is refused");
+        // Pushed straight to the laptop, it is refused there too.
+        let Ok(api::Reply::Status(_)) = laptop.svc.shared_request(api::Request::Push { entries: vec![forged.clone()] }) else { panic!() };
+        assert_ne!(laptop.svc.settings().file.value.history.size, 1);
 
         let x = exchange(&[&laptop.svc, &server.svc], &me, vec![forged]);
         assert!(x.errors.is_empty(), "{:?}", x.errors);
@@ -867,7 +961,8 @@ mod tests {
         exchange(&[&h.svc], &me, seed);
         let mut s = h.svc.settings().file.value;
         s.history.size = 1234;
-        h.svc.set_captured(&store::to_json(&s, &[]), true).unwrap();
+        let o = h.svc.set_captured(&store::to_json(&s, &[]), true).unwrap();
+        assert!(o.issues.is_empty(), "{:?}", o.issues);
         // A later apply keeps it: it is this host's override now.
         h.svc.shared_request(api::Request::Apply).unwrap();
         assert_eq!(h.svc.settings().file.value.history.size, 1234);

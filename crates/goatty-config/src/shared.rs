@@ -86,7 +86,15 @@ impl Hlc {
     /// The next time after `last` (the newest time this device has seen),
     /// at wall time `now_ms`.
     pub fn next(last: Hlc, now_ms: u64) -> Hlc {
-        if now_ms > last.ms { Hlc { ms: now_ms, n: 0 } } else { Hlc { ms: last.ms, n: last.n.saturating_add(1) } }
+        if now_ms > last.ms { Hlc { ms: now_ms, n: 0 } } else { last.plus(1) }
+    }
+
+    /// `k` steps later: the counter carries into the milliseconds instead of
+    /// stopping at its maximum, so a later clock is always later.
+    pub fn plus(self, k: u64) -> Hlc {
+        let total = u64::from(self.n) + k;
+        let span = u64::from(u32::MAX) + 1;
+        Hlc { ms: self.ms.saturating_add(total / span), n: u32::try_from(total % span).unwrap_or(0) }
     }
 
     /// The wall time now, in milliseconds.
@@ -286,6 +294,35 @@ impl Entry {
     }
 }
 
+/// The first `budget` bytes' worth of `entries` (at least one), and whether
+/// any are left.
+pub fn page(mut entries: Vec<Entry>, budget: usize) -> (Vec<Entry>, bool) {
+    let mut used = 0;
+    let mut cut = entries.len();
+    for (i, e) in entries.iter().enumerate() {
+        used += serde_json::to_string(e).map_or(0, |s| s.len()) + 1;
+        if used > budget && i > 0 {
+            cut = i;
+            break;
+        }
+    }
+    let more = cut < entries.len();
+    entries.truncate(cut);
+    (entries, more)
+}
+
+/// Split `entries` into pages of about `budget` bytes of JSON each.
+pub fn pages(entries: Vec<Entry>, budget: usize) -> Vec<Vec<Entry>> {
+    let mut out = Vec::new();
+    let mut rest = entries;
+    while !rest.is_empty() {
+        let (first, more) = page(rest.clone(), budget);
+        rest = if more { rest.split_off(first.len()) } else { Vec::new() };
+        out.push(first);
+    }
+    out
+}
+
 /// JSON with object keys sorted at every level, so a signature doesn't
 /// depend on how a build orders maps.
 fn canonical(v: &Value, out: &mut String) {
@@ -408,14 +445,17 @@ impl SharedDoc {
         if !entry.verify() {
             return false;
         }
-        let per_key = self.entries.entry(entry.key.clone()).or_default();
-        if !per_key.contains_key(&entry.device) {
+        // A safety valve against a misbehaving peer, far above any real
+        // setup: past it, new key/device pairs are refused (and the
+        // document stops converging for them), updates still apply.
+        let known = self.entries.get(&entry.key).is_some_and(|m| m.contains_key(&entry.device));
+        if !known {
             if self.len >= MAX_ENTRIES {
                 return false;
             }
             self.len += 1;
         }
-        per_key.insert(entry.device.clone(), entry);
+        self.entries.entry(entry.key.clone()).or_default().insert(entry.device.clone(), entry);
         true
     }
 
@@ -451,6 +491,16 @@ impl SharedDoc {
         self.entries().filter(|e| vv.get(&e.device).is_none_or(|t| e.hlc > *t)).cloned().collect()
     }
 
+    /// [`newer_than`](Self::newer_than) in pages of about `budget` bytes of
+    /// JSON (a reply must fit in one protocol frame), oldest first per
+    /// device: after merging a page, the receiver's version vector still
+    /// asks for the rest. Returns the page and whether more follow.
+    pub fn newer_than_page(&self, vv: &VersionVector, budget: usize) -> (Vec<Entry>, bool) {
+        let mut all = self.newer_than(vv);
+        all.sort_by(|a, b| (&a.device, a.hlc).cmp(&(&b.device, b.hlc)));
+        page(all, budget)
+    }
+
     /// The newest clock in the document: a new change must come after it.
     pub fn max_hlc(&self) -> Hlc {
         self.entries().map(|e| e.hlc).max().unwrap_or_default()
@@ -471,24 +521,33 @@ impl SharedDoc {
         self.entries.get(key).into_iter().flat_map(BTreeMap::values)
     }
 
-    /// The devices trusted here: `roots` (kept by this machine), plus every
-    /// device a trusted device marked trusted, until nothing changes. A
-    /// root can't be distrusted by an entry.
+    /// The devices trusted here: `roots` (kept by this machine), then every
+    /// device whose newest `trust/<device>` entry among the devices trusted
+    /// so far says `true`, until nothing is added. A device's entries about
+    /// itself don't count, and a device once added stays for this
+    /// computation, so it always ends and every machine with the same
+    /// document and roots gets the same set. A root can't be distrusted by
+    /// an entry; a revocation counts when its signer was trusted first
+    /// (a device can't be cut off by one it vouched for).
     pub fn trust(&self, roots: &BTreeSet<String>) -> Trust {
         let mut trust = Trust { devices: roots.clone() };
         loop {
-            let mut next = roots.clone();
+            let mut added = Vec::new();
             for (key, per_device) in self.entries.range("trust/".to_owned()..) {
                 let Some(device) = key.strip_prefix("trust/") else { break };
-                let newest = per_device.values().filter(|e| trust.contains(&e.device)).max_by(|a, b| a.rank().cmp(&b.rank()));
+                if trust.contains(device) {
+                    continue;
+                }
+                let newest =
+                    per_device.values().filter(|e| e.device != device && trust.contains(&e.device)).max_by(|a, b| a.rank().cmp(&b.rank()));
                 if newest.and_then(Entry::value).and_then(Value::as_bool) == Some(true) {
-                    next.insert(device.to_owned());
+                    added.push(device.to_owned());
                 }
             }
-            if next == trust.devices {
+            if added.is_empty() {
                 return trust;
             }
-            trust.devices = next;
+            trust.devices.extend(added);
         }
     }
 
@@ -593,12 +652,15 @@ impl SharedDoc {
             }
         }
         flat.retain(|p, _| HostSettings::scope(p) == Scope::Shared);
-        for (p, v) in flatten(&sparse(machine)) {
-            if HostSettings::scope(&p) == Scope::Machine {
-                flat.insert(p, v);
-            }
-        }
         let mut doc = unflatten(&flat);
+        // A value can hold a machine-only setting inside it (an entry for
+        // all of `shell`): those never come from the shared config.
+        for m in HostSettings::MACHINE {
+            remove_json_path(&mut doc, &split_path(m));
+        }
+        let machine_values: BTreeMap<String, Value> =
+            flatten(&sparse(machine)).into_iter().filter(|(p, _)| HostSettings::scope(p) == Scope::Machine).collect();
+        merge_json(&mut doc, unflatten(&machine_values));
         if let Value::Object(m) = &mut doc {
             m.insert("version".into(), Value::from(HostSettings::VERSION));
         }
@@ -731,6 +793,38 @@ pub fn unflatten(flat: &BTreeMap<String, Value>) -> Value {
     Value::Object(root)
 }
 
+/// Remove the value at `segs` from a JSON document.
+fn remove_json_path(doc: &mut Value, segs: &[String]) {
+    let Some((last, parents)) = segs.split_last() else { return };
+    let mut cur = doc;
+    for s in parents {
+        match cur.get_mut(s) {
+            Some(next) => cur = next,
+            None => return,
+        }
+    }
+    if let Value::Object(m) = cur {
+        m.remove(last);
+    }
+}
+
+/// Put `add`'s values into `doc` (objects merged, everything else replaced).
+fn merge_json(doc: &mut Value, add: Value) {
+    match (doc, add) {
+        (Value::Object(d), Value::Object(a)) => {
+            for (k, v) in a {
+                match d.get_mut(&k) {
+                    Some(existing) => merge_json(existing, v),
+                    None => {
+                        d.insert(k, v);
+                    }
+                }
+            }
+        }
+        (d, a) => *d = a,
+    }
+}
+
 /// Remove `path` and everything under it.
 fn remove_under(flat: &mut BTreeMap<String, Value>, path: &str) {
     let inside = format!("{path}.");
@@ -775,7 +869,7 @@ pub fn shared_entries(before: &HostSettings, after: &HostSettings, hlc: Hlc, sig
         .into_iter()
         .map(|(p, v)| {
             let e = Entry::new(&Key::Setting(p), v, t, signer);
-            t.n = t.n.saturating_add(1);
+            t = t.plus(1);
             e
         })
         .collect()
@@ -806,7 +900,7 @@ pub fn override_entries(
             None => None,
         };
         out.push(Entry::new(&key, value, t, signer));
-        t.n = t.n.saturating_add(1);
+        t = t.plus(1);
     }
     out
 }
@@ -814,9 +908,22 @@ pub fn override_entries(
 /// The overrides that keep `host`'s own settings when it joins the shared
 /// config ("Keep pi's differences as overrides"): one per path where its
 /// settings differ from the shared ones.
+///
+/// Overrides the host had from before (it left and joins again) are
+/// replaced: one that isn't among the differences now is removed, so the
+/// host ends up with exactly its own settings.
 pub fn keep_as_overrides(doc: &SharedDoc, trust: &Trust, host: &str, own: &HostSettings, hlc: Hlc, signer: &dyn Signer) -> Vec<Entry> {
     let shared = doc.resolve(None, trust, own).value;
-    override_entries(doc, trust, host, &shared, own, hlc, signer)
+    let mut out = override_entries(doc, trust, host, &shared, own, hlc, signer);
+    let set: BTreeSet<String> = out.iter().filter_map(|e| e.key.strip_prefix(&format!("host/{host}/")).map(str::to_owned)).collect();
+    let mut t = bump(hlc, out.len());
+    for path in doc.overrides(host, trust).into_keys() {
+        if !set.contains(&path) {
+            out.push(Entry::new(&Key::Override { host: host.to_owned(), path }, None, t, signer));
+            t = t.plus(1);
+        }
+    }
+    out
 }
 
 /// The entries that seed an empty shared config from one machine's
@@ -827,7 +934,7 @@ pub fn seed_entries(settings: &HostSettings, hlc: Hlc, signer: &dyn Signer) -> V
 
 /// Clocks `n` changes apart from `hlc` (for a batch made at once).
 pub fn bump(hlc: Hlc, n: usize) -> Hlc {
-    Hlc { ms: hlc.ms, n: hlc.n.saturating_add(u32::try_from(n).unwrap_or(u32::MAX)) }
+    hlc.plus(u64::try_from(n).unwrap_or(u64::MAX))
 }
 
 // ---- Trust roots (this machine's) ------------------------------------------------------
@@ -910,6 +1017,9 @@ pub struct ClientState {
     /// The default for hosts without an intent (`ssh.sync`): `None` asks.
     #[serde(default)]
     pub default_intent: Option<bool>,
+    /// Hosts set to ask on their own (`"sync": "ask"`), whatever the default says.
+    #[serde(default)]
+    pub ask: BTreeSet<String>,
     /// Devices whose changes the user chose not to trust (don't ask again).
     #[serde(default)]
     pub ignored: BTreeSet<String>,
@@ -955,16 +1065,27 @@ impl ClientState {
             self.intents.entry(host.clone()).or_insert(true);
         }
         for h in v.pointer("/ssh/hosts").and_then(Value::as_array).into_iter().flatten() {
-            let (Some(name), Some(i)) = (h.get("host").and_then(Value::as_str), intent(h.get("sync").and_then(Value::as_str))) else {
-                continue;
-            };
-            self.intents.insert(name.to_owned(), i);
+            let Some(name) = h.get("host").and_then(Value::as_str) else { continue };
+            match h.get("sync").and_then(Value::as_str) {
+                Some("ask") if !self.intents.contains_key(name) => {
+                    self.ask.insert(name.to_owned());
+                }
+                other => {
+                    if let Some(i) = intent(other) {
+                        self.intents.insert(name.to_owned(), i);
+                    }
+                }
+            }
         }
     }
 
     /// What to do with `host` when it is first met (`None`: ask).
     pub fn intent(&self, host: &str) -> Option<bool> {
-        self.intents.get(host).copied().or(self.default_intent)
+        match self.intents.get(host) {
+            Some(i) => Some(*i),
+            None if self.ask.contains(host) => None,
+            None => self.default_intent,
+        }
     }
 }
 
@@ -1118,6 +1239,79 @@ mod tests {
         d.insert(Entry::new(&Key::Trust(stranger.device()), Some(false.into()), Hlc { ms: 11, n: 0 }, &me));
         let trust = d.trust(&[me.device()].into());
         assert_eq!(d.settings(&trust)["prompt.style"], "lean");
+    }
+
+    #[test]
+    fn trust_ends_when_a_device_revokes_itself_or_its_voucher() {
+        let (a, b, c) = (signer(1), signer(2), signer(3));
+        let mut d = SharedDoc::default();
+        let roots: BTreeSet<String> = [a.device()].into();
+        d.insert(Entry::new(&Key::Trust(b.device()), Some(true.into()), Hlc { ms: 1, n: 0 }, &a));
+        // b distrusts itself: that doesn't count.
+        d.insert(Entry::new(&Key::Trust(b.device()), Some(false.into()), Hlc { ms: 2, n: 0 }, &b));
+        d.insert(Entry::new(&Key::Trust(c.device()), Some(true.into()), Hlc { ms: 3, n: 0 }, &b));
+        // c (trusted through b) distrusts b: b stays.
+        d.insert(Entry::new(&Key::Trust(b.device()), Some(false.into()), Hlc { ms: 4, n: 0 }, &c));
+        let t = d.trust(&roots);
+        assert!(t.contains(&b.device()) && t.contains(&c.device()));
+        // The root's own newer revocation does count.
+        d.insert(Entry::new(&Key::Trust(b.device()), Some(false.into()), Hlc { ms: 5, n: 0 }, &a));
+        let t = d.trust(&roots);
+        assert!(!t.contains(&b.device()) && !t.contains(&c.device()));
+    }
+
+    #[test]
+    fn clocks_carry_and_machine_values_never_come_from_shared_entries() {
+        let top = Hlc { ms: 7, n: u32::MAX };
+        assert!(Hlc::next(top, 0) > top && top.plus(1) == Hlc { ms: 8, n: 0 });
+        let gui = signer(1);
+        let trust = trust_of(&[&gui]);
+        let mut d = SharedDoc::default();
+        d.insert(set("shell", serde_json::json!({"program": "/evil", "path": ["~/bin"]}), 1, &gui));
+        let r = d.resolve(None, &trust, &HostSettings::default()).value;
+        assert_eq!(r.shell.program, None);
+        assert_eq!(r.shell.path, ["~/bin"]);
+    }
+
+    #[test]
+    fn pages_cover_everything_in_order() {
+        let s = signer(1);
+        let mut d = SharedDoc::default();
+        for i in 0..20u64 {
+            d.insert(set(&format!("aliases.a{i}"), serde_json::json!({"command": "x".repeat(100)}), i + 1, &s));
+        }
+        let mut got = SharedDoc::default();
+        let mut rounds = 0;
+        loop {
+            let (page, more) = d.newer_than_page(&got.version(), 600);
+            got.merge(page);
+            rounds += 1;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(got, d);
+        assert!(rounds > 2);
+        assert_eq!(pages(d.newer_than(&VersionVector::new()), 600).concat().len(), 20);
+    }
+
+    #[test]
+    fn rejoining_with_keep_drops_stale_overrides() {
+        let gui = signer(1);
+        let pi = signer(2).device();
+        let trust = trust_of(&[&gui]);
+        let mut d = SharedDoc::default();
+        d.insert(set("history.size", Value::from(5000), 1, &gui));
+        d.insert(Entry::new(
+            &Key::Override { host: pi.clone(), path: "history.size".into() },
+            Some(Value::from(300)),
+            Hlc { ms: 2, n: 0 },
+            &gui,
+        ));
+        let mut own = HostSettings::default();
+        own.history.size = 5000;
+        d.merge(keep_as_overrides(&d.clone(), &trust, &pi, &own, Hlc { ms: 3, n: 0 }, &gui));
+        assert_eq!(d.resolve(Some(&pi), &trust, &HostSettings::default()).value.history.size, 5000);
     }
 
     #[test]
@@ -1286,6 +1480,9 @@ mod tests {
         let mut c = ClientState::default();
         let json = r#"{"ssh": {"sync": "never", "hosts": [{"host": "pi", "sync": "always"}, {"host": "nas"}]}}"#;
         c.migrate(json, &["box".into()]);
+        let mut a = ClientState::default();
+        a.migrate(r#"{"ssh": {"sync": "always", "hosts": [{"host": "pi", "sync": "ask"}]}}"#, &[]);
+        assert_eq!((a.intent("pi"), a.intent("other")), (None, Some(true)), "an explicit ask stays an ask");
         assert!(c.migrated);
         assert_eq!((c.intent("pi"), c.intent("box"), c.intent("nas")), (Some(true), Some(true), Some(false)));
         // Once only.

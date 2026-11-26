@@ -46,6 +46,12 @@ pub struct Shared {
     pub me: Option<String>,
     /// Every host met or named in the shared config, by id.
     pub hosts: BTreeMap<String, Known>,
+    /// Devices the user chose not to be asked about again.
+    pub ignored: BTreeSet<String>,
+    /// The newest exchange started, and the newest one recorded: an older
+    /// result finishing later doesn't replace a newer one.
+    started: u64,
+    recorded: u64,
 }
 
 impl Global for Shared {}
@@ -186,6 +192,13 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    /// At least one goattyd stored what this exchange pushed (or there was
+    /// nothing to push).
+    pub fn saved_anywhere(&self) -> bool {
+        let pushed: Vec<usize> = (0..self.links.len()).filter(|i| self.x.pushed[*i] > 0).collect();
+        pushed.is_empty() || pushed.iter().any(|i| self.x.statuses[*i].is_some() && !self.x.errors.iter().any(|(j, _)| j == i))
+    }
+
     fn index_of(&self, link: &HostLink) -> Option<usize> {
         self.links.iter().position(|l| l.same(link))
     }
@@ -211,6 +224,11 @@ impl Outcome {
 /// `extra`, entries this device just signed), then `done`. Off the UI
 /// thread; the [`Shared`] state is updated before `done` runs.
 pub fn exchange(extra: Vec<Entry>, hint: Option<HostLink>, cx: &mut App, done: impl FnOnce(Result<Arc<Outcome>>, &mut App) + 'static) {
+    let seq = {
+        let s = cx.default_global::<Shared>();
+        s.started += 1;
+        s.started
+    };
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
@@ -228,7 +246,7 @@ pub fn exchange(extra: Vec<Entry>, hint: Option<HostLink>, cx: &mut App, done: i
             .await;
         cx.update(|cx| {
             if let Ok(o) = &result {
-                record(o, cx);
+                record(o, seq, cx);
                 prompt_trust(o, cx);
                 report_reviews(o, cx);
             }
@@ -239,10 +257,16 @@ pub fn exchange(extra: Vec<Entry>, hint: Option<HostLink>, cx: &mut App, done: i
 }
 
 /// Keep what an exchange saw.
-fn record(o: &Outcome, cx: &mut App) {
+fn record(o: &Outcome, seq: u64, cx: &mut App) {
     let trust = o.trust();
     let now = now_unix();
+    let ignored = ClientState::file().map(|f| ClientState::load(&f).ignored).unwrap_or_default();
     let state = cx.default_global::<Shared>();
+    if seq < state.recorded {
+        return;
+    }
+    state.recorded = seq;
+    state.ignored = ignored;
     state.doc = o.x.doc.clone();
     state.trust = trust;
     state.me = Some(o.me.clone());
@@ -285,10 +309,24 @@ pub fn on_connect(link: HostLink, after_install: bool, cx: &mut App) {
             }
         };
         let Some(status) = o.status_of(&l).cloned() else { return crate::shell_setup::offer(l, cx) };
-        if l.is_local() {
-            if status.member.is_none() {
-                seed(l.clone(), o.clone(), cx);
+        // This computer seeds the shared config first; a remote host is
+        // decided about against the seeded document (connect again after).
+        let local = o.local_index().and_then(|i| o.x.statuses[i].clone().map(|s| (o.links[i].clone(), s)));
+        if let Some((local_link, local_status)) = local
+            && local_status.member.is_none()
+        {
+            let again = (!l.is_local()).then(|| l.clone());
+            seed(local_link, o.clone(), cx, move |cx| {
+                if let Some(remote) = again {
+                    on_connect(remote, after_install, cx);
+                }
+            });
+            if l.is_local() {
+                crate::shell_setup::offer(l, cx);
             }
+            return;
+        }
+        if l.is_local() {
             return crate::shell_setup::offer(l, cx);
         }
         match status.member.or_else(|| o.x.doc.member(&status.host, &o.trust())) {
@@ -304,6 +342,23 @@ pub fn on_connect(link: HostLink, after_install: bool, cx: &mut App) {
             }
         }
     });
+}
+
+/// A connection came back after a drop: exchange again (once per
+/// connection, however many panes it has).
+pub fn on_reconnect(link: HostLink, cx: &mut App) {
+    #[derive(Default)]
+    struct Recent(Vec<(usize, std::time::Instant)>);
+    impl Global for Recent {}
+    let HostLink::Daemon(conn) = &link else { return };
+    let key = conn.key();
+    let recent = &mut cx.default_global::<Recent>().0;
+    recent.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(10));
+    if recent.iter().any(|(k, _)| *k == key) {
+        return;
+    }
+    recent.push((key, std::time::Instant::now()));
+    on_connect(link, false, cx);
 }
 
 /// The first run with the shared config on this computer: carry over the
@@ -334,7 +389,7 @@ pub fn migrate_once() {
 
 /// This computer never decided: seed the shared config from its settings
 /// and plugins (signed as of when its settings file last changed).
-fn seed(link: HostLink, o: Arc<Outcome>, cx: &mut App) {
+fn seed(link: HostLink, o: Arc<Outcome>, cx: &mut App, then: impl FnOnce(&mut App) + 'static) {
     let me = o.me.clone();
     cx.spawn(async move |cx| {
         let l = link.clone();
@@ -342,7 +397,10 @@ fn seed(link: HostLink, o: Arc<Outcome>, cx: &mut App) {
         cx.update(|cx| match entries {
             Ok(entries) => {
                 log::info!("shared config: seeded from this computer's settings ({} entries)", entries.len());
-                exchange(entries, Some(link), cx, |_, _| {});
+                exchange(entries, Some(link), cx, |r, cx| match r {
+                    Ok(o) if o.local_index().and_then(|i| o.x.statuses[i].as_ref()).is_some_and(|s| s.member == Some(true)) => then(cx),
+                    _ => log::warn!("shared config: this computer's goattyd didn't take the seed"),
+                });
             }
             Err(e) => log::warn!("shared config: couldn't seed it from this computer: {e:#}"),
         });
@@ -394,13 +452,23 @@ pub fn join(link: HostLink, status: &Status, keep: bool, cx: &mut App) {
             .await;
         cx.update(|cx| match entries {
             Ok(entries) => exchange(entries, Some(link.clone()), cx, move |r, cx| {
-                let t = match r.as_ref().ok().and_then(|o| o.status_of(&link)).and_then(|s| s.last_apply.clone()) {
-                    Some(a) if !a.ok => Toast::error(format!("{label} couldn't apply your shell config")).body(a.lines.join("\n")),
-                    _ => Toast::success(format!("{label} follows your shell config")).body(if keep {
-                        "Its own differences stay as overrides (Settings → Shell, scope picker)."
-                    } else {
-                        "Shells there reload at their next idle prompt."
-                    }),
+                let failed = |why: String| Toast::error(format!("Couldn't bring your shell config to {label}")).body(why);
+                let t = match &r {
+                    Err(e) => failed(format!("{e:#}")),
+                    Ok(o) => match (o.index_of(&link), o.status_of(&link)) {
+                        (Some(i), _) if o.x.errors.iter().any(|(j, _)| *j == i) => {
+                            failed(o.x.errors.iter().filter(|(j, _)| *j == i).map(|(_, e)| e.clone()).collect::<Vec<_>>().join("\n"))
+                        }
+                        (_, Some(s)) if s.member == Some(true) => match &s.last_apply {
+                            Some(a) if !a.ok => Toast::error(format!("{label} couldn't apply your shell config")).body(a.lines.join("\n")),
+                            _ => Toast::success(format!("{label} follows your shell config")).body(if keep {
+                                "Its own differences stay as overrides (Settings → Shell, scope picker)."
+                            } else {
+                                "Shells there reload at their next idle prompt."
+                            }),
+                        },
+                        _ => failed("The host didn't confirm it follows the shared config.".into()),
+                    },
                 };
                 toast::update(cx, id, t.key(toast_key(&host)));
                 crate::shell_setup::offer(link, cx);
@@ -464,10 +532,24 @@ fn ask(link: HostLink, status: Status, o: Arc<Outcome>, cx: &mut App) {
                 let own = store::parse::<HostSettings>(&l.get()?.json).value;
                 anyhow::Ok(host_shared::join_diff(&doc, &trust, &own))
             })
-            .await
-            .unwrap_or_default();
+            .await;
         cx.update(|cx| {
             let key = toast_key(&status.host);
+            let diff = match diff {
+                Ok(d) => d,
+                Err(e) => {
+                    // Without its settings there's no telling what it would lose: ask again later.
+                    let retry = link.clone();
+                    toast::show(
+                        cx,
+                        Toast::warning(format!("Couldn't compare {label}'s shell config with yours"))
+                            .body(format!("{e:#}"))
+                            .key(key)
+                            .action("Retry", move |_, cx| on_connect(retry.clone(), false, cx)),
+                    );
+                    return;
+                }
+            };
             let mut t = Toast::info(format!("Use your goatty setup on {label}?")).key(key).sticky();
             let (l1, s1) = (link.clone(), status.clone());
             let (l2, s2) = (link.clone(), status.clone());
@@ -539,6 +621,14 @@ pub fn trust_device(device: String, trusted: bool, cx: &mut App) {
 
 /// Don't ask about `device` again.
 pub fn ignore_device(device: String, cx: &mut App) {
+    cx.default_global::<Shared>().ignored.insert(device.clone());
+    cx.refresh_windows();
+    toast::show(
+        cx,
+        Toast::info("Ignored that device's changes")
+            .body("goatty won't ask about them again. You can still trust it on the Hosts page.")
+            .key(format!("shared.trust:{device}")),
+    );
     cx.background_executor()
         .spawn(async move {
             let Some(file) = ClientState::file() else { return };
@@ -624,10 +714,22 @@ pub fn share_plugins(link: HostLink, ids: Vec<String>, installed: bool, cx: &mut
                 anyhow::Ok(out)
             })
             .await;
+        let failed = |cx: &mut App, why: String| {
+            toast::show(
+                cx,
+                Toast::warning("The plugin change wasn't shared with your other hosts")
+                    .body(format!("{why}\nIt applies to this host only for now; Sync now on the Hosts page tries again."))
+                    .key("shared.plugins"),
+            );
+        };
         cx.update(|cx| match entries {
             Ok(e) if e.is_empty() => {}
-            Ok(e) => publish(e, cx, |_, _| {}),
-            Err(e) => log::warn!("shared config: couldn't share the plugin change: {e:#}"),
+            Ok(e) => publish(e, cx, move |r, cx| match r {
+                Ok(o) if o.saved_anywhere() => {}
+                Ok(o) => failed(cx, o.x.errors.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>().join("\n")),
+                Err(e) => failed(cx, format!("{e:#}")),
+            }),
+            Err(e) => failed(cx, format!("{e:#}")),
         });
     })
     .detach();
@@ -672,11 +774,13 @@ pub fn set_member(host: String, on: bool, cx: &mut App) {
 /// The palette's "Sync the shared shell config now": exchange with every
 /// host this process reaches (and push-sync the active one if it's older).
 pub fn sync_now(cx: &mut App) {
-    let link = cx.try_global::<settings_window::HostLinkGlobal>().and_then(|g| g.0.clone());
+    let mut link = cx.try_global::<settings_window::HostLinkGlobal>().and_then(|g| g.0.clone());
     if let Some(l) = &link
         && !l.shares_config()
     {
-        return crate::shell_sync::sync_now(cx);
+        // The active host only knows the push sync; the others still exchange.
+        crate::shell_sync::sync_now(cx);
+        link = None;
     }
     let id = toast::show(cx, Toast::loading("Syncing your shell config…").key("shared.sync"));
     exchange(Vec::new(), link, cx, move |r, cx| {

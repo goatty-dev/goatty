@@ -185,11 +185,19 @@ pub fn open_host_color(cx: &mut App, host: &str) {
 /// Open the settings window at `page` (or where it was).
 /// Open the settings at `page` with the shell pages on host `host` (a
 /// toast about that host, #313).
+/// Plugin operations reach the active tab's host only: for another host,
+/// say where to go instead.
 pub fn open_for_host(cx: &mut App, page: Option<Page>, host: String) {
     open_at(cx, page);
-    if let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) {
-        let _ = handle.update(cx, |view, _, cx| view.set_scope(scope::Scope::Host(host), cx));
-    }
+    let Some(handle) = cx.try_global::<OpenWindow>().and_then(|w| w.0) else { return };
+    let _ = handle.update(cx, |view, _, cx| {
+        if view.link_host_id(cx).as_deref() == Some(host.as_str()) {
+            view.set_scope(scope::Scope::Host(host), cx);
+        } else {
+            let label = crate::shared_sync::state(cx).map_or_else(|| "that host".to_string(), |s| s.label(&host));
+            toast::show(cx, Toast::info(format!("Open a tab on {label} to review its plugins")).key("settings.plugins.host"));
+        }
+    });
 }
 
 pub fn open_at(cx: &mut App, page: Option<Page>) {
@@ -426,6 +434,8 @@ pub struct SettingsWindow {
 
     host_error: Option<String>,
     busy: bool,
+    /// An apply is on its way: edits now would be lost when it lands.
+    applying: bool,
     outcome: Option<Outcome>,
     show_diff: bool,
     generations: Vec<GenRow>,
@@ -638,6 +648,7 @@ impl SettingsWindow {
             link_settings: None,
             host_error: None,
             busy: false,
+            applying: false,
             outcome: None,
             show_diff: false,
             generations: Vec::new(),
@@ -709,7 +720,8 @@ impl SettingsWindow {
                 subs.push(cx.observe_global::<crate::shared_sync::Shared>(|this, cx| {
                     if this.scope.is_none() {
                         this.pick_scope(cx);
-                    } else if this.draft.is_none() && !this.busy && !this.scope_is_link(cx) {
+                    } else if this.draft.is_none() && !this.busy && this.page.is_host() {
+                        // The exchange may have changed what the shown host uses.
                         this.reload_scope(cx);
                     }
                     cx.notify();
@@ -1337,8 +1349,13 @@ impl SettingsWindow {
         .detach();
     }
 
-    /// Change the draft host settings.
+    /// Change the draft host settings (not while an apply is on its way:
+    /// that change would be lost when it lands).
     pub fn edit_host(&mut self, cx: &mut Context<'_, Self>, f: impl FnOnce(&mut HostSettings)) {
+        if self.applying {
+            toast::show(cx, Toast::info("Applying the last change…").body("Change more once it's done.").key("settings.busy"));
+            return;
+        }
         let Some(base) = self.host_value().cloned() else { return };
         let mut draft = base;
         f(&mut draft);
@@ -1358,6 +1375,11 @@ impl SettingsWindow {
 
     /// Ask the host what applying the draft would change.
     pub fn preview(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(why) = self.preview_unavailable(cx) {
+            self.outcome = Some(Outcome { ok: false, lines: vec![why], diff: Vec::new(), reload: false });
+            cx.notify();
+            return;
+        }
         self.send_draft(false, cx);
     }
 
@@ -1373,11 +1395,13 @@ impl SettingsWindow {
         }
         let (Some(link), Some(json)) = (self.link.clone(), self.draft_json()) else { return };
         self.busy = true;
+        self.applying = apply;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { link.set(json, apply) }).await;
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
+                view.applying = false;
                 match result {
                     Ok(a) => {
                         let mut lines = Vec::new();

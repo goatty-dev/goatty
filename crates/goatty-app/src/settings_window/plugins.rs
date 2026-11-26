@@ -439,6 +439,11 @@ impl SettingsWindow {
             cx.notify();
             return;
         };
+        if let Some(why) = self.plugins_unavailable(cx) {
+            self.plugins.error = Some(why);
+            cx.notify();
+            return;
+        }
         self.plugins.in_flight += 1;
         cx.notify();
         cx.spawn(async move |this, cx| {

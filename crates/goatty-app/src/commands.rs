@@ -446,6 +446,8 @@ pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
             }
         }
         SettingsCmd::Set { key, value } => {
+            // Carry the old sync choices over before this write drops them (#313).
+            crate::shared_sync::migrate_once();
             let path = client_path()?;
             let loaded = store::set_key::<ClientSettings>(&read_or_empty(&path)?, &key, &value).map_err(anyhow::Error::msg)?;
             store::save(&path, &loaded.value, &loaded.unknown)?;
@@ -461,6 +463,8 @@ pub fn settings(cmd: SettingsCmd, endpoint: Option<Endpoint>) -> Result<()> {
             Ok(())
         }
         SettingsCmd::Unset { key } => {
+            // Carry the old sync choices over before this write drops them (#313).
+            crate::shared_sync::migrate_once();
             let path = client_path()?;
             let loaded = store::unset_key::<ClientSettings>(&read_or_empty(&path)?, &key).map_err(anyhow::Error::msg)?;
             store::save(&path, &loaded.value, &loaded.unknown)?;
@@ -821,11 +825,12 @@ pub fn sync(hosts: Vec<String>, join: bool, keep: bool, separate: bool, trust: V
         host_shared::exchange(&refs, &me, extra)
     };
     let mut x = run(Vec::new());
-    let mut extra = Vec::new();
-    // This computer seeds the shared config the first time.
+    // This computer seeds the shared config the first time, before any
+    // join is decided against the document.
     if x.statuses[0].as_ref().is_some_and(|s| s.member.is_none()) {
-        extra.extend(crate::shared_sync::seed_entries_for(&links[0], &me, &me.device())?);
+        x = run(crate::shared_sync::seed_entries_for(&links[0], &me, &me.device())?);
     }
+    let mut extra = Vec::new();
     let local_trust = x.trust_of(0);
     for d in &trust {
         anyhow::ensure!(shared::is_device_id(d), "{d:?} isn't a device id (64 hex digits; see `goattyd sync status`)");

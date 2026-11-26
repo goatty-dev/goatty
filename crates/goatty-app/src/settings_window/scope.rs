@@ -67,13 +67,13 @@ impl SettingsWindow {
         if self.scope.as_ref() == Some(&scope) {
             return;
         }
-        if self.draft.is_some() {
-            self.outcome = Some(Outcome {
-                ok: false,
-                lines: vec!["Apply or discard the changes first, then pick other hosts.".into()],
-                diff: Vec::new(),
-                reload: false,
-            });
+        if self.draft.is_some() || self.applying || self.plugins.follow.is_some() || self.plugins.batch.is_some() {
+            let why = if self.draft.is_some() {
+                "Apply or discard the changes first, then pick other hosts."
+            } else {
+                "Wait until the running change is done, then pick other hosts."
+            };
+            self.outcome = Some(Outcome { ok: false, lines: vec![why.into()], diff: Vec::new(), reload: false });
             cx.notify();
             return;
         }
@@ -90,6 +90,10 @@ impl SettingsWindow {
             self.host = Some(view);
             self.host_error = None;
             self.sync_prompt_inputs(cx);
+        } else if let (Some(Scope::Host(id)), Some(state)) = (&self.scope, shared_sync::state(cx)) {
+            // A host that keeps its own settings is only reachable through a tab on it.
+            self.host = None;
+            self.host_error = Some(format!("{} keeps its own settings. Open a tab on it to change them there.", state.label(id)));
         }
         cx.notify();
     }
@@ -101,7 +105,11 @@ impl SettingsWindow {
         let machine = self.link_settings.clone().unwrap_or_default();
         let value = match self.scope.as_ref()? {
             Scope::All => shared_sync::resolve(None, &machine, cx)?,
-            Scope::Host(id) => shared_sync::resolve(Some(id), &HostSettings::default(), cx)?,
+            // Only a host that follows has its settings in the shared config.
+            Scope::Host(id) if shared_sync::state(cx)?.member(id) == Some(true) => {
+                shared_sync::resolve(Some(id), &HostSettings::default(), cx)?
+            }
+            Scope::Host(_) => return None,
         };
         Some(HostView {
             loaded: Loaded { value, issues: Vec::new(), unknown: Vec::new() },
@@ -179,8 +187,12 @@ impl SettingsWindow {
                 Scope::Host(id) if state.member(id) == Some(true) && shared_sync::overrides_any(id, e.keys, cx) => {
                     let (id, keys, label) = (id.clone(), e.keys, state.label(id));
                     let this = cx.entity().downgrade();
-                    let reset: NoteAction = Rc::new(move |_, cx| {
-                        let _ = this.update(cx, |v, cx| v.use_shared_value(&id, keys, cx));
+                    let reset: NoteAction = Rc::new(move |window, cx| {
+                        let _ = this.update(cx, |v, cx| {
+                            // The link goes away with the override: keep the user's place on the page.
+                            crate::ui::focus::hand_over(&v.focus, crate::ui::focus::Handover::FirstOnPage, window, cx);
+                            v.use_shared_value(&id, keys, cx);
+                        });
                     });
                     Some(ScopeNote {
                         text: format!("Only on {label}").into(),
@@ -199,6 +211,16 @@ impl SettingsWindow {
 
     /// "Use shared value": drop this host's overrides of `keys`.
     fn use_shared_value(&mut self, host: &str, keys: &[&str], cx: &mut Context<'_, Self>) {
+        if self.draft.is_some() || self.applying {
+            self.outcome = Some(Outcome {
+                ok: false,
+                lines: vec!["Apply or discard the changes first, then use the shared value.".into()],
+                diff: Vec::new(),
+                reload: false,
+            });
+            cx.notify();
+            return;
+        }
         match shared_sync::reset_overrides(host, keys, cx) {
             Ok(entries) => self.publish_entries(entries, "Uses the shared value again.".into(), None, cx),
             Err(e) => {
@@ -238,11 +260,11 @@ impl SettingsWindow {
                     return true;
                 }
                 // Machine-only values go to that host's own file (when it's this tab's).
-                let machine = machine_changed(&base, &draft) && link_id.as_deref() == Some(id.as_str());
-                let unknown = self.host.as_ref().map(|h| h.loaded.unknown.clone()).unwrap_or_default();
+                let patch = machine_patch(&base, &draft);
+                let machine = !patch.is_empty() && link_id.as_deref() == Some(id.as_str());
                 (
                     shared_sync::override_edit(id, &base, &draft, cx),
-                    machine.then(|| store::to_json(&draft, &unknown)),
+                    machine.then_some(patch),
                     format!("Set on {label} only. Other hosts keep the shared values."),
                 )
             }
@@ -257,19 +279,28 @@ impl SettingsWindow {
 
     /// Spread signed entries, then (optionally) apply machine-only values
     /// on the active tab's host, and show the scope again.
-    fn publish_entries(&mut self, entries: Vec<model::Entry>, done: String, machine_json: Option<String>, cx: &mut Context<'_, Self>) {
+    fn publish_entries(&mut self, entries: Vec<model::Entry>, done: String, machine: Option<MachinePatch>, cx: &mut Context<'_, Self>) {
         self.busy = true;
+        self.applying = true;
         let link = self.link.clone();
+        let draft = self.draft.clone();
         let this = cx.entity().downgrade();
         shared_sync::publish(entries, cx, move |result, cx| {
-            let machine = match (machine_json, link) {
-                (Some(json), Some(link)) => Some((json, link)),
+            let machine = match (machine, link) {
+                (Some(patch), Some(link)) => Some((patch, link)),
                 _ => None,
             };
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
+                view.applying = false;
                 let mut lines = Vec::new();
                 let ok = match &result {
+                    Ok(o) if !o.saved_anywhere() => {
+                        // Not stored anywhere: keep the draft to try again.
+                        lines.push("No goatty host stored the change; it's still here to apply again.".into());
+                        lines.extend(o.x.errors.iter().map(|(i, e)| format!("⚠ {}: {e}", o.links[*i].label())));
+                        false
+                    }
                     Ok(o) => {
                         lines.push(done);
                         let failed: Vec<String> =
@@ -293,18 +324,40 @@ impl SettingsWindow {
                 if ok {
                     view.draft = None;
                 }
-                if let Some((json, link)) = machine {
+                if let (true, Some((patch, link))) = (ok, machine) {
                     view.busy = true;
+                    view.applying = true;
                     cx.spawn(async move |this, cx| {
-                        let r = cx.background_executor().spawn(async move { link.set(json, true) }).await;
+                        // Only the machine values changed here, onto what the host has now.
+                        let r = cx
+                            .background_executor()
+                            .spawn(async move {
+                                let current = store::parse::<HostSettings>(&link.get()?.json);
+                                let mut flat = model::flatten(&model::sparse(&current.value));
+                                for (p, v) in patch {
+                                    match v {
+                                        Some(v) => flat.insert(p, v),
+                                        None => flat.remove(&p),
+                                    };
+                                }
+                                let next = store::parse::<HostSettings>(&model::unflatten(&flat).to_string()).value;
+                                link.set(store::to_json(&next, &current.unknown), true)
+                            })
+                            .await;
                         let _ = this.update(cx, |view, cx| {
                             view.busy = false;
-                            if let Err(e) = r
-                                && let Some(o) = view.outcome.as_mut()
-                            {
-                                o.lines.push(format!("⚠ This host's own settings weren't applied: {e:#}"));
-                            }
+                            view.applying = false;
                             view.reload_scope(cx);
+                            if let Err(e) = r {
+                                if let Some(o) = view.outcome.as_mut() {
+                                    o.ok = false;
+                                    o.lines.push(format!(
+                                        "⚠ This host's own settings weren't applied: {e:#}. They're still here to apply again."
+                                    ));
+                                }
+                                // The shared part is in; what's left of the draft is the machine part.
+                                view.draft = draft;
+                            }
                         });
                     })
                     .detach();
@@ -319,10 +372,47 @@ impl SettingsWindow {
     }
 }
 
-/// A machine-only value differs.
-fn machine_changed(a: &HostSettings, b: &HostSettings) -> bool {
-    let only = |h: &HostSettings| {
-        model::flatten(&model::sparse(h)).into_iter().filter(|(p, _)| HostSettings::scope(p) == SettingScope::Machine).collect::<Vec<_>>()
+/// Machine-only values a draft changed: path → new value (`None`: back to its default).
+type MachinePatch = Vec<(String, Option<serde_json::Value>)>;
+
+fn machine_patch(a: &HostSettings, b: &HostSettings) -> MachinePatch {
+    let only = |h: &HostSettings| -> std::collections::BTreeMap<String, serde_json::Value> {
+        model::flatten(&model::sparse(h)).into_iter().filter(|(p, _)| HostSettings::scope(p) == SettingScope::Machine).collect()
     };
-    only(a) != only(b)
+    let (a, b) = (only(a), only(b));
+    let mut out: MachinePatch = b.iter().filter(|(p, v)| a.get(*p) != Some(v)).map(|(p, v)| (p.clone(), Some(v.clone()))).collect();
+    out.extend(a.keys().filter(|p| !b.contains_key(*p)).map(|p| (p.clone(), None)));
+    out
+}
+
+impl SettingsWindow {
+    /// Where the bar's unapplied changes go: "All synced hosts", a host, or
+    /// the active tab's host.
+    pub(super) fn draft_target(&self, cx: &App) -> String {
+        match (&self.scope, shared_sync::state(cx)) {
+            (Some(Scope::All), _) => "all synced hosts".into(),
+            (Some(Scope::Host(id)), Some(state)) if !self.scope_is_link(cx) => state.label(id),
+            _ => self.host_label(),
+        }
+    }
+
+    /// A preview builds on the active tab's host: only there does it show
+    /// what Apply writes.
+    pub(super) fn preview_unavailable(&self, cx: &App) -> Option<String> {
+        (!self.scope_is_link(cx)).then(|| {
+            "Preview builds the shell configuration on the active tab's host. Pick that host in the picker above to preview, or Apply \
+             directly."
+                .to_string()
+        })
+    }
+
+    /// Plugin operations reach the active tab's host only.
+    pub(super) fn plugins_unavailable(&self, cx: &App) -> Option<String> {
+        match (&self.scope, shared_sync::state(cx)) {
+            (Some(Scope::Host(id)), Some(state)) if !self.scope_is_link(cx) => {
+                Some(format!("Plugins are installed on one host at a time: open a tab on {} to change its plugins.", state.label(id)))
+            }
+            _ => None,
+        }
+    }
 }
