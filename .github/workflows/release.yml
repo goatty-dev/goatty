@@ -147,7 +147,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP/bin" nfpm
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
       - run: cargo build --profile dist --locked -p goatty-app -p goatty-daemon
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: goattyd-*
           path: remote
@@ -190,7 +190,7 @@ jobs:
             # vulkan-swrast provides vulkan-driver without pulling in a GPU driver.
             install: pacman -Syu --noconfirm vulkan-swrast && pacman -U --noconfirm ./goatty-*.pkg.tar.zst
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
       - name: Install
@@ -218,7 +218,7 @@ jobs:
       # vulkan-swrast provides vulkan-driver without pulling in a GPU driver.
       - run: pacman -Syu --noconfirm --needed base-devel git namcap vulkan-swrast
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: packages
@@ -253,7 +253,7 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: assets
           merge-multiple: true
