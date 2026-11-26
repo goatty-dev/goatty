@@ -181,7 +181,9 @@ pub fn ask_for(hs: &HostSnippet, link: &HostLink, cwd: Option<PathBuf>, back: Op
         }
         preview_snippet.preview(&values, Some(current))
     }));
-    ask.badge = Some(safety_badge(snippet.safety()));
+    // Only the snippets that delete something are marked: everything else
+    // just puts a line on the prompt to read first.
+    ask.badge = (snippet.safety() == Safety::Destructive).then(|| safety_badge(Safety::Destructive));
     ask.back = back;
     ask.done_label = Some("put it on the prompt".into());
     ask
