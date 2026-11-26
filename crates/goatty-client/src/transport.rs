@@ -356,6 +356,11 @@ impl StderrTail {
         tail
     }
 
+    /// Lines captured so far, without waiting for the command to exit.
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        self.0.0.lock().lines.iter().cloned().collect()
+    }
+
     /// The command's exit code, when it exited on its own (or was reaped
     /// by [`Closer::reap`]) with one.
     pub fn exit(&self) -> Option<i32> {

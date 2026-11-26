@@ -181,6 +181,7 @@ struct Shared {
     early_size: Mutex<HashMap<SessionId, PaneEvent>>,
     next_req: AtomicU32,
     host: Mutex<HostInfo>,
+    remote_probe: Mutex<Option<remote::Probe>>,
     /// The protocol version we announce: ours, or lower after an old
     /// exact-match daemon told us its version.
     announce: AtomicU32,
@@ -281,6 +282,9 @@ impl Shared {
                 if g.version >= HISTORY_SINCE && !self.endpoint.is_local() {
                     self.send(&ClientMsg::Compress { zstd: true });
                 }
+                if matches!(self.endpoint, Endpoint::Ssh(_)) {
+                    *self.remote_probe.lock() = remote::parse_probe(&stderr.snapshot());
+                }
                 Ok(Some((t.reader, g.host, g.pid)))
             }
             Ok(Outcome::RetryWith(v)) => {
@@ -343,6 +347,7 @@ impl Connection {
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
             host: Mutex::new(HostInfo::default()),
+            remote_probe: Mutex::new(None),
             announce: AtomicU32::new(PROTOCOL_VERSION),
             version: AtomicU32::new(0),
             daemon_pid: AtomicU32::new(0),
@@ -408,6 +413,12 @@ impl Connection {
 
     pub fn host(&self) -> HostInfo {
         self.shared.host.lock().clone()
+    }
+
+    /// What the SSH connect script reported (platform and goattyd path), if
+    /// this is an SSH connection.
+    pub fn remote_probe(&self) -> Option<remote::Probe> {
+        self.shared.remote_probe.lock().clone()
     }
 
     /// The protocol version agreed with the daemon on the current link.
@@ -1860,6 +1871,7 @@ mod tests {
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
             host: Mutex::new(HostInfo::default()),
+            remote_probe: Mutex::new(None),
             announce: AtomicU32::new(PROTOCOL_VERSION),
             version: AtomicU32::new(PROTOCOL_VERSION),
             daemon_pid: AtomicU32::new(1),
@@ -1957,6 +1969,7 @@ mod tests {
             early_size: Mutex::new(HashMap::new()),
             next_req: AtomicU32::new(1),
             host: Mutex::new(HostInfo::default()),
+            remote_probe: Mutex::new(None),
             announce: AtomicU32::new(PROTOCOL_VERSION),
             version: AtomicU32::new(version),
             daemon_pid: AtomicU32::new(1),

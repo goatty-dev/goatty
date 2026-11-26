@@ -350,16 +350,20 @@ pub fn describe_local(problem: &LocalProblem, installed: Option<&std::path::Path
     }
 }
 
-/// What happened to an outdated local daemon on the way (the tab tells
+/// What happened to an outdated daemon on the way (the tab tells
 /// the user once it's connected).
 enum Restart {
-    /// Restarted; it had no sessions.
+    /// Local daemon restarted; it had no sessions.
     Empty,
-    /// Restarted with its sessions.
+    /// Local daemon restarted with its sessions.
     Kept,
-    /// It could have kept its sessions, but didn't restart (why): goatty
-    /// goes on with it.
+    /// Local daemon could have kept its sessions, but didn't restart (why):
+    /// goatty goes on with it.
     Refused(String),
+    /// Remote daemon updated and restarted with its sessions.
+    RemoteUpdated(String),
+    /// Remote daemon restarted (this build was already installed) with its sessions.
+    RemoteRestarted(String),
 }
 
 /// Restart the local daemon with the installed build and connect to it. Its
@@ -392,6 +396,113 @@ fn restart_local(conn: Option<Arc<Connection>>, force: bool) -> Result<(Arc<Conn
 fn one_local_restart() -> std::sync::MutexGuard<'static, ()> {
     static RESTARTING: Mutex<()> = Mutex::new(());
     RESTARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Held while auto-updating a remote daemon so concurrent tabs on the same
+/// host don't upload and restart it twice.
+fn one_remote_restart() -> std::sync::MutexGuard<'static, ()> {
+    static RESTARTING: Mutex<()> = Mutex::new(());
+    RESTARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Connect to an SSH host. When an older goattyd is running there and can
+/// keep its sessions over a restart (Unix, protocol v10+), upload this
+/// build's goattyd if needed and restart it right away without asking.
+fn open_remote(endpoint: Endpoint, restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
+    let err = match pool::open(endpoint.clone()) {
+        Ok(conn) => return Ok(conn),
+        Err(e) => e,
+    };
+    let Endpoint::Ssh(target) = &endpoint else { return Err(err) };
+    if target.remote_daemon.is_some() {
+        return Err(err);
+    }
+    let Some(RemoteProblem::Incompatible { host, mismatch, probe }) = err.downcast_ref::<RemoteProblem>() else {
+        return Err(err);
+    };
+    let platform = probe.as_ref().map(|p| &p.platform);
+    if !remote_keeps_sessions(mismatch, platform) {
+        return Err(err);
+    }
+    let runs_ours = probe.as_ref().is_some_and(Probe::runs_ours);
+    let bundled = if runs_ours {
+        None
+    } else {
+        let Some(b) = platform.and_then(Platform::target).and_then(remote::find_bundled) else {
+            return Err(err);
+        };
+        Some(b)
+    };
+    let _one = one_remote_restart();
+    if let Ok(conn) = pool::open(endpoint.clone()) {
+        // Another tab updated and restarted it meanwhile.
+        return Ok(conn);
+    }
+    log::info!("updating goattyd on {host} automatically (sessions kept): {err:#}");
+    if let Some(bundled) = bundled {
+        remote::install(target, &bundled.path)?;
+    }
+    remote::restart_daemon(target, false)?;
+    let conn = pool::open(endpoint)?;
+    let how = if runs_ours { Restart::RemoteRestarted(host.clone()) } else { Restart::RemoteUpdated(host.clone()) };
+    *restarted.lock().unwrap_or_else(|p| p.into_inner()) = Some(how);
+    Ok(conn)
+}
+
+/// Check an already-connected remote daemon is not an older version than this
+/// build: when it can keep its sessions (Unix, protocol v10+) and we have a
+/// matching binary, update and restart it seamlessly without asking. Any
+/// failure logs and keeps the working connection.
+fn check_remote(conn: Arc<Connection>, endpoint: &Endpoint, restarted: &Mutex<Option<Restart>>) -> Result<Arc<Connection>> {
+    let Endpoint::Ssh(target) = endpoint else { return Ok(conn) };
+    if target.remote_daemon.is_some() || target.is_windows() {
+        return Ok(conn);
+    }
+    if !remote::is_older_version(&conn.host().daemon_version, env!("CARGO_PKG_VERSION")) {
+        return Ok(conn);
+    }
+    if conn.protocol_version() < goatty_proto::RESTART_SINCE {
+        return Ok(conn);
+    }
+    let Some(probe) = conn.remote_probe() else { return Ok(conn) };
+    if probe.platform.is_windows() {
+        return Ok(conn);
+    }
+    let runs_ours = probe.runs_ours();
+    let bundled = if runs_ours {
+        None
+    } else {
+        let Some(b) = probe.platform.target().and_then(remote::find_bundled) else { return Ok(conn) };
+        Some(b)
+    };
+    let _one = one_remote_restart();
+    let conn = pool::live(endpoint).unwrap_or(conn);
+    if !remote::is_older_version(&conn.host().daemon_version, env!("CARGO_PKG_VERSION")) {
+        return Ok(conn);
+    }
+    log::info!("updating older goattyd {} on {} to {} (sessions kept)", conn.host().daemon_version, target.host, env!("CARGO_PKG_VERSION"));
+    if let Some(bundled) = bundled
+        && let Err(e) = remote::install(target, &bundled.path)
+    {
+        log::warn!("couldn't update goattyd on {}: {e:#}; keeping the running daemon", target.host);
+        return Ok(conn);
+    }
+    if let Err(e) = remote::restart_daemon(target, false) {
+        log::warn!("couldn't restart goattyd on {}: {e:#}; keeping the running daemon", target.host);
+        return Ok(conn);
+    }
+    conn.reconnect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(conn.is_connected() && !remote::is_older_version(&conn.host().daemon_version, env!("CARGO_PKG_VERSION"))) {
+        if Instant::now() >= deadline {
+            log::warn!("restarted goattyd on {} didn't answer within 10s; continuing", target.host);
+            return Ok(conn);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let how = if runs_ours { Restart::RemoteRestarted(target.host.clone()) } else { Restart::RemoteUpdated(target.host.clone()) };
+    *restarted.lock().unwrap_or_else(|p| p.into_inner()) = Some(how);
+    Ok(conn)
 }
 
 /// Check the local daemon is the installed build: restart it right away
@@ -601,6 +712,12 @@ impl ConnectView {
                         Toast::warning("goattyd still runs the older build")
                             .body(format!("It couldn't restart with the new one: {why}. Everything works, without what changed since.")),
                     ),
+                    Some(Restart::RemoteUpdated(host)) => Some(
+                        Toast::success(format!("Updated goattyd on {host}")).body("It was an older build. Your sessions kept running."),
+                    ),
+                    Some(Restart::RemoteRestarted(host)) => Some(
+                        Toast::success(format!("Restarted goattyd on {host}")).body("It was an older build. Your sessions kept running."),
+                    ),
                     None => None,
                 };
                 if let Some(t) = toast {
@@ -662,10 +779,13 @@ impl ConnectView {
             let mut conn = match conn {
                 Some(c) => c,
                 None if check => open_local(&restarted)?,
-                None => pool::open(endpoint)?,
+                None if matches!(endpoint, Endpoint::Ssh(_)) => open_remote(endpoint.clone(), &restarted)?,
+                None => pool::open(endpoint.clone())?,
             };
             if check {
                 conn = check_local(conn, &restarted)?;
+            } else if matches!(endpoint, Endpoint::Ssh(_)) {
+                conn = check_remote(conn, &endpoint, &restarted)?;
             }
             let startup = start(&conn, mode, join.as_ref())?;
             Ok((startup, Spawner::Daemon(conn)))
@@ -719,15 +839,21 @@ impl ConnectView {
                 } else {
                     format!("Restarting goattyd on {}…", target.host)
                 };
+                let restarted = self.restarted.clone();
                 self.work(label, window, cx, move || {
                     if let Some(bundled) = upload {
                         remote::install(&target, &bundled.path)?;
                     }
                     if restart {
-                        remote::restart_daemon(&target)?;
+                        remote::restart_daemon(&target, true)?;
                     }
-                    let conn = Connection::open(endpoint, crate::CLIENT)?;
-                    pool::add(&conn);
+                    let conn = if restart {
+                        let c = Connection::open(endpoint, crate::CLIENT)?;
+                        pool::add(&c);
+                        c
+                    } else {
+                        open_remote(endpoint, &restarted)?
+                    };
                     let startup = start(&conn, mode, join.as_ref())?;
                     Ok((startup, Spawner::Daemon(conn)))
                 });
