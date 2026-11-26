@@ -331,7 +331,7 @@ impl SettingsWindow {
                 if let (true, Some((patch, link))) = (ok, machine) {
                     view.busy = true;
                     view.applying = true;
-                    let retry = patch.clone();
+                    let retry = (link.clone(), patch.clone());
                     cx.spawn(async move |this, cx| {
                         // Only the machine values changed here, onto what the host has now.
                         let r = cx
@@ -354,6 +354,8 @@ impl SettingsWindow {
                             view.applying = false;
                             if r.is_err() {
                                 view.pending_machine = Some(retry);
+                                // Edits wait until the draft is back from the reload.
+                                view.applying = true;
                             }
                             view.reload_scope(cx);
                             if let Err(e) = r
@@ -378,7 +380,7 @@ impl SettingsWindow {
 }
 
 /// Machine-only values a draft changed: path → new value (`None`: back to its default).
-type MachinePatch = Vec<(String, Option<serde_json::Value>)>;
+pub(super) type MachinePatch = Vec<(String, Option<serde_json::Value>)>;
 
 fn machine_patch(a: &HostSettings, b: &HostSettings) -> MachinePatch {
     let only = |h: &HostSettings| -> std::collections::BTreeMap<String, serde_json::Value> {

@@ -481,15 +481,18 @@ impl SharedDoc {
         entries.into_iter().filter(|e| self.insert(e.clone())).count()
     }
 
-    /// [`merge`](Self::merge) on a machine with this `trust`: entries that
-    /// count here are always taken (up to [`MAX_ENTRIES`]); ones from
-    /// devices it doesn't trust only while fewer than [`MAX_UNTRUSTED`] of
-    /// those are stored.
-    pub fn merge_trusted(&mut self, entries: impl IntoIterator<Item = Entry>, trust: &Trust) -> usize {
-        let mut untrusted = self.entries().filter(|e| !trust.accepts(e)).count();
+    /// [`merge`](Self::merge) on a machine with this `trust` (and its own
+    /// device id `own`): entries signed by a trusted device or by this
+    /// machine are always taken (up to [`MAX_ENTRIES`]); ones signed by
+    /// anyone else only while fewer than [`MAX_UNTRUSTED`] of those are
+    /// stored, whatever they're about (a device's overrides of itself
+    /// count too).
+    pub fn merge_trusted(&mut self, entries: impl IntoIterator<Item = Entry>, trust: &Trust, own: Option<&str>) -> usize {
+        let trusted_signer = |e: &Entry| trust.contains(&e.device) || own == Some(e.device.as_str());
+        let mut untrusted = self.entries().filter(|e| !trusted_signer(e)).count();
         let mut n = 0;
         for e in entries {
-            let counts = trust.accepts(&e);
+            let counts = trusted_signer(&e);
             let known = self.entries.get(&e.key).is_some_and(|m| m.contains_key(&e.device));
             if !counts && !known && untrusted >= MAX_UNTRUSTED {
                 continue;
@@ -546,9 +549,17 @@ impl SharedDoc {
         self.entries().map(|e| e.hlc).max().unwrap_or_default()
     }
 
+    /// How far ahead of this machine's clock an entry may be and still
+    /// push the clock of new changes forward (clocks drift; one far in the
+    /// future, from a broken or hostile device, mustn't freeze them).
+    pub const MAX_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
+
     /// The clock for a change made now.
     pub fn next_hlc(&self) -> Hlc {
-        Hlc::next(self.max_hlc(), Hlc::now_ms())
+        let now = Hlc::now_ms();
+        let horizon = now.saturating_add(Self::MAX_SKEW_MS);
+        let last = self.entries().map(|e| e.hlc).filter(|t| t.ms <= horizon).max().unwrap_or_default();
+        Hlc::next(last, now)
     }
 
     /// The deciding entry for `key`: the newest one `trust` accepts.
@@ -1267,8 +1278,18 @@ mod tests {
         let trust = trust_of(&[&me]);
         let mut d = SharedDoc::default();
         let flood: Vec<Entry> = (0..MAX_UNTRUSTED as u64 + 5).map(|i| set(&format!("aliases.j{i}"), Value::from(1), 1, &junk)).collect();
-        assert_eq!(d.merge_trusted(flood, &trust), MAX_UNTRUSTED);
-        assert_eq!(d.merge_trusted([set("history.size", Value::from(5), 2, &me)], &trust), 1);
+        assert_eq!(d.merge_trusted(flood, &trust, None), MAX_UNTRUSTED);
+        assert_eq!(d.merge_trusted([set("history.size", Value::from(5), 2, &me)], &trust, None), 1);
+        // Overrides of itself count against the cap too.
+        let other = signer(3);
+        let own_overrides = (0..5u64).map(|i| {
+            Entry::new(&Key::Override { host: other.device(), path: format!("aliases.o{i}") }, Some(1.into()), Hlc { ms: 1, n: 0 }, &other)
+        });
+        assert_eq!(d.merge_trusted(own_overrides, &trust, None), 0);
+        // A far-future clock doesn't freeze new changes.
+        let far = Entry::new(&Key::Setting("prompt.style".into()), Some("x".into()), Hlc { ms: u64::MAX - 1, n: 0 }, &me);
+        d.insert(far);
+        assert!(d.next_hlc().ms < u64::MAX - 1);
         assert_eq!(Hlc { ms: u64::MAX, n: u32::MAX }.plus(10), Hlc { ms: u64::MAX, n: u32::MAX });
     }
 

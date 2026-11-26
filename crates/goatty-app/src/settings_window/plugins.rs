@@ -365,7 +365,23 @@ const LOSE_TRACK_AFTER: std::time::Duration = std::time::Duration::from_secs(15 
 
 /// The request failed because the connection did (it may come back), not
 /// because the host refused.
+/// A plugin request refused because the settings show another host (not
+/// sent at all, so not a lost connection).
+#[derive(Debug)]
+struct OtherHost(String);
+
+impl std::fmt::Display for OtherHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OtherHost {}
+
 fn connection_lost(link: &HostLink, e: &anyhow::Error) -> bool {
+    if e.downcast_ref::<OtherHost>().is_some() {
+        return false;
+    }
     let m = format!("{e:#}");
     !link.is_connected() || m.contains("did not answer") || m.contains("not connected to goattyd")
 }
@@ -442,7 +458,7 @@ impl SettingsWindow {
         if let Some(why) = self.plugins_unavailable(cx) {
             self.plugins.error = Some(why.clone());
             // The caller's state (a followed install, a review) ends through its own path.
-            done(self, Err(anyhow::anyhow!(why)), cx);
+            done(self, Err(OtherHost(why).into()), cx);
             cx.notify();
             return;
         }

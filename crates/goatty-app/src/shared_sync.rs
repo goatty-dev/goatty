@@ -349,17 +349,35 @@ pub fn on_connect(link: HostLink, after_install: bool, cx: &mut App) {
 /// connection, however many panes it has).
 pub fn on_reconnect(link: HostLink, cx: &mut App) {
     #[derive(Default)]
-    struct Recent(Vec<(usize, std::time::Instant)>);
+    struct Recent {
+        at: Vec<(usize, std::time::Instant)>,
+        /// Connections with an exchange scheduled at the end of the window.
+        trailing: HashSet<usize>,
+    }
     impl Global for Recent {}
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
     let HostLink::Daemon(conn) = &link else { return };
     let key = conn.key();
-    let recent = &mut cx.default_global::<Recent>().0;
-    // Every pane of the connection reports the same reconnect within moments.
-    recent.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(2));
-    if recent.iter().any(|(k, _)| *k == key) {
+    let recent = cx.default_global::<Recent>();
+    recent.at.retain(|(_, at)| at.elapsed() < WINDOW);
+    if recent.at.iter().any(|(k, _)| *k == key) {
+        // Another pane's report of this reconnect, or a second reconnect
+        // right after: one more exchange once the window is over covers both.
+        if recent.trailing.insert(key) {
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(WINDOW).await;
+                cx.update(|cx| {
+                    cx.default_global::<Recent>().trailing.remove(&key);
+                    if link.is_connected() {
+                        exchange(Vec::new(), Some(link), cx, |_, _| {});
+                    }
+                });
+            })
+            .detach();
+        }
         return;
     }
-    recent.push((key, std::time::Instant::now()));
+    recent.at.push((key, std::time::Instant::now()));
     on_connect(link, false, cx);
 }
 

@@ -433,7 +433,7 @@ pub struct SettingsWindow {
     link_settings: Option<HostSettings>,
     /// Machine-only values whose write failed after the shared part was
     /// stored: they go back into the draft once the host's file is loaded.
-    pending_machine: Option<Vec<(String, Option<serde_json::Value>)>>,
+    pending_machine: Option<(HostLink, scope::MachinePatch)>,
 
     host_error: Option<String>,
     busy: bool,
@@ -757,13 +757,21 @@ impl SettingsWindow {
             (a, b) => a.is_none() && b.is_none(),
         };
         // An install in progress keeps its host until it's over.
-        if same || self.draft.is_some() || self.busy || self.plugins.follow.is_some() || self.plugins.batch.is_some() {
+        if same
+            || self.draft.is_some()
+            || self.busy
+            || self.applying
+            || self.plugins.follow.is_some()
+            || self.plugins.batch.is_some()
+            || self.plugins.is_loading()
+        {
             return;
         }
         self.link = link;
         self.host = None;
         self.scope = None;
         self.link_settings = None;
+        self.pending_machine = None;
         self.host_error = None;
         self.outcome = None;
         self.imported_plugins.clear();
@@ -1334,7 +1342,11 @@ impl SettingsWindow {
                             view.draft = None;
                         }
                         // Only the machine values that didn't make it are still to apply.
-                        if let Some(patch) = view.pending_machine.take() {
+                        // Only for the host it was meant for, and not over a newer draft.
+                        if let Some((for_link, patch)) = view.pending_machine.take()
+                            && view.link.as_ref().is_some_and(|l| l.same(&for_link))
+                            && view.draft.is_none()
+                        {
                             let mut flat = goatty_config::shared::flatten(&goatty_config::shared::sparse(&loaded.value));
                             for (p, v) in patch {
                                 match v {
@@ -1346,6 +1358,9 @@ impl SettingsWindow {
                             view.draft = (draft != loaded.value).then_some(draft);
                         }
                         view.host = Some(HostView { loaded, issues, env_overrides: snap.env_overrides, generation: snap.generation });
+                        if view.pending_machine.is_none() && !view.busy {
+                            view.applying = false;
+                        }
                         if let Some(before) = before {
                             view.announce_host_issues(&before, cx);
                         }
@@ -1357,7 +1372,10 @@ impl SettingsWindow {
                         view.everywhere_host_changed(cx);
                         view.pick_scope(cx);
                     }
-                    Err(e) => view.host_error = Some(format!("{e:#}")),
+                    Err(e) => {
+                        view.host_error = Some(format!("{e:#}"));
+                        view.applying = false;
+                    }
                 }
                 cx.notify();
             });

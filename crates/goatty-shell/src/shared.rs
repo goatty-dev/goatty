@@ -288,7 +288,8 @@ impl HostService {
         let _guard = self.shared_lock()?;
         let mut doc = SharedDoc::load(&files.doc);
         let trust = doc.trust(&Roots::load(&files.roots).devices());
-        let n = doc.merge_trusted(entries, &trust);
+        let own = self.device().ok().map(|d| d.device());
+        let n = doc.merge_trusted(entries, &trust, own.as_deref());
         if n > 0 {
             doc.save(&files.doc).with_context(|| format!("save {}", files.doc.display()))?;
         }
@@ -753,10 +754,12 @@ pub fn exchange(peers: &[&dyn Peer], me: &Device, extra: Vec<Entry>) -> Exchange
         let missing = out.doc.newer_than(h);
         if missing.is_empty() {
             // Nothing new, but its last apply failed: an empty push makes it try again.
-            if out.statuses[i].as_ref().and_then(|s| s.last_apply.as_ref()).is_some_and(|a| !a.ok)
-                && let Ok(api::Reply::Status(s)) = p.shared(api::Request::Push { entries: Vec::new() })
-            {
-                out.statuses[i] = Some(*s);
+            if out.statuses[i].as_ref().and_then(|s| s.last_apply.as_ref()).is_some_and(|a| !a.ok) {
+                match p.shared(api::Request::Push { entries: Vec::new() }) {
+                    Ok(api::Reply::Status(s)) => out.statuses[i] = Some(*s),
+                    Ok(other) => out.errors.push((i, format!("unexpected reply {other:?}"))),
+                    Err(e) => out.errors.push((i, format!("{e:#}"))),
+                }
             }
             continue;
         }
