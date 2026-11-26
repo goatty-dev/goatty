@@ -35,6 +35,7 @@ cargo build --release --workspace
 ./target/release/goatty --via 'docker exec -i box goattyd proxy'
 ./target/release/goatty --help
 
+./target/release/goattyd icat photo.jpg   # show an image (in goatty's shell just `icat photo.jpg`)
 ./target/release/goattyd list      # sessions
 ./target/release/goattyd send 1 'htop\r'
 ./target/release/goattyd stop

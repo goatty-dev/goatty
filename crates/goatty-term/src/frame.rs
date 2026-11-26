@@ -6,7 +6,8 @@ use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::pos::{Column, Line, Pos};
 use rio_vt::crosswords::style::StyleFlags;
 
-use crate::{Rgb, TermMode, Terminal};
+use crate::graphics::{self, PlaceholderCell};
+use crate::{FrameImage, Rgb, TermMode, Terminal};
 
 impl Terminal {
     /// Copy everything a renderer needs for one frame into `frame`, reusing
@@ -33,6 +34,7 @@ impl Terminal {
         frame.cells.clear();
         frame.cells.reserve(cols * rows);
         frame.extra_text.clear();
+        let mut placeholders = Vec::new();
 
         for r in 0..rows {
             let line = Line(r as i32 - offset);
@@ -52,6 +54,25 @@ impl Terminal {
                     bg = pal.selection_bg;
                 }
                 let mut ch = sq.c();
+                if graphics::is_placeholder(ch) {
+                    // A kitty Unicode placeholder: a piece of an image, not text.
+                    let mut marks = ['\0'; 3];
+                    let mut n = 0;
+                    for m in t.grid.cell_text(pos).skip(1).take(3) {
+                        marks[n] = m;
+                        n += 1;
+                    }
+                    placeholders.push(PlaceholderCell {
+                        row: r,
+                        col: c,
+                        fg: style.fg,
+                        underline: style.underline_color,
+                        marks,
+                        n_marks: n as u8,
+                    });
+                    frame.cells.push(Cell { ch: ' ', fg, bg, flags: CellFlags::empty(), extra: 0 });
+                    continue;
+                }
                 if ch == '\0' || style.flags.contains(StyleFlags::HIDDEN) {
                     ch = ' ';
                 }
@@ -112,6 +133,7 @@ impl Terminal {
         };
         frame.cursor_color = pal.cursor;
         frame.mode = mode;
+        graphics::collect(&t, &mut self.inner.images.lock(), &placeholders, &mut frame.images);
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -180,6 +202,8 @@ pub struct Frame {
     pub cursor_color: Rgb,
     pub background: Rgb,
     pub mode: TermMode,
+    /// The images on screen, in paint order (see [`FrameImage`]).
+    pub images: Vec<FrameImage>,
 }
 
 impl Frame {
@@ -210,6 +234,7 @@ impl Default for Frame {
             cursor_color: Rgb::default(),
             background: Rgb::default(),
             mode: TermMode::empty(),
+            images: Vec::new(),
         }
     }
 }

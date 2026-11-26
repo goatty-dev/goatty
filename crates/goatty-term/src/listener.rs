@@ -65,8 +65,11 @@ pub(crate) struct Listener {
     pub(crate) answer_queries: bool,
     pub(crate) palette: SharedPalette,
     pub(crate) size: Arc<AtomicU32>, // packed (cols << 16 | rows)
+    pub(crate) cell: Arc<AtomicU32>, // packed (width << 16 | height), pixels
     /// Progress reports (OSC 9;4) land here, next to the OSC 7501 records.
     pub(crate) status: Arc<Mutex<Store>>,
+    /// rio-vt's image uploads land here (see `graphics`).
+    pub(crate) images: Arc<Mutex<crate::graphics::Store>>,
 }
 
 impl EventListener for Listener {
@@ -87,7 +90,12 @@ impl EventListener for Listener {
             RioEvent::TextAreaSizeRequest(_, fmt) => {
                 if self.answer_queries {
                     let packed = self.size.load(Ordering::Relaxed);
-                    let ws = rio_vt::event::WindowSize { cols: (packed >> 16) as u16, rows: (packed & 0xffff) as u16, width: 0, height: 0 };
+                    let (cols, rows) = ((packed >> 16) as u16, (packed & 0xffff) as u16);
+                    let cell = self.cell.load(Ordering::Relaxed);
+                    // The text area in pixels (CSI 14 t, sixel geometry).
+                    let width = cols.saturating_mul((cell >> 16) as u16);
+                    let height = rows.saturating_mul((cell & 0xffff) as u16);
+                    let ws = rio_vt::event::WindowSize { cols, rows, width, height };
                     let _ = self.replies.send(fmt(ws).into_bytes());
                 }
             }
@@ -129,6 +137,7 @@ impl EventListener for Listener {
                     let _ = self.ui.send(UiEvent::Notification { title, body });
                 }
             }
+            RioEvent::UpdateGraphics { queues, .. } => self.images.lock().apply(queues),
             RioEvent::Exit | RioEvent::CloseTerminal(_) => {
                 let _ = self.ui.send(UiEvent::Exit);
             }

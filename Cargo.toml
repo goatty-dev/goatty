@@ -11,7 +11,11 @@ publish = false
 
 [workspace.dependencies]
 # Terminal core — pinned exactly; API still evolving (see docs/goatty-project-plan.md).
-rio-vt = { version = "=0.5.29", default-features = false }
+# `graphics` decodes PNG (and the other formats) for the kitty graphics
+# protocol and iTerm2 images; rio-graphics (same version, pinned with it)
+# holds the image types.
+rio-vt = { version = "=0.5.29", default-features = false, features = ["graphics"] }
+rio-graphics = "=0.5.29"
 portable-pty = "0.9.0"
 # GPUI: Longbridge's weekly crates.io snapshots of Zed main (`gpui-pre`),
 # pinned exactly. Bump deliberately: change both versions, then `just update-gpui`.
@@ -72,6 +76,8 @@ similar = "3"
 # Managed tool installs (goatty-shell): verify + unpack release archives.
 sha2 = "0.11"
 flate2 = "1"
+# Kitty graphics payloads (goatty-term); the version rio-vt uses.
+base64 = "0.23"
 tar = "0.4"
 # Plugin packages in other formats (goatty-plugin `archive`): .zip and .tar.xz,
 # both pure Rust (the static goattyd build has no C toolchain to spare).

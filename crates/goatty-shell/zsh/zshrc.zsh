@@ -812,6 +812,15 @@ if (( ! ${+commands[copy]} && ! ${+aliases[copy]} && ! ${+functions[copy]} && ! 
 fi
 (( ${+functions[compdef]} )) && compdef _files goatty-copy
 
+# `icat FILE…` shows images in the terminal (kitty graphics protocol, no
+# kitty tools needed): goattyd's, so it's there on every host goatty's shell
+# runs on. Unless that name is already yours, like `copy`.
+if (( ! ${+commands[icat]} && ! ${+aliases[icat]} && ! ${+functions[icat]} && ! ${+builtins[icat]} )) \
+    && (( ${+commands[goattyd]} || ${+functions[goattyd]} )); then
+  icat() { goattyd icat "$@" }
+  (( ${+functions[compdef]} )) && compdef _files icat
+fi
+
 # --- Reload on request -------------------------------------------------------
 # After host settings change, goatty can ask running shells to pick up the
 # new configuration: it sends SIGURG (ignored by default, so other programs
