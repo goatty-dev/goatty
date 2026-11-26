@@ -29,7 +29,7 @@ zsh then reads the startup files from goatty's directory:
            ZDOTDIR = the user's again
            ~/.config/goatty/zshrc (the user's additions)
            plugins-last.zsh (syntax highlighting: it wraps every widget defined before it)
-           goatty-status / goatty-setup / goatty-reload, reload-on-request trap, missing-tools hint
+           goatty-status / goatty-setup / goatty-reload / goatty-copy (copy), reload-on-request trap, missing-tools hint
 .zlogin    the user's own, because ZDOTDIR is already theirs again
            (goatty's .zlogin only runs when something pointed ZDOTDIR back at goatty's directory: it hands it back and runs theirs)
 ```
@@ -227,6 +227,10 @@ Nested shells and `exec zsh` from a hooked shell are goatty's again (that's the 
 Outside goatty (above), only OSC 133 and OSC 7 go out, and OSC 133 only when the terminal has no shell integration of its own. `integration.zsh` emits OSC 133 `A` (prompt start) and `B` (input start) inside `PS1`, re-added on every prompt if a theme rebuilt it. It emits `C` from `preexec`, then `D;<status>` and OSC 7 (`file://host/percent-encoded/path`) from `precmd`. zsh restores `$?` for every hook, so hook order doesn't affect the status. rio-vt parses OSC 7; goatty-term applies the OSC 133 marks itself: they mark prompt rows (so the output viewer finds each command's output and Ctrl+Shift+Up/Down jump between prompts), say whether a command runs, and finished commands show as tab activity.
 
 The right-click menu (#186) reads and changes the line typed at the prompt through zle widgets bound to private key sequences (`goatty_term::input::LineEdit`, `ESC [ 7337 ; n ~`, which no keyboard sends; bound in the emacs, viins and vicmd keymaps): `1` reports `$BUFFER` as `OSC 7337;line=<percent-encoded bytes>` (`UiEvent::CommandLine`; goatty acts on it only while it asked), `2` puts `sudo ` in front or takes it away (an empty line gets the previous command first), `3` runs zsh's `edit-command-line` (`$VISUAL`/`$EDITOR`) between `zle=0` and `zle=1`, since the editor owns the terminal meanwhile, `4` is `kill-buffer`. `precmd` prints `OSC 7337;zle=1` so goatty knows the widgets are there; `C` clears that, and the app also holds back while the pane's foreground program isn't a shell, so another shell or a running program never gets the keys. Attach and resync snapshots carry the flag (`zle=0|1` after the shell state). The encoding deliberately runs without `LC_ALL=C`: zle would turn characters C can't spell into `?`. Tested against real zsh in `tests/zsh_startup.rs::command_line_widgets_report_and_change_the_line`.
+
+## Copying to your clipboard (#307)
+
+`goatty-copy` (also `copy`, unless that name is already a command, alias or function of yours) puts stdin, or the files named, on the clipboard of the computer you're looking at: `cat log | copy`, `copy notes.txt`, `copy -p` for the primary selection. `wl-copy` and `xclip` can't do that from a remote host: they talk to the display server of the host they run on. `copy` writes OSC 52 (`ESC ] 52 ; c|p ; <base64> BEL`) to `/dev/tty` instead. The bytes travel with the output to every client's mirror `Terminal`, and the GUI writes the text locally (`UiEvent::ClipboardStore`; Settings → Terminal → Clipboard, `clipboard.programs`: copy with a toast, quietly, or not at all; OSC 52 reads are always denied). Inside tmux it goes through `tmux load-buffer -w -`, which tmux 3.2+ passes on to the outer terminal. Input over 8 MiB is refused, because it crosses the network and every attached window decodes it. Outside goatty's panes it prints a one-line note, since nothing else confirms the copy. On plain-SSH hosts, where nothing of goatty runs, the same one-liner works by hand: `printf '\e]52;c;%s\a' "$(base64 | tr -d '\r\n')" > /dev/tty`. Tested in `tests/zsh_startup.rs::copy_*`.
 
 ## Installing and updating tools
 

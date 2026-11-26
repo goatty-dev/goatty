@@ -82,6 +82,8 @@ pub const INDEX: &[Entry] = &[
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     e(Page::Terminal, "Selection", "Middle click pastes what you select", "primary selection middle click paste")
         .keys(&["selection.primary"]),
+    e(Page::Terminal, "Clipboard", "When a program copies", "osc 52 osc52 copy clipboard remote ssh wl-copy xclip pbcopy toast")
+        .keys(&["clipboard.programs"]),
     e(Page::Terminal, "Mouse", "Right click", "context menu mouse button paste copy vim tmux shift").keys(&["mouse.right_click"]),
     e(Page::Terminal, "Pasting", "Middle click pastes", "middle mouse button paste").keys(&["paste.middle_click"]),
     e(Page::Terminal, "Pasting", "Ask before pasting", "paste confirm protection bracketed multiline").keys(&["paste.confirm"]),

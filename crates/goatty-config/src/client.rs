@@ -27,6 +27,7 @@ pub struct ClientSettings {
     pub links: LinkSettings,
     pub paste: PasteSettings,
     pub selection: SelectionSettings,
+    pub clipboard: ClipboardSettings,
     pub mouse: MouseSettings,
     pub keyboard: KeyboardSettings,
     pub ssh: SshSettings,
@@ -973,6 +974,28 @@ impl Default for SelectionSettings {
     }
 }
 
+/// What happens when a program in the terminal sets the clipboard (OSC 52:
+/// goatty's `copy` command, vim, tmux, here or on a remote host; #307).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramCopy {
+    /// Copy, and say so with a toast: any program can replace the
+    /// clipboard, so it shouldn't happen unseen.
+    #[default]
+    Notify,
+    /// Copy without a word.
+    Quiet,
+    /// Don't copy (a toast says a program tried).
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ClipboardSettings {
+    /// Programs setting the clipboard (OSC 52). Reading it is always denied.
+    pub programs: ProgramCopy,
+}
+
 /// What a right click on the terminal does (#186). Programs that use the
 /// mouse (vim, tmux, htop with mouse support on) get the click unless the
 /// setting says otherwise, and Shift+right-click always does the other
@@ -1655,6 +1678,18 @@ mod tests {
         assert!(unset.issues.is_empty(), "{:?}", unset.issues);
         assert_eq!(unset.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Background)), None);
         assert_eq!(unset.value.theme.overrides_for("nord").and_then(|o| o.get(ColorSlot::Ansi(1))), Some(Color(0x445566)));
+    }
+
+    #[test]
+    fn program_copy_defaults_to_notify_and_loads_its_values() {
+        use crate::store;
+        let programs = |text: &str| store::parse::<ClientSettings>(text).value.clipboard.programs;
+        assert_eq!(programs("{}"), ProgramCopy::Notify);
+        assert_eq!(programs(r#"{"clipboard": {"programs": "quiet"}}"#), ProgramCopy::Quiet);
+        assert_eq!(programs(r#"{"clipboard": {"programs": "deny"}}"#), ProgramCopy::Deny);
+        let typo = store::parse::<ClientSettings>(r#"{"clipboard": {"programs": "nope"}}"#);
+        assert_eq!(typo.value.clipboard.programs, ProgramCopy::Notify);
+        assert!(typo.issues.iter().any(|i| i.path.contains("programs")), "{:?}", typo.issues);
     }
 
     #[test]
