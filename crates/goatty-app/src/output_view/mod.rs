@@ -40,6 +40,7 @@ use self::search::{Match, Matcher, Query, find_all};
 use crate::actions::{Copy, CopyOrInterrupt};
 use crate::session::Session;
 use crate::terminal::element::hsla;
+use crate::terminal::wheel::wheel_lines;
 use crate::toast::{self, Toast};
 use crate::ui::controls::{ButtonKind, Tone, badge, button_with, icon_button, icon_button_tinted, segmented, tooltip};
 use crate::ui::icons::Icon;
@@ -711,7 +712,10 @@ impl OutputView {
     fn on_scroll(&mut self, ev: &ScrollEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
         let lh = self.geom.cell.height.max(px(1.));
         let (dx, dy) = match ev.delta {
-            ScrollDelta::Lines(p) => (self.geom.cell.width * p.x * 3., p.y * 3.),
+            ScrollDelta::Lines(p) => {
+                let p = wheel_lines(p, cx.global::<crate::settings::AppSettings>().client.mouse.scroll_lines);
+                (self.geom.cell.width * p.x, p.y)
+            }
             ScrollDelta::Pixels(p) => (p.x, p.y / lh),
         };
         // Shift turns the wheel sideways.

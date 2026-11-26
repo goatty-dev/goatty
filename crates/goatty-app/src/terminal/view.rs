@@ -64,6 +64,7 @@ use crate::agent::{AgentStatus, Identity};
 use crate::output_view::{self, OutputEvent, OutputView};
 use crate::session::{LinkStatus, Session};
 use crate::settings::{AppSettings, palette};
+use crate::terminal::wheel::wheel_lines;
 use crate::toast::{self, Toast};
 use crate::ui::context_menu::{Entry, Item};
 use crate::ui::icons::Icon;
@@ -2362,7 +2363,7 @@ impl TerminalView {
     fn on_scroll(&mut self, ev: &ScrollEvent, _window: &mut Window, cx: &mut Context<'_, Self>) {
         let geom = self.geom.get();
         let lines = match ev.delta {
-            ScrollDelta::Lines(p) => p.y * 3.0,
+            ScrollDelta::Lines(p) => wheel_lines(p, cx.global::<AppSettings>().client.mouse.scroll_lines).y,
             ScrollDelta::Pixels(p) => p.y / geom.cell.height.max(px(1.0)),
         };
         self.prompt_jump_pending = false;
