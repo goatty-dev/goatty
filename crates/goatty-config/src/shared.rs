@@ -233,7 +233,7 @@ pub struct Entry {
     pub hlc: Hlc,
     /// The device that made it ([`is_device_id`]).
     pub device: String,
-    /// ed25519 over [`Entry::message`], hex.
+    /// ed25519 over everything else in the entry (canonical JSON), hex.
     pub sig: String,
 }
 
@@ -738,7 +738,7 @@ pub fn sparse(settings: &HostSettings) -> Value {
 }
 
 /// A settings document as one value per path. Objects are walked into,
-/// except entries of [`ATOMIC_MAPS`] (an alias is one value); lists and
+/// except entries of aliases, snippets and expansions (an alias is one value); lists and
 /// empty objects are values.
 pub fn flatten(doc: &Value) -> BTreeMap<String, Value> {
     fn walk(v: &Value, path: &mut Vec<String>, out: &mut BTreeMap<String, Value>) {
