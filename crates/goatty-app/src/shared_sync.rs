@@ -275,7 +275,6 @@ pub fn on_connect(link: HostLink, after_install: bool, cx: &mut App) {
     if !link.shares_config() {
         return crate::shell_sync::on_connect(link, after_install, cx);
     }
-    migrate_once(cx);
     let l = link.clone();
     exchange(Vec::new(), Some(link), cx, move |result, cx| {
         let o = match result {
@@ -308,38 +307,30 @@ pub fn on_connect(link: HostLink, after_install: bool, cx: &mut App) {
 }
 
 /// The first run with the shared config on this computer: carry over the
-/// old push sync's choices (#159) from the raw settings file, once.
-fn migrate_once(cx: &mut App) {
+/// old push sync's choices (#159) from the raw settings file, once. Runs
+/// at startup before anything saves `settings.json` (a save drops the old
+/// keys) and before any host is met (it reads the choices). Small file
+/// reads only.
+pub fn migrate_once() {
     let Some(file) = ClientState::file() else { return };
-    if cx.try_global::<Migrated>().is_some() {
+    let mut state = ClientState::load(&file);
+    if state.migrated {
         return;
     }
-    cx.set_global(Migrated);
-    cx.background_executor()
-        .spawn(async move {
-            let mut state = ClientState::load(&file);
-            if state.migrated {
-                return;
-            }
-            let raw = goatty_config::client_file().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-            let synced: Vec<String> = goatty_config::sync_state::state_file()
-                .map(|f| goatty_config::sync_state::SyncState::load(&f))
-                .unwrap_or_default()
-                .hosts
-                .into_iter()
-                .filter(|(_, h)| h.synced)
-                .map(|(host, _)| host)
-                .collect();
-            state.migrate(&raw, &synced);
-            if let Err(e) = state.save(&file) {
-                log::warn!("couldn't save {}: {e}", file.display());
-            }
-        })
-        .detach();
+    let raw = goatty_config::client_file().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let synced: Vec<String> = goatty_config::sync_state::state_file()
+        .map(|f| goatty_config::sync_state::SyncState::load(&f))
+        .unwrap_or_default()
+        .hosts
+        .into_iter()
+        .filter(|(_, h)| h.synced)
+        .map(|(host, _)| host)
+        .collect();
+    state.migrate(&raw, &synced);
+    if let Err(e) = state.save(&file) {
+        log::warn!("couldn't save {}: {e}", file.display());
+    }
 }
-
-struct Migrated;
-impl Global for Migrated {}
 
 /// This computer never decided: seed the shared config from its settings
 /// and plugins (signed as of when its settings file last changed).

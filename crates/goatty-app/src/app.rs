@@ -28,6 +28,8 @@ pub enum Initial {
 /// `more`: further windows to open (the other windows of the last run).
 pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) {
     gpui_platform::application().with_assets(crate::ui::icons::Assets).run(move |cx: &mut App| {
+        // Before anything can save settings.json without the old sync choices (#313).
+        crate::shared_sync::migrate_once();
         AppSettings::init(cx);
         crate::agent::notify::init(cx);
         crate::workspace::reopen::init(cx);
