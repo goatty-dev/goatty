@@ -63,6 +63,10 @@ pub struct Cli {
     #[arg(long, value_name = "PAGE", num_args = 0..=1, default_missing_value = "appearance")]
     pub settings: Option<String>,
 
+    /// `goatty://` link(s) to open (shorthand for `goatty open <URL>`).
+    #[arg(value_name = "URL")]
+    pub urls: Vec<String>,
+
     #[command(subcommand)]
     pub cmd: Option<Command>,
 }
@@ -70,6 +74,11 @@ pub struct Cli {
 /// Work without a window.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Open a `goatty://` link in a running goatty window (or start goatty).
+    Open {
+        /// The `goatty://` link to open.
+        url: String,
+    },
     /// Inspect and change settings, export and import profiles.
     #[command(subcommand)]
     Settings(SettingsCmd),
@@ -351,6 +360,13 @@ mod tests {
         assert!(matches!(cli.cmd, Some(Command::Net(NetCmd::Forget { .. }))));
         assert!(Cli::try_parse_from(["goatty", "--ssh", "a", "--tailnet", "b"]).is_err());
         assert!(Cli::try_parse_from(["goatty", "--local", "--tailnet", "b"]).is_err());
+
+        // `goatty open <URL>` and bare `goatty goatty://…` shorthand.
+        let cli = Cli::parse_from(["goatty", "open", "goatty://settings/terminal?setting=links.open_on"]);
+        assert!(matches!(cli.cmd, Some(Command::Open { ref url }) if url == "goatty://settings/terminal?setting=links.open_on"));
+        let cli = Cli::parse_from(["goatty", "goatty://plugins/eza"]);
+        assert!(cli.cmd.is_none());
+        assert_eq!(cli.urls, ["goatty://plugins/eza"]);
     }
 
     #[test]

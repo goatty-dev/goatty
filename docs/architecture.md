@@ -64,7 +64,7 @@ Design and startup sequence: [`managed-zsh.md`](managed-zsh.md). The zsh behavio
 
 | Where | What |
 |---|---|
-| `main.rs`, `cli.rs`, `commands.rs` | CLI parsing, what the window starts with (a connect plan, or a local PTY for `--local`), the headless `settings`/`theme` commands |
+| `main.rs`, `cli.rs`, `commands.rs`, `links.rs` | CLI parsing, what the window starts with (a connect plan, or a local PTY for `--local`), the headless `settings`/`theme` commands, and `goatty://` deep links + GUI-to-GUI handoff |
 | `app.rs`, `settings.rs`, `actions.rs` | GPUI bootstrap and windows; the `AppSettings` global (file ⇄ live values, theme previews); the action map, including `plugin.<id>.<cmd>` and `custom.<id>` |
 | `workspace/` | a window's root view: tabs of split panes, each tab on its own host. `mod.rs` behaviour, `layout.rs` split trees (pure), `arrange.rs` swap/rotate/move, `tab_bar.rs`, `sidebar.rs`, `groups.rs` (tabs grouped by host), `menu.rs` (context menus), `chrome.rs` (title bar and frame when goatty draws them), `notices.rs` (agent and program notifications), `gestures.rs`, `icons.rs`, and the workspace sync below: `sync.rs`, `saved.rs`, `reopen.rs`, `switcher.rs` |
 | `terminal/` | `TerminalView` (input → terminal, actions, emits `TerminalEvent`), the grid `Element`, per-cell glyph cache, box drawing, key translation (pure), links |
@@ -126,4 +126,5 @@ View tree: `Workspace` → tab bar (or, vertical, the sidebar beside the panes c
 | Several clients on one session | `Session::subscribe`/`resize`/`take_size` in `goatty-daemon/src/session.rs`; see `remote-architecture.md` §4c |
 | Scrollback on demand, snapshots | `goatty-term/src/history.rs`, `snapshot.rs`; fetching: `Session::fill_history` in the app; see `remote-architecture.md` §4a |
 | The tailnet | `goatty-net` (tested against `tests/fake-tailscale.sh`); a new host-side operation: `goatty_net::api::Request` + `Host::request`; client: `goatty-client/src/tailnet.rs`; GUI: `tailnet.rs`, `settings_window/network.rs`. See [`tailnet.md`](tailnet.md) |
+| `goatty://` deep links | parser, per-process app socket (`app-<pid>.sock`/`app-active`), and dispatch: `goatty-app/src/links.rs`; UI targets: `settings_window/` (`mod.rs`, `search.rs`, `plugins.rs`). See [`links.md`](links.md) |
 | New wire messages | `goatty-proto/src/msg.rs`: a new variant at the *end* (append-only), bump `PROTOCOL_VERSION`, mark it `vN:`; handle in `goatty-daemon/src/client.rs` and `goatty-client/src/connection.rs`, which must not send it to a daemon that agreed on an older version (`Connection::protocol_version`) |

@@ -1,16 +1,21 @@
 //! GPUI bootstrap: settings, key bindings, the main window.
 
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, Global, WindowBounds, WindowOptions, px, size};
 
 use crate::actions::{OpenSettings, ReloadShells};
 use crate::command_palette;
 use crate::connect::ConnectPlan;
+use crate::links::{self, AppListener, Link, LinkInbox};
 use crate::session::Spawner;
 use crate::settings::AppSettings;
 use crate::settings_window;
 use crate::toast::{self, Toast};
 use crate::workspace::Workspace;
 use crate::workspace::saved::{SavedWindow, Startup};
+
+/// Keeps the per-process GUI link socket alive until quit.
+struct LinkServer(Option<AppListener>);
+impl Global for LinkServer {}
 
 /// What a terminal window starts with.
 pub enum Initial {
@@ -20,19 +25,61 @@ pub enum Initial {
     /// shows the connect screen meanwhile (`crate::connect`, #37).
     Connect(ConnectPlan),
     /// A window from the last run, with its tabs on every host (#252).
-    /// The second field: `--settings[=PAGE]`, opened once the active tab's
-    /// host is there.
-    Reopen(crate::workspace::reopen::WindowRecord, Option<String>),
+    /// The second field: initial links (`--settings[=PAGE]`, `goatty open`),
+    /// applied once the active tab's host is there.
+    Reopen(crate::workspace::reopen::WindowRecord, Vec<Link>),
 }
 
 /// `more`: further windows to open (the other windows of the last run).
-pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) {
-    gpui_platform::application().with_assets(crate::ui::icons::Assets).run(move |cx: &mut App| {
+pub fn run(initial: Initial, more: Vec<Initial>, initial_links: Vec<Link>) {
+    let inbox = LinkInbox::new();
+    let app = gpui_platform::application().with_assets(crate::ui::icons::Assets);
+    // macOS (and any platform delivering URLs to a running app): feed the same
+    // inbox as the per-process app socket.
+    let url_inbox = inbox.clone();
+    app.on_open_urls(move |urls| {
+        for raw in urls {
+            match links::parse(&raw) {
+                Ok(link) => url_inbox.push(link),
+                Err(e) => log::warn!("ignoring invalid URL from OS ({raw:?}): {e}"),
+            }
+        }
+    });
+    app.run(move |cx: &mut App| {
         // Before anything can save settings.json without the old sync choices (#313).
         crate::shared_sync::migrate_once();
         AppSettings::init(cx);
         crate::agent::notify::init(cx);
         crate::workspace::reopen::init(cx);
+        links::init_active_writer(cx);
+        match AppListener::bind(inbox.clone()) {
+            Ok(listener) => cx.set_global(LinkServer(Some(listener))),
+            Err(e) => log::warn!("couldn't open app link socket: {e:#}"),
+        }
+        cx.on_app_quit(|cx| {
+            if cx.has_global::<LinkServer>() {
+                drop(cx.global_mut::<LinkServer>().0.take());
+            }
+            async {}
+        })
+        .detach();
+        let (wake, wake_rx) = inbox.subscribe();
+        let drain_inbox = inbox.clone();
+        cx.spawn(async move |cx| {
+            while wake_rx.recv_async().await.is_ok() {
+                wake.clear();
+                let incoming = drain_inbox.drain();
+                if incoming.is_empty() {
+                    continue;
+                }
+                cx.update(|cx| {
+                    for link in incoming {
+                        links::apply(cx, link);
+                    }
+                });
+            }
+        })
+        .detach();
         cx.on_action(|_: &OpenSettings, cx| settings_window::open(cx));
         cx.on_action(|_: &ReloadShells, cx| reload_shells(cx));
         command_palette::register_builtins(cx);
@@ -45,9 +92,9 @@ pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) 
 
         crate::welcome::check_first_run(cx);
         cx.background_executor().spawn(async { crate::terminal::cleanup_stale_remote_cache() }).detach();
-        open_terminal_window(cx, initial, open_settings);
+        open_terminal_window(cx, initial, initial_links);
         for initial in more {
-            open_terminal_window(cx, initial, None);
+            open_terminal_window(cx, initial, Vec::new());
         }
         crate::welcome::open_if_first_run(cx);
         // Quit with the last window (the settings window may outlive the
@@ -64,17 +111,20 @@ pub fn run(initial: Initial, more: Vec<Initial>, open_settings: Option<String>) 
     crate::terminal::cleanup_remote_cache();
 }
 
-/// Open a terminal window starting with `initial`. `open_settings`
-/// (`--settings[=PAGE]`) opens the settings window too, once the window's
+/// Open a terminal window starting with `initial`. `initial_links`
+/// (`--settings[=PAGE]`, `goatty open <URL>`) are applied once the window's
 /// host is known.
-pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Option<String>) {
-    let (initial, open_settings) = match initial {
+pub fn open_terminal_window(cx: &mut App, initial: Initial, initial_links: Vec<Link>) {
+    let (initial, initial_links) = match initial {
         Initial::Connect(mut plan) => {
-            plan.open_settings = plan.open_settings.or(open_settings);
-            (Initial::Connect(plan), None)
+            plan.initial_links.extend(initial_links);
+            (Initial::Connect(plan), Vec::new())
         }
-        Initial::Reopen(record, settings) => (Initial::Reopen(record, settings.or(open_settings)), None),
-        ready => (ready, open_settings),
+        Initial::Reopen(record, mut links) => {
+            links.extend(initial_links);
+            (Initial::Reopen(record, links), Vec::new())
+        }
+        ready => (ready, initial_links),
     };
     // A restored layout resizes the window when it arrives (`Workspace`);
     // a reopened window knows its size right away.
@@ -110,8 +160,8 @@ pub fn open_terminal_window(cx: &mut App, initial: Initial, open_settings: Optio
         }
         return;
     }
-    if let Some(page) = open_settings {
-        settings_window::open_at(cx, settings_window::Page::from_name(&page));
+    for link in initial_links {
+        links::apply(cx, link);
     }
 }
 

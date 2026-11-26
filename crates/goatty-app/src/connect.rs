@@ -57,8 +57,8 @@ use crate::workspace::saved::{self, Startup};
 pub struct ConnectPlan {
     pub endpoint: Endpoint,
     pub mode: AttachMode,
-    /// `--settings[=PAGE]`, opened with the terminal window.
-    pub open_settings: Option<String>,
+    /// Initial links (`--settings[=PAGE]`, `goatty open <URL>`) to apply once connected.
+    pub initial_links: Vec<crate::links::Link>,
     /// Plain SSH right away (the host is set to it): `ssh host` in a local
     /// session instead of goattyd on the host.
     pub plain: bool,
@@ -516,9 +516,9 @@ impl ConnectView {
         }
     }
 
-    /// `--settings`, to open once connected.
-    pub fn take_open_settings(&mut self) -> Option<String> {
-        self.plan.open_settings.take()
+    /// Initial links (`--settings`, `goatty open`), to apply once connected.
+    pub fn take_initial_links(&mut self) -> Vec<crate::links::Link> {
+        std::mem::take(&mut self.plan.initial_links)
     }
 
     /// goattyd was freshly installed on the host for this connection (then

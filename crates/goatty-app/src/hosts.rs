@@ -356,7 +356,7 @@ pub fn open(cx: &mut App, req: OpenRequest) {
     let plan = ConnectPlan {
         endpoint: req.host.endpoint(),
         mode: req.attach,
-        open_settings: None,
+        initial_links: Vec::new(),
         plain,
         conn: req.conn,
         join: None,
@@ -375,7 +375,7 @@ pub fn open(cx: &mut App, req: OpenRequest) {
                 return;
             }
         }
-        crate::app::open_terminal_window(cx, crate::app::Initial::Connect(plan), None);
+        crate::app::open_terminal_window(cx, crate::app::Initial::Connect(plan), Vec::new());
     });
 }
 
