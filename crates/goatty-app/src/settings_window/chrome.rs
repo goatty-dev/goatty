@@ -11,7 +11,7 @@ use gpui::{
 use super::kit::{self, search_field};
 use super::{Page, SettingsWindow};
 use crate::settings::AppSettings;
-use crate::ui::controls::{ButtonKind, Tone, banner, button, button_with, icon_button};
+use crate::ui::controls::{ButtonKind, Tone, banner, button, button_with, icon_button, keycap};
 use crate::ui::focus::{self, Ring};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
@@ -205,7 +205,9 @@ impl SettingsWindow {
             .pt(px(14.))
             .gap(px(4.))
             .child(icon_button("rail-menu", Icon::Menu, "Show the sidebar", ui, |_, _| {}).size(px(40.)).on_click(open_drawer(false)))
-            .child(icon_button("rail-search", Icon::Search, "Search settings", ui, |_, _| {}).size(px(40.)).on_click(open_drawer(true)))
+            .child(
+                icon_button("rail-search", Icon::Search, "Search settings  (/)", ui, |_, _| {}).size(px(40.)).on_click(open_drawer(true)),
+            )
             .child(div().h(px(8.)))
             .child(
                 self.nav_frame(&self.nav_focus, "rail-nav", cx)
@@ -294,7 +296,14 @@ impl SettingsWindow {
                             )
                             .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child("Settings")),
                     )
-                    .child(search_field(ui, "nav-search", &self.search, window, cx)),
+                    .child({
+                        // While it's idle, the field shows its shortcut.
+                        let idle = {
+                            let i = self.search.read(cx);
+                            i.text().is_empty() && !i.is_focused(window)
+                        };
+                        search_field(ui, "nav-search", &self.search, window, cx).when(idle, |d| d.child(keycap("/", ui)))
+                    }),
             )
             .child(
                 self.nav_frame(handle, if self.drawer { "drawer-nav" } else { "sidebar-nav" }, cx)
@@ -609,6 +618,9 @@ impl SettingsWindow {
             } else if !self.search.read(cx).text().is_empty() {
                 self.search.update(cx, |i, cx| i.set_text("", cx));
                 window.focus(&self.focus, cx);
+            } else if self.search.read(cx).is_focused(window) {
+                // Empty search: Esc leaves it for the page (Tab goes on from there).
+                window.focus(&self.focus, cx);
             } else if self.plugins.plan.is_some() || self.plugins.detail.is_some() || self.prompt.modules_open {
                 self.back(cx);
             } else {
@@ -636,6 +648,10 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
+        if std::mem::take(&mut self.focus_search_on_open) && f32::from(window.viewport_size().width) >= RAIL_BELOW {
+            let search = self.search.focus_handle(cx);
+            window.focus(&search, cx);
+        }
         let opened_snippet = self.take_pending_snippet(window, cx);
         focus::begin(cx, window, &self.scroll, &self.menu_scroll);
         let restore = self
@@ -731,6 +747,7 @@ impl Render for SettingsWindow {
             .on_action(cx.listener(Self::close))
             .on_action(cx.listener(Self::focus_next_control))
             .on_action(cx.listener(Self::focus_prev_control))
+            .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::prev_page))
             .on_action(cx.listener(Self::dismiss_notifications))
