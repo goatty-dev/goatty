@@ -66,10 +66,13 @@ pub(super) fn host_label(spawner: &Spawner) -> String {
     }
 }
 
+/// This computer's group chip: short, like the other hosts' names.
+pub(super) const LOCAL_LABEL: &str = "Local";
+
 /// One host's tabs, as drawn.
 pub(super) struct Group {
     pub key: HostKey,
-    /// The host as the user named it ("prod", "This computer").
+    /// The host as the user named it ("prod", or [`LOCAL_LABEL`]).
     pub label: SharedString,
     /// More about it: `user@hostname`, "plain SSH", "Connecting…".
     pub detail: Option<SharedString>,
@@ -136,7 +139,7 @@ impl Workspace {
     fn host_names(tab: &Tab, cx: &gpui::App) -> (String, Option<String>, bool) {
         let local = Self::is_local(tab, cx);
         if local && !matches!(tab.host, Some(Spawner::Plain { .. })) {
-            return ("This computer".into(), None, true);
+            return (LOCAL_LABEL.into(), None, true);
         }
         match (&tab.host, &tab.connecting) {
             (Some(Spawner::Daemon(conn)), _) => {
@@ -146,7 +149,7 @@ impl Workspace {
             }
             (Some(Spawner::Plain { host, .. }), _) => (host.clone(), Some("Plain SSH".into()), false),
             (None, Some((view, _))) => (view.read(cx).host_label().to_string(), Some("Connecting…".into()), false),
-            _ => ("This computer".into(), None, true),
+            _ => (LOCAL_LABEL.into(), None, true),
         }
     }
 
@@ -171,8 +174,11 @@ impl Workspace {
             }
             let (label, detail, local) = Self::host_names(tab, cx);
             let color = if local {
-                // Quiet, like its chip.
-                crate::ui::style::Ui::get(cx).muted.opacity(0.5)
+                // Quiet, like its chip, and opaque: the group's line overlaps
+                // the active tab's outline and flared corners, where a
+                // translucent color would show darker seams.
+                let c = super::tab_bar::Colors::get(cx);
+                c.bar.blend(c.ui.muted.opacity(0.5))
             } else {
                 host_color(&label, settings)
             };
