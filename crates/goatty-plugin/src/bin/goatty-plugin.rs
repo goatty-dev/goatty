@@ -205,11 +205,24 @@ fn validate(dir: &Path) -> Result<bool> {
 }
 
 fn render(dir: &Path, set: &[String], shell: &str) -> Result<()> {
-    let m = manifest::load_dir(dir)?;
+    // What a host with that managed shell uses (`os`/`shells` limits).
+    let host = manifest::Platform::host();
+    let platform = match shell {
+        "zsh" => manifest::Platform { os: if host.os == "windows" { "linux".into() } else { host.os }, shell: "zsh" },
+        "powershell" | "pwsh" => manifest::Platform { os: "windows".into(), shell: "powershell" },
+        other => bail!("unknown shell {other:?}: use `zsh` or `powershell`"),
+    };
+    let full = manifest::load_dir(dir)?;
+    let m = full.for_platform(&platform);
+    eprintln!("note: as a {} host with {} uses it", platform.os, platform.shell);
     let mut stored = BTreeMap::new();
     for kv in set {
         let (k, v) = kv.split_once('=').with_context(|| format!("{kv:?}: use KEY=VALUE"))?;
-        let s = m.setting(k).with_context(|| format!("no setting {k:?}"))?;
+        let s = match (m.setting(k), full.setting(k)) {
+            (Some(s), _) => s,
+            (None, Some(_)) => bail!("setting {k:?} isn't used on {} with {}", platform.os, platform.shell),
+            (None, None) => bail!("no setting {k:?}"),
+        };
         stored.insert(k.to_owned(), schema::parse_input(s, v).map_err(anyhow::Error::msg)?);
     }
     let (values, issues) = schema::resolve(&m, &stored);
@@ -246,6 +259,7 @@ fn render(dir: &Path, set: &[String], shell: &str) -> Result<()> {
                     home: home.as_deref(),
                     label: format!("{} {}", m.id, m.version),
                     feature: zsh::feature(&m.id),
+                    packages: "$_goatty_packages".into(),
                 },
             );
             println!("### plugins-early.ps1\n{}", if r.early.is_empty() { "(nothing)\n" } else { &r.early });

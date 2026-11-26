@@ -232,6 +232,8 @@ mod tests {
             separator: None,
             arg: None,
             arg_off: None,
+            os: Vec::new(),
+            shells: Vec::new(),
         };
         assert!(check_value(&int, &Value::from(10)).is_ok());
         assert!(check_value(&int, &Value::from(11)).unwrap_err().contains("outside 1–10"));

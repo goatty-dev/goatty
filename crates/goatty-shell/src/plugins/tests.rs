@@ -808,3 +808,90 @@ fn an_expired_index_warns_but_keeps_working() {
     assert!(!cat.issues.iter().any(|i| i.contains("expired")), "{:?}", cat.issues);
     assert_eq!(cat.registries[0].sequence, Some(2));
 }
+
+/// Parts limited to another OS stay out of what this host renders, plans
+/// and hands to clients; their stored values stay without an issue (#333).
+#[test]
+fn hosts_use_their_platforms_part_and_link_applets() {
+    let w = world();
+    let p = w.plugins();
+    let dir = w.tmp.path().join("multi");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = std::fs::read_to_string(w.tmp.path().join("registry/plugins/demo/1.0.0/plugin.toml")).unwrap();
+    let text = text.replace("bin = [\"demo\"]", "bin = [\"demo\"]\napplets = [\"dm\"]").replace(
+        "[permissions]",
+        "[compat]\nos = [\"linux\", \"macos\", \"windows\"]\nshells = [\"zsh\", \"powershell\"]\n\n\
+         [[setting]]\nid = \"win_only\"\nlabel = \"Windows only\"\ntype = \"bool\"\ndefault = true\nos = [\"windows\"]\n\n\
+         [[setting]]\nid = \"dirs\"\nlabel = \"Dirs\"\ntype = \"list\"\nseparator = \"path\"\ndefault = [\"/a\", \"/b\"]\n\n\
+         [[env]]\nname = \"DEMO_WIN\"\nvalue = \"1\"\nwhen = \"win_only\"\n\n\
+         [[env]]\nname = \"DEMO_DIRS\"\nvalue = \"{dirs}\"\n\n\
+         [[env]]\nname = \"DEMO_PS\"\nvalue = \"1\"\nshells = [\"powershell\"]\n\n\
+         [permissions]",
+    );
+    std::fs::write(dir.join("plugin.toml"), text).unwrap();
+    let mut settings = HostSettings::default();
+    settings
+        .plugins
+        .insert("demo".into(), PluginConfig { settings: BTreeMap::from([("win_only".into(), false.into())]), ..Default::default() });
+
+    let c = Candidate::local(&dir).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    assert_eq!(plan.downloads[0].bins, ["demo", "dm"]);
+    assert_eq!(plan.env.iter().filter(|e| e.starts_with("DEMO_")).count(), 1, "{:?}", plan.env);
+    assert!(plan.env.iter().any(|e| e.starts_with("DEMO_DIRS=/a:/b")), "{:?}", plan.env);
+    p.install(&c, &plan.digest, &settings).unwrap();
+    let bin = w.dirs.bin_dir();
+    assert_eq!(std::fs::read_link(bin.join("dm")).unwrap(), std::fs::read_link(bin.join("demo")).unwrap());
+    assert_eq!(Lock::load(&w.dirs).unwrap().plugins["demo"].packages[0].bins, ["demo", "dm"]);
+
+    let (active, issues) = active(&w.dirs, &settings);
+    assert!(issues.is_empty(), "the Windows setting's value isn't a problem here: {issues:?}");
+    let a = active.iter().find(|a| a.manifest.id == "demo").unwrap();
+    assert!(a.manifest.setting("win_only").is_none());
+    assert_eq!(a.manifest.env.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["DEMO_DIRS"]);
+
+    let cat = p.catalog(false, &settings);
+    let i = installed(&cat).into_iter().find(|i| i.id == "demo").unwrap();
+    assert!(i.manifest.setting("win_only").is_none() && i.manifest.setting("dirs").is_some());
+    assert!(i.manifest.packages[0].applets.is_empty(), "older clients can't read applets");
+    assert!(!serde_json::to_string(&i.manifest).unwrap().contains("\"os\":[\"windows\"]"));
+
+    p.uninstall("demo").unwrap();
+    assert!(bin.join("dm").symlink_metadata().is_err() && bin.join("demo").symlink_metadata().is_err());
+}
+
+/// The catalog says which plugins aren't for this host, from the index, and
+/// the shared settings of one aren't an issue here (#333).
+#[test]
+fn the_catalog_marks_plugins_for_other_platforms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = Dirs::under(&tmp.path().join("host"));
+    let manifest = |id: &str, compat: &str| {
+        format!(
+            "schema = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\nsummary = \"x\"\npublisher = \"tests\"\n\n[compat]\n{compat}\n\n\
+             [[snippet]]\nid = \"hi\"\ntitle = \"Say hi\"\nline = \"echo hi\"\n"
+        )
+    };
+    let reg = tmp.path().join("registry");
+    let (win, ps, both) = (
+        manifest("winonly", "os = [\"windows\"]"),
+        manifest("psonly", "shells = [\"powershell\"]"),
+        manifest("both", "shells = [\"zsh\", \"powershell\"]"),
+    );
+    let (public, _) = make_registry(&reg, &[("winonly", "1.0.0", &win, &[]), ("psonly", "1.0.0", &ps, &[]), ("both", "1.0.0", &both, &[])]);
+    let fetch = Fixed(BTreeMap::new());
+    let sources = vec![Source { name: "test".into(), url: reg.to_string_lossy().into_owned(), keys: vec![public], builtin: true }];
+    let p = Plugins { dirs: &dirs, fetch: &fetch, builtin: &sources };
+    let mut settings = HostSettings::default();
+    settings.plugins.insert("winonly".into(), PluginConfig::default());
+    settings.plugins.insert("both".into(), PluginConfig::default());
+    let cat = p.catalog(true, &settings);
+    let why = |id: &str| cat.available.iter().find(|a| a.id == id).unwrap().incompatible.clone();
+    assert_eq!(why("winonly").as_deref(), Some("supports windows only"));
+    assert!(why("psonly").unwrap().contains("integrates with powershell only"));
+    assert_eq!(why("both"), None);
+    assert!(!cat.issues.iter().any(|i| i.starts_with("plugins.winonly")), "{:?}", cat.issues);
+    assert!(cat.issues.iter().any(|i| i.starts_with("plugins.both: not installed")), "{:?}", cat.issues);
+    // The same from the stored snapshots alone (the host's settings check).
+    assert_eq!(p.not_for_this_host().into_iter().collect::<Vec<_>>(), ["psonly", "winonly"]);
+}

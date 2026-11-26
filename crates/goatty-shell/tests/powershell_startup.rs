@@ -119,6 +119,8 @@ fn powershell_quoted_command_line_survives_real_shell() {
         when: None,
         open_in: OpenIn::Current,
         menu: None,
+        os: Vec::new(),
+        shells: Vec::new(),
     };
     let nasty_a = "it's $(exit 99); $env:USERNAME | 'quoted'";
     let nasty_b = "curly\u{2019}quote; & calc";
@@ -221,6 +223,8 @@ fn native_embedded_quotes_and_snippets_survive_pwsh_and_ps51() {
         when: None,
         open_in: OpenIn::Current,
         menu: None,
+        os: Vec::new(),
+        shells: Vec::new(),
     };
     let json_val = r#"{"name":"value"}"#;
     let spaced_val = r#"{"msg": "hi \"there\""}"#;
@@ -400,6 +404,8 @@ fn native_verb_noun_and_windows_mode_legacy_exes_preserve_json_args() {
         when: None,
         open_in: OpenIn::Current,
         menu: None,
+        os: Vec::new(),
+        shells: Vec::new(),
     };
 
     let json_val = r#"{"name":"value"}"#;

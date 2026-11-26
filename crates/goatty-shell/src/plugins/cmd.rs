@@ -126,7 +126,8 @@ pub fn info(svc: &HostService, id: &str) -> Result<()> {
         Some(c) => Ok(c),
         None => Err(e),
     })?;
-    let m = &c.manifest;
+    // What this host would use of it.
+    let m = &c.manifest.for_platform(&goatty_plugin::manifest::Platform::host());
     println!("{} {}  ({})", m.name, m.version, m.id);
     println!("  {}", m.summary);
     if !m.description.trim().is_empty() {
@@ -414,14 +415,16 @@ pub fn list(svc: &HostService) -> Result<()> {
     Ok(())
 }
 
+/// The installed plugin `id` as this host uses it ([`Manifest::for_platform`](goatty_plugin::manifest::Manifest::for_platform)).
 fn installed_manifest(svc: &HostService, id: &str) -> Result<goatty_plugin::Manifest> {
+    let here = goatty_plugin::manifest::Platform::host();
     if let Some(b) = crate::builtins::get(id) {
-        return Ok(b.manifest().clone());
+        return Ok(b.manifest().for_platform(&here));
     }
     let dirs = svc.launcher.dirs().context("$HOME is not set")?;
     let lock = super::lock::Lock::load(dirs)?;
     let e = lock.plugins.get(id).with_context(|| format!("{id} isn't installed"))?;
-    super::lock::manifest_of(dirs, id, e)
+    Ok(super::lock::manifest_of(dirs, id, e)?.for_platform(&here))
 }
 
 fn print_outcome(o: &crate::service::ApplyOutcome) {

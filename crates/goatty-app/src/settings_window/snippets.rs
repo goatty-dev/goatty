@@ -236,6 +236,8 @@ impl SettingsWindow {
             safety: None,
             line,
             inputs: Vec::new(),
+            os: Vec::new(),
+            shells: Vec::new(),
         };
         self.open_snippet_form(None, s, window, cx);
         true
@@ -410,6 +412,8 @@ impl SettingsWindow {
             safety: f.safety,
             line: self.text_of(&f.line, cx),
             inputs,
+            os: Vec::new(),
+            shells: Vec::new(),
         }
     }
 
@@ -567,6 +571,8 @@ impl SettingsWindow {
                     safety: None,
                     line: String::new(),
                     inputs: Vec::new(),
+                    os: Vec::new(),
+                    shells: Vec::new(),
                 };
                 v.open_snippet_form(None, blank, window, cx)
             }),

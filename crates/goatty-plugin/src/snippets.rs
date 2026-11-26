@@ -85,6 +85,13 @@ pub struct Snippet {
     /// Asked in this order.
     #[serde(default, rename = "input", skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<SnippetInput>,
+    /// A plugin's snippet only on these OSes; empty: everywhere
+    /// ([`Manifest::for_platform`](crate::manifest::Manifest::for_platform)).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// A plugin's snippet only with these managed shells.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shells: Vec<String>,
 }
 
 /// What running a snippet does, shown as a colored badge.
