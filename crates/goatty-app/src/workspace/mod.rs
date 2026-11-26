@@ -444,7 +444,7 @@ impl Workspace {
         match initial {
             Initial::Ready { startup, spawner } => {
                 this.home = Some(spawner.clone());
-                crate::shell_sync::on_connect(spawner.host_link(), false, cx);
+                crate::shared_sync::on_connect(spawner.host_link(), false, cx);
                 match startup {
                     Startup::Session(session) => this.insert_pane(session, Placement::NewTab, spawner, None, window, cx),
                     Startup::Joined(j) => this.show_joined(0, j, spawner, None, true, window, cx),
@@ -898,9 +898,10 @@ impl Workspace {
         if self.home.is_none() {
             self.home = Some(spawner.clone());
         }
-        // Another host: bring the shell setup there (asks, once per change
-        // made here); this computer: offer missing tools (once per run).
-        crate::shell_sync::on_connect(spawner.host_link(), installed, cx);
+        // Exchange the shared shell config with that host (asks once whether
+        // it follows it; an older goattyd gets the push sync); offer
+        // missing tools.
+        crate::shared_sync::on_connect(spawner.host_link(), installed, cx);
         let was_active = index == self.active;
         let tab_id = self.tabs[index].id;
         self.restoring.retain(|(id, _)| *id != tab_id);

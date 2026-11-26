@@ -209,12 +209,30 @@ pub fn focus_target(ui: Ui, label: &str, el: Div) -> Div {
         .child(el)
 }
 
-/// What a page knows about one of its rows: problems reading the setting
-/// and the `GOATTY_*` variable overriding it (#53).
-#[derive(Debug, Clone, Default, PartialEq)]
+/// What a page knows about one of its rows: problems reading the setting,
+/// the `GOATTY_*` variable overriding it (#53), and where it stands in the
+/// shared config (#313).
+#[derive(Clone, Default)]
 pub struct RowNote {
     pub problems: Vec<SharedString>,
     pub overridden_by: Option<SharedString>,
+    pub scope: Option<ScopeNote>,
+}
+
+/// What a click on a row note's link does.
+pub type NoteAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A row's place in the shared config: "Overridden on pi", "Only on pi ·
+/// Use shared value", "This host only".
+#[derive(Clone)]
+pub struct ScopeNote {
+    pub text: SharedString,
+    /// The value is this host's override: an accent bar marks the row.
+    pub accent: bool,
+    /// A link after the text (label, what it does).
+    pub action: Option<(SharedString, NoteAction)>,
+    /// The row can't be edited in this scope.
+    pub disable: bool,
 }
 
 thread_local! {
@@ -307,7 +325,8 @@ impl RenderOnce for Row {
         let focused = is_focus_row(&self.label);
         let note = row_note(window, &self.label).unwrap_or_default();
         // The environment wins over the file: editing here would change nothing.
-        let disabled = self.disabled || note.overridden_by.is_some();
+        let disabled = self.disabled || note.overridden_by.is_some() || note.scope.as_ref().is_some_and(|s| s.disable);
+        let accent = note.scope.as_ref().is_some_and(|s| s.accent);
         let label = div().text_size(px(text::BODY)).text_color(ui.text).child(self.label.clone());
         let text_col = div()
             .flex()
@@ -317,8 +336,46 @@ impl RenderOnce for Row {
             .min_w_0()
             .child(label)
             .when_some(self.desc, |d, t| d.child(div().text_size(px(text::SMALL)).text_color(ui.muted).child(t)));
+        let scope_line = match note.scope.clone() {
+            Some(s) => {
+                let n = ROW_SEQ.get();
+                ROW_SEQ.set(n + 1);
+                let action = match s.action {
+                    Some((label, f)) => {
+                        let id: ElementId = ("row-scope-action", n).into();
+                        let el = div()
+                            .id(id.clone())
+                            .role(Role::Link)
+                            .aria_label(label.clone())
+                            .cursor_pointer()
+                            .underline()
+                            .child(format!("· {label}"))
+                            .on_click(move |_, window, cx| f(window, cx));
+                        // A row renders while the window lays out, after the page was built.
+                        let scope = focus::enter(window);
+                        let el = focus::tab(el, &id, ui, Ring::Outer, Scroller::Page);
+                        focus::leave(scope, window);
+                        Some(el)
+                    }
+                    None => None,
+                };
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .text_size(px(text::SMALL))
+                        .text_color(ui.accent_text)
+                        .child(Icon::Info.svg().flex_shrink_0().size(px(13.)).text_color(ui.accent_text))
+                        .child(div().min_w_0().child(s.text))
+                        .children(action),
+                )
+            }
+            None => None,
+        };
         let notes =
-            (!note.problems.is_empty() || note.overridden_by.is_some()).then(|| {
+            (!note.problems.is_empty() || note.overridden_by.is_some() || scope_line.is_some()).then(|| {
                 let line = |icon: Icon, color: gpui::Hsla, t: SharedString| {
                     div()
                         .flex()
@@ -337,6 +394,7 @@ impl RenderOnce for Row {
                     .children(note.overridden_by.map(|var| {
                         line(Icon::Info, ui.accent_text, format!("Set by {var} for this run; unset it to use this setting").into())
                     }))
+                    .children(scope_line)
                     .children(note.problems.into_iter().map(|p| line(Icon::TriangleAlert, ui.warning, p)))
             });
         let label_text = self.label.clone();
@@ -395,6 +453,8 @@ impl RenderOnce for Row {
             .relative()
             .flex()
             .flex_col()
+            // This host's own value (an override of the shared config).
+            .when(accent, |d| d.child(div().absolute().left_0().top(px(10.)).bottom(px(10.)).w(px(3.)).rounded_full().bg(ui.accent)))
             .when(focused, |d| {
                 d.child(div().absolute().inset(px(4.)).rounded(px(radius::CONTROL)).bg(ui.accent_soft))
                     .child(canvas(|_, _, _| (), |bounds, _, window, _| scroll_to_focus_row(bounds.top(), window)).absolute().size_full())

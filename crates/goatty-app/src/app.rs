@@ -46,6 +46,8 @@ pub fn run(initial: Initial, more: Vec<Initial>, initial_links: Vec<Link>) {
         }
     });
     app.run(move |cx: &mut App| {
+        // Before anything can save settings.json without the old sync choices (#313).
+        crate::shared_sync::migrate_once();
         AppSettings::init(cx);
         crate::agent::notify::init(cx);
         crate::workspace::reopen::init(cx);

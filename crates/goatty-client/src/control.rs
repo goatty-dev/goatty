@@ -191,6 +191,24 @@ impl Control {
         }
     }
 
+    /// An operation on the shared shell config (`goatty_shell::shared::api`
+    /// JSON); returns the reply JSON. Needs protocol v18.
+    pub fn shared(&mut self, request: String) -> Result<String> {
+        if self.version < goatty_proto::SHARED_SINCE {
+            bail!("goattyd (protocol v{}) is too old for the shared shell config; restart it with `goattyd restart`", self.version);
+        }
+        match self.request(|req| ClientMsg::Shared { req, request })? {
+            ServerMsg::Shared { reply, .. } => Ok(reply),
+            ServerMsg::Error { message, .. } => bail!("{message}"),
+            other => bail!("unexpected reply {other:?}"),
+        }
+    }
+
+    /// The daemon takes part in the shared shell config (protocol v18).
+    pub fn shares_config(&self) -> bool {
+        self.version >= goatty_proto::SHARED_SINCE
+    }
+
     /// Replace the daemon with `exe` (default: the goattyd it was started
     /// as), keeping every session (protocol v10). Returns once the old
     /// process image is gone: the daemon closes this connection when it

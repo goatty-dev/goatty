@@ -23,6 +23,8 @@ use crate::workspaces::Changes;
 /// Max concurrent `StatPath` worker threads per connection (bounds thread
 /// leaks if a remote mount stalls `stat`).
 const MAX_STAT_WORKERS: usize = 4;
+/// Shared-config requests in flight per connection (they queue behind one apply).
+const MAX_SHARED_WORKERS: usize = 4;
 /// Max concurrent `ReadFile` worker threads per connection (bounds memory and
 /// stream head-of-line delay).
 const MAX_FILE_WORKERS: usize = 2;
@@ -274,6 +276,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
     let mut features = SubFeatures::default();
     let flow = Arc::new(FlowControl::new());
     let stat_workers = Arc::new(AtomicUsize::new(0));
+    let shared_workers = Arc::new(AtomicUsize::new(0));
     let file_workers = Arc::new(AtomicUsize::new(0));
     let file_queued_bytes = Arc::new(AtomicUsize::new(0));
     let mut rstream = BufReader::with_capacity(64 << 10, stream);
@@ -395,9 +398,32 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
                 },
                 ClientMsg::GetHostSettings { req } => reply(crate::settings::get(&daemon, req)),
-                ClientMsg::SetHostSettings { req, json, apply } => reply(crate::settings::set(&daemon, req, &json, apply)),
+                // Both may wait for a shared-config apply (#313), which can
+                // take as long as a plugin install: off the reader thread, so
+                // input on this connection keeps flowing.
+                ClientMsg::SetHostSettings { req, json, apply } => {
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-settings")).spawn(move || {
+                        if let Ok(f) = encode(&crate::settings::set(&daemon, req, &json, apply)) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start applying the settings: {e}") });
+                    }
+                }
                 ClientMsg::ListGenerations { req } => reply(crate::settings::generations(&daemon, req)),
-                ClientMsg::Rollback { req, generation } => reply(crate::settings::rollback(&daemon, req, generation)),
+                ClientMsg::Rollback { req, generation } => {
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-rollback")).spawn(move || {
+                        if let Ok(f) = encode(&crate::settings::rollback(&daemon, req, generation)) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the rollback: {e}") });
+                    }
+                }
                 ClientMsg::ReloadShells { req } => match daemon.host.reload_shells() {
                     Ok(count) => reply(ServerMsg::ShellsReloaded { req, count: u32::try_from(count).unwrap_or(u32::MAX) }),
                     Err(e) => reply(ServerMsg::Error { req: Some(req), message: format!("{e:#}") }),
@@ -427,6 +453,35 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
                     });
                     if let Err(e) = spawned {
                         reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the shell operation: {e}") });
+                    }
+                }
+                ClientMsg::Shared { req, request } => {
+                    if agreed_version < goatty_proto::SHARED_SINCE {
+                        reply(ServerMsg::Error {
+                            req: Some(req),
+                            message: format!("Shared needs protocol v18 (this connection is v{agreed_version})"),
+                        });
+                        continue;
+                    }
+                    // Applies queue behind one another: a few waiting per connection at most.
+                    let Some(guard) = try_acquire_worker(&shared_workers, MAX_SHARED_WORKERS) else {
+                        reply(ServerMsg::Error {
+                            req: Some(req),
+                            message: "busy with earlier shared-config requests; try again shortly".into(),
+                        });
+                        continue;
+                    };
+                    // Applying builds a generation and may install plugins: off the reader thread.
+                    let (daemon, tx) = (daemon.clone(), tx.clone());
+                    let spawned = std::thread::Builder::new().name(format!("c{conn}-shared")).spawn(move || {
+                        let _guard = guard;
+                        let msg = crate::settings::shared(&daemon, req, &request);
+                        if let Ok(f) = encode(&msg) {
+                            let _ = tx.send(Outbound::from(f));
+                        }
+                    });
+                    if let Err(e) = spawned {
+                        reply(ServerMsg::Error { req: Some(req), message: format!("couldn't start the shared-config operation: {e}") });
                     }
                 }
                 ClientMsg::Net { req, request } => {

@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// The oldest protocol version this build still speaks. v17 replaced the
 /// exclusive window layouts with shared workspaces, which can't be appended.
@@ -80,6 +80,12 @@ pub const FLOW_CONTROL_SINCE: u32 = 15;
 /// `SaveWorkspace` with revisions, `ServerMsg::LayoutChanged`, …). They
 /// replaced v8's and v16's exclusive window layouts.
 pub const WORKSPACES_SINCE: u32 = 17;
+
+/// v18: the shared shell config (#313): `Shared` exchanges a host's copy
+/// of the signed shared document, its trust roots and membership
+/// (`goatty_shell::shared::api` JSON). Older daemons keep the push sync
+/// (#159).
+pub const SHARED_SINCE: u32 = 18;
 
 /// Maximum single-frame remote file transfer size (`MAX_FRAME` minus headroom
 /// for postcard headers and path metadata).
@@ -419,6 +425,15 @@ pub enum ClientMsg {
         req: ReqId,
         id: WorkspaceId,
     },
+    /// v18: an operation on the host's copy of the shared shell config
+    /// (`goatty_shell::shared::api::Request` as JSON: status, pull what the
+    /// client lacks, push signed entries, trust the client's device).
+    /// Answered off the reader thread, since applying a change builds a
+    /// generation and may install plugins. Reply: `Shared`.
+    Shared {
+        req: ReqId,
+        request: String,
+    },
 }
 
 /// Why the daemon sent `ServerMsg::TopLine`.
@@ -731,6 +746,11 @@ pub enum ServerMsg {
         seq: u64,
         list: Vec<WorkspaceInfo>,
     },
+    /// v18: `goatty_shell::shared::api::Reply` as JSON.
+    Shared {
+        req: ReqId,
+        reply: String,
+    },
 }
 
 impl ServerMsg {
@@ -751,6 +771,7 @@ impl ServerMsg {
             | ServerMsg::WorkspaceLayout { req, .. }
             | ServerMsg::Shell { req, .. }
             | ServerMsg::Net { req, .. }
+            | ServerMsg::Shared { req, .. }
             | ServerMsg::History { req, .. }
             | ServerMsg::PathStat { req, .. }
             | ServerMsg::FileData { req, .. } => Some(*req),
@@ -856,6 +877,9 @@ mod tests {
         assert_eq!(postcard::to_allocvec(&ServerMsg::RetiredLayouts).unwrap()[0], 26);
         assert_eq!(postcard::to_allocvec(&ServerMsg::Workspaces { req: 1, seq: 0, list: Vec::new() }).unwrap()[0], 27);
         assert_eq!(postcard::to_allocvec(&ServerMsg::WorkspacesChanged { seq: 0, list: Vec::new() }).unwrap()[0], 32);
+        // v18 additions come after v17's.
+        assert_eq!(postcard::to_allocvec(&ClientMsg::Shared { req: 1, request: String::new() }).unwrap()[0], 42);
+        assert_eq!(postcard::to_allocvec(&ServerMsg::Shared { req: 1, reply: String::new() }).unwrap()[0], 33);
     }
 
     #[test]
