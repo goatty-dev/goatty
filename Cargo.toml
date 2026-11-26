@@ -75,7 +75,7 @@ flate2 = "1"
 tar = "0.4"
 # Plugin packages in other formats (goatty-plugin `archive`): .zip and .tar.xz,
 # both pure Rust (the static goattyd build has no C toolchain to spare).
-zip = { version = "~9.7", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "~9.8", default-features = false, features = ["deflate-flate2"] }
 lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "xz"] }
 # Plugins (goatty-plugin): TOML manifests, version requirements, signed registry indexes.
 toml = "1.1"
