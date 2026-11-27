@@ -1136,15 +1136,14 @@ impl SettingsWindow {
                             return;
                         };
                         b.current = None;
-                        match result {
-                            // A goattyd that doesn't send the installed
-                            // version: no way to tell, so review it.
-                            Ok(plan) if plan.changes().is_none_or(|c| c.needs_review()) => {
+                        match decide_batch_plan(b, &asked, result) {
+                            PlanDecision::Stopped => {}
+                            PlanDecision::Install(plan) => b.queue.push_front(Job::Install(plan)),
+                            PlanDecision::Review(plan) => {
                                 b.reviews += 1;
                                 view.plugins.queue_reviews(vec![plan]);
                             }
-                            Ok(plan) => b.queue.push_front(Job::Install(plan)),
-                            Err(e) => b.failed.push(format!("{asked}: {e:#}")),
+                            PlanDecision::Failed(msg) => b.failed.push(msg),
                         }
                         view.next_in_batch(cx);
                     }),
@@ -2513,6 +2512,34 @@ fn changed(r: api::Reply) -> Option<api::Changed> {
     }
 }
 
+/// How [`SettingsWindow::next_in_batch`] handles a `Plan` reply.
+#[derive(Debug)]
+enum PlanDecision {
+    Stopped,
+    Install(Box<Plan>),
+    Review(Box<Plan>),
+    Failed(String),
+}
+
+fn decide_batch_plan(b: &Batch, asked: &str, result: anyhow::Result<Box<Plan>>) -> PlanDecision {
+    if b.stopped {
+        return PlanDecision::Stopped;
+    }
+    match result {
+        Ok(plan) if b.repair && plan.replaces.as_deref() != Some(plan.version.as_str()) => {
+            let msg = match &plan.replaces {
+                Some(installed) => format!("{} changed to {installed} meanwhile; refresh and retry", plan.name),
+                None => format!("{} was uninstalled meanwhile", plan.name),
+            };
+            PlanDecision::Failed(msg)
+        }
+        // A goattyd that doesn't send the installed version: no way to tell, so review it.
+        Ok(plan) if plan.changes().is_none_or(|c| c.needs_review()) => PlanDecision::Review(plan),
+        Ok(plan) => PlanDecision::Install(plan),
+        Err(e) => PlanDecision::Failed(format!("{asked}: {e:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2715,6 +2742,50 @@ mod tests {
         page.catalog.as_mut().unwrap().installed[0].packages[0].state = PackageState::Managed { version: "0.23.4".into() };
         page.prune_reviews();
         assert!(page.review_queue.is_empty(), "installed package drops stale repair review");
+    }
+
+    #[test]
+    fn batch_plan_honors_stop_and_refuses_repair_version_mismatch() {
+        let mut plan = test_plan("eza");
+        plan.replaces = Some("1.0.0".into());
+        plan.previous = Some(Box::new(api::Previous {
+            version: "1.0.0".into(),
+            source: "test".into(),
+            verified: true,
+            packages: Vec::new(),
+            permissions: Vec::new(),
+            aliases: Vec::new(),
+            env: Vec::new(),
+            files: Vec::new(),
+            shell_code: None,
+            requires: Vec::new(),
+        }));
+
+        // Matching version in an active repair batch installs without another review.
+        let active_repair = Batch { repair: true, ..Default::default() };
+        assert!(matches!(decide_batch_plan(&active_repair, "eza", Ok(plan.clone())), PlanDecision::Install(_)));
+
+        // Stopped batch ignores the arriving plan without queuing install or review.
+        let stopped_repair = Batch { repair: true, stopped: true, ..Default::default() };
+        assert!(matches!(decide_batch_plan(&stopped_repair, "eza", Ok(plan.clone())), PlanDecision::Stopped));
+
+        // Another window updated the plugin to 1.1.0 before the repair ran: must not downgrade.
+        let mut mismatch = plan.clone();
+        mismatch.replaces = Some("1.1.0".into());
+        mismatch.previous.as_mut().unwrap().version = "1.1.0".into();
+        match decide_batch_plan(&active_repair, "eza", Ok(mismatch)) {
+            PlanDecision::Failed(msg) => assert!(msg.contains("changed to 1.1.0"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Another window uninstalled the plugin before the repair ran: must not reinstall.
+        let mut removed = plan;
+        removed.replaces = None;
+        removed.previous = None;
+        match decide_batch_plan(&active_repair, "eza", Ok(removed)) {
+            PlanDecision::Failed(msg) => assert!(msg.contains("was uninstalled"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
