@@ -895,3 +895,64 @@ fn the_catalog_marks_plugins_for_other_platforms() {
     // The same from the stored snapshots alone (the host's settings check).
     assert_eq!(p.not_for_this_host().into_iter().collect::<Vec<_>>(), ["psonly", "winonly"]);
 }
+
+/// Removing a system binary that an installed registry plugin previously used
+/// transitions the package to `PackageState::Missing`, and reinstalling at the
+/// installed version downloads goatty's managed copy and updates the lock (#340).
+#[test]
+fn missing_system_binary_recovers_into_managed_copy_and_falls_back_to_lock() {
+    let w = world();
+    let p = w.plugins();
+    let settings = HostSettings::default();
+
+    // Install `demo` normally, then simulate an install that originally used a
+    // system binary (no managed `tools/` or `bin/` copy, `system: Some(...)` in lock).
+    let c = p.find("demo", None).unwrap();
+    let plan = p.plan(&c, &settings).unwrap();
+    p.install(&c, &plan.digest, &settings).unwrap();
+    install::uninstall_package("demo", &["demo".into()], &w.dirs).unwrap();
+    let mut lock = Lock::load(&w.dirs).unwrap();
+    lock.plugins.get_mut("demo").unwrap().packages[0].system = Some("/usr/local/bin/demo".into());
+    lock.save(&w.dirs).unwrap();
+
+    // Without the system binary on PATH, the catalog reports `PackageState::Missing`.
+    let cat = p.catalog_with_env_path(false, &settings, Some(""));
+    let inst = installed(&cat).into_iter().find(|i| i.id == "demo").unwrap();
+    assert_eq!(inst.packages[0].state, PackageState::Missing);
+    assert!(inst.packages[0].available);
+    assert!(inst.packages[0].needs_install());
+
+    // Planning at the installed version needs no new review for a verified
+    // registry plugin whose manifest and checksums are unchanged.
+    let same = p.find("demo", Some("1.0.0")).unwrap();
+    let repair_plan = p.plan(&same, &settings).unwrap();
+    assert_eq!(repair_plan.replaces.as_deref(), Some("1.0.0"));
+    assert!(repair_plan.downloads[0].fetches());
+    let changes = repair_plan.changes().expect("same-version plan compares against installed");
+    assert!(!changes.needs_review(), "{:?}", changes.review_reasons());
+
+    // Installing restores the managed binary and clears `system` in lock.json so
+    // uninstalling later removes goatty's copy cleanly.
+    p.install(&same, &repair_plan.digest, &settings).unwrap();
+    assert!(w.dirs.bin_dir().join("demo").is_file());
+    let lock = Lock::load(&w.dirs).unwrap();
+    assert_eq!(lock.plugins["demo"].packages[0].system, None);
+    let cat = p.catalog_with_env_path(false, &settings, Some(""));
+    let inst = installed(&cat).into_iter().find(|i| i.id == "demo").unwrap();
+    assert_eq!(inst.packages[0].state, PackageState::Managed { version: "2.0".into() });
+
+    // Even when no registry offers the installed version (e.g. registry removed
+    // or local plugin), `find(id, Some(installed_version))` falls back to the
+    // verified installed bundle.
+    let no_regs = Plugins { dirs: &w.dirs, fetch: &w.fetch, builtin: &[] };
+    let from_lock = no_regs.find("demo", Some("1.0.0")).unwrap();
+    assert_eq!(from_lock.manifest.id, "demo");
+    assert!(from_lock.verified);
+    assert!(no_regs.find("demo", Some("9.9.9")).is_err(), "other versions do not fall back");
+    assert!(no_regs.find("demo", None).is_err(), "unversioned find still requires a registry");
+
+    // Tampering with the installed bundle causes the lock fallback to fail.
+    std::fs::write(lock::bundle_dir(&w.dirs, "demo").join("plugin.toml"), "tampered\n").unwrap();
+    let err = no_regs.find("demo", Some("1.0.0")).unwrap_err();
+    assert!(format!("{err:#}").contains("changed after it was installed"), "{err:#}");
+}

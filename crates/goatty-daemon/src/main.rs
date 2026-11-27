@@ -251,6 +251,13 @@ enum PluginCmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Download missing (or outdated) managed tools for installed plugins (default: all enabled plugins).
+    Repair {
+        plugins: Vec<String>,
+        /// Approve the plan without asking (it's still printed).
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Remove plugins, their programs and their settings.
     Uninstall {
         plugins: Vec<String>,
@@ -574,6 +581,7 @@ fn main() -> Result<()> {
                 PluginCmd::Info { id } => cmd::info(&svc, &id),
                 PluginCmd::Install { plugins, path, yes } => cmd::install(&svc, &plugins, path.as_deref(), yes),
                 PluginCmd::Update { plugins, yes } => cmd::update(&svc, &plugins, yes),
+                PluginCmd::Repair { plugins, yes } => cmd::repair(&svc, &plugins, yes),
                 PluginCmd::Uninstall { plugins, yes } => cmd::uninstall(&svc, &plugins, yes),
                 PluginCmd::List => cmd::list(&svc),
                 PluginCmd::Enable { id } => cmd::set_enabled(&svc, &id, true),

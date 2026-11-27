@@ -129,6 +129,7 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
 
     match &s.startup {
         Some(st) => {
+            let installed_plugins = svc.plugins(|p| Ok(p.installed(&svc.settings().value).0)).unwrap_or_default();
             println!("  startup     {} ms (login + interactive, measured just now)", st.ms);
             println!();
             for f in &st.features {
@@ -154,7 +155,17 @@ pub fn status(svc: &crate::HostService) -> Result<()> {
                     }
                     FeatureState::Missing => match s.tool(&f.id) {
                         Some(t) => format!("\u{2717} not installed: goattyd shell install {} ({} {})", t.id, t.name, t.version),
-                        None => "\u{2717} its command isn't installed (see `goattyd plugin info`)".into(),
+                        None => match f.id.strip_prefix("plugin:") {
+                            Some(pid)
+                                if installed_plugins.iter().any(|i| {
+                                    i.id == pid && i.incompatible.is_none() && i.packages.iter().any(|p| p.available && p.needs_install())
+                                }) =>
+                            {
+                                format!("\u{2717} not installed: goattyd plugin repair {pid}")
+                            }
+                            Some(pid) => format!("\u{2717} its command isn't installed (see `goattyd plugin info {pid}`)"),
+                            None => "\u{2717} its command isn't installed (see `goattyd plugin info`)".into(),
+                        },
                     },
                 };
                 println!("  {:<20} {line}", f.id);
