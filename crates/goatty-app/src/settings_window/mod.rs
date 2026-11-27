@@ -13,6 +13,7 @@
 //! a preview, apply, rollback or profile import, with the diff.
 
 mod about;
+mod agent_hooks;
 mod aliases;
 mod appearance;
 mod chrome;
@@ -620,6 +621,7 @@ pub struct SettingsWindow {
     path: path::PathPage,
     dotfiles: dotfiles::DotfilesPage,
     everywhere: everywhere::EverywhereState,
+    agent_hooks: agent_hooks::HooksState,
     aliases: aliases::AliasesPage,
     snippets: snippets::SnippetsPage,
     prompt: prompt::PromptPage,
@@ -829,6 +831,7 @@ impl SettingsWindow {
             path: path::PathPage::new(cx),
             dotfiles: dotfiles::DotfilesPage::new(cx),
             everywhere: everywhere::EverywhereState::new(cx),
+            agent_hooks: agent_hooks::HooksState::default(),
             aliases: aliases::AliasesPage::new(cx),
             snippets: snippets::SnippetsPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
@@ -918,6 +921,7 @@ impl SettingsWindow {
         self.path.reset();
         self.dotfiles.reset();
         self.everywhere.reset();
+        self.agent_hooks.reset();
         self.load_host(cx);
         self.load_plugins(false, cx);
         match self.page {
@@ -925,7 +929,10 @@ impl SettingsWindow {
             Page::Network => self.load_net(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
-            Page::Shell => self.load_everywhere(cx),
+            Page::Shell => {
+                self.load_everywhere(cx);
+                self.load_agent_hooks(cx);
+            }
             _ => {}
         }
         cx.notify();
@@ -968,8 +975,11 @@ impl SettingsWindow {
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
-            // What the host's .zshenv has now (the user may have edited it).
-            Page::Shell => self.load_everywhere(cx),
+            // What the host's .zshenv and agent configs have now (the user may have edited them).
+            Page::Shell => {
+                self.load_everywhere(cx);
+                self.load_agent_hooks(cx);
+            }
             _ => {}
         }
         cx.notify();

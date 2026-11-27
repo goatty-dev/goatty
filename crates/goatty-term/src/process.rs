@@ -27,14 +27,15 @@ pub fn process_name(pid: u32) -> Option<String> {
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         display_name(comm.as_deref().unwrap_or("").trim_end_matches('\n'), &cmdline)
     }
-    // macOS: the kernel's name (`proc_name`, up to 32 bytes); no argv, so
-    // a coding agent under a runtime shows as the runtime.
+    // macOS: the kernel's name (`proc_name`, up to 32 bytes), and the
+    // arguments (`KERN_PROCARGS2`) for a coding agent under a runtime.
     #[cfg(target_os = "macos")]
     {
         let mut buf = [0u8; 64];
         // SAFETY: `buf` is valid for writes of the size passed.
         let n = unsafe { libc::proc_name(pid as i32, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        display_name(&String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(buf.len())]), &[])
+        let cmdline = procargs(pid).map(|(args, _)| args.join("\0")).unwrap_or_default();
+        display_name(&String::from_utf8_lossy(&buf[..(n.max(0) as usize).min(buf.len())]), cmdline.as_bytes())
     }
     #[cfg(windows)]
     {
@@ -91,7 +92,7 @@ impl Process {
         process_name(self.0)
     }
 
-    /// Its arguments, `argv[0]` first (Linux only).
+    /// Its arguments, `argv[0]` first (Linux, macOS, Windows).
     pub fn args(self) -> Option<Vec<String>> {
         #[cfg(target_os = "linux")]
         {
@@ -99,23 +100,36 @@ impl Process {
             let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
             (!raw.is_empty()).then(|| raw.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            procargs(self.0).map(|(args, _)| args).filter(|a| !a.is_empty())
+        }
+        #[cfg(windows)]
+        {
+            windows_impl::read_peb_cmdline(self.0).map(|c| split_windows_cmdline(&c)).filter(|a| !a.is_empty())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         None
     }
 
-    /// One of its environment variables as it started (Linux only).
+    /// One of its environment variables as it started (Linux, macOS).
     pub fn env(self, name: &str) -> Option<String> {
+        let find = |kv: &[u8]| {
+            let rest = kv.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+            Some(String::from_utf8_lossy(rest).into_owned())
+        };
         #[cfg(target_os = "linux")]
         {
             let raw = std::fs::read(format!("/proc/{}/environ", self.0)).ok()?;
-            raw.split(|&b| b == 0).find_map(|kv| {
-                let rest = kv.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
-                Some(String::from_utf8_lossy(rest).into_owned())
-            })
+            raw.split(|&b| b == 0).find_map(find)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            let _ = name;
+            procargs(self.0)?.1.iter().find_map(|kv| find(kv.as_bytes()))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = find;
             None
         }
     }
@@ -159,6 +173,38 @@ impl Process {
             Vec::new()
         }
     }
+}
+
+/// A process's arguments and environment on macOS (`KERN_PROCARGS2`: argc,
+/// the executable's path, padding, then argv and envp, NUL-separated).
+#[cfg(target_os = "macos")]
+fn procargs(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a null buffer asks for the size needed; `mib` and `size` are valid.
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &raw mut size, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` is valid for writes of `size` bytes.
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &raw mut size, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    parse_procargs(&buf)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs(buf: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
+    let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = &buf[4..];
+    let rest = &rest[rest.iter().position(|&b| b == 0)?..];
+    let rest = &rest[rest.iter().position(|&b| b != 0)?..];
+    let mut parts = rest.split(|&b| b == 0);
+    let text = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+    let args: Vec<String> = parts.by_ref().take(argc).map(text).collect();
+    let env = parts.take_while(|p| !p.is_empty()).map(text).collect();
+    Some((args, env))
 }
 
 /// Strip a trailing `.exe` (case-insensitive) from a Windows image name so tab
@@ -417,7 +463,7 @@ mod windows_impl {
     /// Best-effort read of another same-bitness process's command line from its
     /// PEB via `NtQueryInformationProcess` + `ReadProcessMemory`. Returns `None`
     /// on access denied or architecture mismatch.
-    fn read_peb_cmdline(pid: u32) -> Option<String> {
+    pub(crate) fn read_peb_cmdline(pid: u32) -> Option<String> {
         #[repr(C)]
         struct ProcessBasicInformation {
             _exit_status: isize,
@@ -613,6 +659,16 @@ fn wait(rx: &flume::Receiver<()>, d: Duration) -> Option<bool> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn macos_procargs() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/local/bin/claude\0\0\0claude\0--resume\0abc\0HOME=/Users/me\0CLAUDE_CONFIG_DIR=/c\0\0junk");
+        let (args, env) = parse_procargs(&buf).unwrap();
+        assert_eq!(args, ["claude", "--resume", "abc"]);
+        assert_eq!(env, ["HOME=/Users/me", "CLAUDE_CONFIG_DIR=/c"]);
+        assert_eq!(parse_procargs(&[1, 0]), None);
+    }
 
     #[test]
     fn names() {

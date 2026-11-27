@@ -3,7 +3,8 @@
 //! killed outright (as by a reboot or a crash) takes its shells with it; the
 //! next one opens a shell for each session, with the same id, in the same
 //! folder, starts a listed program again there, and keeps the workspaces.
-//! `goattyd stop` ends them for good.
+//! `goattyd stop` keeps them too, and a coding agent's session hook
+//! (`goattyd agent-hook`) names the conversation the tab resumes.
 //!
 //! Sandboxed: the daemon has its own `GOATTY_SOCKET` and `HOME`. Linux
 //! only: the program in the foreground is read from `/proc`.
@@ -34,6 +35,9 @@ fn goattyd(dir: &Path) -> Daemon {
         .env("GOATTY_SHELL", "/bin/sh")
         .env("RUST_LOG", "warn,rio_vt=error")
         .env("HOME", dir)
+        // The fake agents in `bin/`, and the goattyd their hooks run.
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.join("bin").display()))
+        .env("FAKE_GOATTYD", env!("CARGO_BIN_EXE_goattyd"))
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_STATE_HOME")
@@ -176,18 +180,58 @@ fn tabs_come_back_after_goattyd_died_with_their_shells() {
 }
 
 #[test]
-fn goattyd_stop_ends_the_tabs_for_good() {
+fn tabs_come_back_after_goattyd_stop() {
     let dir = tempfile::Builder::new().prefix("goatty-test-").tempdir().unwrap();
     let home = dir.path();
     let mut daemon = goattyd(home);
     let mut s = connect(home);
-    create(&mut s, 1, home);
+    let id = create(&mut s, 1, home);
     wait_for(20, "the record", || record(home).is_some());
     send(&mut s, &ClientMsg::Shutdown { req: 2 });
     let _ = daemon.0.wait();
-    assert_eq!(record(home), None, "stop forgets the record");
+    assert!(record(home).is_some(), "stop keeps the record");
     let _daemon = goattyd(home);
-    assert!(list(home).is_empty());
+    assert_eq!(list(home).iter().map(|s| s.id).collect::<Vec<_>>(), [id]);
+}
+
+/// A stand-in for Claude Code: notes how it was started, runs its
+/// `SessionStart` hook as Claude Code would (the session as JSON on
+/// stdin), then waits. Its process is called `claude`.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+echo "args: $*" >> "$HOME/claude-started"
+printf '{"session_id":"sess-42","hook_event_name":"SessionStart","source":"startup"}' | "$FAKE_GOATTYD" agent-hook claude
+sleep 600
+"#;
+
+#[test]
+fn an_agents_hook_names_the_conversation_to_resume() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::Builder::new().prefix("goatty-test-").tempdir().unwrap();
+    let home = dir.path();
+    std::fs::create_dir_all(home.join("bin")).unwrap();
+    let claude = home.join("bin/claude");
+    std::fs::write(&claude, FAKE_CLAUDE).unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let work = home.join("project");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let mut daemon = goattyd(home);
+    let mut s = connect(home);
+    let id = create(&mut s, 1, &work);
+    send(&mut s, &ClientMsg::Input { session: id, data: b"claude\r".to_vec() });
+    wait_for(20, "the record to name the hook's session", || {
+        record(home).is_some_and(|r| r.contains(r#""argv":["claude","--resume","sess-42"]"#))
+    });
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    drop(s);
+
+    let _daemon = goattyd(home);
+    wait_for(15, "claude to resume the conversation", || {
+        std::fs::read_to_string(home.join("claude-started")).is_ok_and(|t| t.contains("args: --resume sess-42"))
+    });
+    let started = std::fs::read_to_string(home.join("claude-started")).unwrap();
+    assert_eq!(started.lines().collect::<Vec<_>>(), ["args: ", "args: --resume sess-42"], "{started}");
 }
 
 #[test]

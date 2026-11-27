@@ -197,6 +197,11 @@ pub const INDEX: &[Entry] = &[
         .keys(&["restore.agents"]),
     e(Page::Shell, "After a restart", "Programs to start again", "restore restart lazygit htop programs reboot")
         .keys(&["restore.programs"]),
+    e(Page::Shell, "After a restart", "Claude Code hook", "agent hook resume session conversation reboot claude"),
+    e(Page::Shell, "After a restart", "Codex hook", "agent hook resume session conversation reboot codex openai"),
+    e(Page::Shell, "After a restart", "Copilot CLI hook", "agent hook resume session conversation reboot copilot github"),
+    e(Page::Shell, "After a restart", "Antigravity hook", "agent hook resume session conversation reboot agy gemini google"),
+    e(Page::Shell, "After a restart", "OpenCode hook", "agent hook resume session conversation reboot opencode"),
     e(Page::Prompt, "Prompt", "Starship", "prompt git").keys(&["plugins.starship.enabled"]),
     e(Page::Prompt, "Prompt", "Use my own starship.toml", "starship config").keys(&["plugins.starship.settings.prefer_user_config"]),
     e(Page::Prompt, "Style", "Style", "starship lean classic rainbow powerline p10k powerlevel look theme").keys(&["prompt.style"]),

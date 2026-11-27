@@ -212,6 +212,7 @@ impl SettingsWindow {
                         .disabled(!back)
                         .below(self.restore_programs.clone()),
                 )
+                .children(self.agent_hook_rows(ui, back && r.agents, cx))
                 .footer("A restart of goattyd keeps the shells and what runs in them; this is for when they ended.");
             vec![
                 hero.into_any_element(),
@@ -304,12 +305,12 @@ impl SettingsWindow {
     }
 }
 
-/// `100000` → `100 000`.
 /// The "Programs to start again" field: names split at commas and spaces.
 pub(super) fn parse_programs(text: &str) -> Vec<String> {
     text.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()).map(String::from).collect()
 }
 
+/// `100000` → `100 000`.
 fn group_digits(n: u32) -> SharedString {
     let s = n.to_string();
     let mut out = String::new();

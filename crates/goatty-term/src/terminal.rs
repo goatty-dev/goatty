@@ -74,6 +74,8 @@ pub(crate) struct Inner {
     /// How many times the shell said `zle=1`: once per prompt (local echo
     /// prediction tells a fresh prompt from the one input went to).
     pub(crate) prompts: AtomicU64,
+    /// How many prompts the shell marked (`OSC 133 ; A`), any shell.
+    pub(crate) marked_prompts: AtomicU64,
     /// Which host line each row shows (clients; see `history`).
     pub(crate) lines: Mutex<crate::history::LineMap>,
     /// The primary screen's kitty keyboard flags when it last switched to
@@ -156,6 +158,7 @@ impl Terminal {
             started: AtomicU64::new(0),
             zle: AtomicBool::new(false),
             prompts: AtomicU64::new(0),
+            marked_prompts: AtomicU64::new(0),
             lines: Mutex::new(Default::default()),
             primary_kitty: AtomicU8::new(0),
             win32_input: AtomicBool::new(false),
@@ -225,6 +228,7 @@ impl Terminal {
             Mark::PromptStart => {
                 t.grid[row].semantic_prompt = SemanticPrompt::Prompt;
                 self.set_shell(ShellState::Prompt);
+                self.inner.marked_prompts.fetch_add(1, Ordering::Relaxed);
                 // The program that reported is gone.
                 if self.inner.status.lock().prompt() {
                     let _ = self.inner.ui.send(UiEvent::Status { news: None });
@@ -321,9 +325,14 @@ impl Terminal {
         self.inner.zle.load(Ordering::Relaxed) && self.shell_state() != ShellState::Running
     }
 
-    /// Counts the prompts with line editing (`zle=1`) so far: once it's
-    /// above zero, the managed zsh reads what's typed in its line editor.
-    pub fn prompt_generation(&self) -> u64 {
+    /// Counts the prompts any shell with shell integration marked so far
+    /// (`OSC 133 ; A`): once it's above zero, the shell reads what's typed.
+    pub fn prompts_marked(&self) -> u64 {
+        self.inner.marked_prompts.load(Ordering::Relaxed)
+    }
+
+    /// Counts the prompts with line editing (`zle=1`) so far.
+    pub(crate) fn prompt_generation(&self) -> u64 {
         self.inner.prompts.load(Ordering::Relaxed)
     }
 

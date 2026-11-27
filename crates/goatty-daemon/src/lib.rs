@@ -26,7 +26,6 @@ mod launchd;
 mod net;
 pub mod proxy;
 mod restore;
-#[cfg(unix)]
 mod resurrect;
 pub mod server;
 mod session;

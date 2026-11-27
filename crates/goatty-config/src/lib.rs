@@ -27,7 +27,8 @@
 //! | `GOATTY_ZSH_USER_RC`   | [`ZshSettings::user_rc`] (`0`/`1`)        |
 //!
 //! `GOATTY_SOCKET` is not a setting: it says where a daemon lives and is
-//! handled by `goatty_proto::socket_path`.
+//! handled by `goatty_proto::socket_path`. Nor is [`AGENT_REPORT_VAR`],
+//! which goattyd sets in each session for coding agents' session hooks.
 
 mod client;
 pub mod color_history;
@@ -94,6 +95,17 @@ pub(crate) fn home_dir_for(windows: bool, var: &impl Fn(&str) -> Option<String>)
 
 /// Config directory (`$XDG_CONFIG_HOME/goatty`, default `~/.config/goatty` on
 /// Unix and `%APPDATA%\goatty` on Windows). `None` without a home/config base.
+/// Set by goattyd in each session (#344): the file a coding agent's session
+/// hook (`goattyd agent-hook`) writes the agent's session id to, so the
+/// session can resume the conversation after a reboot.
+pub const AGENT_REPORT_VAR: &str = "GOATTY_AGENT_REPORT";
+
+/// [`AGENT_REPORT_VAR`] in this process's environment: the hook runs inside a
+/// goattyd session.
+pub fn agent_report_file() -> Option<PathBuf> {
+    std::env::var_os(AGENT_REPORT_VAR).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
 pub fn config_dir() -> Option<PathBuf> {
     config_dir_from(|k| std::env::var(k).ok())
 }

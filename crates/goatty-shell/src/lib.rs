@@ -34,6 +34,7 @@
 //! opt-in: with the user's consent, [`everywhere`] adds one guarded line to
 //! their `.zshenv` (and removes exactly that line when they turn it off).
 
+pub mod agent_hooks;
 pub mod aliases;
 pub mod builtins;
 pub mod cmd;

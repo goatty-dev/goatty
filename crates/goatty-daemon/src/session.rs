@@ -393,8 +393,7 @@ pub(crate) struct Session {
     /// Serialized working directory state (`OSC 7` + `/proc/<pid>/cwd`).
     pub(crate) cwd: Arc<CwdCoordinator>,
     pub(crate) fg: OnceLock<ForegroundWatch>,
-    /// goatty's managed zsh (it handles reload requests).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// goatty's managed shell (zsh handles reload requests).
     pub(crate) managed: bool,
     /// Lets a restart stop the output pump between two reads (Unix only).
     #[cfg(unix)]

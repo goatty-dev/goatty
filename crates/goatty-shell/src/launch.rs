@@ -109,6 +109,11 @@ impl Launcher {
         self.dirs.as_ref()
     }
 
+    /// The goattyd that `goatty-setup` and coding agents' session hooks run.
+    pub fn daemon_exe(&self) -> Option<&Path> {
+        self.daemon_exe.as_deref()
+    }
+
     fn render(&self, dirs: &Dirs, settings: &HostSettings) -> Vec<GeneratedFile> {
         let (plugins, _) = crate::plugins::active(dirs, settings);
         if cfg!(windows) {

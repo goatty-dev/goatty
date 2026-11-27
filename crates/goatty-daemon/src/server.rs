@@ -61,7 +61,6 @@ pub(crate) struct Daemon {
     #[cfg(unix)]
     pub(crate) socket_activated: AtomicBool,
     /// What comes back after a reboot or crash (#344).
-    #[cfg(unix)]
     pub(crate) resurrect: crate::resurrect::Keeper,
 }
 
@@ -94,7 +93,6 @@ impl Daemon {
     pub(crate) fn new(socket: PathBuf) -> Self {
         // `goatty-setup` in a managed shell runs this goattyd's `shell install`.
         let host = HostService::from_env(std::env::current_exe().ok());
-        #[cfg(unix)]
         let resurrect = crate::resurrect::Keeper::new(host.launcher.dirs().map(|d| d.state.as_path()), &socket);
         Self {
             host,
@@ -112,7 +110,6 @@ impl Daemon {
             conns: Mutex::default(),
             #[cfg(unix)]
             socket_activated: AtomicBool::new(false),
-            #[cfg(unix)]
             resurrect,
         }
     }
@@ -139,7 +136,6 @@ impl Daemon {
 
     /// A new shell for session `id`, whose shell ended with the previous
     /// goattyd (`crate::resurrect`).
-    #[cfg(unix)]
     pub(crate) fn resurrect_session(self: &Arc<Self>, id: SessionId, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
         let launch = self.host.launcher.launch(&self.host.settings());
         let managed = launch.managed;
@@ -174,12 +170,16 @@ impl Daemon {
             cmd.cwd = Some(cwd.into());
         }
         let initial_cwd = cmd.cwd.clone();
+        let id = id.unwrap_or_else(|| self.next_session.fetch_add(1, Ordering::Relaxed) + 1);
+        // A coding agent's session hook reports here (#344).
+        if let Some(report) = self.resurrect.report_file(id) {
+            cmd.env.push((goatty_config::AGENT_REPORT_VAR.into(), report.to_string_lossy().into_owned()));
+        }
         let (pty, reader) = Pty::spawn(&cmd, size).with_context(|| format!("couldn't start {}", cmd.program))?;
         // The daemon's terminal is authoritative and answers queries
         // (DA, DSR, OSC 4/10/11...). Clients run with answering disabled.
         // Over a remote link this also means query replies never pay the RTT.
         let (term, chans) = Terminal::new(size, true, Arc::new(Palette::default()));
-        let id = id.unwrap_or_else(|| self.next_session.fetch_add(1, Ordering::Relaxed) + 1);
         let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let pid = pty.pid();
         log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
@@ -383,8 +383,7 @@ impl Daemon {
     /// the process.
     pub(crate) fn shutdown(&self) -> ! {
         log::info!("shutdown requested");
-        #[cfg(unix)]
-        self.resurrect.forget();
+        self.resurrect.stop();
         for s in self.sessions.lock().values() {
             s.pty.lock().kill();
         }
@@ -518,14 +517,16 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
             let _ = crate::restore::take_over(&daemon, &state)?;
             bind(&path)?
         }
-        Start::Normal => bind(&path)?,
+        Start::Normal => {
+            crate::resurrect::resurrect(&daemon);
+            bind(&path)?
+        }
     };
     log::info!("goattyd {} listening on {} (pid {})", env!("CARGO_PKG_VERSION"), path.display(), std::process::id());
     #[cfg(unix)]
     if crate::systemd::has_fd_store() {
         crate::restore::save_on_sigterm(daemon.clone())?;
     }
-    #[cfg(unix)]
     crate::resurrect::Keeper::start(&daemon)?;
     {
         let d = daemon.clone();

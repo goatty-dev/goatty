@@ -238,6 +238,19 @@ impl HostLink {
         }
     }
 
+    /// Coding agents' session hooks on the host, after `action` (`install`
+    /// and `remove` write the agent's config file there).
+    pub fn agent_hooks(
+        &self,
+        action: goatty_shell::agent_hooks::Action,
+        agent: Option<goatty_shell::agent_hooks::Agent>,
+    ) -> Result<goatty_shell::agent_hooks::Status> {
+        match self.shell(setup::Request::AgentHooks { action, agent })? {
+            setup::Reply::AgentHooks(s) => Ok(*s),
+            other => bail!("unexpected reply from the host: {other:?}"),
+        }
+    }
+
     /// A tailnet operation on the host (its availability, pairing, paired
     /// devices). Runs `tailscale` there: off the UI thread.
     pub fn net(&self, req: &goatty_net::api::Request) -> Result<goatty_net::api::NetStatus> {

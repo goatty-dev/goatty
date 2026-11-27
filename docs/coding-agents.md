@@ -51,17 +51,32 @@ Colored logos are rasterized at exactly the size they're drawn in device pixels 
 
 ## Resuming after a reboot
 
-A restart of goattyd keeps the agents running (#131). When the shells ended with goattyd (a reboot, a crash, `systemctl --user stop`, logging out), the next goattyd reopens every tab in its folder and resumes the agent's conversation there (#344, `goatty-daemon/src/resurrect.rs`; Settings → Shell → After a restart, `restore.*` in `host.json`). goatty reads the agent's session from outside, without hooks in the agent's config (herdr installs hooks to learn the same ids):
+A restart of goattyd keeps the agents running (#131). When the shells ended with goattyd (a reboot, a crash, `goattyd stop`, `systemctl --user stop`, logging out), the next goattyd reopens every tab in its folder and resumes the agent's conversation there (#344, `goatty-daemon/src/resurrect.rs`; Settings → Shell → After a restart, `restore.*` in `host.json`). Which conversation, best first:
 
-| Agent | Exact session | Else |
-|---|---|---|
-| Claude Code | `sessionId` in `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (it follows `/clear`), or `--resume`/`--session-id` on the command line → `claude --resume <id>` | `claude --continue` |
-| Codex | `codex resume <id>` on the command line, or a `rollout-…-<id>.jsonl` it holds open → `codex resume <id>` | `codex resume --last` (the newest in that folder) |
-| Copilot CLI | the `session-state/<id>/inuse.<pid>.hold` it holds open, or `--resume=<id>` → `copilot --resume=<id>` | `copilot --continue` |
-| OpenCode | `--session <id>` on the command line | `opencode --continue` |
-| Antigravity | `--conversation <id>` on the command line | `agy --continue` |
+1. **The agent's session hook**, when the user installed it (the "… hook" rows there, or `goattyd agent-hooks install [agent]`; `goatty_shell::agent_hooks`). goattyd sets `GOATTY_AGENT_REPORT` in every session; the agent runs `goattyd agent-hook <agent>` when it starts, resumes or clears a conversation, and that writes the session id to the file the variable names. This works on every platform. The hook formats follow herdr's integrations:
 
-Checked against the binaries on a development machine (Nov 2026: Claude Code 2.1.332, Codex 0.172.0, Copilot 1.0.112, OpenCode 2.4.1). Command lines, environments and open files come from `/proc`, so this works on Linux; on macOS goatty can't read command lines yet (agents under a runtime or a versioned binary aren't recognized, listed programs start without their arguments), and Windows tabs don't come back. Two tabs never resume the same conversation: an exact session starts in the first tab that had it, a "continue" once per folder. An agent whose folder is gone isn't started. The command is typed at the new shell's first prompt, so it lands in the shell's history and the shell is back when the agent exits. Other programs start again only when listed in `restore.programs` (lazygit, htop, … by default); a build or a training run never does. The previous screen isn't shown again yet.
+   | Agent | Hook in | Event, id |
+   |---|---|---|
+   | Claude Code | `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`) | `SessionStart` (startup, resume, clear, compact, fork), `session_id` |
+   | Codex | `~/.codex/hooks.json` (`$CODEX_HOME`); Codex asks once to trust a new hook | `SessionStart`, `session_id` |
+   | Copilot CLI | `~/.copilot/settings.json` (`$COPILOT_HOME`), `bash`/`powershell` field | `SessionStart`, `session_id` |
+   | Antigravity | `~/.gemini/config/hooks.json`, its own block `goatty` (the hook answers `{}`) | `PreInvocation`, `conversationId` |
+   | OpenCode | the plugin `~/.config/opencode/plugins/goatty-resume.js` | `session.created`/`updated` of a root session |
+
+   Installing backs the file up to `$XDG_STATE_HOME/goatty/agent-hooks/`, keeps every other key in its order and only adds goatty's entry; removing takes out only entries that run `goattyd … agent-hook`. A hook that runs another goattyd (moved, reinstalled) shows as outdated. On Windows the command goes through `powershell -Command "& '…goattyd.exe' agent-hook …"`, which cmd, PowerShell and Git Bash all run (not checked on a Windows machine yet).
+2. **What can be seen from outside**, without a hook:
+
+   | Agent | Exact session | Else |
+   |---|---|---|
+   | Claude Code | `sessionId` in `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (it follows `/clear`), or `--resume`/`--session-id` on the command line → `claude --resume <id>` | `claude --continue` |
+   | Codex | `codex resume <id>` on the command line, or a `rollout-…-<id>.jsonl` it holds open → `codex resume <id>` | `codex resume --last` (the newest in that folder) |
+   | Copilot CLI | the `session-state/<id>/inuse.<pid>.hold` it holds open, or `--resume=<id>` → `copilot --resume=<id>` | `copilot --continue` |
+   | OpenCode | `--session <id>` on the command line | `opencode --continue` |
+   | Antigravity | `--conversation <id>` on the command line | `agy --continue` |
+
+   Command lines come from `/proc` on Linux, `KERN_PROCARGS2` on macOS (with the environment) and the process's own command line on Windows; open files only on Linux.
+
+Checked against the binaries on a development machine (Nov 2026: Claude Code 2.1.332, Codex 0.172.0, Copilot 1.0.112, OpenCode 2.4.1). Which agent runs is the foreground program's name, on every platform. Two tabs never resume the same conversation: an exact session starts in the first tab that had it, a "continue" once per folder. An agent whose folder is gone isn't started. The command is typed once the new shell marked its first prompt (OSC 133), so it lands in the shell's history and the shell is back when the agent exits; arguments are single-quoted, which zsh, bash, fish and PowerShell read alike (an argument with `'` isn't started again). Other programs start again only when listed in `restore.programs` (lazygit, htop, … by default); a build or a training run never does. The previous screen isn't shown again yet.
 
 ## Notifications
 

@@ -12,11 +12,13 @@
 //!
 //! What starts again is decided per program, never "whatever ran":
 //!
-//! * coding agents resume their own conversation (`restore.agents`), found
-//!   from the outside without any hook in the agent's config: Claude Code's
-//!   `sessions/<pid>.json`, the session file Copilot holds open, the session
-//!   id on the command line, else the agent's own "continue the last one in
-//!   this folder" (`claude --continue`, `codex resume --last`);
+//! * coding agents resume their own conversation (`restore.agents`): the
+//!   one their session hook reported when the user installed it
+//!   (`goatty_shell::agent_hooks`, every platform), else what can be seen
+//!   from the outside (Claude Code's `sessions/<pid>.json`, the session file
+//!   Copilot holds open, the session id on the command line), else the
+//!   agent's own "continue the last one in this folder" (`claude
+//!   --continue`, `codex resume --last`);
 //! * programs the user listed (`restore.programs`: lazygit, htop, …) start
 //!   again with their arguments;
 //! * anything else (a build, a training run) is not started again, and a
@@ -26,13 +28,14 @@
 //! `agent_resume` (<https://github.com/herdrdev/herdr>, Apache-2.0), which
 //! learns the session ids through hooks it installs instead.
 //!
-//! `goattyd stop` forgets the record: stopping ends the sessions on purpose.
-//! Closing a tab (`Kill`) drops its session from the record right away; a
-//! shell that exits on its own is dropped after [`GRACE`], so the shells a
+//! `goattyd stop` keeps the record, so the next goattyd brings the tabs back
+//! too. Closing a tab (`Kill`) drops its session from the record right away;
+//! a shell that exits on its own is dropped after [`GRACE`], so the shells a
 //! shutdown ends one by one before goattyd itself stay in it.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use goatty_config::RestoreSettings;
 use goatty_proto::{SessionId, WinSize};
+use goatty_shell::agent_hooks::{Report, read_report};
 use goatty_term::process::Process;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -58,8 +62,10 @@ const GRACE: Duration = Duration::from_secs(15);
 /// How long a resurrected managed zsh may take to its first prompt before
 /// the command is typed anyway (zsh reads it once it's ready).
 const PROMPT_WAIT: Duration = Duration::from_secs(5);
-/// The same for other shells, which don't say when they're at a prompt.
-const PLAIN_WAIT: Duration = Duration::from_millis(500);
+/// The same for other shells, which may not say when they're at a prompt.
+const PLAIN_WAIT: Duration = Duration::from_secs(2);
+/// The agents goatty resumes.
+const AGENTS: &[&str] = &["claude", "codex", "copilot", "agy", "opencode"];
 
 const MAX_ID: usize = 512;
 const MAX_ARGS: usize = 64;
@@ -110,16 +116,36 @@ impl Resume {
     }
 }
 
+/// How `what` resumes session `id`.
+fn by_id(what: &str, id: &str) -> Option<Resume> {
+    let resume: &[&str] = match what {
+        "claude" => &["claude", "--resume"],
+        "codex" => &["codex", "resume"],
+        "copilot" => &["copilot", "--resume="],
+        "agy" => &["agy", "--conversation"],
+        "opencode" => &["opencode", "--session"],
+        _ => return None,
+    };
+    valid_id(id).then(|| Resume::agent_with(what, resume, id))
+}
+
 /// How to start again what runs in the foreground of a session whose shell
-/// is `shell`, if it's an agent or one of `programs`. `None` while the
-/// shell itself is in the foreground.
-pub(crate) fn detect(fg: Process, shell: Option<u32>, programs: &[String]) -> Option<Resume> {
+/// is `shell`, if it's an agent or one of `programs`. `report`: what the
+/// agent's session hook said. `None` while the shell itself is in the
+/// foreground.
+pub(crate) fn detect(fg: Process, shell: Option<u32>, programs: &[String], report: Option<&Report>) -> Option<Resume> {
     if Some(fg.0) == shell {
         return None;
     }
-    let name = fg.name()?;
     let args = fg.args().unwrap_or_default();
+    // macOS names a versioned binary by its file (Claude Code's `2.1.332`):
+    // the name it was started as counts too.
+    let names = [fg.name(), args.first().map(|a| program_name(a).to_string())];
+    let name = names.into_iter().flatten().find(|n| AGENTS.contains(&n.as_str()) || programs.contains(n))?;
     let own = own_args(&args);
+    if let Some(r) = report.filter(|r| r.agent == name).and_then(|r| by_id(&name, &r.session)) {
+        return Some(r).filter(|r| valid_argv(&r.argv));
+    }
     let resume = match name.as_str() {
         "claude" => claude(fg, own),
         "codex" => codex(fg, own),
@@ -132,8 +158,7 @@ pub(crate) fn detect(fg: Process, shell: Option<u32>, programs: &[String]) -> Op
             || Resume::latest("agy", &["agy", "--continue"]),
             |id| Resume::agent_with("agy", &["agy", "--conversation"], &id),
         )),
-        _ if programs.contains(&name) => Some(program(&name, &args)),
-        _ => None,
+        _ => Some(program(&name, &args)),
     };
     resume.filter(|r| valid_argv(&r.argv))
 }
@@ -142,7 +167,7 @@ pub(crate) fn detect(fg: Process, shell: Option<u32>, programs: &[String]) -> Op
 /// `codex resume X` both give `resume X`.
 fn own_args(args: &[String]) -> &[String] {
     let Some(first) = args.first() else { return args };
-    if !goatty_term::process::is_runtime(base(first)) {
+    if !goatty_term::process::is_runtime(program_name(first)) {
         return &args[1..];
     }
     // Past the runtime's own options to the script it runs.
@@ -152,15 +177,20 @@ fn own_args(args: &[String]) -> &[String] {
     }
 }
 
-fn base(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// `/usr/bin/lazygit` → `lazygit`, `C:\\tools\\lazygit.exe` → `lazygit`.
+fn program_name(path: &str) -> &str {
+    let leaf = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    match leaf.len().checked_sub(4) {
+        Some(i) if leaf.get(i..).is_some_and(|ext| ext.eq_ignore_ascii_case(".exe")) => &leaf[..i],
+        _ => leaf,
+    }
 }
 
 /// A listed program, with the arguments it was started with when its
 /// command line is known.
 fn program(name: &str, args: &[String]) -> Resume {
     let mut argv = vec![name.to_string()];
-    if args.first().is_some_and(|a| base(a) == name) {
+    if args.first().is_some_and(|a| program_name(a) == name) {
         argv.extend(args[1..].iter().cloned());
     }
     Resume { what: name.into(), agent: false, argv, latest: false }
@@ -257,21 +287,22 @@ fn valid_id(id: &str) -> bool {
 
 /// What's typed into the new shell: a plain command name first (shells
 /// disagree on running a quoted path), no control characters (a newline
-/// would run what follows), and not too long.
+/// would run what follows), no `'` (see [`command_line`]), and not too long.
 fn valid_argv(argv: &[String]) -> bool {
     let Some(cmd) = argv.first() else { return false };
     argv.len() <= MAX_ARGS
         && argv.iter().map(String::len).sum::<usize>() <= MAX_ARGV_BYTES
-        && !argv.iter().any(|a| a.chars().any(char::is_control))
+        && !argv.iter().any(|a| a.chars().any(char::is_control) || a.contains('\''))
         && goatty_config::is_program_name(cmd)
 }
 
-/// `argv` as one command line for zsh, bash, sh or fish: arguments that
-/// aren't plain words go in single quotes (`'` as `'\''`, which all of them read).
+/// `argv` as one command line for zsh, bash, sh, fish and PowerShell:
+/// arguments that aren't plain words go in single quotes, which all of them
+/// read alike as long as there's no `'` inside ([`valid_argv`]).
 pub(crate) fn command_line(argv: &[String]) -> String {
     let quote = |a: &String| {
-        let plain = !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./:@%+=,".contains(&b));
-        if plain { a.clone() } else { format!("'{}'", a.replace('\'', r"'\''")) }
+        let plain = !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./:%+=".contains(&b));
+        if plain { a.clone() } else { format!("'{a}'") }
     };
     argv.iter().map(quote).collect::<Vec<_>>().join(" ")
 }
@@ -303,6 +334,8 @@ struct Record {
 pub(crate) struct Keeper {
     /// `None` without a state directory (no `$HOME`): nothing is kept.
     file: Option<PathBuf>,
+    /// Where each session's agent hook reports its session (`<id>.json`).
+    reports: Option<PathBuf>,
     /// Held while the record is built and written, so [`Keeper::forget`]
     /// never races a write.
     state: Mutex<KeeperState>,
@@ -323,8 +356,24 @@ impl Keeper {
     /// The record for the daemon on `socket`, in `state_dir` (goatty's
     /// `$XDG_STATE_HOME`): one per socket, so a test daemon never sees the user's.
     pub(crate) fn new(state_dir: Option<&Path>, socket: &Path) -> Self {
-        let file = state_dir.map(|d| d.join("sessions").join(format!("{:016x}.json", fnv(socket.as_os_str().as_encoded_bytes()))));
-        Self { file, state: Mutex::default(), stopped: AtomicBool::new(false) }
+        let name = format!("{:016x}", fnv(socket.as_os_str().as_encoded_bytes()));
+        let file = state_dir.map(|d| d.join("sessions").join(format!("{name}.json")));
+        let reports = state_dir.map(|d| d.join("sessions").join(name));
+        Self { file, reports, state: Mutex::default(), stopped: AtomicBool::new(false) }
+    }
+
+    /// The file session `id`'s agent hook writes to (`GOATTY_AGENT_REPORT`),
+    /// its folder made.
+    pub(crate) fn report_file(&self, id: SessionId) -> Option<PathBuf> {
+        let dir = self.reports.as_ref()?;
+        make_private_dir(dir).ok()?;
+        Some(dir.join(format!("{id}.json")))
+    }
+
+    fn drop_report(&self, id: SessionId) {
+        if let Some(dir) = &self.reports {
+            let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        }
     }
 
     fn load(&self) -> Option<Record> {
@@ -337,13 +386,10 @@ impl Keeper {
         self.state.lock().closed.insert(id);
     }
 
-    /// `goattyd stop`: the sessions end on purpose, so nothing comes back.
-    pub(crate) fn forget(&self) {
+    /// goattyd is stopping: the record stays as it is, for the next one.
+    pub(crate) fn stop(&self) {
         let _state = self.state.lock();
         self.stopped.store(true, Ordering::SeqCst);
-        if let Some(f) = &self.file {
-            let _ = std::fs::remove_file(f);
-        }
     }
 
     /// Keep the record up to date on its own thread from now on.
@@ -376,7 +422,7 @@ impl Keeper {
             let s = daemon.sessions.lock();
             (w.export(), s.values().cloned().collect::<Vec<Arc<Session>>>())
         };
-        let mut saved: Vec<Saved> = sessions.iter().map(|s| saved(s, &programs)).collect();
+        let mut saved: Vec<Saved> = sessions.iter().map(|s| self.saved(s, &programs)).collect();
         saved.sort_by_key(|s| s.id);
         let next = Record { version: VERSION, next_session: daemon.next_session.load(Ordering::SeqCst), sessions: saved, workspaces };
         let KeeperState { written, closed, missing } = &mut *state;
@@ -398,6 +444,9 @@ impl Keeper {
         match self.write(&next) {
             Ok(()) => {
                 let live: HashSet<SessionId> = next.sessions.iter().map(|s| s.id).collect();
+                for gone in state.written.iter().flat_map(|w| &w.sessions).filter(|s| !live.contains(&s.id)) {
+                    self.drop_report(gone.id);
+                }
                 state.closed.retain(|id| live.contains(id));
                 state.missing.clear();
                 state.written = Some(next);
@@ -414,21 +463,40 @@ impl Keeper {
                 _ => Ok(()),
             };
         }
-        let dir = file.parent().expect("the record is in a directory");
-        std::fs::DirBuilder::new().mode(0o700).recursive(true).create(dir)?;
+        make_private_dir(file.parent().expect("the record is in a directory"))?;
         let tmp = file.with_extension("json.tmp");
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        open.mode(0o600);
+        let mut f = open.open(&tmp)?;
         f.write_all(&serde_json::to_vec(record).map_err(std::io::Error::other)?)?;
         f.sync_all()?;
         std::fs::rename(&tmp, file)
     }
 }
 
-fn saved(s: &Session, programs: &[String]) -> Saved {
-    let (cols, rows) = s.term.size();
-    let fg = s.pty.lock().foreground_pid();
-    let resume = fg.and_then(|fg| detect(Process(fg), s.pid, programs));
-    Saved { id: s.id, cwd: s.current_cwd(), cols, rows, resume }
+impl Keeper {
+    fn saved(&self, s: &Session, programs: &[String]) -> Saved {
+        let (cols, rows) = s.term.size();
+        let fg = s.pty.lock().foreground_pid();
+        // The shell is back: what an agent's hook said is over.
+        if fg.is_none_or(|fg| Some(fg) == s.pid) {
+            self.drop_report(s.id);
+        }
+        let report = self.reports.as_ref().and_then(|d| read_report(&d.join(format!("{}.json", s.id))));
+        let resume = fg.and_then(|fg| detect(Process(fg), s.pid, programs, report.as_ref()));
+        Saved { id: s.id, cwd: s.current_cwd(), cols, rows, resume }
+    }
+}
+
+/// A folder only this user can read (0700 on Unix).
+fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    b.mode(0o700);
+    b.create(dir)
 }
 
 /// FNV-1a: a stable name for a socket path.
@@ -481,7 +549,7 @@ pub(crate) fn resurrect(daemon: &Arc<Daemon>) {
 fn type_when_ready(session: Arc<Session>, line: String) {
     let spawned = std::thread::Builder::new().name(format!("s{}-resume", session.id)).spawn(move || {
         let deadline = Instant::now() + if session.managed { PROMPT_WAIT } else { PLAIN_WAIT };
-        while session.term.prompt_generation() == 0 && Instant::now() < deadline {
+        while session.term.prompts_marked() == 0 && Instant::now() < deadline {
             if session.exited.lock().is_some() {
                 return;
             }
@@ -580,15 +648,36 @@ mod tests {
         assert!(valid_argv(&args(&["claude", "--resume", "id"])));
         assert!(!valid_argv(&args(&["/usr/bin/claude"])));
         assert!(!valid_argv(&args(&["claude", "a\rb"])));
+        assert!(!valid_argv(&args(&["lazygit", "it's"])), "PowerShell reads ' in quotes differently");
         assert!(!valid_argv(&[]));
-        assert_eq!(command_line(&args(&["lazygit", "-p", "/src/my repo", "it's", ""])), r"lazygit -p '/src/my repo' 'it'\''s' ''");
+        assert_eq!(
+            command_line(&args(&["lazygit", "-p", "/src/my repo", r"C:\src", "a,b", ""])),
+            r"lazygit -p '/src/my repo' 'C:\src' 'a,b' ''"
+        );
         assert_eq!(command_line(&args(&["codex", "resume", "abc; rm -rf /"])), "codex resume 'abc; rm -rf /'");
     }
 
     #[test]
     fn shell_in_the_foreground_starts_nothing() {
         let me = std::process::id();
-        assert_eq!(detect(Process(me), Some(me), &[]), None);
+        assert_eq!(detect(Process(me), Some(me), &[], None), None);
+    }
+
+    #[test]
+    fn program_names_on_every_platform() {
+        assert_eq!(program_name("/usr/bin/lazygit"), "lazygit");
+        assert_eq!(program_name(r"C:\tools\LazyGit.EXE"), "LazyGit");
+        assert_eq!(program_name("claude"), "claude");
+        assert_eq!(program_name(".exe"), "");
+    }
+
+    #[test]
+    fn a_hooks_report_names_the_session() {
+        let r = by_id("copilot", "abc").unwrap();
+        assert_eq!(r.argv, args(&["copilot", "--resume=abc"]));
+        assert!(!r.latest);
+        assert_eq!(by_id("claude", "--help"), None);
+        assert_eq!(by_id("nano", "x"), None);
     }
 
     #[test]
@@ -605,9 +694,13 @@ mod tests {
         };
         k.write(&record).unwrap();
         assert_eq!(k.load(), Some(record));
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(std::fs::metadata(k.file.as_ref().unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
-        k.forget();
-        assert_eq!(k.load(), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(k.file.as_ref().unwrap()).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let report = k.report_file(3).unwrap();
+        assert!(report.parent().unwrap().is_dir());
+        assert_ne!(report.parent(), other.report_file(3).unwrap().parent(), "one report folder per socket");
     }
 }
