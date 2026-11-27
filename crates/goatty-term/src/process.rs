@@ -137,9 +137,9 @@ impl Process {
     /// The process and its descendants, parents first, at most `max` (Linux only;
     /// needs `/proc/<pid>/task/<tid>/children`).
     pub fn tree(self, max: usize) -> Vec<Process> {
-        let mut out = vec![self];
         #[cfg(target_os = "linux")]
         {
+            let mut out = vec![self];
             let mut i = 0;
             while i < out.len() && out.len() < max {
                 let pid = out[i].0;
@@ -154,10 +154,13 @@ impl Process {
                     }
                 }
             }
+            out
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = max;
-        out
+        {
+            let _ = max;
+            vec![self]
+        }
     }
 
     /// The files it has open, at most `max` (Linux only).
