@@ -6,7 +6,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use goatty_plugin::api::{Changed, PackageState, Plan};
+use goatty_plugin::api::{Changed, Installed, PackageState, Plan};
 use goatty_plugin::manifest::SettingKind;
 use goatty_plugin::{Permission, schema};
 
@@ -122,9 +122,12 @@ pub fn search(svc: &HostService, query: Option<&str>, refresh: bool) -> Result<(
 
 /// `goattyd plugin info ID`.
 pub fn info(svc: &HostService, id: &str) -> Result<()> {
-    let c = svc.plugins(|p| p.find(id, None)).or_else(|e| match local_installed(svc, id) {
-        Some(c) => Ok(c),
-        None => Err(e),
+    let c = svc.plugins(|p| match p.find(id, None) {
+        Ok(c) => Ok(c),
+        Err(e) => match p.find_installed(id)? {
+            Some(c) => Ok(c),
+            None => Err(e),
+        },
     })?;
     // What this host would use of it.
     let m = &c.manifest.for_platform(&goatty_plugin::manifest::Platform::host());
@@ -175,22 +178,6 @@ fn details(d: &[String]) -> String {
     if d.is_empty() { String::new() } else { format!(": {}", d.join(", ")) }
 }
 
-/// An installed local plugin, found again from its directory.
-fn local_installed(svc: &HostService, id: &str) -> Option<Candidate> {
-    let dirs = svc.launcher.dirs()?;
-    let lock = super::lock::Lock::load(dirs).ok()?;
-    let e = lock.plugins.get(id)?;
-    let m = super::lock::manifest_of(dirs, id, e).ok()?;
-    Some(Candidate {
-        manifest: m,
-        files: e.files.clone(),
-        dir: super::lock::bundle_dir(dirs, id),
-        source: e.source.clone(),
-        verified: e.verified,
-        builtin: None,
-    })
-}
-
 /// Print an install plan the way the user approves it: the plugins it
 /// needs first, then the plugin.
 pub fn print_plan(plan: &Plan) {
@@ -209,7 +196,11 @@ pub fn print_plan(plan: &Plan) {
 
 /// The approval question for `plan`: "Install Base and Addon?".
 pub fn question(plan: &Plan) -> String {
-    let verb = if plan.replaces.is_some() { "Update" } else { "Install" };
+    let verb = match &plan.replaces {
+        Some(old) if *old != plan.version => "Update",
+        Some(_) => "Reinstall",
+        None => "Install",
+    };
     let mut names: Vec<&str> = plan.all().map(|p| p.name.as_str()).collect();
     let last = names.pop().unwrap_or_default();
     if names.is_empty() { format!("{verb} {last}?") } else { format!("{verb} {} and {last}?", names.join(", ")) }
@@ -378,36 +369,141 @@ pub fn uninstall(svc: &HostService, ids: &[String], yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// `goattyd plugin repair [ID…]`: download missing (or outdated) managed
+/// tools for already-installed plugins without changing their versions.
+pub fn repair(svc: &HostService, ids: &[String], yes: bool) -> Result<()> {
+    let settings = svc.settings().value;
+    let (installed, issues) = svc.plugins(|p| Ok(p.installed(&settings)))?;
+    for issue in &issues {
+        println!("⚠ {issue}");
+    }
+    let todo = select_repair_targets(&installed, ids)?;
+    if ids.is_empty() {
+        for i in installed
+            .iter()
+            .filter(|i| !i.builtin && i.enabled && i.incompatible.is_none() && i.packages.iter().any(|p| !p.available && p.needs_install()))
+        {
+            let missing: Vec<&str> = i.packages.iter().filter(|p| !p.available && p.needs_install()).map(|p| p.id.as_str()).collect();
+            println!(
+                "{} has no build for this host ({}); install it with your package manager.",
+                safe(&i.manifest.name),
+                missing.join(", ")
+            );
+        }
+    }
+    if todo.is_empty() {
+        if ids.is_empty() {
+            println!("All installed plugin tools are present.");
+            if installed
+                .iter()
+                .any(|i| i.builtin && i.enabled && i.incompatible.is_none() && i.packages.iter().any(|p| p.available && p.needs_install()))
+            {
+                println!("Built-in shell tools can be installed with `goattyd shell install`.");
+            }
+        }
+        return Ok(());
+    }
+    for i in todo {
+        let Some(c) = svc.plugins(|p| p.find_installed(&i.id))? else {
+            bail!("{} isn't installed", i.id);
+        };
+        let plan = svc.plugins(|p| p.plan(&c, &settings))?;
+        if !plan.downloads.iter().any(|d| d.fetches()) {
+            println!("{} already has its tools installed.", safe(&plan.name));
+            continue;
+        }
+        print_plan(&plan);
+        if !yes && !approve(&question(&plan))? {
+            println!("Not installed.");
+            continue;
+        }
+        print_changed(&svc.install_plugin(&c, &plan.digest)?);
+    }
+    Ok(())
+}
+
+/// Which installed plugins `goattyd plugin repair [ids...]` should download
+/// tools for. Explicit `ids` are validated against `installed` (and checked
+/// for compatibility); without `ids`, every enabled non-builtin plugin with a
+/// missing or outdated downloadable package is picked.
+fn select_repair_targets<'a>(installed: &'a [Installed], ids: &[String]) -> Result<Vec<&'a Installed>> {
+    if ids.is_empty() {
+        return Ok(installed
+            .iter()
+            .filter(|i| !i.builtin && i.enabled && i.incompatible.is_none() && i.packages.iter().any(|p| p.available && p.needs_install()))
+            .collect());
+    }
+    let mut selected = Vec::new();
+    for id in ids {
+        let Some(inst) = installed.iter().find(|i| i.id == *id) else {
+            bail!("{id:?} isn't installed (try `goattyd plugin list`)");
+        };
+        if !selected.iter().any(|r: &&Installed| r.id == inst.id) {
+            selected.push(inst);
+        }
+    }
+    let mut todo = Vec::new();
+    for inst in selected {
+        if let Some(why) = &inst.incompatible {
+            bail!("{} can't be repaired here: {why}", inst.manifest.name);
+        }
+        if !inst.packages.iter().any(|p| p.needs_install()) {
+            println!("{} already has its tools installed.", safe(&inst.manifest.name));
+            continue;
+        }
+        todo.push(inst);
+    }
+    Ok(todo)
+}
+
+/// Parenthetical status notes for one plugin in `goattyd plugin list`.
+fn list_notes(i: &Installed) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !i.enabled {
+        notes.push(if i.builtin { "off" } else { "disabled" }.to_string());
+    }
+    if i.builtin {
+        notes.push("built in".into());
+    } else if !i.verified {
+        notes.push("local, unverified".into());
+    }
+    if i.incompatible.is_none() {
+        for p in i.packages.iter().filter(|p| p.needs_install()) {
+            let cmd = if i.builtin { format!("goattyd shell install {}", i.id) } else { format!("goattyd plugin repair {}", i.id) };
+            notes.push(match &p.state {
+                PackageState::Managed { version } if p.available => format!("{} {version} → {}: {cmd}", p.id, p.version),
+                PackageState::Managed { version } => format!("{} {version} → {} (no build for this host)", p.id, p.version),
+                _ if p.available => format!("{} not installed: {cmd}", p.id),
+                _ => format!("{} not installed (no build for this host)", p.id),
+            });
+        }
+    }
+    if let Some(why) = &i.incompatible {
+        notes.push(format!("off: {why}"));
+    }
+    if let Some(u) = &i.update {
+        notes.push(format!("{u} available"));
+    }
+    notes
+}
+
 /// `goattyd plugin list`.
 pub fn list(svc: &HostService) -> Result<()> {
     let cat = svc.plugins(|p| Ok(p.catalog(false, &svc.settings().value)))?;
     if cat.installed.iter().all(|i| i.builtin) {
         println!("Only goatty's built-in plugins so far. Browse more with `goattyd plugin search`.");
     }
+    let mut needs_repair = false;
     for i in &cat.installed {
-        let mut notes = Vec::new();
-        if !i.enabled {
-            notes.push(if i.builtin { "off" } else { "disabled" }.to_string());
+        if !i.builtin && i.enabled && i.incompatible.is_none() && i.packages.iter().any(|p| p.available && p.needs_install()) {
+            needs_repair = true;
         }
-        if i.builtin {
-            notes.push("built in".into());
-            for p in i.packages.iter().filter(|p| p.needs_install()) {
-                notes.push(match &p.state {
-                    PackageState::Managed { version } => format!("{} {version} → {}: goattyd shell install {}", p.id, p.version, i.id),
-                    _ => format!("{} not installed: goattyd shell install {}", p.id, i.id),
-                });
-            }
-        } else if !i.verified {
-            notes.push("local, unverified".into());
-        }
-        if let Some(why) = &i.incompatible {
-            notes.push(format!("off: {why}"));
-        }
-        if let Some(u) = &i.update {
-            notes.push(format!("{u} available"));
-        }
+        let notes = list_notes(i);
         let notes = if notes.is_empty() { String::new() } else { format!("  ({})", notes.join("; ")) };
         println!("{:<20} {:<8} {:<10} {}{notes}", i.id, i.version, i.source, i.manifest.summary);
+    }
+    if needs_repair {
+        println!("\nInstall missing plugin tools with `goattyd plugin repair`.");
     }
     for issue in &cat.issues {
         println!("⚠ {issue}");
@@ -525,5 +621,175 @@ mod tests {
             "Running shells (goattyd on deploy@box): run `goattyd shell reload` there (or `goatty-reload` in one shell)."
         );
         assert!(reload_hint(Some("box\x1b[31m")).contains("box\\u{1b}[31m"));
+    }
+
+    fn stub_installed(id: &str, builtin: bool, enabled: bool, packages: Vec<goatty_plugin::api::PackageStatus>) -> Installed {
+        let m = goatty_plugin::manifest::parse(
+            &format!("schema = 1\nid = \"{id}\"\nname = \"{id}\"\nversion = \"1.0.0\"\nsummary = \"s\"\npublisher = \"t\"\n"),
+            None,
+        )
+        .unwrap();
+        Installed {
+            id: id.into(),
+            version: "1.0.0".into(),
+            source: if builtin { "goatty".into() } else { "official".into() },
+            verified: true,
+            manifest: m,
+            enabled,
+            incompatible: None,
+            update: None,
+            installed_unix: 0,
+            builtin,
+            packages,
+            unavailable_commands: Vec::new(),
+            command_open_in: Default::default(),
+        }
+    }
+
+    #[test]
+    fn list_notes_surface_missing_and_outdated_packages_for_non_builtin_plugins() {
+        use goatty_plugin::api::PackageStatus;
+
+        let eza = stub_installed(
+            "eza",
+            false,
+            true,
+            vec![PackageStatus { id: "eza".into(), version: "0.23.4".into(), state: PackageState::Missing, available: true }],
+        );
+        assert_eq!(list_notes(&eza), ["eza not installed: goattyd plugin repair eza"]);
+
+        let no_build = stub_installed(
+            "custom",
+            false,
+            true,
+            vec![PackageStatus { id: "custom".into(), version: "1.0".into(), state: PackageState::Missing, available: false }],
+        );
+        assert_eq!(list_notes(&no_build), ["custom not installed (no build for this host)"]);
+
+        let outdated = stub_installed(
+            "bat",
+            false,
+            true,
+            vec![PackageStatus {
+                id: "bat".into(),
+                version: "0.25.0".into(),
+                state: PackageState::Managed { version: "0.24.0".into() },
+                available: true,
+            }],
+        );
+        assert_eq!(list_notes(&outdated), ["bat 0.24.0 → 0.25.0: goattyd plugin repair bat"]);
+
+        let builtin_missing = stub_installed(
+            "fzf",
+            true,
+            true,
+            vec![PackageStatus { id: "fzf".into(), version: "0.60.0".into(), state: PackageState::Missing, available: true }],
+        );
+        assert_eq!(list_notes(&builtin_missing), ["built in", "fzf not installed: goattyd shell install fzf"]);
+
+        let mut incompat = eza.clone();
+        incompat.incompatible = Some("supports windows only".into());
+        assert_eq!(list_notes(&incompat), ["off: supports windows only"]);
+    }
+
+    #[test]
+    fn select_repair_targets_filters_defaults_and_validates_explicit_ids() {
+        use goatty_plugin::api::PackageStatus;
+
+        let missing = |id: &str, available: bool| {
+            vec![PackageStatus { id: id.into(), version: "1.0".into(), state: PackageState::Missing, available }]
+        };
+        let present = |id: &str| {
+            vec![PackageStatus {
+                id: id.into(),
+                version: "1.0".into(),
+                state: PackageState::Managed { version: "1.0".into() },
+                available: true,
+            }]
+        };
+        let list = vec![
+            stub_installed("fzf", true, true, missing("fzf", true)),
+            stub_installed("eza", false, true, missing("eza", true)),
+            stub_installed("disabled-p", false, false, missing("disabled-p", true)),
+            stub_installed("nobuild", false, true, missing("nobuild", false)),
+            stub_installed("healthy", false, true, present("healthy")),
+        ];
+        // Default: only enabled non-builtin plugins with available missing packages.
+        let default_ids: Vec<&str> = select_repair_targets(&list, &[]).unwrap().into_iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(default_ids, ["eza"]);
+
+        // Explicit ids can target builtins or disabled plugins, deduplicate, and skip healthy ones.
+        let explicit: Vec<&str> = select_repair_targets(&list, &["fzf".into(), "fzf".into(), "healthy".into(), "disabled-p".into()])
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(explicit, ["fzf", "disabled-p"]);
+
+        // Unknown id errors.
+        assert!(select_repair_targets(&list, &["ghost".into()]).unwrap_err().to_string().contains("isn't installed"));
+    }
+
+    #[test]
+    fn question_uses_reinstall_for_same_version() {
+        let mut p = Plan {
+            id: "eza".into(),
+            name: "eza".into(),
+            version: "1.0.0".into(),
+            summary: String::new(),
+            description: String::new(),
+            publisher: "t".into(),
+            homepage: None,
+            license: None,
+            source: "official".into(),
+            verified: true,
+            builtin: false,
+            replaces: None,
+            downloads: Vec::new(),
+            permissions: Vec::new(),
+            aliases: Vec::new(),
+            env: Vec::new(),
+            files: Vec::new(),
+            shell_code: None,
+            requires: Vec::new(),
+            warnings: Vec::new(),
+            dependencies: Vec::new(),
+            digest: "d".into(),
+            previous: None,
+        };
+        assert_eq!(question(&p), "Install eza?");
+        p.replaces = Some("1.0.0".into());
+        assert_eq!(question(&p), "Reinstall eza?");
+        p.replaces = Some("0.9.0".into());
+        assert_eq!(question(&p), "Update eza?");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_command_downloads_missing_binary_without_upgrading_version() {
+        use std::sync::Arc;
+
+        let w = crate::plugins::tests::world();
+        let file = w.tmp.path().join("config/host.json");
+        let svc = HostService::new(crate::launch::Launcher::new(Some(w.dirs.clone()), None), Some(file))
+            .with_plugin_sources(Arc::new(w.fetch.clone()), w.sources.clone());
+
+        // Install `demo` 1.0.0, then delete its binary and record it as if a
+        // previously-used system binary vanished.
+        let c = svc.plugins(|p| p.find("demo", None)).unwrap();
+        let plan = svc.plugins(|p| p.plan(&c, &svc.settings().value)).unwrap();
+        svc.install_plugin(&c, &plan.digest).unwrap();
+        crate::install::uninstall_package("demo", &["demo".into()], &w.dirs).unwrap();
+        let mut lock = super::super::lock::Lock::load(&w.dirs).unwrap();
+        lock.plugins.get_mut("demo").unwrap().packages[0].system = Some("/nix/store/gone/bin/demo".into());
+        lock.save(&w.dirs).unwrap();
+        assert!(!w.dirs.bin_dir().join("demo").exists());
+
+        // `goattyd plugin repair --yes` restores the managed binary.
+        repair(&svc, &[], true).unwrap();
+        assert!(w.dirs.bin_dir().join("demo").is_file());
+        let lock = super::super::lock::Lock::load(&w.dirs).unwrap();
+        assert_eq!(lock.plugins["demo"].version, "1.0.0");
+        assert_eq!(lock.plugins["demo"].packages[0].system, None);
     }
 }

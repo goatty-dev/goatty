@@ -313,7 +313,23 @@ impl SettingsWindow {
                     Some(t) => {
                         r.desc(t.unavailable.clone().unwrap_or_else(|| "Not installed".into())).control(badge("Missing", Tone::Warning, ui))
                     }
-                    None => r.desc("Its command isn't installed").control(badge("Missing", Tone::Warning, ui)),
+                    None => match f.id.strip_prefix("plugin:") {
+                        Some(pid) => {
+                            let pid = pid.to_owned();
+                            r.desc("Its command isn't installed; open the plugin to install or check it")
+                                .control(badge("Missing", Tone::Warning, ui))
+                                .on_click(
+                                    SharedString::from(format!("diag-plugin-{pid}")),
+                                    cx.listener(move |v, _, _, cx| {
+                                        v.go(Page::Plugins, cx);
+                                        v.plugins.tab = super::plugins::Tab::Installed;
+                                        v.plugins.detail = Some(pid.clone());
+                                        cx.notify();
+                                    }),
+                                )
+                        }
+                        None => r.desc("Its command isn't installed").control(badge("Missing", Tone::Warning, ui)),
+                    },
                 },
             }
         });

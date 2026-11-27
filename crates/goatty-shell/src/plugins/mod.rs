@@ -240,8 +240,34 @@ impl Plugins<'_> {
         (snaps, status, issues)
     }
 
+    /// An already-installed plugin (built-in or in `installed/lock.json`),
+    /// verified against the lock. Used to plan or reinstall missing tools
+    /// without needing a registry or changing the installed version.
+    pub fn find_installed(&self, id: &str) -> Result<Option<Candidate>> {
+        if let Some(b) = builtins::get(id) {
+            return Ok(Some(Candidate::builtin(b)));
+        }
+        let lock = Lock::load(self.dirs)?;
+        let Some(e) = lock.plugins.get(id) else {
+            return Ok(None);
+        };
+        let manifest = lock::manifest_of(self.dirs, id, e)?;
+        let source = if e.source == "local" { e.path.clone().unwrap_or_else(|| e.source.clone()) } else { e.source.clone() };
+        Ok(Some(Candidate {
+            manifest,
+            files: e.files.clone(),
+            dir: lock::bundle_dir(self.dirs, id),
+            source,
+            verified: e.verified,
+            builtin: None,
+        }))
+    }
+
     /// `id` (at `version`, default the newest): a built-in plugin, or from
-    /// the first registry that has it.
+    /// the first registry that has it. When `version` matches the currently
+    /// installed version and no registry has it (a local plugin, a removed
+    /// registry, a pruned version, or offline), falls back to the verified
+    /// installed bundle.
     pub fn find(&self, id: &str, version: Option<&str>) -> Result<Candidate> {
         if let Some(b) = builtins::get(id) {
             let have = &b.manifest().version;
@@ -251,10 +277,17 @@ impl Plugins<'_> {
             return Ok(Candidate::builtin(b));
         }
         let (snaps, status, _) = self.snapshots(false, false);
+        let mut version_error = None;
         for snap in &snaps {
             let Some(entry) = snap.index.plugins.get(id) else { continue };
             let (v, ver) = match version {
-                Some(v) => (v, entry.versions.get(v).with_context(|| format!("{id} has no version {v} in registry {}", snap.source.name))?),
+                Some(v) => match entry.versions.get(v) {
+                    Some(ver) => (v, ver),
+                    None => {
+                        version_error.get_or_insert_with(|| anyhow!("{id} has no version {v} in registry {}", snap.source.name));
+                        continue;
+                    }
+                },
                 None => snap.index.latest(id).with_context(|| format!("every version of {id} is yanked"))?,
             };
             let dir = snap.plugin_dir(id, v);
@@ -269,6 +302,16 @@ impl Plugins<'_> {
                 verified: true,
                 builtin: None,
             });
+        }
+        if let Some(want) = version
+            && let Ok(lock) = Lock::load(self.dirs)
+            && lock.plugins.get(id).is_some_and(|e| e.version == want)
+            && let Some(c) = self.find_installed(id)?
+        {
+            return Ok(c);
+        }
+        if let Some(err) = version_error {
+            return Err(err);
         }
         let errors: Vec<String> = status.iter().filter_map(|s| s.error.as_ref().map(|e| format!("{}: {e}", s.name))).collect();
         if errors.is_empty() {

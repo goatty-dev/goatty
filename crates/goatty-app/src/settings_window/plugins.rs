@@ -245,11 +245,20 @@ impl PluginsPage {
         }
     }
 
-    /// Drop waiting reviews that no longer apply: the plugin is gone, or
-    /// the update on offer is another version now.
+    /// Drop waiting reviews that no longer apply: the plugin is gone, the
+    /// update on offer is another version now, or its missing tools are
+    /// already installed.
     fn prune_reviews(&mut self) {
         let Some(cat) = &self.catalog else { return };
-        let current = |p: &Plan| cat.installed.iter().any(|i| i.id == p.id && i.update.as_deref() == Some(p.version.as_str()));
+        let current = |p: &Plan| {
+            cat.installed.iter().any(|i| {
+                i.id == p.id
+                    && (i.update.as_deref() == Some(p.version.as_str())
+                        || (i.version == p.version
+                            && i.incompatible.is_none()
+                            && i.packages.iter().any(|pkg| pkg.available && pkg.needs_install())))
+            })
+        };
         self.review_queue.retain(|p| current(p));
     }
 
@@ -270,6 +279,23 @@ impl PluginsPage {
             return Some(UpdateState::NeedsReview);
         }
         None
+    }
+
+    /// Whether the active/queued work for `id` is a same-version missing-tool
+    /// repair rather than a version update.
+    pub fn is_repair_job(&self, id: &str) -> bool {
+        if let Some(f) = self.follow.as_ref().filter(|f| f.id == id) {
+            return f.verb == "Reinstalling";
+        }
+        if let Some(b) = &self.batch
+            && (b.current.as_deref() == Some(id) || b.queue.iter().any(|j| j.id() == id))
+        {
+            return b.repair;
+        }
+        if let Some(p) = self.review_queue.iter().find(|p| p.id == id).or_else(|| self.plan.as_ref().filter(|p| p.id == id)) {
+            return p.replaces.as_deref() == Some(p.version.as_str());
+        }
+        false
     }
 
     /// Empty the search field (so the whole list shows).
@@ -324,8 +350,8 @@ impl Job {
     }
 }
 
-/// Updates (and approved installs) done one after the other, reported
-/// together at the end (#244).
+/// Updates (and approved installs or missing-tool repairs) done one after
+/// the other, reported together at the end (#244).
 #[derive(Debug, Default)]
 pub struct Batch {
     queue: VecDeque<Job>,
@@ -334,13 +360,15 @@ pub struct Batch {
     /// "eza 1.1.0", by whether it was an update.
     done: Vec<(bool, String)>,
     failed: Vec<String>,
-    /// Updates it found that need a look (queued for review).
+    /// Updates or repairs it found that need a look (queued for review).
     reviews: usize,
     reload: bool,
     /// The host's report, for a batch of one.
     lines: Vec<String>,
     /// Stopped by a cancel: the rest isn't done.
     stopped: bool,
+    /// Started to download missing/outdated tools of already-installed plugins.
+    repair: bool,
 }
 
 impl Batch {
@@ -360,13 +388,15 @@ impl Batch {
         let plugins = |n: usize| if n == 1 { "1 plugin".to_string() } else { format!("{n} plugins") };
         if self.stopped {
             lines.push(if self.done.is_empty() {
-                "Stopped: nothing was updated".into()
+                if self.repair { "Stopped: nothing was installed".into() } else { "Stopped: nothing was updated".into() }
             } else {
                 format!("Stopped after {}", plugins(self.done.len()))
             });
         } else if !self.failed.is_empty() {
             lines.push(if self.done.is_empty() {
                 format!("{} failed", plugins(self.failed.len()))
+            } else if updated.is_empty() {
+                format!("Installed {}; {} failed", plugins(self.done.len()), self.failed.len())
             } else {
                 format!("Updated {}; {} failed", plugins(self.done.len()), self.failed.len())
             });
@@ -940,8 +970,12 @@ impl SettingsWindow {
     /// Start installing `plan` and follow it.
     fn install_plan(&mut self, plan: Box<Plan>, return_id: Option<u64>, batch: bool, cx: &mut Context<'_, Self>) {
         let id = plan.id.clone();
-        let update = plan.replaces.is_some();
-        let verb = if update { "Updating" } else { "Installing" };
+        let update = plan.replaces.as_deref().is_some_and(|old| old != plan.version);
+        let verb = match &plan.replaces {
+            Some(old) if *old != plan.version => "Updating",
+            Some(_) => "Reinstalling",
+            None => "Installing",
+        };
         let mut follow = Follow::new(id.clone(), verb, true, return_id);
         follow.batch = batch;
         let deps: Vec<String> = plan.dependencies.iter().map(|d| d.id.clone()).collect();
@@ -1051,6 +1085,27 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// Download missing (or outdated) managed tools for already-installed
+    /// plugins `(id, installed_version)`, one after the other. Verified
+    /// plugins whose manifest and checksums match the installed version
+    /// download without another review; unverified or changed ones wait for
+    /// review at the end.
+    pub fn install_missing_plugins(&mut self, items: Vec<(String, String)>, cx: &mut Context<'_, Self>) {
+        let mut added = false;
+        for (id, version) in items {
+            if self.plugins.update_state(&id).is_some() {
+                continue;
+            }
+            let b = self.plugins.batch.get_or_insert_with(|| Batch { repair: true, ..Default::default() });
+            b.queue.push_back(Job::Check { id, version });
+            added = true;
+        }
+        if added {
+            self.next_in_batch(cx);
+        }
+        cx.notify();
+    }
+
     /// Do the batch's next job, once nothing else is installing.
     fn next_in_batch(&mut self, cx: &mut Context<'_, Self>) {
         if self.plugins.follow.is_some() {
@@ -1124,12 +1179,20 @@ impl SettingsWindow {
         }
         let n = self.plugins.review_queue.len();
         let this = cx.entity().downgrade();
-        let t = Toast::info(if n == 1 { "An update needs your review".to_string() } else { format!("{n} updates need your review") })
-            .body("Check what changes before they install.")
-            .key("plugins.review")
-            .action("Review", move |_, cx| {
-                let _ = this.update(cx, |v, cx| v.open_queued_review(cx));
-            });
+        let (title, body) = if b.repair {
+            (
+                if n == 1 { "A plugin needs your review".to_string() } else { format!("{n} plugins need your review") },
+                "Check before installing its missing tools.",
+            )
+        } else {
+            (
+                if n == 1 { "An update needs your review".to_string() } else { format!("{n} updates need your review") },
+                "Check what changes before they install.",
+            )
+        };
+        let t = Toast::info(title).body(body).key("plugins.review").action("Review", move |_, cx| {
+            let _ = this.update(cx, |v, cx| v.open_queued_review(cx));
+        });
         toast::show(cx, t);
     }
 
@@ -1479,7 +1542,93 @@ impl SettingsWindow {
                 let builtin: Vec<&Installed> = cat.installed.iter().filter(|i| i.builtin).filter(shown).collect();
                 let installed: Vec<&Installed> = cat.installed.iter().filter(|i| !i.builtin).filter(shown).collect();
                 if !installed.is_empty() || query.is_empty() {
+                    let missing_fetchable: Vec<(String, String)> = installed
+                        .iter()
+                        .filter(|i| {
+                            self.enabled(&i.id)
+                                && i.incompatible.is_none()
+                                && i.packages.iter().any(|p| p.available && p.needs_install())
+                                && self.plugins.update_state(&i.id).is_none()
+                        })
+                        .map(|i| (i.id.clone(), i.version.clone()))
+                        .collect();
+                    let missing_count = installed
+                        .iter()
+                        .filter(|i| {
+                            self.enabled(&i.id)
+                                && i.incompatible.is_none()
+                                && i.packages.iter().any(|p| matches!(p.state, PackageState::Missing))
+                        })
+                        .count();
+                    let outdated_count = installed
+                        .iter()
+                        .filter(|i| {
+                            self.enabled(&i.id)
+                                && i.incompatible.is_none()
+                                && !i.packages.iter().any(|p| matches!(p.state, PackageState::Missing))
+                                && i.packages.iter().any(|p| p.needs_install())
+                        })
+                        .count();
+                    let missing_review = installed
+                        .iter()
+                        .filter(|i| self.plugins.is_repair_job(&i.id) && self.plugins.update_state(&i.id) == Some(UpdateState::NeedsReview))
+                        .count();
+                    let repairing = self.plugins.batch.as_ref().is_some_and(|b| b.repair);
                     let mut s = section(ui, "Installed");
+                    if repairing {
+                        s = s.desc("Installing missing tools…").action(button_with(
+                            "plugins-install-missing",
+                            Some(Icon::Close),
+                            "Stop",
+                            ButtonKind::Normal,
+                            ui,
+                            self.act_and_focus(cx, None, |v, cx| v.stop_updates(cx)),
+                        ));
+                    } else {
+                        if missing_count > 0 {
+                            s = s.desc(if missing_count == 1 {
+                                "1 plugin is missing its tool".to_string()
+                            } else {
+                                format!("{missing_count} plugins are missing their tools")
+                            });
+                        } else if outdated_count > 0 {
+                            s = s.desc(if outdated_count == 1 {
+                                "1 plugin tool can be updated".to_string()
+                            } else {
+                                format!("{outdated_count} plugin tools can be updated")
+                            });
+                        }
+                        if !missing_fetchable.is_empty() && self.plugins.batch.is_none() && self.plugins.follow.is_none() {
+                            let n = missing_fetchable.len();
+                            let has_missing = installed.iter().any(|i| {
+                                missing_fetchable.iter().any(|(id, _)| id == &i.id)
+                                    && i.packages.iter().any(|p| p.available && matches!(p.state, PackageState::Missing))
+                            });
+                            let label = match (has_missing, n) {
+                                (true, 1) => "Install missing tool".to_string(),
+                                (true, n) => format!("Install {n} missing tools"),
+                                (false, 1) => "Update tool".to_string(),
+                                (false, n) => format!("Update {n} tools"),
+                            };
+                            s = s.action(button_with(
+                                "plugins-install-missing",
+                                Some(Icon::Download),
+                                label,
+                                ButtonKind::Primary,
+                                ui,
+                                self.act_and_focus(cx, None, move |v, cx| v.install_missing_plugins(missing_fetchable.clone(), cx)),
+                            ));
+                        } else if missing_review > 0 && missing_fetchable.is_empty() && self.plugins.batch.is_none() {
+                            s = s.action(button_with(
+                                "plugins-install-missing",
+                                Some(Icon::Shield),
+                                if missing_review == 1 { "Review".to_string() } else { format!("Review {missing_review}") },
+                                ButtonKind::Primary,
+                                ui,
+                                self.act_and_focus(cx, None, |v, cx| v.open_queued_review(cx)),
+                            ));
+                        }
+                    }
                     if installed.is_empty() {
                         s = s.child(
                             row(ui, "Nothing installed yet")
@@ -1634,10 +1783,14 @@ impl SettingsWindow {
             desc.push_str(&format!(" · new: {}", short.join(", ")));
         }
         let id = inst.id.clone();
+        let repairing = self.plugins.is_repair_job(&id);
         let control = match self.plugins.update_state(&id) {
             Some(UpdateState::Queued) => badge("Queued", Tone::Neutral, ui).into_any_element(),
             Some(UpdateState::Checking) => badge("Checking…", Tone::Neutral, ui).into_any_element(),
-            Some(UpdateState::Installing) => badge("Updating…", Tone::Accent, ui).into_any_element(),
+            Some(UpdateState::Installing) => {
+                badge(if repairing { "Installing…" } else { "Updating…" }, Tone::Accent, ui).into_any_element()
+            }
+            Some(UpdateState::NeedsReview) if repairing => badge("Needs review", Tone::Warning, ui).into_any_element(),
             Some(UpdateState::NeedsReview) => button_with(
                 SharedString::from(format!("update-review-{id}")),
                 Some(Icon::Shield),
@@ -1745,7 +1898,11 @@ impl SettingsWindow {
             .as_ref()
             .and_then(|c| c.installed.iter().find(|i| &i.id == id))
             .map_or_else(|| id.clone(), |i| i.manifest.name.clone());
-        let mut desc = "Asking the host what the update changes".to_string();
+        let mut desc = if b.repair {
+            "Checking what needs to be downloaded".to_string()
+        } else {
+            "Asking the host what the update changes".to_string()
+        };
         if b.queued() > 0 {
             desc.push_str(&format!(" · {} more after this", b.queued()));
         }
@@ -1785,7 +1942,10 @@ impl SettingsWindow {
         let id = inst.id.clone();
         let enabled = self.enabled(&id);
         let missing = inst.packages.iter().any(|p| matches!(p.state, PackageState::Missing));
-        let fetch = inst.builtin && inst.packages.iter().any(|p| p.available && p.needs_install());
+        let fetch = inst.incompatible.is_none() && inst.packages.iter().any(|p| p.available && p.needs_install());
+        let missing_unfetchable = missing && !fetch && inst.incompatible.is_none();
+        let active_state = self.plugins.update_state(&inst.id);
+        let repairing_this = self.plugins.is_repair_job(&inst.id);
         let open_id = id.clone();
         let row_id: gpui::ElementId = SharedString::from(format!("plugin-{id}")).into();
         let row = div()
@@ -1822,14 +1982,31 @@ impl SettingsWindow {
                                     .child(SharedString::from(inst.manifest.name.clone())),
                             )
                             .when_some(inst.update.clone(), |d, v| {
-                                d.child(match self.plugins.update_state(&inst.id) {
+                                d.child(match active_state.filter(|_| !repairing_this) {
                                     Some(UpdateState::Installing) => badge("Updating…", Tone::Accent, ui),
                                     Some(UpdateState::NeedsReview) => badge("Update needs review", Tone::Warning, ui),
                                     Some(UpdateState::Queued | UpdateState::Checking) => badge("Update queued", Tone::Neutral, ui),
                                     None => badge(format!("Update {v}"), Tone::Accent, ui),
                                 })
                             })
-                            .when(fetch && enabled, |d| d.child(badge(if missing { "Needs install" } else { "Update" }, Tone::Warning, ui)))
+                            .when_some(active_state.filter(|_| repairing_this), |d, state| {
+                                d.child(match state {
+                                    UpdateState::Installing => badge("Installing…", Tone::Accent, ui),
+                                    UpdateState::NeedsReview => badge("Needs review", Tone::Warning, ui),
+                                    UpdateState::Queued | UpdateState::Checking => badge("Queued", Tone::Neutral, ui),
+                                })
+                            })
+                            .when(fetch && enabled && !repairing_this, |d| {
+                                let label = if missing {
+                                    "Needs install"
+                                } else if inst.builtin {
+                                    "Update"
+                                } else {
+                                    "Update tool"
+                                };
+                                d.child(badge(label, Tone::Warning, ui))
+                            })
+                            .when(missing_unfetchable && enabled, |d| d.child(badge("Missing tool", Tone::Warning, ui)))
                             .when(inst.incompatible.is_some(), |d| d.child(badge("Not for this host", Tone::Danger, ui)))
                             .when(!inst.verified && !inst.builtin, |d| d.child(badge("Unverified", Tone::Warning, ui))),
                     )
@@ -1944,8 +2121,11 @@ impl SettingsWindow {
         let id = inst.id.clone();
         let enabled = self.enabled(&id);
         let confirming = self.plugins.confirm_uninstall.as_deref() == Some(id.as_str());
-        let fetch = inst.builtin && inst.packages.iter().any(|p| p.available && p.needs_install());
-        let outdated = inst.packages.iter().any(|p| matches!(&p.state, PackageState::Managed { version } if *version != p.version));
+        let fetch = inst.incompatible.is_none() && inst.packages.iter().any(|p| p.available && p.needs_install());
+        let missing_available = inst.packages.iter().any(|p| p.available && matches!(p.state, PackageState::Missing));
+        let fetch_count = inst.packages.iter().filter(|p| p.available && p.needs_install()).count();
+        let outdated = !missing_available
+            && inst.packages.iter().any(|p| p.available && matches!(&p.state, PackageState::Managed { version } if *version != p.version));
         let source = if inst.builtin {
             "Built into goatty".to_string()
         } else if inst.verified {
@@ -1959,9 +2139,11 @@ impl SettingsWindow {
         }
 
         let mut actions = div().flex().flex_wrap().items_center().gap(px(8.));
+        let active_state = self.plugins.update_state(&id);
+        let repairing_this = self.plugins.is_repair_job(&id);
         if let Some(newer) = inst.update.clone() {
             let (id, v) = (id.clone(), newer.clone());
-            actions = actions.child(match self.plugins.update_state(&id) {
+            actions = actions.child(match active_state.filter(|_| !repairing_this) {
                 Some(UpdateState::NeedsReview) => button_with(
                     SharedString::from(format!("update-{id}")),
                     Some(Icon::Shield),
@@ -1995,15 +2177,39 @@ impl SettingsWindow {
                 }
             });
         }
-        if fetch {
+        if let Some(state) = active_state.filter(|_| repairing_this) {
             let id = id.clone();
+            actions = actions.child(match state {
+                UpdateState::NeedsReview => button_with(
+                    SharedString::from(format!("fetch-{id}")),
+                    Some(Icon::Shield),
+                    "Review",
+                    ButtonKind::Primary,
+                    ui,
+                    self.act_and_focus(cx, None, move |view, cx| view.open_review_for(&id, cx)),
+                )
+                .into_any_element(),
+                UpdateState::Installing => badge("Installing…", Tone::Accent, ui).into_any_element(),
+                UpdateState::Checking => badge("Checking…", Tone::Accent, ui).into_any_element(),
+                UpdateState::Queued => badge("Queued", Tone::Accent, ui).into_any_element(),
+            });
+        } else if fetch && active_state.is_none() {
+            let id = id.clone();
+            let version = (!inst.builtin).then(|| inst.version.clone());
+            let label = match (outdated, fetch_count > 1) {
+                (true, true) => "Update the tools",
+                (true, false) => "Update the tool",
+                (false, true) => "Install the tools",
+                (false, false) => "Install the tool",
+            };
+            let kind = if inst.update.is_some() { ButtonKind::Normal } else { ButtonKind::Primary };
             actions = actions.child(button_with(
                 SharedString::from(format!("fetch-{id}")),
                 Some(Icon::Download),
-                if outdated { "Update the tool" } else { "Install the tool" },
-                ButtonKind::Primary,
+                label,
+                kind,
                 ui,
-                self.act(cx, move |v, cx| v.review_plugin(id.clone(), None, cx)),
+                self.act(cx, move |v, cx| v.review_plugin(id.clone(), version.clone(), cx)),
             ));
         }
         if let Some(home) = inst.manifest.homepage.clone() {
@@ -2444,7 +2650,71 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(page.update_state("eza"), Some(UpdateState::Queued));
+        assert!(!page.is_repair_job("eza"));
         assert_eq!(page.update_state("bat"), None);
+
+        // Repair batch summaries and job-kind detection.
+        let repair_stopped = Batch { stopped: true, repair: true, ..Default::default() };
+        assert_eq!(repair_stopped.summary(), Some((false, vec!["Stopped: nothing was installed".to_string()])));
+        let mut repair_partial = Batch { repair: true, ..Default::default() };
+        repair_partial.done.push((false, "eza 1.0.0".into()));
+        repair_partial.failed.push("bat 1.0.0: timeout".into());
+        let (ok, lines) = repair_partial.summary().unwrap();
+        assert!(!ok);
+        assert_eq!(lines, ["Installed 1 plugin; 1 failed", "Installed eza 1.0.0", "Failed: bat 1.0.0: timeout"]);
+
+        let repair_page = PluginsPage {
+            batch: Some(Batch {
+                queue: [Job::Check { id: "eza".into(), version: "1.0.0".into() }].into(),
+                repair: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(repair_page.update_state("eza"), Some(UpdateState::Queued));
+        assert!(repair_page.is_repair_job("eza"));
+    }
+
+    #[test]
+    fn prune_reviews_keeps_same_version_repair_while_package_is_missing() {
+        let mut cat = Catalog::default();
+        cat.installed.push(Installed {
+            id: "eza".into(),
+            version: "1.0.0".into(),
+            source: "local".into(),
+            verified: false,
+            manifest: goatty_plugin::manifest::parse(
+                "schema = 1\nid = \"eza\"\nname = \"eza\"\nversion = \"1.0.0\"\nsummary = \"ls\"\npublisher = \"me\"\n",
+                None,
+            )
+            .unwrap(),
+            enabled: true,
+            incompatible: None,
+            update: None,
+            installed_unix: 1,
+            builtin: false,
+            packages: vec![api::PackageStatus {
+                id: "eza".into(),
+                version: "0.23.4".into(),
+                state: PackageState::Missing,
+                available: true,
+            }],
+            unavailable_commands: Vec::new(),
+            command_open_in: Default::default(),
+        });
+        let mut repair_plan = test_plan("eza");
+        repair_plan.replaces = Some("1.0.0".into());
+
+        let mut page = PluginsPage { catalog: Some(cat), ..Default::default() };
+        page.queue_reviews(vec![repair_plan]);
+        assert!(page.is_repair_job("eza"));
+        page.prune_reviews();
+        assert_eq!(page.review_queue.len(), 1, "missing package keeps same-version repair review");
+
+        // Once the binary is installed, the queued repair review is dropped.
+        page.catalog.as_mut().unwrap().installed[0].packages[0].state = PackageState::Managed { version: "0.23.4".into() };
+        page.prune_reviews();
+        assert!(page.review_queue.is_empty(), "installed package drops stale repair review");
     }
 
     #[test]
