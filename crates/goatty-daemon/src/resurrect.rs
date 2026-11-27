@@ -64,6 +64,9 @@ const GRACE: Duration = Duration::from_secs(15);
 const PROMPT_WAIT: Duration = Duration::from_secs(5);
 /// The same for other shells, which may not say when they're at a prompt.
 const PLAIN_WAIT: Duration = Duration::from_secs(2);
+/// How long a brought-back tab's command counts as what runs there while
+/// its shell starts and the command hasn't shown up yet.
+const PENDING: Duration = Duration::from_secs(20);
 /// The agents goatty resumes.
 const AGENTS: &[&str] = &["claude", "codex", "copilot", "agy", "opencode"];
 
@@ -287,18 +290,26 @@ fn valid_id(id: &str) -> bool {
 
 /// What's typed into the new shell: a plain command name first (shells
 /// disagree on running a quoted path), no control characters (a newline
-/// would run what follows), no `'` (see [`command_line`]), and not too long.
+/// would run what follows), nothing a shell reads specially inside single
+/// quotes (see [`command_line`]), and not too long.
 fn valid_argv(argv: &[String]) -> bool {
     let Some(cmd) = argv.first() else { return false };
     argv.len() <= MAX_ARGS
         && argv.iter().map(String::len).sum::<usize>() <= MAX_ARGV_BYTES
-        && !argv.iter().any(|a| a.chars().any(char::is_control) || a.contains('\''))
+        && !argv.iter().any(|a| a.chars().any(special_in_quotes))
         && goatty_config::is_program_name(cmd)
+}
+
+/// A character that would end or change a single-quoted argument in one of
+/// the shells: `'`, the typographic single quotes PowerShell reads as `'`,
+/// and (outside Windows, where fish reads `\'` and `\\` in quotes) a backslash.
+fn special_in_quotes(c: char) -> bool {
+    c.is_control() || matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') || (c == '\\' && !cfg!(windows))
 }
 
 /// `argv` as one command line for zsh, bash, sh, fish and PowerShell:
 /// arguments that aren't plain words go in single quotes, which all of them
-/// read alike as long as there's no `'` inside ([`valid_argv`]).
+/// read alike as long as nothing special is inside ([`valid_argv`]).
 pub(crate) fn command_line(argv: &[String]) -> String {
     let quote = |a: &String| {
         let plain = !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./:%+=".contains(&b));
@@ -336,9 +347,16 @@ pub(crate) struct Keeper {
     file: Option<PathBuf>,
     /// Where each session's agent hook reports its session (`<id>.json`).
     reports: Option<PathBuf>,
-    /// Held while the record is built and written, so [`Keeper::forget`]
-    /// never races a write.
+    /// Held while the record is built and written, so [`Keeper::stop`]
+    /// waits for a write under way.
     state: Mutex<KeeperState>,
+    /// Sessions whose tab was closed: they leave the record right away. Its
+    /// own short lock, so closing a tab never waits for a write.
+    closed: Mutex<HashSet<SessionId>>,
+    /// What brought-back tabs start again, until it runs (or [`PENDING`]
+    /// passed): the shell is in the foreground meanwhile, and the record
+    /// mustn't lose the command then.
+    pending: Mutex<HashMap<SessionId, (Resume, Instant)>>,
     stopped: AtomicBool,
 }
 
@@ -346,8 +364,6 @@ pub(crate) struct Keeper {
 struct KeeperState {
     /// What the file holds.
     written: Option<Record>,
-    /// Sessions whose tab was closed: they leave the record right away.
-    closed: HashSet<SessionId>,
     /// When each session missing from the daemon was first seen missing.
     missing: HashMap<SessionId, Instant>,
 }
@@ -359,7 +375,14 @@ impl Keeper {
         let name = format!("{:016x}", fnv(socket.as_os_str().as_encoded_bytes()));
         let file = state_dir.map(|d| d.join("sessions").join(format!("{name}.json")));
         let reports = state_dir.map(|d| d.join("sessions").join(name));
-        Self { file, reports, state: Mutex::default(), stopped: AtomicBool::new(false) }
+        Self {
+            file,
+            reports,
+            state: Mutex::default(),
+            closed: Mutex::default(),
+            pending: Mutex::default(),
+            stopped: AtomicBool::new(false),
+        }
     }
 
     /// The file session `id`'s agent hook writes to (`GOATTY_AGENT_REPORT`),
@@ -383,7 +406,7 @@ impl Keeper {
 
     /// The tab showing `id` was closed.
     pub(crate) fn closed(&self, id: SessionId) {
-        self.state.lock().closed.insert(id);
+        self.closed.lock().insert(id);
     }
 
     /// goattyd is stopping: the record stays as it is, for the next one.
@@ -422,10 +445,11 @@ impl Keeper {
             let s = daemon.sessions.lock();
             (w.export(), s.values().cloned().collect::<Vec<Arc<Session>>>())
         };
-        let mut saved: Vec<Saved> = sessions.iter().map(|s| self.saved(s, &programs)).collect();
+        let mut saved: Vec<Saved> = sessions.iter().map(|s| self.saved(s, &programs, now)).collect();
         saved.sort_by_key(|s| s.id);
         let next = Record { version: VERSION, next_session: daemon.next_session.load(Ordering::SeqCst), sessions: saved, workspaces };
-        let KeeperState { written, closed, missing } = &mut *state;
+        let closed = self.closed.lock().clone();
+        let KeeperState { written, missing } = &mut *state;
         if let Some(written) = written {
             let live: HashSet<SessionId> = next.sessions.iter().map(|s| s.id).collect();
             let gone: Vec<SessionId> = written.sessions.iter().map(|s| s.id).filter(|id| !live.contains(id)).collect();
@@ -447,7 +471,7 @@ impl Keeper {
                 for gone in state.written.iter().flat_map(|w| &w.sessions).filter(|s| !live.contains(&s.id)) {
                     self.drop_report(gone.id);
                 }
-                state.closed.retain(|id| live.contains(id));
+                self.closed.lock().retain(|id| live.contains(id));
                 state.missing.clear();
                 state.written = Some(next);
             }
@@ -477,15 +501,32 @@ impl Keeper {
 }
 
 impl Keeper {
-    fn saved(&self, s: &Session, programs: &[String]) -> Saved {
+    fn saved(&self, s: &Session, programs: &[String], now: Instant) -> Saved {
         let (cols, rows) = s.term.size();
         let fg = s.pty.lock().foreground_pid();
-        // The shell is back: what an agent's hook said is over.
-        if fg.is_none_or(|fg| Some(fg) == s.pid) {
+        let shell = fg.is_none_or(|fg| Some(fg) == s.pid);
+        let pending = {
+            let mut p = self.pending.lock();
+            match p.get(&s.id) {
+                Some((r, until)) if now < *until => Some(r.clone()),
+                Some(_) => {
+                    p.remove(&s.id);
+                    None
+                }
+                None => None,
+            }
+        };
+        // The shell is back: what an agent's hook said is over (unless the
+        // tab was just brought back and its command hasn't started yet).
+        if shell && pending.is_none() {
             self.drop_report(s.id);
         }
         let report = self.reports.as_ref().and_then(|d| read_report(&d.join(format!("{}.json", s.id))));
         let resume = fg.and_then(|fg| detect(Process(fg), s.pid, programs, report.as_ref()));
+        if resume.is_some() {
+            self.pending.lock().remove(&s.id);
+        }
+        let resume = resume.or(pending.filter(|_| shell));
         Saved { id: s.id, cwd: s.current_cwd(), cols, rows, resume }
     }
 }
@@ -517,24 +558,19 @@ pub(crate) fn resurrect(daemon: &Arc<Daemon>) {
     }
     let top = record.sessions.iter().map(|s| s.id).max().unwrap_or(0);
     daemon.next_session.fetch_max(record.next_session.max(top), Ordering::SeqCst);
-    let mut started = HashSet::new();
+    let is_dir = |c: &str| Path::new(c).is_dir();
+    let plans = plan(&record.sessions, &settings, is_dir);
     let mut back = 0;
-    for s in &record.sessions {
-        let cwd = s.cwd.clone().filter(|c| Path::new(c).is_dir());
+    for (s, resume) in record.sessions.iter().zip(plans) {
+        let cwd = s.cwd.clone().filter(|c| is_dir(c));
         let size = WinSize { cols: s.cols.max(2), rows: s.rows.max(1), cell_width: 0, cell_height: 0 };
-        // In another folder, an agent would resume another project's
-        // conversation (or none): only in the same one.
-        let resume = s
-            .resume
-            .clone()
-            .filter(|r| cwd.is_some() && r.allowed(&settings) && valid_argv(&r.argv))
-            .filter(|r| started.insert(r.key(cwd.as_deref().unwrap_or_default())));
         match daemon.resurrect_session(s.id, size, cwd) {
             Ok(session) => {
                 back += 1;
                 if let Some(r) = resume {
                     log::info!("session {}: starting {} again", s.id, r.what);
                     type_when_ready(session, command_line(&r.argv));
+                    daemon.resurrect.pending.lock().insert(s.id, (r, Instant::now() + PENDING));
                 }
             }
             Err(e) => log::warn!("session {}: couldn't bring it back: {e:#}", s.id),
@@ -543,6 +579,41 @@ pub(crate) fn resurrect(daemon: &Arc<Daemon>) {
     let live = daemon.live();
     *daemon.workspaces.lock() = Workspaces::import(record.workspaces, |s| live.contains(&s));
     log::info!("brought back {back} of {} sessions whose shells ended with the last goattyd", record.sessions.len());
+}
+
+/// What each saved session starts again (`None`: only its shell), in order.
+/// Only in its own folder (in another one an agent would resume another
+/// project's conversation, or none), and never one conversation twice: an
+/// exact session in the first tab that had it, a "last one here" once per
+/// folder, and not at all in a folder where the same agent resumes an exact
+/// session (the last one there may be that one). Listed programs start in
+/// every tab that had them.
+fn plan(sessions: &[Saved], settings: &RestoreSettings, is_dir: impl Fn(&str) -> bool) -> Vec<Option<Resume>> {
+    let usable: Vec<Option<Resume>> = sessions
+        .iter()
+        .map(|s| s.resume.clone().filter(|r| s.cwd.as_deref().is_some_and(&is_dir) && r.allowed(settings) && valid_argv(&r.argv)))
+        .collect();
+    let folder = |s: &Saved| s.cwd.clone().unwrap_or_default();
+    let exact: HashSet<(String, String)> = sessions
+        .iter()
+        .zip(&usable)
+        .filter_map(|(s, r)| r.as_ref().filter(|r| r.agent && !r.latest).map(|r| (r.what.clone(), folder(s))))
+        .collect();
+    let mut started = HashSet::new();
+    sessions
+        .iter()
+        .zip(usable)
+        .map(|(s, r)| {
+            let r = r?;
+            if !r.agent {
+                return Some(r);
+            }
+            if r.latest && exact.contains(&(r.what.clone(), folder(s))) {
+                return None;
+            }
+            started.insert(r.key(&folder(s))).then_some(r)
+        })
+        .collect()
 }
 
 /// Type `line` and Enter into the new shell once it's at its first prompt.
@@ -634,6 +705,37 @@ mod tests {
         assert!(!program("lazygit", &[]).allowed(&off));
     }
 
+    fn tab(id: SessionId, cwd: &str, resume: Resume) -> Saved {
+        Saved { id, cwd: Some(cwd.into()), cols: 80, rows: 24, resume: Some(resume) }
+    }
+
+    #[test]
+    fn listed_programs_start_in_every_tab_that_had_them() {
+        let s = RestoreSettings::default();
+        let tabs = [tab(1, "/a", program("lazygit", &[])), tab(2, "/b", program("lazygit", &[])), tab(3, "/a", program("lazygit", &[]))];
+        assert!(plan(&tabs, &s, |_| true).iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn a_continue_never_picks_a_conversation_an_exact_resume_has() {
+        let s = RestoreSettings::default();
+        let exact = || Resume::agent_with("claude", &["claude", "--resume"], "S");
+        let latest = || Resume::latest("claude", &["claude", "--continue"]);
+        for tabs in [[tab(1, "/a", exact()), tab(2, "/a", latest())], [tab(1, "/a", latest()), tab(2, "/a", exact())]] {
+            let p = plan(&tabs, &s, |_| true);
+            assert_eq!(p.iter().filter(|r| r.is_some()).count(), 1, "{p:?}");
+            assert!(p.iter().flatten().all(|r| !r.latest), "the exact one resumes: {p:?}");
+        }
+        // Another folder, or another agent, is another conversation.
+        let other = [tab(1, "/a", exact()), tab(2, "/b", latest()), tab(3, "/a", Resume::latest("codex", &["codex", "resume", "--last"]))];
+        assert!(plan(&other, &s, |_| true).iter().all(Option::is_some));
+        // Two tabs with one session: the first.
+        let twice = [tab(1, "/a", exact()), tab(2, "/b", exact())];
+        assert_eq!(plan(&twice, &s, |_| true).iter().filter(|r| r.is_some()).count(), 1);
+        // A folder that's gone starts nothing.
+        assert_eq!(plan(&[tab(1, "/gone", exact())], &s, |_| false), [None]);
+    }
+
     #[test]
     fn two_tabs_never_resume_the_same_conversation() {
         let latest = Resume::latest("claude", &["claude", "--continue"]);
@@ -649,6 +751,10 @@ mod tests {
         assert!(!valid_argv(&args(&["/usr/bin/claude"])));
         assert!(!valid_argv(&args(&["claude", "a\rb"])));
         assert!(!valid_argv(&args(&["lazygit", "it's"])), "PowerShell reads ' in quotes differently");
+        for q in ['\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'] {
+            assert!(!valid_argv(&[String::from("lazygit"), format!("./it{q}s; calc")]), "PowerShell reads {q} as '");
+        }
+        assert_eq!(valid_argv(&args(&["lazygit", r"/tmp/dir\"])), cfg!(windows), "fish reads \\ in quotes");
         assert!(!valid_argv(&[]));
         assert_eq!(
             command_line(&args(&["lazygit", "-p", "/src/my repo", r"C:\src", "a,b", ""])),

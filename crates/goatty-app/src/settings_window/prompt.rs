@@ -186,6 +186,10 @@ impl SettingsWindow {
     /// Put the host's values into the page's text fields (after loading or
     /// discarding).
     pub(super) fn sync_prompt_inputs(&mut self, cx: &mut Context<'_, Self>) {
+        // The Shell page's "Programs to start again" field shows the same scope.
+        if let Some(programs) = self.host_value().map(|h| h.restore.programs.join(", ")) {
+            self.restore_programs.update(cx, |input, cx| input.set_text(programs, cx));
+        }
         let Some(p) = self.host_value().map(|h| h.prompt.clone()) else { return };
         let i = &self.prompt.inputs;
         for (input, text) in [

@@ -1487,8 +1487,6 @@ impl SettingsWindow {
                         }
                         let program = loaded.value.shell.program.clone().unwrap_or_default();
                         view.shell_path.update(cx, |input, cx| input.set_text(program, cx));
-                        let programs = loaded.value.restore.programs.join(", ");
-                        view.restore_programs.update(cx, |input, cx| input.set_text(programs, cx));
                         let before = view.host.as_ref().map(|h| h.issues.clone());
                         view.link_settings = Some(loaded.value.clone());
                         if !view.scope_is_link(cx) {
@@ -1667,8 +1665,6 @@ impl SettingsWindow {
         if let Some(h) = &self.host {
             let program = h.loaded.value.shell.program.clone().unwrap_or_default();
             self.shell_path.update(cx, |input, cx| input.set_text(program, cx));
-            let programs = h.loaded.value.restore.programs.join(", ");
-            self.restore_programs.update(cx, |input, cx| input.set_text(programs, cx));
         }
         self.sync_prompt_inputs(cx);
         cx.notify();

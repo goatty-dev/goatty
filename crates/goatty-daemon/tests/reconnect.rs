@@ -662,8 +662,14 @@ fn workspaces_end_with_their_sessions_and_closing_keeps_them() {
     a.save_workspace(1, logs.id, 0, 1, vec![s2], "logs".into()).unwrap();
     // The window shows "logs" now; "ops" ends with its shell.
     a.kill(s1).unwrap();
-    eventually("ops ends", || {
-        heard.0.lock().iter().any(|e| matches!(e, goatty_client::WorkspaceEvent::List { list, .. } if !list.iter().any(|w| w.id == ops.id)))
+    // The daemon's list, then the newest one the window heard (an older one,
+    // from before "ops" existed, doesn't count).
+    eventually("ops ends", || !a.list_workspaces().unwrap().iter().any(|w| w.id == ops.id));
+    eventually("the window hears it", || {
+        heard.0.lock().iter().rev().find_map(|e| match e {
+            goatty_client::WorkspaceEvent::List { list, .. } => Some(!list.iter().any(|w| w.id == ops.id)),
+            _ => None,
+        }) == Some(true)
     });
     // Closing "logs" forgets it, but its shell keeps running.
     a.leave_workspace(1);

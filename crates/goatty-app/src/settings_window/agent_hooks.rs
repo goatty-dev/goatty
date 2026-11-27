@@ -143,7 +143,8 @@ impl SettingsWindow {
                 let agent = x.agent;
                 let this = cx.entity().downgrade();
                 let id = format!("agent-hook-{}", agent.id());
-                let disabled = !on || x.problem.is_some() || (status.unavailable.is_some() && action == Action::Install);
+                // Taking a hook out always works; adding one only makes sense while agents resume.
+                let disabled = x.problem.is_some() || (action == Action::Install && (!on || status.unavailable.is_some()));
                 let control = button(SharedString::from(id), if busy { "Working…" } else { label }, kind, ui, move |_, cx| {
                     if !disabled {
                         let _ = this.update(cx, |v, cx| v.agent_hooks_request(action, Some(agent), cx));

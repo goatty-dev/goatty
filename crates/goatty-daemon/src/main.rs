@@ -98,41 +98,29 @@ enum AgentHooksCmd {
     Status,
     /// Add goatty's hook to AGENT's config (claude, codex, copilot, agy,
     /// opencode), or to every agent set up here. The file is backed up first.
-    Install { agent: Option<String> },
+    Install {
+        agent: Option<String>,
+        /// Don't ask before changing the files.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Take goatty's hook out again.
     Remove { agent: Option<String> },
 }
 
 impl AgentHooksCmd {
     fn run(self) -> Result<()> {
-        use goatty_shell::agent_hooks::{Action, Agent, State};
+        use goatty_shell::agent_hooks::{Action, Agent};
         let svc = goatty_shell::HostService::from_env(std::env::current_exe().ok());
         let agent = |a: Option<String>| -> Result<Option<Agent>> {
             a.map(|id| Agent::from_id(&id).ok_or_else(|| anyhow::anyhow!("no agent {id:?}: claude, codex, copilot, agy or opencode")))
                 .transpose()
         };
-        let (action, which) = match self {
-            AgentHooksCmd::Status => (Action::Status, None),
-            AgentHooksCmd::Install { agent: a } => (Action::Install, agent(a)?),
-            AgentHooksCmd::Remove { agent: a } => (Action::Remove, agent(a)?),
-        };
-        let status = svc.agent_hooks(action, which)?;
-        for h in &status.hooks {
-            let state = match (h.available, h.state) {
-                (false, State::Off) => "not set up here",
-                (_, State::Off) => "no hook",
-                (_, State::On) => "hook installed",
-                (_, State::Outdated) => "hook runs another goattyd (install again to update)",
-            };
-            println!("{:<12} {state:<16} {}", h.agent.id(), h.file);
-            if let Some(p) = &h.problem {
-                println!("{:<12} {p}", "");
-            }
+        match self {
+            AgentHooksCmd::Status => goatty_shell::cmd::agent_hooks(&svc, Action::Status, None, false),
+            AgentHooksCmd::Install { agent: a, yes } => goatty_shell::cmd::agent_hooks(&svc, Action::Install, agent(a)?, yes),
+            AgentHooksCmd::Remove { agent: a } => goatty_shell::cmd::agent_hooks(&svc, Action::Remove, agent(a)?, false),
         }
-        if let Some(b) = &status.backup {
-            println!("the file as it was: {b}");
-        }
-        Ok(())
     }
 }
 

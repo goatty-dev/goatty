@@ -391,14 +391,39 @@ fn back_up(ctx: &Ctx<'_>, a: Agent, path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(to))
 }
 
-/// Write `text` to `path` through a file next to it.
+/// Write `text` to `path` through a file next to it (readers never see half
+/// of it). On Unix it keeps the file's permissions (a private config stays
+/// private); a new file is 0600, since agents' configs can hold tokens.
 fn write(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let tmp = path.with_extension("goatty-tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mode = std::fs::metadata(path).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o600);
+        open.mode(mode);
+        mode
+    };
+    let mut f = open.open(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+    // Exactly the mode: the umask may have taken bits away, and a file left
+    // behind by an earlier try keeps its own.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(std::fs::Permissions::from_mode(mode)).with_context(|| format!("write {}", tmp.display()))?;
+    }
+    f.write_all(text.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))
+}
+
+/// Whether `text` is goatty's OpenCode plugin (any version of it).
+fn is_our_plugin(text: &str) -> bool {
+    text.starts_with("// Installed by goatty")
 }
 
 /// Change the agent's JSON config with `edit` (returns whether it changed
@@ -419,8 +444,10 @@ fn edit_json(ctx: &Ctx<'_>, a: Agent, path: &Path, edit: impl FnOnce(&mut Json))
 
 fn install(ctx: &Ctx<'_>, a: Agent, path: &Path, cmd: &str) -> Result<Option<PathBuf>> {
     if a == Agent::OpenCode {
-        if std::fs::read_to_string(path).is_ok_and(|t| t == OPENCODE_PLUGIN) {
-            return Ok(None);
+        match std::fs::read_to_string(path) {
+            Ok(t) if t == OPENCODE_PLUGIN => return Ok(None),
+            Ok(t) if !is_our_plugin(&t) => bail!("{} isn't goatty's plugin; leaving it alone", ctx.show(path)),
+            _ => {}
         }
         let backup = back_up(ctx, a, path)?;
         write(path, OPENCODE_PLUGIN)?;
@@ -471,7 +498,7 @@ fn remove(ctx: &Ctx<'_>, a: Agent, path: &Path) -> Result<Option<PathBuf>> {
         }
         // Only goatty's own plugin (any version of it).
         let text = std::fs::read_to_string(path).unwrap_or_default();
-        if !text.starts_with("// Installed by goatty") {
+        if !is_our_plugin(&text) {
             bail!("{} isn't goatty's plugin; leaving it alone", ctx.show(path));
         }
         std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
@@ -793,6 +820,37 @@ mod tests {
         assert!(st.hooks.iter().all(|h| h.state == State::Off), "{st:?}");
         assert!(!s.home().join(".config/opencode/plugins/goatty-resume.js").exists());
         assert!(s.read(".gemini/config/hooks.json").contains("\"herdr\""), "others' blocks stay");
+    }
+
+    #[test]
+    fn a_users_own_plugin_with_that_name_is_left_alone() {
+        let s = Sandbox::new(&[".config/opencode/plugins"]);
+        let mine = s.home().join(".config/opencode/plugins/goatty-resume.js");
+        std::fs::write(&mine, "export const Mine = async () => ({});\n").unwrap();
+        assert!(s.run(Action::Install, Some(Agent::OpenCode), false).is_err());
+        assert!(s.run(Action::Remove, Some(Agent::OpenCode), false).is_err());
+        assert_eq!(s.read(".config/opencode/plugins/goatty-resume.js"), "export const Mine = async () => ({});\n");
+        // An older goatty plugin is updated.
+        std::fs::write(&mine, "// Installed by goatty (an older one)\n").unwrap();
+        assert_eq!(state_of(&s.run(Action::Install, Some(Agent::OpenCode), false).unwrap(), Agent::OpenCode), State::On);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_config_stays_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let s = Sandbox::new(&[".claude", ".codex"]);
+        let file = s.home().join(".claude/settings.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        s.run(Action::Install, Some(Agent::Claude), false).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        s.run(Action::Remove, Some(Agent::Claude), false).unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o644, "and a shared one shared");
+        s.run(Action::Install, Some(Agent::Codex), false).unwrap();
+        let new = s.home().join(".codex/hooks.json");
+        assert_eq!(std::fs::metadata(&new).unwrap().permissions().mode() & 0o777, 0o600, "a new one is private");
     }
 
     #[test]

@@ -53,7 +53,7 @@ Colored logos are rasterized at exactly the size they're drawn in device pixels 
 
 A restart of goattyd keeps the agents running (#131). When the shells ended with goattyd (a reboot, a crash, `goattyd stop`, `systemctl --user stop`, logging out), the next goattyd reopens every tab in its folder and resumes the agent's conversation there (#344, `goatty-daemon/src/resurrect.rs`; Settings → Shell → After a restart, `restore.*` in `host.json`). Which conversation, best first:
 
-1. **The agent's session hook**, when the user installed it (the "… hook" rows there, or `goattyd agent-hooks install [agent]`; `goatty_shell::agent_hooks`). goattyd sets `GOATTY_AGENT_REPORT` in every session; the agent runs `goattyd agent-hook <agent>` when it starts, resumes or clears a conversation, and that writes the session id to the file the variable names. This works on every platform. The hook formats follow herdr's integrations:
+1. **The agent's session hook**, when the user installed it (the "… hook" rows there, or `goattyd agent-hooks install [agent]`, which names the files and asks first; `goatty_shell::agent_hooks`). goattyd sets `GOATTY_AGENT_REPORT` in every session; the agent runs `goattyd agent-hook <agent>` when it starts, resumes or clears a conversation, and that writes the session id to the file the variable names. This works on every platform. The hook formats follow herdr's integrations:
 
    | Agent | Hook in | Event, id |
    |---|---|---|
@@ -63,7 +63,7 @@ A restart of goattyd keeps the agents running (#131). When the shells ended with
    | Antigravity | `~/.gemini/config/hooks.json`, its own block `goatty` (the hook answers `{}`) | `PreInvocation`, `conversationId` |
    | OpenCode | the plugin `~/.config/opencode/plugins/goatty-resume.js` | `session.created`/`updated` of a root session |
 
-   Installing backs the file up to `$XDG_STATE_HOME/goatty/agent-hooks/`, keeps every other key in its order and only adds goatty's entry; removing takes out only entries that run `goattyd … agent-hook`. A hook that runs another goattyd (moved, reinstalled) shows as outdated. On Windows the command goes through `powershell -Command "& '…goattyd.exe' agent-hook …"`, which cmd, PowerShell and Git Bash all run (not checked on a Windows machine yet).
+   Installing backs the file up to `$XDG_STATE_HOME/goatty/agent-hooks/`, keeps every other key in its order and the file's permissions (a new file is 0600), and only adds goatty's entry (an OpenCode `goatty-resume.js` that isn't goatty's is left alone); removing takes out only entries that run `goattyd … agent-hook`. A hook that runs another goattyd (moved, reinstalled) shows as outdated. On Windows the command goes through `powershell -Command "& '…goattyd.exe' agent-hook …"`, which cmd, PowerShell and Git Bash all run (not checked on a Windows machine yet).
 2. **What can be seen from outside**, without a hook:
 
    | Agent | Exact session | Else |
@@ -76,7 +76,7 @@ A restart of goattyd keeps the agents running (#131). When the shells ended with
 
    Command lines come from `/proc` on Linux, `KERN_PROCARGS2` on macOS (with the environment) and the process's own command line on Windows; open files only on Linux.
 
-Checked against the binaries on a development machine (Nov 2026: Claude Code 2.1.332, Codex 0.172.0, Copilot 1.0.112, OpenCode 2.4.1). Which agent runs is the foreground program's name, on every platform. Two tabs never resume the same conversation: an exact session starts in the first tab that had it, a "continue" once per folder. An agent whose folder is gone isn't started. The command is typed once the new shell marked its first prompt (OSC 133), so it lands in the shell's history and the shell is back when the agent exits; arguments are single-quoted, which zsh, bash, fish and PowerShell read alike (an argument with `'` isn't started again). Other programs start again only when listed in `restore.programs` (lazygit, htop, … by default); a build or a training run never does. The previous screen isn't shown again yet.
+Checked against the binaries on a development machine (Nov 2026: Claude Code 2.1.332, Codex 0.172.0, Copilot 1.0.112, OpenCode 2.4.1). Which agent runs is the foreground program's name, on every platform. Two tabs never resume the same conversation: an exact session starts in the first tab that had it, a "continue" once per folder and not at all where the same agent resumes an exact session (the last one there may be that one). An agent whose folder is gone isn't started. The command is typed once the new shell marked its first prompt (OSC 133), so it lands in the shell's history and the shell is back when the agent exits; arguments are single-quoted, which zsh, bash, fish and PowerShell read alike (an argument with `'`, a typographic single quote, or outside Windows a backslash, isn't started again). Other programs start again only when listed in `restore.programs` (lazygit, htop, … by default), in every tab that had them; a build or a training run never does. Until a brought-back tab's command shows up in its foreground (20 s at most), the record keeps it, so a second reboot right away doesn't lose it. The previous screen isn't shown again yet.
 
 ## Notifications
 
