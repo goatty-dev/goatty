@@ -578,6 +578,8 @@ pub struct SettingsWindow {
     font_filter: Entity<TextInput>,
     ui_font_filter: Entity<TextInput>,
     shell_path: Entity<TextInput>,
+    /// The Shell page's "Programs to start again" (restore.programs).
+    restore_programs: Entity<TextInput>,
     /// The PATH page's "Add a folder" field (shell.path).
     path_entry: Entity<TextInput>,
     file_opener: Entity<TextInput>,
@@ -661,6 +663,7 @@ impl SettingsWindow {
         let ui_font_filter = cx.new(|cx| TextInput::new("Search fonts", "", cx).bare());
         let search = cx.new(|cx| TextInput::new("Search settings", "", cx).bare());
         let shell_path = cx.new(|cx| TextInput::new("/usr/bin/nu", "", cx).label("Shell program"));
+        let restore_programs = cx.new(|cx| TextInput::new("lazygit, htop", "", cx).label("Programs to start again"));
         let path_entry = cx.new(|cx| TextInput::new("~/bin or /opt/tool/bin", "", cx).label("Folder to add to PATH"));
         let picker = cx.new(|cx| ColorPicker::new(cx.global::<AppSettings>().colors.get(ColorSlot::Background), cx));
         let theme_name = cx.new(|cx| TextInput::new("Name for a new theme", "", cx).label("Theme name"));
@@ -756,6 +759,12 @@ impl SettingsWindow {
                     this.edit_host(cx, |h| h.shell.program = (!text.is_empty()).then_some(text));
                 }
             }),
+            cx.subscribe(&restore_programs, |this, _, ev: &TextInputEvent, cx| {
+                if let TextInputEvent::Submitted(text) = ev {
+                    let programs = shell::parse_programs(text);
+                    this.edit_host(cx, |h| h.restore.programs = programs);
+                }
+            }),
         ];
         let mut this = Self {
             focus,
@@ -787,6 +796,7 @@ impl SettingsWindow {
             font_filter,
             ui_font_filter,
             shell_path,
+            restore_programs,
             path_entry,
             file_opener,
             remote_file_opener,
@@ -1467,6 +1477,8 @@ impl SettingsWindow {
                         }
                         let program = loaded.value.shell.program.clone().unwrap_or_default();
                         view.shell_path.update(cx, |input, cx| input.set_text(program, cx));
+                        let programs = loaded.value.restore.programs.join(", ");
+                        view.restore_programs.update(cx, |input, cx| input.set_text(programs, cx));
                         let before = view.host.as_ref().map(|h| h.issues.clone());
                         view.link_settings = Some(loaded.value.clone());
                         if !view.scope_is_link(cx) {
@@ -1645,6 +1657,8 @@ impl SettingsWindow {
         if let Some(h) = &self.host {
             let program = h.loaded.value.shell.program.clone().unwrap_or_default();
             self.shell_path.update(cx, |input, cx| input.set_text(program, cx));
+            let programs = h.loaded.value.restore.programs.join(", ");
+            self.restore_programs.update(cx, |input, cx| input.set_text(programs, cx));
         }
         self.sync_prompt_inputs(cx);
         cx.notify();

@@ -10,6 +10,7 @@ fn goattyd(home: &Path, args: &[&str]) -> Output {
         .env("HOME", home)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .env_remove("GOATTY_SHELL")
         .env_remove("GOATTY_SHELL_MANAGED")
         .env_remove("GOATTY_ZSH_USER_RC")

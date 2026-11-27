@@ -49,6 +49,7 @@ fn start_daemon() -> Daemon {
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -684,6 +685,7 @@ fn unhandled_osc_is_silenced_by_default() {
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

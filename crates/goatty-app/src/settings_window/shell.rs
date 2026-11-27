@@ -184,7 +184,42 @@ impl SettingsWindow {
                         })
                         .on_click("shell-path", self.listener_go(cx, Page::Path)),
                 );
-            vec![hero.into_any_element(), program_section.into_any_element(), dotfiles.into_any_element(), integration.into_any_element()]
+            let r = &h.restore;
+            let back = r.sessions;
+            let restore = section(ui, "After a restart")
+                .child(
+                    row(ui, "Reopen tabs")
+                        .desc("When a reboot or crash ended the shells, each tab comes back in its folder")
+                        .control(toggle("restore-sessions", back, ui, self.host(cx, |h| h.restore.sessions = !h.restore.sessions))),
+                )
+                .child(
+                    row(ui, "Resume coding agents")
+                        .desc(if back {
+                            "Claude Code, Codex, OpenCode, Copilot and Antigravity continue their conversation"
+                        } else {
+                            "Only when tabs reopen"
+                        })
+                        .disabled(!back)
+                        .control(toggle("restore-agents", r.agents && back, ui, self.host(cx, |h| h.restore.agents = !h.restore.agents))),
+                )
+                .child(
+                    row(ui, "Programs to start again")
+                        .desc(if back {
+                            "With the arguments they had. Anything else isn't started again. Enter saves"
+                        } else {
+                            "Only when tabs reopen"
+                        })
+                        .disabled(!back)
+                        .below(self.restore_programs.clone()),
+                )
+                .footer("A restart of goattyd keeps the shells and what runs in them; this is for when they ended.");
+            vec![
+                hero.into_any_element(),
+                program_section.into_any_element(),
+                dotfiles.into_any_element(),
+                integration.into_any_element(),
+                restore.into_any_element(),
+            ]
         })
     }
 
@@ -270,6 +305,11 @@ impl SettingsWindow {
 }
 
 /// `100000` → `100 000`.
+/// The "Programs to start again" field: names split at commas and spaces.
+pub(super) fn parse_programs(text: &str) -> Vec<String> {
+    text.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()).map(String::from).collect()
+}
+
 fn group_digits(n: u32) -> SharedString {
     let s = n.to_string();
     let mut out = String::new();

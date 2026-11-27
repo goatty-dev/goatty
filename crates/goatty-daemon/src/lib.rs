@@ -13,6 +13,7 @@
 //! * `net`: this host on the user's tailnet (the gateway socket, pairing),
 //! * [`proxy`]: stdio ⇄ socket relay for remote transports,
 //! * `restore`: sessions that outlive goattyd (restart, upgrade, crash),
+//! * `resurrect`: tabs that come back when their shells didn't (reboot, #344),
 //! * [`systemd`]: Linux socket activation and the fd store,
 //! * `launchd`: macOS socket activation (`launch_activate_socket`).
 //!
@@ -25,6 +26,8 @@ mod launchd;
 mod net;
 pub mod proxy;
 mod restore;
+#[cfg(unix)]
+mod resurrect;
 pub mod server;
 mod session;
 mod settings;

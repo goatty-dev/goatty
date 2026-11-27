@@ -192,6 +192,11 @@ pub const INDEX: &[Entry] = &[
     e(Page::Shell, "Integration", "Shell integration", "osc 133 osc 7 prompt marks directory").keys(&["shell.zsh.integration"]),
     e(Page::Shell, "Integration", "Highlight pasted text", "paste selected marked reverse video zle_highlight bracketed")
         .keys(&["shell.zsh.highlight_paste"]),
+    e(Page::Shell, "After a restart", "Reopen tabs", "restore resurrect reboot crash sessions come back").keys(&["restore.sessions"]),
+    e(Page::Shell, "After a restart", "Resume coding agents", "restore resume claude codex opencode copilot agent conversation reboot")
+        .keys(&["restore.agents"]),
+    e(Page::Shell, "After a restart", "Programs to start again", "restore restart lazygit htop programs reboot")
+        .keys(&["restore.programs"]),
     e(Page::Prompt, "Prompt", "Starship", "prompt git").keys(&["plugins.starship.enabled"]),
     e(Page::Prompt, "Prompt", "Use my own starship.toml", "starship config").keys(&["plugins.starship.settings.prefer_user_config"]),
     e(Page::Prompt, "Style", "Style", "starship lean classic rainbow powerline p10k powerlevel look theme").keys(&["prompt.style"]),

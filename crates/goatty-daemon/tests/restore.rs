@@ -40,6 +40,7 @@ fn goattyd(exe: &Path, dir: &Path) -> Command {
         .env("HOME", dir)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .env_remove("NOTIFY_SOCKET")
         .env_remove("LISTEN_PID")
         .env_remove("LISTEN_FDS")

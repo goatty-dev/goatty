@@ -35,6 +35,7 @@ fn start_daemon() -> Daemon {
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     let d = Daemon { child, sock, _dir: dir };

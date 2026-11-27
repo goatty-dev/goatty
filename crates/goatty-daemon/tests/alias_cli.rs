@@ -13,6 +13,7 @@ fn goattyd(home: &Path, args: &[&str]) -> Output {
         .env("PATH", "/usr/bin:/bin")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("GOATTY_SHELL")
         .env_remove("GOATTY_SHELL_MANAGED")

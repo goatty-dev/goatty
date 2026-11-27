@@ -321,8 +321,9 @@ impl Terminal {
         self.inner.zle.load(Ordering::Relaxed) && self.shell_state() != ShellState::Running
     }
 
-    /// Counts the prompts with line editing (`zle=1`) so far.
-    pub(crate) fn prompt_generation(&self) -> u64 {
+    /// Counts the prompts with line editing (`zle=1`) so far: once it's
+    /// above zero, the managed zsh reads what's typed in its line editor.
+    pub fn prompt_generation(&self) -> u64 {
         self.inner.prompts.load(Ordering::Relaxed)
     }
 

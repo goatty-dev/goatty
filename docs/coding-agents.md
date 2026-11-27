@@ -49,6 +49,20 @@ Colored logos are rasterized at exactly the size they're drawn in device pixels 
 - **Progress**: a thin line along the tab's bottom: the agent's `progress`, else the pane's OSC 9;4 bar (red on error, warning color when paused, a moving segment when indeterminate).
 - **Split panes**: a pane whose agent waits gets a warning ring and a pill naming what it waits for.
 
+## Resuming after a reboot
+
+A restart of goattyd keeps the agents running (#131). When the shells ended with goattyd (a reboot, a crash, `systemctl --user stop`, logging out), the next goattyd reopens every tab in its folder and resumes the agent's conversation there (#344, `goatty-daemon/src/resurrect.rs`; Settings → Shell → After a restart, `restore.*` in `host.json`). goatty reads the agent's session from outside, without hooks in the agent's config (herdr installs hooks to learn the same ids):
+
+| Agent | Exact session | Else |
+|---|---|---|
+| Claude Code | `sessionId` in `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (it follows `/clear`), or `--resume`/`--session-id` on the command line → `claude --resume <id>` | `claude --continue` |
+| Codex | `codex resume <id>` on the command line, or a `rollout-…-<id>.jsonl` it holds open → `codex resume <id>` | `codex resume --last` (the newest in that folder) |
+| Copilot CLI | the `session-state/<id>/inuse.<pid>.hold` it holds open, or `--resume=<id>` → `copilot --resume=<id>` | `copilot --continue` |
+| OpenCode | `--session <id>` on the command line | `opencode --continue` |
+| Antigravity | `--conversation <id>` on the command line | `agy --continue` |
+
+Checked against the binaries on a development machine (Nov 2026: Claude Code 2.1.332, Codex 0.172.0, Copilot 1.0.112, OpenCode 2.4.1). Command lines, environments and open files come from `/proc`, so this works on Linux; on macOS goatty can't read command lines yet (agents under a runtime or a versioned binary aren't recognized, listed programs start without their arguments), and Windows tabs don't come back. Two tabs never resume the same conversation: an exact session starts in the first tab that had it, a "continue" once per folder. An agent whose folder is gone isn't started. The command is typed at the new shell's first prompt, so it lands in the shell's history and the shell is back when the agent exits. Other programs start again only when listed in `restore.programs` (lazygit, htop, … by default); a build or a training run never does. The previous screen isn't shown again yet.
+
 ## Notifications
 
 `notifications.in_app` and `notifications.system` (Settings → Workspace → Notifications) each pick never, when not looking (the pane isn't on screen: another tab, or goatty isn't focused; the default in goatty), when goatty isn't focused (the default on the desktop), or always. `agent_waiting`, `agent_done` and `programs` pick the events.

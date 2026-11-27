@@ -36,6 +36,7 @@ fn start_daemon() -> Daemon {
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     // The guard first, so a daemon that misses the deadline is killed too.

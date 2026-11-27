@@ -78,6 +78,89 @@ pub fn cwd(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// What a process looks like from outside, for telling which program runs
+/// and how to start it again (`goattyd`'s session resurrection, #344).
+/// Each read is a few small `/proc` files on Linux; elsewhere only what the
+/// platform offers cheaply (macOS: the name, no arguments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Process(pub u32);
+
+impl Process {
+    /// The name [`process_name`] shows for it.
+    pub fn name(self) -> Option<String> {
+        process_name(self.0)
+    }
+
+    /// Its arguments, `argv[0]` first (Linux only).
+    pub fn args(self) -> Option<Vec<String>> {
+        #[cfg(target_os = "linux")]
+        {
+            let raw = std::fs::read(format!("/proc/{}/cmdline", self.0)).ok()?;
+            let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+            (!raw.is_empty()).then(|| raw.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect())
+        }
+        #[cfg(not(target_os = "linux"))]
+        None
+    }
+
+    /// One of its environment variables as it started (Linux only).
+    pub fn env(self, name: &str) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let raw = std::fs::read(format!("/proc/{}/environ", self.0)).ok()?;
+            raw.split(|&b| b == 0).find_map(|kv| {
+                let rest = kv.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+                Some(String::from_utf8_lossy(rest).into_owned())
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            None
+        }
+    }
+
+    /// The process and its descendants, parents first, at most `max` (Linux only;
+    /// needs `/proc/<pid>/task/<tid>/children`).
+    pub fn tree(self, max: usize) -> Vec<Process> {
+        let mut out = vec![self];
+        #[cfg(target_os = "linux")]
+        {
+            let mut i = 0;
+            while i < out.len() && out.len() < max {
+                let pid = out[i].0;
+                i += 1;
+                let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+                for task in tasks.flatten() {
+                    let Ok(children) = std::fs::read_to_string(task.path().join("children")) else { continue };
+                    for c in children.split_whitespace().filter_map(|c| c.parse().ok()) {
+                        if out.len() < max && !out.contains(&Process(c)) {
+                            out.push(Process(c));
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = max;
+        out
+    }
+
+    /// The files it has open, at most `max` (Linux only).
+    pub fn open_files(self, max: usize) -> Vec<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", self.0)) else { return Vec::new() };
+            fds.flatten().take(max).filter_map(|fd| std::fs::read_link(fd.path()).ok()).filter(|p| p.is_absolute()).collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = max;
+            Vec::new()
+        }
+    }
+}
+
 /// Strip a trailing `.exe` (case-insensitive) from a Windows image name so tab
 /// icons and shell checks match Unix names (`pwsh`, `nvim`, `node`, `cmd`).
 #[cfg(any(windows, test))]
@@ -125,8 +208,8 @@ pub(crate) fn display_name_windows(image_name: &str, cmdline: Option<&str>) -> O
     Some(name.to_string())
 }
 
-/// Interpreters that run other programs' code.
-fn is_runtime(name: &str) -> bool {
+/// Interpreters that run other programs' code (`node`, `bun`, `python3`, …).
+pub fn is_runtime(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let stem = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     matches!(stem, "node" | "nodejs" | "bun" | "deno" | "python" | "uv" | "uvx")
