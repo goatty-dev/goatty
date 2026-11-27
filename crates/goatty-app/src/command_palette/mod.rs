@@ -17,7 +17,9 @@
 //! needed): first the tabs detached there (or left by a window that
 //! closed) to restore all at once, one entry per window's worth (#252);
 //! then a new session, "reattach every detached session" (a tab each), and
-//! each session. Enter opens one where `ssh.open_in` says (a new tab or
+//! each session. When there's nothing to choose (an empty host, or its
+//! only workspace holding every session, unshown and with nothing
+//! detached) picking the host opens that right away (#342). Enter opens one where `ssh.open_in` says (a new tab or
 //! window), Shift+Enter the other way. Shift+Delete on a "Restore N tabs"
 //! entry (twice) ends those tabs' shells. Shift+Delete (or the row's
 //! trash button), pressed twice, ends a session without opening it: the
@@ -268,6 +270,20 @@ fn session_commands(mut list: Vec<SessionInfo>, workspaces: Option<&[HostWorkspa
     }
     out.extend(list.iter().map(|s| session_command(s, now)));
     out.into_iter().map(Rc::new).collect()
+}
+
+/// What connecting to a host opens without asking (#342): a fresh tab when
+/// nothing runs there, its only workspace when that holds every session,
+/// no window shows it and it has no detached tabs to choose about. `None`:
+/// there's a choice, so the picker asks.
+fn sole_choice(list: &[SessionInfo], workspaces: &[HostWorkspace]) -> Option<AttachMode> {
+    match workspaces {
+        [] if list.is_empty() => Some(AttachMode::New),
+        [w] if w.info.views == 0 && w.detached.is_empty() && list.iter().all(|s| w.info.sessions.contains(&s.id)) => {
+            Some(AttachMode::Join(Some(w.info.id)))
+        }
+        _ => None,
+    }
 }
 
 /// What ending sessions from the picker left.
@@ -614,7 +630,7 @@ impl CommandPalette {
         };
         // A host's sessions are fetched; the other scopes list what's here.
         match this.scope.clone() {
-            Scope::Sessions(host) => this.show_sessions(host, cx),
+            Scope::Sessions(host) => this.show_sessions(host, false, cx),
             _ => {
                 this.load_commands(cx);
                 this.set_query("", cx);
@@ -1222,7 +1238,11 @@ impl CommandPalette {
 
     /// The sessions picker for `host`: a new session right away, the
     /// host's sessions once fetched (connecting first if no tab is on it).
-    fn show_sessions(&mut self, host: HostRef, cx: &mut Context<'_, Self>) {
+    /// `connecting`: the host was just picked to connect to, so when there's
+    /// nothing to choose ([`sole_choice`]) that opens right away, and a host
+    /// that can't be reached opens a new session (whose connect screen says
+    /// what's wrong and offers the install).
+    fn show_sessions(&mut self, host: HostRef, connecting: bool, cx: &mut Context<'_, Self>) {
         let now = unix_now();
         self.show_scope(Scope::Sessions(host.clone()), cx);
         self.workspaces.clear();
@@ -1255,6 +1275,20 @@ impl CommandPalette {
             let _ = this.update(cx, |this, cx| {
                 if this.scope != Scope::Sessions(host.clone()) {
                     return;
+                }
+                // Typed into meanwhile: they're choosing, don't take over.
+                if connecting && this.query.is_empty() {
+                    let pick = match &result {
+                        Ok((conn, list, Some(workspaces))) => sole_choice(list, workspaces).map(|a| (a, Some(conn.clone()))),
+                        Ok((_, _, None)) => None,
+                        Err(_) => Some((AttachMode::New, None)),
+                    };
+                    if let Some((attach, conn)) = pick {
+                        let place = cx.global::<AppSettings>().client.ssh.open_in;
+                        hosts::open(cx, OpenRequest { host: host.clone(), attach, conn, place });
+                        cx.emit(PaletteEvent::Dismissed);
+                        return;
+                    }
                 }
                 match result {
                     Ok((conn, list, workspaces)) => {
@@ -1401,7 +1435,7 @@ impl CommandPalette {
                     let plain = matches!(&host, HostRef::Ssh(h) if cx.global::<AppSettings>().client.ssh.plain(h));
                     if !plain {
                         self.remember(&command.id, cx);
-                        self.show_sessions(host, cx);
+                        self.show_sessions(host, true, cx);
                         return;
                     }
                 }
@@ -1943,6 +1977,43 @@ mod tests {
         assert_eq!(age(100, 130), "just now");
         assert_eq!(age(0, 300), "5 min");
         assert_eq!(age(0, 3 * 86_400), "3 d");
+    }
+
+    #[test]
+    fn sole_choice_skips_the_picker() {
+        let s = |id: u64| SessionInfo {
+            id,
+            pid: None,
+            title: String::new(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            attached: 0,
+            created_unix: 0,
+            process: None,
+        };
+        let ws = |sessions: Vec<u64>, views: u32, detached: bool| HostWorkspace {
+            info: goatty_proto::WorkspaceInfo { id: 5, name: "Main".into(), revision: 1, tabs: 1, sessions, views, active: 1 },
+            detached: if detached {
+                vec![crate::workspace::saved::SavedTab {
+                    id: 1,
+                    name: None,
+                    tree: crate::workspace::saved::leaf(1),
+                    plain: None,
+                    detached_at: Some(1),
+                }]
+            } else {
+                Vec::new()
+            },
+        };
+        assert!(matches!(sole_choice(&[], &[]), Some(AttachMode::New)), "nothing there");
+        assert!(sole_choice(&[s(1)], &[]).is_none(), "a loose session");
+        assert!(matches!(sole_choice(&[s(1), s(2)], &[ws(vec![1, 2], 0, false)]), Some(AttachMode::Join(Some(5)))));
+        assert!(matches!(sole_choice(&[], &[ws(vec![], 0, false)]), Some(AttachMode::Join(Some(5)))));
+        assert!(sole_choice(&[s(1), s(2)], &[ws(vec![1], 0, false)]).is_none(), "a session outside it");
+        assert!(sole_choice(&[s(1)], &[ws(vec![1], 1, false)]).is_none(), "a window shows it");
+        assert!(sole_choice(&[s(1)], &[ws(vec![1], 0, true)]).is_none(), "detached tabs to choose about");
+        assert!(sole_choice(&[], &[ws(vec![], 0, false), ws(vec![], 0, false)]).is_none(), "two workspaces");
     }
 
     #[test]
