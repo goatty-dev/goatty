@@ -66,6 +66,20 @@ Automated tests (`cargo test -p goatty-daemon`) and a manual GUI check both pass
 - A full-screen app (htop) is restored exactly on reattach, including alt-screen and DECCKM state.
 - The GUI auto-starts `goattyd` (detached with `setsid`) when it isn't running.
 
+### Images (kitty graphics; 2026-11-26)
+
+`cargo run --release -p goatty-term --example imgcheck -- 10 CMD` runs `CMD` on a PTY behind a goattyd-like terminal (`MediaRewriter`, query answers) and a mirror fed the same bytes, and reports the cost per image and whether the mirror and an attaching client match. Workload: terminal-browser 0.13.4 on an animated local page, 1000×600 RGBA frames through shared memory (`t=s`), about 58 frames/s (its own limit):
+
+| Rewriter output | Fed per frame | Rewriting | Daemon feed | Mirror feed |
+|---|---|---|---|---|
+| zlib (miniz_oxide), base64 | 892 KiB | 10.6 ms | 6.4 ms | 6.4 ms |
+| zlib (zlib-rs), base64 | 1164 KiB | 9.3 ms | 3.5 ms | 3.5 ms |
+| **as it is, base64 (shipped)** | 3125 KiB | **2.0 ms** | **1.2 ms** | **1.2 ms** |
+
+Compressing frames cost the daemon four times everything else, so the rewriter inlines the data as it is. A local socket carries 180 MB/s easily; a remote client that can't keep up falls behind its flow-control window and gets `Resync` snapshots, whose images are zlib-compressed once and cached. flate2 uses zlib-rs, which halves decoding when programs send `o=z` themselves (terminal-browser over SSH, yazi).
+
+In the GUI (gamescope headless, 1400×900) the same page while it animates: goatty about 0.3 cores, goattyd about 0.25, memory flat over 30 s (each frame's texture is freed when the next one shows). The browser stops sending frames while the pane is unfocused (it asks for focus reports).
+
 ---
 
 ## Decisions the spike led to

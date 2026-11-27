@@ -6,7 +6,9 @@
 //!   * one shaped text line per row *segment* (a maximal stretch of simple
 //!     narrow cells, possibly mixing colors/weights via multiple `TextRun`s),
 //!     shaped with `force_width = cell_width` so glyphs land on the grid,
-//!   * wide / combining cells shaped individually at their exact cell.
+//!   * wide / combining cells shaped individually at their exact cell,
+//!   * images (kitty graphics, sixel, iTerm2) under the cell backgrounds,
+//!     between backgrounds and text, or over the text, as they ask.
 //!
 //! GPUI caches shaped lines across frames keyed by (text, runs), so unchanged
 //! rows cost a hash lookup, not a reshape.
@@ -16,16 +18,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use goatty_term::{CellFlags, CursorKind, Frame, LinkSpan, Rgb, TermSize};
+use goatty_term::{CellFlags, CursorKind, Frame, ImageLayer, LinkSpan, Rgb, TermSize};
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
-    Hsla, InspectorElementId, LayoutId, Pixels, Point, ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextRun, UnderlineStyle,
-    Window, fill, point, px, relative, size,
+    App, Bounds, ContentMask, Corners, Element, ElementId, ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight,
+    GlobalElementId, Hsla, InspectorElementId, LayoutId, Pixels, Point, RenderImage, ShapedLine, SharedString, Size, StrikethroughStyle,
+    Style, TextRun, UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::box_drawing::{self, CellGrid, DpRect, PathDraw};
 use super::glyphs::{Glyph, GlyphCache};
+use super::images::ImageTextures;
 use super::stats::Stats;
 use super::view::TerminalView;
 use crate::session::Session;
@@ -121,6 +124,8 @@ pub struct TerminalElement {
     /// (supports ligatures, slower when many lines change).
     pub glyph_mode: bool,
     pub glyphs: Rc<RefCell<GlyphCache>>,
+    /// The textures of the images on screen.
+    pub images: Rc<RefCell<ImageTextures>>,
     /// Blink phase; when false the focused cursor is not drawn.
     pub cursor_visible: bool,
     /// The hovered link, underlined.
@@ -140,6 +145,16 @@ struct GlyphDraw {
     color: Hsla,
 }
 
+/// An image piece: its layer, where it shows (clipped to the grid), where
+/// the whole image would be (so the shown part is the right crop), and the
+/// texture.
+struct ImageDraw {
+    layer: ImageLayer,
+    bounds: Bounds<Pixels>,
+    image_bounds: Bounds<Pixels>,
+    texture: Arc<RenderImage>,
+}
+
 enum Deco {
     Underline(Point<Pixels>, Pixels, UnderlineStyle),
     Strike(Point<Pixels>, Pixels, StrikethroughStyle),
@@ -156,6 +171,7 @@ struct CursorLayout {
 }
 
 pub struct Layout {
+    images: Vec<ImageDraw>,
     rects: Vec<(Bounds<Pixels>, Hsla)>,
     fg_rects: Vec<(Bounds<Pixels>, Hsla)>,
     paths: Vec<PathDraw>,
@@ -296,6 +312,7 @@ impl Element for TerminalElement {
 
         let scale = window.scale_factor();
         let grid = CellGrid::new(origin, cell_w, line_height, self.font_size, scale);
+        let images = self.image_draws(&frame, origin, size(cell_w, line_height));
         let default_bg = frame.background;
         let mut cache = self.glyphs.borrow_mut();
         cache.ensure(&ts, &self.font, self.font_size);
@@ -561,6 +578,7 @@ impl Element for TerminalElement {
 
         self.stats.borrow_mut().shaped_segments += if self.glyph_mode { glyph_draws.len() } else { lines.len() } as u64;
         Layout {
+            images,
             rects,
             fg_rects,
             paths,
@@ -590,6 +608,7 @@ impl Element for TerminalElement {
         window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
         let mask = layout.letterbox.map(|_| ContentMask { bounds });
         window.with_content_mask(mask, |window| self.paint_grid(layout, window, cx));
+        self.images.borrow_mut().sweep(window, cx);
         if let Some(grid) = layout.letterbox {
             paint_letterbox(bounds, grid, window);
         }
@@ -620,10 +639,50 @@ fn paint_letterbox(pane: Bounds<Pixels>, grid: Bounds<Pixels>, window: &mut Wind
 }
 
 impl TerminalElement {
+    /// The frame's images in window coordinates, with their textures.
+    fn image_draws(&self, frame: &Frame, origin: Point<Pixels>, cell: Size<Pixels>) -> Vec<ImageDraw> {
+        let mut textures = self.images.borrow_mut();
+        textures.begin();
+        let grid = Bounds::new(origin, size(cell.width * frame.cols as f32, cell.height * frame.rows as f32));
+        frame
+            .images
+            .iter()
+            .filter_map(|i| {
+                let [u0, v0, u1, v1] = i.source;
+                if u1 <= u0 || v1 <= v0 || i.width <= 0.0 || i.height <= 0.0 {
+                    return None;
+                }
+                let target = Bounds::new(
+                    point(origin.x + cell.width * i.x, origin.y + cell.height * i.y),
+                    size(cell.width * i.width, cell.height * i.height),
+                );
+                let bounds = target.intersect(&grid);
+                if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+                    return None;
+                }
+                // The whole image, placed so the crop lands on the target.
+                let whole = size(target.size.width / (u1 - u0), target.size.height / (v1 - v0));
+                let image_bounds = Bounds::new(point(target.origin.x - whole.width * u0, target.origin.y - whole.height * v0), whole);
+                let texture = textures.get(&i.image)?;
+                Some(ImageDraw { layer: i.layer, bounds, image_bounds, texture })
+            })
+            .collect()
+    }
+
+    fn paint_images(layout: &Layout, layer: ImageLayer, window: &mut Window) {
+        for d in layout.images.iter().filter(|d| d.layer == layer) {
+            if let Err(e) = window.paint_image(d.bounds, d.image_bounds, Corners::default(), d.texture.clone(), 0, false) {
+                log::warn!("couldn't paint an image: {e}");
+            }
+        }
+    }
+
     fn paint_grid(&mut self, layout: &mut Layout, window: &mut Window, cx: &mut App) {
+        Self::paint_images(layout, ImageLayer::BelowBackground, window);
         for (b, color) in layout.rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
+        Self::paint_images(layout, ImageLayer::BelowText, window);
         for (b, color) in layout.fg_rects.drain(..) {
             window.paint_quad(fill(b, color));
         }
@@ -654,6 +713,7 @@ impl TerminalElement {
                 Deco::Strike(o, w, st) => window.paint_strikethrough(o, w, &st),
             }
         }
+        Self::paint_images(layout, ImageLayer::AboveText, window);
         // While composing, the composition stands where the cursor is.
         let cursor = layout.cursor.take().filter(|_| (self.cursor_visible || !self.focused) && layout.preedit.is_none());
         if let Some(cur) = cursor {

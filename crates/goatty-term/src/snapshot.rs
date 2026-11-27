@@ -13,7 +13,10 @@
 //!     commands and unwrapped lines,
 //!   * OSC 8 hyperlinks,
 //!   * what programs said about themselves (OSC 7501 records, the OSC 9;4
-//!     progress bar; see [`crate::status`]).
+//!     progress bar; see [`crate::status`]),
+//!   * images (kitty graphics, sixel, iTerm2; see [`crate::graphics`]):
+//!     each image once, then its placements, each written while the
+//!     row it starts on is replayed.
 
 use std::fmt::Write as _;
 
@@ -23,6 +26,7 @@ use rio_vt::crosswords::pos::{Column, Line};
 use rio_vt::crosswords::square::Hyperlink;
 use rio_vt::crosswords::style::Style;
 
+use crate::graphics::Replay;
 use crate::marks::ShellState;
 use crate::terminal::{Term, with_primary};
 use crate::{TermMode, Terminal};
@@ -43,21 +47,27 @@ impl Terminal {
     }
 
     pub fn reattach_snapshot_with_history(&self, max_history: usize) -> Vec<u8> {
+        self.full_snapshot(max_history, true)
+    }
+
+    fn full_snapshot(&self, max_history: usize, images: bool) -> Vec<u8> {
         // The shell state changes with the terminal locked: read it locked.
         self.with_term(|t| {
-            let mut out = serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info(), self.win32_input());
+            let mut images = images.then(|| Images::new(self));
+            let mut out = serialize(t, max_history.min(MAX_REPLAY_HISTORY), self.shell_info(), self.win32_input(), images.as_mut());
             self.write_status(false, &mut out);
             out.into_bytes()
         })
     }
 
     /// Everything another process needs to rebuild this terminal (goattyd
-    /// handing its sessions to its next version): identical to
+    /// handing its sessions to its next version): like
     /// [`Self::reattach_snapshot`] (full [`MAX_REPLAY_HISTORY`] scrollback and
-    /// both screens when the alternate screen is active). Leaves the terminal
-    /// as it was.
+    /// both screens when the alternate screen is active), without images
+    /// (they'd make the restore state as large as they are). Leaves the
+    /// terminal as it was.
     pub fn restore_snapshot(&self) -> Vec<u8> {
-        self.reattach_snapshot()
+        self.full_snapshot(MAX_REPLAY_HISTORY, false)
     }
 
     /// Catch-up snapshot for a client terminal that already mirrors this
@@ -68,7 +78,8 @@ impl Terminal {
     /// skipped lines are simply absent. Small: one screen plus modes.
     pub fn resync_snapshot(&self) -> Vec<u8> {
         self.with_term(|t| {
-            let mut out = resync(t, self.shell_info(), self.primary_kitty(), self.win32_input());
+            let mut images = Images::new(self);
+            let mut out = resync(t, self.shell_info(), self.primary_kitty(), self.win32_input(), &mut images);
             self.write_status(true, &mut out);
             out.into_bytes()
         })
@@ -87,9 +98,38 @@ impl Terminal {
     }
 }
 
+/// The image state a snapshot reads: the pixels of sixel/iTerm2 images and
+/// the transmissions encoded before. Locked after the terminal, and only
+/// while a screen's images are read: switching screens can make rio-vt
+/// queue uploads, which the listener applies under the same lock.
+struct Images<'a> {
+    term: &'a Terminal,
+    /// What the whole snapshot may still spend on images (both screens).
+    budget: crate::graphics::Budget,
+}
+
+impl<'a> Images<'a> {
+    fn new(term: &'a Terminal) -> Self {
+        Self { term, budget: crate::graphics::Budget::default() }
+    }
+
+    /// The active screen's images, for rows replayed from `first_line` on.
+    fn replay(&mut self, t: &Term, first_line: i32) -> Replay {
+        let store = self.term.inner.images.lock();
+        let cache = self.term.inner.encoded.lock();
+        Replay::build(t, &store, &cache, &mut self.budget, first_line)
+    }
+}
+
+impl Drop for Images<'_> {
+    fn drop(&mut self) {
+        self.budget.finish(&mut self.term.inner.encoded.lock());
+    }
+}
+
 /// `primary`: the primary screen's kitty keyboard flags, used while the
 /// alternate screen is active (each screen has its own).
-fn resync(t: &mut Term, shell: ShellInfo, primary: u8, win32_input: bool) -> String {
+fn resync(t: &mut Term, shell: ShellInfo, primary: u8, win32_input: bool, images: &mut Images<'_>) -> String {
     let mut mode = TermMode::of(t);
     if win32_input {
         mode |= TermMode::WIN32_INPUT_MODE;
@@ -107,7 +147,12 @@ fn resync(t: &mut Term, shell: ShellInfo, primary: u8, win32_input: bool) -> Str
         write_kitty_flags(primary, &mut out);
         out.push_str("\x1b[?1049h");
     }
-    write_screen(t, true, &mut out);
+    // The client may have missed placements and deletes: its images on
+    // this screen go, the session's come back.
+    out.push_str("\x1b_Ga=d,d=A,q=2\x1b\\");
+    let mut replay = images.replay(t, 0);
+    out.push_str(&replay.prelude);
+    write_screen(t, true, &mut out, Some(&mut replay));
     write_shell_state(shell, &mut out);
     // Mouse protocols are one setting in rio: reset, then set what's active.
     out.push_str("\x1b[?1000l\x1b[?1005l\x1b[?1006l");
@@ -115,7 +160,7 @@ fn resync(t: &mut Term, shell: ShellInfo, primary: u8, win32_input: bool) -> Str
     out
 }
 
-fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo, win32_input: bool) -> String {
+fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo, win32_input: bool, mut images: Option<&mut Images<'_>>) -> String {
     let mut mode = TermMode::of(t);
     if win32_input {
         mode |= TermMode::WIN32_INPUT_MODE;
@@ -125,18 +170,22 @@ fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo, win32_input: bo
     out.push_str("\x1bc");
 
     if !mode.contains(TermMode::ALT_SCREEN) {
-        write_primary(t, max_history, &mut out);
+        write_primary(t, max_history, &mut out, images);
     } else {
         // Replay the primary screen + its scrollback and kitty flags before
         // switching to the alternate screen, so leaving the full-screen app
         // restores the original screen.
         let primary_kitty = with_primary(t, |t| {
-            write_primary(t, max_history, &mut out);
+            write_primary(t, max_history, &mut out, images.as_deref_mut());
             TermMode::of(t).kitty_flags()
         });
         write_kitty_flags(primary_kitty, &mut out);
         out.push_str("\x1b[?1049h");
-        write_screen(t, false, &mut out);
+        let mut replay = images.map(|i| i.replay(t, 0));
+        if let Some(r) = &replay {
+            out.push_str(&r.prelude);
+        }
+        write_screen(t, false, &mut out, replay.as_mut());
     }
     write_shell_state(shell, &mut out);
     write_modes(t, mode, &mut out);
@@ -148,9 +197,13 @@ fn serialize(t: &mut Term, max_history: usize, shell: ShellInfo, win32_input: bo
 /// screen row lands on the client's bottom row, which scrolls exactly the
 /// scrollback into its history, and a line wrapping from the scrollback onto
 /// the screen stays one line.
-fn write_primary(t: &Term, max_history: usize, out: &mut String) {
+fn write_primary(t: &Term, max_history: usize, out: &mut String, images: Option<&mut Images<'_>>) {
     let history = t.history_size().min(max_history) as i32;
-    write_rows(t, -history..t.screen_lines() as i32, false, out);
+    let mut replay = images.map(|i| i.replay(t, -history));
+    if let Some(r) = &replay {
+        out.push_str(&r.prelude);
+    }
+    write_rows_with(t, -history..t.screen_lines() as i32, false, out, replay.as_mut());
     write_cursor(t, out);
 }
 
@@ -158,14 +211,17 @@ fn write_primary(t: &Term, max_history: usize, out: &mut String) {
 /// cursor position and visibility), but with prompt marks and soft wraps.
 /// `clear`: erase the client's screen first (on the primary screen rio
 /// pushes it into history, which resync wants).
-fn write_screen(t: &Term, clear: bool, out: &mut String) {
+fn write_screen(t: &Term, clear: bool, out: &mut String, mut replay: Option<&mut Replay>) {
     out.push_str(if clear { "\x1b[0m\x1b[2J\x1b[H" } else { "\x1b[0m\x1b[H" });
     let cols = t.columns();
     let last = (0..t.screen_lines() as i32)
         .rev()
         .find(|&r| last_content_col(t, Line(r), cols).is_some() || t.grid[Line(r)].semantic_prompt != SemanticPrompt::None);
     if let Some(last) = last {
-        write_rows(t, 0..last + 1, false, out);
+        write_rows_with(t, 0..last + 1, false, out, replay.as_deref_mut());
+    }
+    if let Some(r) = replay {
+        r.write_rest(t.screen_lines(), out);
     }
     write_cursor(t, out);
 }
@@ -184,6 +240,11 @@ fn write_cursor(t: &Term, out: &mut String) {
 /// `newline_after_last`: end with a newline (the scrollback) or not (the
 /// screen, which would scroll).
 pub(crate) fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, out: &mut String) {
+    write_rows_with(t, lines, newline_after_last, out, None);
+}
+
+/// [`write_rows`], writing `images`' placements on each row as it goes.
+fn write_rows_with(t: &Term, lines: std::ops::Range<i32>, newline_after_last: bool, out: &mut String, mut images: Option<&mut Replay>) {
     let cols = t.columns();
     let mut current = Style::default();
     let mut wrapping = false;
@@ -199,6 +260,9 @@ pub(crate) fn write_rows(t: &Term, lines: std::ops::Range<i32>, newline_after_la
         if wrapping && written == 0 {
             // Move past the pending wrap, or the newline stays on the row above.
             out.push(' ');
+        }
+        if let Some(images) = images.as_deref_mut() {
+            images.write_row(r, out);
         }
         wrapping = wraps;
         if !wraps && (!last || newline_after_last) {

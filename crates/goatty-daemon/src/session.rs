@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use goatty_proto::{Frame, ReqId, ServerMsg, SessionId, SessionInfo, StreamOpts, TopLineCause, WinSize, encode, encode_server};
 use goatty_term::process::ForegroundWatch;
 use goatty_term::pty::{Pty, PtyInput, PtyReader};
-use goatty_term::{TermSize, Terminal, UiEvent};
+use goatty_term::{MediaRewriter, TermSize, Terminal, UiEvent};
 #[cfg(unix)]
 use parking_lot::Condvar;
 use parking_lot::Mutex;
@@ -665,7 +665,9 @@ impl Session {
             }
         }
         let changed = self.term.size() != (size.cols, size.rows);
-        if changed {
+        // The cell size alone can change too (a font change keeping the
+        // grid): images are placed with it.
+        if changed || self.term.cell_size() != (size.cell_width, size.cell_height) {
             self.term.resize(size);
         }
         changed
@@ -921,9 +923,41 @@ pub(crate) fn to_size(ws: WinSize) -> TermSize {
     TermSize { cols: ws.cols.max(2), rows: ws.rows.max(1), cell_width: ws.cell_width, cell_height: ws.cell_height }
 }
 
-fn dispatch_output_chunk(s: &Session, chunk: &[u8]) {
-    let n = chunk.len();
+/// Feed one read of PTY output to the authoritative terminal and the
+/// subscribers. Kitty images sent through a file or shared memory are
+/// rewritten first, so every terminal gets the image itself (see
+/// `goatty_term::media`).
+fn dispatch_output_chunk(s: &Session, media: &mut MediaRewriter, chunk: &[u8]) {
+    let chunk = media.rewrite(chunk);
+    if chunk.is_empty() {
+        return; // all of it is the start of a sequence that continues
+    }
     s.poke_foreground();
+    // A rewritten image can be hundreds of MiB, past what one frame may
+    // carry: it goes out in pieces, each through flow control on its own.
+    for piece in chunk.chunks(MAX_OUTPUT_PIECE) {
+        broadcast_output(s, piece);
+    }
+    let mut cwd_changed = false;
+    for ev in s.ui_events.try_iter() {
+        if matches!(ev, UiEvent::CwdChanged) {
+            cwd_changed = true;
+        }
+    }
+    if cwd_changed && let Some(dir) = s.term.current_directory() {
+        s.set_osc_cwd(dir.to_string_lossy().into_owned());
+    }
+}
+
+/// Most output bytes in one `Output` frame (a PTY read is at most 64 KiB;
+/// only a rewritten image is larger).
+const MAX_OUTPUT_PIECE: usize = 1 << 20;
+
+/// Feed `chunk` to the authoritative terminal and send it to every
+/// subscriber that keeps up, under the subscriber lock (so the order is
+/// the same for all).
+fn broadcast_output(s: &Session, chunk: &[u8]) {
+    let n = chunk.len();
     {
         let mut subs = s.subs.lock();
         s.term.feed(chunk);
@@ -946,15 +980,6 @@ fn dispatch_output_chunk(s: &Session, chunk: &[u8]) {
             sub.push(f, n)
         });
     }
-    let mut cwd_changed = false;
-    for ev in s.ui_events.try_iter() {
-        if matches!(ev, UiEvent::CwdChanged) {
-            cwd_changed = true;
-        }
-    }
-    if cwd_changed && let Some(dir) = s.term.current_directory() {
-        s.set_osc_cwd(dir.to_string_lossy().into_owned());
-    }
 }
 
 /// Read PTY output until EOF, feeding the authoritative terminal and every
@@ -963,6 +988,7 @@ fn dispatch_output_chunk(s: &Session, chunk: &[u8]) {
 #[cfg(unix)]
 pub(crate) fn pump_output(s: &Session, mut reader: PtyReader) {
     let mut buf = vec![0u8; 64 * 1024];
+    let mut media = MediaRewriter::new();
     loop {
         let mut fds = [
             libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 },
@@ -984,7 +1010,7 @@ pub(crate) fn pump_output(s: &Session, mut reader: PtyReader) {
         }
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => dispatch_output_chunk(s, &buf[..n]),
+            Ok(n) => dispatch_output_chunk(s, &mut media, &buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break, // EIO when the child exits
         }
@@ -997,10 +1023,11 @@ pub(crate) fn pump_output(s: &Session, mut reader: PtyReader) {
 #[cfg(windows)]
 pub(crate) fn pump_output(s: &Session, mut reader: PtyReader) {
     let mut buf = vec![0u8; 64 * 1024];
+    let mut media = MediaRewriter::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => dispatch_output_chunk(s, &buf[..n]),
+            Ok(n) => dispatch_output_chunk(s, &mut media, &buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }

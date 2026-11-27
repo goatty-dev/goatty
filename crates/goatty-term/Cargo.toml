@@ -9,6 +9,13 @@ description = "goatty's TerminalEngine: a thin, UI-agnostic wrapper around rio-v
 
 [dependencies]
 rio-vt.workspace = true
+rio-graphics.workspace = true
+base64.workspace = true
+# `icat`: the formats rio-vt's `graphics` feature already builds.
+image = { workspace = true, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico", "pnm"] }
+# zlib-rs: several times faster than the default miniz_oxide, still pure
+# Rust; images from shared memory are compressed and decompressed per frame.
+flate2 = { workspace = true, features = ["zlib-rs"] }
 parking_lot.workspace = true
 anyhow.workspace = true
 log.workspace = true
@@ -21,6 +28,9 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[example]]
 name = "vtbench"

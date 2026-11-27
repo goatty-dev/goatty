@@ -1018,6 +1018,35 @@ fn goattyd_runs_even_when_not_in_path() {
     assert_eq!(stdout(&out).trim(), "linked", "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// `icat` is goattyd's image viewer, unless the name is already taken: a
+/// program called icat, or a function or alias of the user's. (Read from
+/// the definition: a packaged goattyd in /usr/bin may be the one that would
+/// answer.)
+#[test]
+fn icat_is_goattyds_unless_the_name_is_yours() {
+    let Some(zsh) = zsh() else { return };
+    let sb = Sandbox::new(zsh);
+    exe(&sb.home.join("goattyd"), "#!/bin/sh\necho \"daemon $*\"\n");
+    let launch = sb.launch_with(no_highlighting(), None);
+    let what = |sb: &Sandbox| stdout(&sb.run(&launch, "whence -c icat")).trim().to_string();
+    assert!(what(&sb).contains("goattyd icat \"$@\""), "{}", what(&sb));
+
+    for (rc, want) in [("alias icat='echo mine' copy='echo mine'\n", "icat: aliased to echo mine"), ("icat() { echo mine }\n", "echo mine")]
+    {
+        std::fs::create_dir_all(sb.dirs.user_zshrc().parent().unwrap()).unwrap();
+        std::fs::write(sb.dirs.user_zshrc(), rc).unwrap();
+        assert!(what(&sb).contains(want), "{rc:?}: {}", what(&sb));
+        // The rest of the startup still ran (an alias must not break parsing it).
+        let out = sb.run(&launch, "whence -w TRAPURG");
+        assert!(stdout(&out).contains("function"), "{rc:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    std::fs::remove_file(sb.dirs.user_zshrc()).unwrap();
+
+    std::fs::create_dir_all(sb.home.join("sysbin")).unwrap();
+    exe(&sb.home.join("sysbin/icat"), "#!/bin/sh\necho installed\n");
+    assert_eq!(what(&sb), sb.home.join("sysbin/icat").to_string_lossy(), "an installed icat stays");
+}
+
 /// The PATH page's marks: each folder is attributed to the startup step
 /// that added it.
 #[test]

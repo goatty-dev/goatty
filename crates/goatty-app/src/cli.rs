@@ -106,11 +106,41 @@ pub enum Command {
         #[arg(long, value_name = "DEVICE")]
         trust: Vec<String>,
     },
+    /// Show images in the terminal (PNG, JPEG, GIF, WebP, BMP, TIFF, …): `icat` in goatty's shell.
+    /// Uses the kitty graphics protocol, so it works in goatty, kitty, WezTerm and Ghostty.
+    Icat(IcatArgs),
     /// Print the completion script for SHELL (goatty's managed zsh has it already).
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct IcatArgs {
+    /// Image files (`-` reads one from standard input).
+    #[arg(required = true, value_hint = clap::ValueHint::FilePath)]
+    pub files: Vec<std::path::PathBuf>,
+    /// At most this many columns wide (default: the terminal's width).
+    #[arg(short = 'W', long, value_name = "COLUMNS")]
+    pub width: Option<u16>,
+    /// At most this many rows high (default: the terminal's height).
+    #[arg(short = 'H', long, value_name = "ROWS")]
+    pub height: Option<u16>,
+    /// Send the images without asking the terminal whether it shows them.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl IcatArgs {
+    /// Show the images; exit status 1 when one couldn't be shown.
+    pub fn run(self) -> anyhow::Result<()> {
+        let opts = goatty_term::icat::Options { files: self.files, width: self.width, height: self.height, force: self.force };
+        if goatty_term::icat::run(&opts)? > 0 {
+            std::process::exit(1);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand)]

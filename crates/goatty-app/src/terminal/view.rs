@@ -51,6 +51,7 @@ use gpui::{
 
 use super::element::{Geom, TerminalElement, hsla};
 use super::glyphs::GlyphCache;
+use super::images::ImageTextures;
 use super::keys::{mods, terminal_key};
 use super::links::{self, Place, RemoteAction, RemoteLookup, Target};
 use super::stats::Stats;
@@ -276,6 +277,7 @@ pub struct TerminalView {
     geom: Rc<StdCell<Geom>>,
     stats: Rc<RefCell<Stats>>,
     glyphs: Rc<RefCell<GlyphCache>>,
+    images: Rc<RefCell<ImageTextures>>,
     // Appearance (from the settings; see `apply_settings`).
     font: Font,
     /// Settings size plus `zoom`.
@@ -400,7 +402,11 @@ impl TerminalView {
         let token = TOKENS.fetch_add(1, Ordering::Relaxed);
         // The pane that has focus sets the session's size.
         cx.on_focus_in(&focus, window, |view: &mut Self, _, _| view.session.own_size(view.token)).detach();
-        cx.on_release(|view: &mut Self, _| view.session.disown_size(view.token)).detach();
+        cx.on_release(|view: &mut Self, cx| {
+            view.session.disown_size(view.token);
+            view.images.borrow_mut().clear(cx);
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
             while wake_rx.recv_async().await.is_ok() {
                 if this.update(cx, |view, cx| view.on_wake(cx)).is_err() {
@@ -456,6 +462,7 @@ impl TerminalView {
             geom: Rc::new(StdCell::new(Geom::default())),
             stats: Rc::new(RefCell::new(Stats::default())),
             glyphs: Rc::new(RefCell::new(GlyphCache::new())),
+            images: Rc::default(),
             font: gpui::font("monospace"),
             font_size: px(settings.font.size),
             zoom: 0.0,
@@ -2740,6 +2747,7 @@ impl Render for TerminalView {
                 focused,
                 glyph_mode: self.glyph_mode,
                 glyphs: self.glyphs.clone(),
+                images: self.images.clone(),
                 cursor_visible: self.cursor_visible,
                 link_spans,
             })

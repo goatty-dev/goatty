@@ -14,6 +14,7 @@ use rio_vt::event::WindowId;
 use rio_vt::performer::handler::Processor;
 use rio_vt::selection::{Selection, SelectionType};
 
+use crate::graphics;
 use crate::listener::Listener;
 use crate::marks::{Mark, MarkScanner, ShellState};
 use crate::status::{self, Applied, ProgramStatus, Report};
@@ -49,6 +50,8 @@ pub(crate) struct Inner {
     /// Lock order: `parser`, `term`, `lines`.
     pub(crate) parser: Mutex<Parser>,
     size: Arc<AtomicU32>,
+    /// The cell size in pixels, packed (width << 16 | height).
+    cell: Arc<AtomicU32>,
     /// For the marks rio-vt doesn't report (see `marks`).
     ui: flume::Sender<UiEvent>,
     /// The answer to the OSC 7501 probe goes here, in stream order with
@@ -80,6 +83,11 @@ pub(crate) struct Inner {
     /// ConPTY / Windows win32-input-mode (`CSI ? 9001 h` / `l`), tracked
     /// alongside rio-vt because rio-vt does not implement mode 9001.
     pub(crate) win32_input: AtomicBool,
+    /// The pixels of the images placed (see `graphics`); shared with the
+    /// listener, which gets rio-vt's uploads. Lock order: after `term`.
+    pub(crate) images: Arc<Mutex<graphics::Store>>,
+    /// Image transmissions already encoded for snapshots.
+    pub(crate) encoded: Mutex<graphics::EncodeCache>,
 }
 
 /// rio-vt's parser plus the scanner for the OSC 133 marks it ignores; both
@@ -122,19 +130,24 @@ impl Terminal {
         let packed = Arc::new(AtomicU32::new(pack(size)));
         let palette: SharedPalette = Arc::new(parking_lot::RwLock::new(palette));
         let status = Arc::new(Mutex::new(status::Store::default()));
+        let images = Arc::new(Mutex::new(graphics::Store::default()));
+        let cell = Arc::new(AtomicU32::new(pack_cell(size)));
         let listener = Listener {
             replies: rtx.clone(),
             ui: utx.clone(),
             answer_queries,
             palette: palette.clone(),
             size: packed.clone(),
+            cell: cell.clone(),
             status: status.clone(),
+            images: images.clone(),
         };
         let term = Crosswords::new(size.to_crosswords(), CursorShape::Block, listener, WindowId::from(0), 0, DEFAULT_SCROLLBACK);
         let inner = Inner {
             term: Mutex::new(term),
             parser: Mutex::new(Parser::default()),
             size: packed,
+            cell,
             ui: utx,
             replies: rtx,
             answer_queries,
@@ -146,6 +159,8 @@ impl Terminal {
             lines: Mutex::new(Default::default()),
             primary_kitty: AtomicU8::new(0),
             win32_input: AtomicBool::new(false),
+            images,
+            encoded: Mutex::default(),
         };
         (Self { inner: Arc::new(inner), palette }, TerminalChannels { replies: rrx, ui: urx })
     }
@@ -338,8 +353,16 @@ impl Terminal {
 
     pub fn resize(&self, size: TermSize) {
         let old = self.inner.size.swap(pack(size), Ordering::Relaxed);
+        self.inner.cell.store(pack_cell(size), Ordering::Relaxed);
         self.inner.term.lock().resize(size.to_crosswords());
         self.line_map_resized(old >> 16 != size.cols as u32);
+    }
+
+    /// The cell size in pixels last given to [`Self::resize`] (0 when
+    /// unknown): what images are sized with.
+    pub fn cell_size(&self) -> (u16, u16) {
+        let p = self.inner.cell.load(Ordering::Relaxed);
+        ((p >> 16) as u16, (p & 0xffff) as u16)
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -433,6 +456,10 @@ pub(crate) fn pack(s: TermSize) -> u32 {
     ((s.cols as u32) << 16) | s.rows as u32
 }
 
+pub(crate) fn pack_cell(s: TermSize) -> u32 {
+    ((s.cell_width as u32) << 16) | s.cell_height as u32
+}
+
 /// Run `f` with the primary screen in `t.grid`, even while the alternate
 /// screen is active (rio-vt keeps the inactive grid private). Switching back
 /// to the alternate screen clears it, so its grid and selection are saved and
@@ -447,7 +474,12 @@ pub(crate) fn with_primary<R>(t: &mut Term, f: impl FnOnce(&mut Term) -> R) -> R
     let selection = t.selection.take();
     t.swap_alt();
     let r = f(t);
+    // Entering the alternate screen drops its sixel/iTerm2 images (it
+    // starts blank); keep them, they're still on it.
+    let inactive = &mut t.graphics.kitty_inactive_screen;
+    let atlas = (std::mem::take(&mut inactive.atlas_placements), std::mem::take(&mut inactive.atlas_key_refs));
     t.swap_alt();
+    (t.graphics.atlas_placements, t.graphics.atlas_key_refs) = atlas;
     t.grid = alt;
     t.selection = selection;
     r

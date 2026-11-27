@@ -124,6 +124,13 @@ fn main() -> Result<()> {
                 let Some(cli::Command::Sync { hosts, join, keep, separate, trust }) = cli.cmd else { unreachable!() };
                 return commands::sync(hosts, join, keep, separate, trust);
             }
+            cli::Command::Icat(_) => {
+                if remote {
+                    anyhow::bail!("--ssh and --via don't apply to `icat` (run it in the remote shell: `icat FILE`)");
+                }
+                let Some(cli::Command::Icat(args)) = cli.cmd else { unreachable!() };
+                return args.run();
+            }
             cli::Command::Completions { shell } => {
                 if remote {
                     anyhow::bail!("--ssh and --via don't apply to `completions`");
