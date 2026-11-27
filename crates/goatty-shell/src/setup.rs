@@ -7,7 +7,7 @@
 //! Everything here runs on the host whose shells it describes: for a remote
 //! goattyd, the remote host.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -81,6 +81,13 @@ pub enum Request {
     /// would (shells outside goatty ask when a startup file changed).
     /// Reply: `Done`.
     Refresh,
+    /// Coding agents' session hooks (#344): `status`, or `install`/`remove`
+    /// for `agent` (every agent set up here when `None`). Reply: `AgentHooks`.
+    AgentHooks {
+        action: crate::agent_hooks::Action,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<crate::agent_hooks::Agent>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +101,7 @@ pub enum Reply {
     Path(Box<crate::path_report::Report>),
     Import(Box<crate::import::Status>),
     Everywhere(Box<crate::everywhere::Status>),
+    AgentHooks(Box<crate::agent_hooks::Status>),
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -298,11 +306,36 @@ impl HostService {
                 self.refresh()?;
                 Ok(Reply::Done)
             }
+            Request::AgentHooks { action, agent } => Ok(Reply::AgentHooks(Box::new(self.agent_hooks(action, agent)?))),
         }
     }
 }
 
 impl HostService {
+    /// Coding agents' session hooks on this host, after `action`.
+    pub fn agent_hooks(
+        &self,
+        action: crate::agent_hooks::Action,
+        agent: Option<crate::agent_hooks::Agent>,
+    ) -> Result<crate::agent_hooks::Status> {
+        let dirs = dirs_of(self)?;
+        let home = Dirs::home_dir().context("no home directory on this host")?;
+        // After an update the running goattyd's file may be the old one, deleted.
+        let exe = self.launcher.daemon_exe().map(|p| {
+            let s = p.to_string_lossy();
+            s.strip_suffix(" (deleted)").map(PathBuf::from).unwrap_or_else(|| p.to_path_buf())
+        });
+        let backups = dirs.state.join("agent-hooks");
+        let ctx = crate::agent_hooks::Ctx {
+            home: &home,
+            exe: exe.as_deref(),
+            backups: &backups,
+            var: &|k| std::env::var(k).ok(),
+            windows: cfg!(windows),
+        };
+        crate::agent_hooks::apply(&ctx, action, agent)
+    }
+
     /// What goatty imports from the user's shell; `refresh` runs it first.
     pub fn import_status(&self, refresh: bool) -> Result<crate::import::Status> {
         let dirs = dirs_of(self)?;

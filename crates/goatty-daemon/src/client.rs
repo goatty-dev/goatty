@@ -366,6 +366,7 @@ pub(crate) fn handle(daemon: Arc<Daemon>, stream: LocalStream) -> Result<()> {
                 ClientMsg::Ping { nonce } => reply(ServerMsg::Pong { nonce }),
                 ClientMsg::Kill { req, session } => match daemon.get(session) {
                     Some(s) => {
+                        daemon.resurrect.closed(session);
                         s.pty.lock().kill();
                         reply(ServerMsg::Ok { req });
                     }

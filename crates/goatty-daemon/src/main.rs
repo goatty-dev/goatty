@@ -78,11 +78,50 @@ enum Cmd {
     /// Show images in the terminal (PNG, JPEG, GIF, WebP, BMP, TIFF, …): `icat` in goatty's shell.
     /// Uses the kitty graphics protocol, so it works in goatty, kitty, WezTerm and Ghostty.
     Icat(IcatArgs),
+    /// Session hooks in coding agents' configs, so a tab resumes the agent's
+    /// conversation after a reboot (Claude Code, Codex, Copilot, Antigravity, OpenCode).
+    #[command(subcommand)]
+    AgentHooks(AgentHooksCmd),
+    /// What an agent's session hook runs (reads the agent's JSON on stdin).
+    #[command(hide = true)]
+    AgentHook { agent: String },
     /// Print the completion script for SHELL (goatty's managed zsh has it already).
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentHooksCmd {
+    /// Which agents are set up here and whether goatty's hook is in their config.
+    Status,
+    /// Add goatty's hook to AGENT's config (claude, codex, copilot, agy,
+    /// opencode), or to every agent set up here. The file is backed up first.
+    Install {
+        agent: Option<String>,
+        /// Don't ask before changing the files.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Take goatty's hook out again.
+    Remove { agent: Option<String> },
+}
+
+impl AgentHooksCmd {
+    fn run(self) -> Result<()> {
+        use goatty_shell::agent_hooks::{Action, Agent};
+        let svc = goatty_shell::HostService::from_env(std::env::current_exe().ok());
+        let agent = |a: Option<String>| -> Result<Option<Agent>> {
+            a.map(|id| Agent::from_id(&id).ok_or_else(|| anyhow::anyhow!("no agent {id:?}: claude, codex, copilot, agy or opencode")))
+                .transpose()
+        };
+        match self {
+            AgentHooksCmd::Status => goatty_shell::cmd::agent_hooks(&svc, Action::Status, None, false),
+            AgentHooksCmd::Install { agent: a, yes } => goatty_shell::cmd::agent_hooks(&svc, Action::Install, agent(a)?, yes),
+            AgentHooksCmd::Remove { agent: a } => goatty_shell::cmd::agent_hooks(&svc, Action::Remove, agent(a)?, false),
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -452,6 +491,8 @@ fn main() -> Result<()> {
             | Cmd::Alias(_)
             | Cmd::Snippet(_)
             | Cmd::Net(_)
+            | Cmd::AgentHooks(_)
+            | Cmd::AgentHook { .. }
     ) {
         "warn,rio_vt=error"
     } else {
@@ -504,6 +545,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Icat(args) => args.run(),
+        Cmd::AgentHooks(cmd) => cmd.run(),
+        Cmd::AgentHook { agent } => {
+            let report = goatty_config::agent_report_file();
+            goatty_shell::agent_hooks::run_hook(&agent, std::io::stdin().lock(), std::io::stdout().lock(), report.as_deref());
+            Ok(())
+        }
         Cmd::Proxy => goatty_daemon::proxy(),
         Cmd::List => {
             let list = Control::connect_local(CLIENT)?.list_sessions()?;

@@ -44,6 +44,7 @@ Rules:
 | `server` | socket bind (or the socket from systemd), accept loop, watchdog, the session registry (`Daemon`), shutdown |
 | `workspaces` | workspaces (#215): the client's layout JSON, sessions, revisions and conflicts, which windows show which, lifecycle. See [`workspaces.md`](workspaces.md) |
 | `restore`, `systemd` | sessions that outlive the daemon process (#131): `Restart` re-execs with the PTYs inherited, and under systemd the PTYs come back from the fd store |
+| `resurrect` | tabs whose shells ended with the daemon (reboot, crash, stop, #344): a record in `$XDG_STATE_HOME/goatty/sessions/`, and the next daemon opens a shell per session (same id, same folder) and starts its coding agent or listed program again; agents' session hooks report into `sessions/<socket>/<id>.json` (`GOATTY_AGENT_REPORT`) |
 | `client` | one connection: decode requests, subscriptions, the writer thread, liveness |
 | `session` | PTY + authoritative `Terminal` + subscribers with flow control, the output pump |
 | `writer`, `flow` | the per-connection writer with per-session lanes, and the adaptive flow-control window |
@@ -56,7 +57,7 @@ Threads per session: a PTY reader and a reply thread (query answers → PTY). Pe
 
 ## Shell environment (`crates/goatty-shell`)
 
-One module per concern: `launch` (`Launcher`), `zsh` (renders `settings.zsh`, plugin slot files and the static startup files in `zsh/`), `starship`, `builtins` and `plugins` (the built-in tools are plugins compiled in; `plugins/` is registry, lock, install and load order), `packages` and `install` (tool downloads), `completions`, `doctor` and `setup` (diagnostics as JSON), `import` (the user's own shell setup, harvested without a terminal), `everywhere` (goatty's shell in every terminal, #283), `path_report`, `generation` and `history` (build, validate with `zsh -n`, activate, roll back, diff), `shared` (the shared shell config on a host: storage, the `Shared` API, applying it, plugin reconciling, relaying between hosts, #313), `sync` (the push sync for older goattyds, #159), `snippets`, `service` (`HostService`), `cmd` (`goattyd shell|plugin|snippet …`), `dirs`.
+One module per concern: `agent_hooks` (coding agents' session hooks, opt-in, #344), `launch` (`Launcher`), `zsh` (renders `settings.zsh`, plugin slot files and the static startup files in `zsh/`), `starship`, `builtins` and `plugins` (the built-in tools are plugins compiled in; `plugins/` is registry, lock, install and load order), `packages` and `install` (tool downloads), `completions`, `doctor` and `setup` (diagnostics as JSON), `import` (the user's own shell setup, harvested without a terminal), `everywhere` (goatty's shell in every terminal, #283), `path_report`, `generation` and `history` (build, validate with `zsh -n`, activate, roll back, diff), `shared` (the shared shell config on a host: storage, the `Shared` API, applying it, plugin reconciling, relaying between hosts, #313), `sync` (the push sync for older goattyds, #159), `snippets`, `service` (`HostService`), `cmd` (`goattyd shell|plugin|snippet …`), `dirs`.
 
 Design and startup sequence: [`managed-zsh.md`](managed-zsh.md). The zsh behaviour is tested against real zsh in `tests/zsh_startup.rs` (sandboxed `$HOME`, PTY for OSC 133/7).
 
@@ -118,6 +119,7 @@ View tree: `Workspace` → tab bar (or, vertical, the sidebar beside the panes c
 | A color setting | embed `Entity<ColorPicker>` (`ui/color_picker.rs`); parsing in `goatty-config/src/colorspace.rs` |
 | New theme import format | `goatty-config/src/theme_import.rs` |
 | Settings migration | bump `Document::VERSION`, add `(from, fn(&mut Value))` to `migrations()` |
+| Something that starts again after a reboot (#344) | `goatty-daemon/src/resurrect.rs`: a new agent is an arm in `detect` and `by_id` (how its session id is found from outside, its resume command, its "continue the last one" fallback); its session hook goes in `goatty-shell/src/agent_hooks.rs`; see `coding-agents.md` |
 | Something a session carries over a restart | `goatty-daemon/src/restore.rs`: a field in `SavedSession`/`State` (new fields need `#[serde(default)]`; a change older builds can't read bumps `STATE_VERSION`) |
 | A palette command that asks for input | build a `command_palette::Ask` in a `Command::handler` and call `command_palette::ask`. Plugins: `[[command]]` (`goatty-plugin/src/commands.rs`) |
 | Host list, switcher | `hosts.rs`, `command_palette` (`Scope::Hosts`/`Sessions`), `settings_window/hosts.rs`, `SshSettings` in `goatty-config`, `goatty-client/src/ssh_config.rs` |

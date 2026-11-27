@@ -43,6 +43,7 @@ fn start_daemon_with(shell: &str) -> Daemon {
         .env("HOME", &home)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);

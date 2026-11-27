@@ -67,6 +67,7 @@ fn start_daemon() -> Daemon {
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     // The guard first: a panic while waiting still kills the daemon.
@@ -256,6 +257,7 @@ fn headless_token_pairing_and_direct_remote_pairing() {
         .env("HOME", d.dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .output()
         .unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));

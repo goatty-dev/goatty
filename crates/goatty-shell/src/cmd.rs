@@ -468,6 +468,63 @@ fn confirm(prompt: &str, verb: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"))
 }
 
+/// `goattyd agent-hooks [status|install|remove] [AGENT]`: coding agents'
+/// session hooks. Installing names the files it changes and asks first.
+pub fn agent_hooks(
+    svc: &crate::HostService,
+    action: crate::agent_hooks::Action,
+    agent: Option<crate::agent_hooks::Agent>,
+    yes: bool,
+) -> Result<()> {
+    use crate::agent_hooks::{Action, State};
+    let before = svc.agent_hooks(Action::Status, None)?;
+    if action == Action::Install {
+        if let Some(why) = &before.unavailable {
+            bail!("{why}");
+        }
+        let todo: Vec<_> = before
+            .hooks
+            .iter()
+            .filter(|h| agent.is_none_or(|a| a == h.agent) && h.available && h.state != State::On && h.problem.is_none())
+            .collect();
+        if todo.is_empty() {
+            if let Some(h) = agent.and_then(|a| before.hooks.iter().find(|h| h.agent == a)) {
+                match (&h.problem, h.available) {
+                    (Some(p), _) => bail!("{p}"),
+                    (None, false) => bail!("{} isn't set up here", h.name),
+                    _ => {}
+                }
+            }
+            println!("nothing to change");
+            return Ok(());
+        }
+        println!("goatty's session hook goes into (each file is backed up first):");
+        for h in &todo {
+            println!("  {}  ({})", h.file, h.name);
+        }
+        if !yes && !confirm("\nAdd it? [Y/n] ", "add it")? {
+            return Ok(());
+        }
+    }
+    let status = if action == Action::Status { before } else { svc.agent_hooks(action, agent)? };
+    for h in &status.hooks {
+        let state = match (h.available, h.state) {
+            (false, State::Off) => "not set up here",
+            (_, State::Off) => "no hook",
+            (_, State::On) => "hook installed",
+            (_, State::Outdated) => "hook runs another goattyd (install again to update)",
+        };
+        println!("{:<12} {state:<16} {}", h.agent.id(), h.file);
+        if let Some(p) = &h.problem {
+            println!("{:<12} {p}", "");
+        }
+    }
+    if let Some(b) = &status.backup {
+        println!("the file as it was: {b}");
+    }
+    Ok(())
+}
+
 /// `goattyd shell uninstall NAME...|--all`: remove goatty's downloads of
 /// built-in plugins' tools (the plugins stay; system copies still work).
 /// Downloads of tools that used to come with goatty (Atuin) are removed by

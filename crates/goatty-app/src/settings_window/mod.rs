@@ -13,6 +13,7 @@
 //! a preview, apply, rollback or profile import, with the diff.
 
 mod about;
+mod agent_hooks;
 mod aliases;
 mod appearance;
 mod chrome;
@@ -578,6 +579,8 @@ pub struct SettingsWindow {
     font_filter: Entity<TextInput>,
     ui_font_filter: Entity<TextInput>,
     shell_path: Entity<TextInput>,
+    /// The Shell page's "Programs to start again" (restore.programs).
+    restore_programs: Entity<TextInput>,
     /// The PATH page's "Add a folder" field (shell.path).
     path_entry: Entity<TextInput>,
     file_opener: Entity<TextInput>,
@@ -618,6 +621,7 @@ pub struct SettingsWindow {
     path: path::PathPage,
     dotfiles: dotfiles::DotfilesPage,
     everywhere: everywhere::EverywhereState,
+    agent_hooks: agent_hooks::HooksState,
     aliases: aliases::AliasesPage,
     snippets: snippets::SnippetsPage,
     prompt: prompt::PromptPage,
@@ -661,6 +665,7 @@ impl SettingsWindow {
         let ui_font_filter = cx.new(|cx| TextInput::new("Search fonts", "", cx).bare());
         let search = cx.new(|cx| TextInput::new("Search settings", "", cx).bare());
         let shell_path = cx.new(|cx| TextInput::new("/usr/bin/nu", "", cx).label("Shell program"));
+        let restore_programs = cx.new(|cx| TextInput::new("lazygit, htop", "", cx).label("Programs to start again"));
         let path_entry = cx.new(|cx| TextInput::new("~/bin or /opt/tool/bin", "", cx).label("Folder to add to PATH"));
         let picker = cx.new(|cx| ColorPicker::new(cx.global::<AppSettings>().colors.get(ColorSlot::Background), cx));
         let theme_name = cx.new(|cx| TextInput::new("Name for a new theme", "", cx).label("Theme name"));
@@ -756,6 +761,12 @@ impl SettingsWindow {
                     this.edit_host(cx, |h| h.shell.program = (!text.is_empty()).then_some(text));
                 }
             }),
+            cx.subscribe(&restore_programs, |this, _, ev: &TextInputEvent, cx| {
+                if let TextInputEvent::Submitted(text) = ev {
+                    let programs = shell::parse_programs(text);
+                    this.edit_host(cx, |h| h.restore.programs = programs);
+                }
+            }),
         ];
         let mut this = Self {
             focus,
@@ -787,6 +798,7 @@ impl SettingsWindow {
             font_filter,
             ui_font_filter,
             shell_path,
+            restore_programs,
             path_entry,
             file_opener,
             remote_file_opener,
@@ -819,6 +831,7 @@ impl SettingsWindow {
             path: path::PathPage::new(cx),
             dotfiles: dotfiles::DotfilesPage::new(cx),
             everywhere: everywhere::EverywhereState::new(cx),
+            agent_hooks: agent_hooks::HooksState::default(),
             aliases: aliases::AliasesPage::new(cx),
             snippets: snippets::SnippetsPage::new(cx),
             prompt: prompt::PromptPage::new(cx),
@@ -908,6 +921,7 @@ impl SettingsWindow {
         self.path.reset();
         self.dotfiles.reset();
         self.everywhere.reset();
+        self.agent_hooks.reset();
         self.load_host(cx);
         self.load_plugins(false, cx);
         match self.page {
@@ -915,7 +929,10 @@ impl SettingsWindow {
             Page::Network => self.load_net(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
-            Page::Shell => self.load_everywhere(cx),
+            Page::Shell => {
+                self.load_everywhere(cx);
+                self.load_agent_hooks(cx);
+            }
             _ => {}
         }
         cx.notify();
@@ -958,8 +975,11 @@ impl SettingsWindow {
             Page::Diagnostics => self.load_diagnostics(cx),
             Page::Path => self.load_path_report(cx),
             Page::Dotfiles => self.load_dotfiles(false, cx),
-            // What the host's .zshenv has now (the user may have edited it).
-            Page::Shell => self.load_everywhere(cx),
+            // What the host's .zshenv and agent configs have now (the user may have edited them).
+            Page::Shell => {
+                self.load_everywhere(cx);
+                self.load_agent_hooks(cx);
+            }
             _ => {}
         }
         cx.notify();

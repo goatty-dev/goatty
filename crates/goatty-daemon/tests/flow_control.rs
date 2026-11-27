@@ -44,6 +44,7 @@ fn start_daemon() -> Daemon {
         .env("HOME", dir.path())
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     // Wrap `child` in `Daemon` before polling so Drop kills/reaps it even if

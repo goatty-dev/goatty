@@ -32,8 +32,8 @@ impl SettingsWindow {
         let plugin = |id: &str| d.plugins.get(id) != h.plugins.get(id);
         match page {
             Page::Shell => {
-                (&d.shell.program, d.shell.managed, d.shell.zsh.integration, d.shell.zsh.highlight_paste)
-                    != (&h.shell.program, h.shell.managed, h.shell.zsh.integration, h.shell.zsh.highlight_paste)
+                (&d.shell.program, d.shell.managed, d.shell.zsh.integration, d.shell.zsh.highlight_paste, &d.restore)
+                    != (&h.shell.program, h.shell.managed, h.shell.zsh.integration, h.shell.zsh.highlight_paste, &h.restore)
             }
             Page::Dotfiles => {
                 (&d.shell.import, d.shell.zsh.user_env, d.shell.zsh.user_rc) != (&h.shell.import, h.shell.zsh.user_env, h.shell.zsh.user_rc)

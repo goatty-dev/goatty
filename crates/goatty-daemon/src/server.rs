@@ -60,6 +60,8 @@ pub(crate) struct Daemon {
     /// so `shutdown` must not unlink the socket path.
     #[cfg(unix)]
     pub(crate) socket_activated: AtomicBool,
+    /// What comes back after a reboot or crash (#344).
+    pub(crate) resurrect: crate::resurrect::Keeper,
 }
 
 /// What [`Daemon::start`] makes a session of: a PTY with its process, and
@@ -89,9 +91,11 @@ fn own_exe() -> Option<PathBuf> {
 
 impl Daemon {
     pub(crate) fn new(socket: PathBuf) -> Self {
+        // `goatty-setup` in a managed shell runs this goattyd's `shell install`.
+        let host = HostService::from_env(std::env::current_exe().ok());
+        let resurrect = crate::resurrect::Keeper::new(host.launcher.dirs().map(|d| d.state.as_path()), &socket);
         Self {
-            // `goatty-setup` in a managed shell runs this goattyd's `shell install`.
-            host: HostService::from_env(std::env::current_exe().ok()),
+            host,
             socket,
             sessions: Mutex::default(),
             workspaces: Mutex::default(),
@@ -106,6 +110,7 @@ impl Daemon {
             conns: Mutex::default(),
             #[cfg(unix)]
             socket_activated: AtomicBool::new(false),
+            resurrect,
         }
     }
 
@@ -126,7 +131,15 @@ impl Daemon {
             goatty_shell::setup::gui_offers_setup(&mut launch);
         }
         let managed = launch.managed;
-        self.spawn(conn, ShellCommand::new(launch.program, launch.args, launch.env), managed, ws, cwd)
+        self.spawn(None, Some(conn), ShellCommand::new(launch.program, launch.args, launch.env), managed, ws, cwd)
+    }
+
+    /// A new shell for session `id`, whose shell ended with the previous
+    /// goattyd (`crate::resurrect`).
+    pub(crate) fn resurrect_session(self: &Arc<Self>, id: SessionId, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
+        let launch = self.host.launcher.launch(&self.host.settings());
+        let managed = launch.managed;
+        self.spawn(Some(id), None, ShellCommand::new(launch.program, launch.args, launch.env), managed, ws, cwd)
     }
 
     /// A session running `argv` instead of a shell, using the host's managed
@@ -135,10 +148,19 @@ impl Daemon {
     pub(crate) fn run(self: &Arc<Self>, conn: u64, ws: WinSize, cwd: Option<String>, argv: Vec<String>) -> Result<Arc<Session>> {
         let host = self.host.settings();
         let launch = self.host.launcher.launch_command(&host, argv, cwd.as_deref())?;
-        self.spawn(conn, ShellCommand::new(launch.program, launch.args, launch.env), false, ws, cwd)
+        self.spawn(None, Some(conn), ShellCommand::new(launch.program, launch.args, launch.env), false, ws, cwd)
     }
 
-    fn spawn(self: &Arc<Self>, conn: u64, mut cmd: ShellCommand, managed: bool, ws: WinSize, cwd: Option<String>) -> Result<Arc<Session>> {
+    /// Start `cmd` as session `id` (a new one when `None`) for connection `creator`.
+    fn spawn(
+        self: &Arc<Self>,
+        id: Option<SessionId>,
+        creator: Option<u64>,
+        mut cmd: ShellCommand,
+        managed: bool,
+        ws: WinSize,
+        cwd: Option<String>,
+    ) -> Result<Arc<Session>> {
         let _admitted = self.admission.read();
         if self.restarting.load(Ordering::SeqCst) {
             bail!("goattyd is restarting; try again in a moment");
@@ -148,16 +170,20 @@ impl Daemon {
             cmd.cwd = Some(cwd.into());
         }
         let initial_cwd = cmd.cwd.clone();
+        let id = id.unwrap_or_else(|| self.next_session.fetch_add(1, Ordering::Relaxed) + 1);
+        // A coding agent's session hook reports here (#344).
+        if let Some(report) = self.resurrect.report_file(id) {
+            cmd.env.push((goatty_config::AGENT_REPORT_VAR.into(), report.to_string_lossy().into_owned()));
+        }
         let (pty, reader) = Pty::spawn(&cmd, size).with_context(|| format!("couldn't start {}", cmd.program))?;
         // The daemon's terminal is authoritative and answers queries
         // (DA, DSR, OSC 4/10/11...). Clients run with answering disabled.
         // Over a remote link this also means query replies never pay the RTT.
         let (term, chans) = Terminal::new(size, true, Arc::new(Palette::default()));
-        let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
         let created_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let pid = pty.pid();
         log::info!("session {id}: spawned {}{} (pid {pid:?})", cmd.program, if managed { " with goatty's managed config" } else { "" });
-        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator: Some(conn), initial_cwd })?;
+        let session = self.start(NewSession { id, pty, reader, term, chans, created_unix, managed, creator, initial_cwd })?;
         #[cfg(unix)]
         if crate::systemd::has_fd_store() {
             crate::systemd::store(&session.stored(), session.master_fd);
@@ -357,6 +383,7 @@ impl Daemon {
     /// the process.
     pub(crate) fn shutdown(&self) -> ! {
         log::info!("shutdown requested");
+        self.resurrect.stop();
         for s in self.sessions.lock().values() {
             s.pty.lock().kill();
         }
@@ -460,6 +487,7 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
             Start::Normal => {
                 let passed = crate::systemd::take_passed();
                 crate::restore::adopt_stored(&daemon, passed.ptys);
+                crate::resurrect::resurrect(&daemon);
                 let activated = passed
                     .listener
                     .map(|fd| {
@@ -489,13 +517,17 @@ pub fn serve(path: &Path, start: Start) -> Result<()> {
             let _ = crate::restore::take_over(&daemon, &state)?;
             bind(&path)?
         }
-        Start::Normal => bind(&path)?,
+        Start::Normal => {
+            crate::resurrect::resurrect(&daemon);
+            bind(&path)?
+        }
     };
     log::info!("goattyd {} listening on {} (pid {})", env!("CARGO_PKG_VERSION"), path.display(), std::process::id());
     #[cfg(unix)]
     if crate::systemd::has_fd_store() {
         crate::restore::save_on_sigterm(daemon.clone())?;
     }
+    crate::resurrect::Keeper::start(&daemon)?;
     {
         let d = daemon.clone();
         std::thread::Builder::new().name("accept".into()).spawn(move || accept_loop(d, listener))?;

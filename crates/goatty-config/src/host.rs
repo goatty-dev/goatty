@@ -35,6 +35,9 @@ pub struct HostSettings {
     /// not a setting (goatty-shell's lock file); an entry for a plugin that
     /// isn't there is ignored.
     pub plugins: BTreeMap<String, PluginConfig>,
+    /// What comes back when the shells ended with goattyd (#344): after a
+    /// reboot, a crash or `systemctl --user stop`. A restart keeps them.
+    pub restore: RestoreSettings,
 }
 
 /// One plugin's configuration in `host.json`.
@@ -180,6 +183,44 @@ impl Default for PowerShellSettings {
     fn default() -> Self {
         Self { user_profile: false, integration: true }
     }
+}
+
+/// What goattyd brings back when its sessions' shells are gone the next
+/// time it starts (#344): each tab and split in its folder, and in it the
+/// coding agent or program that ran there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestoreSettings {
+    /// Reopen every tab with a new shell in the folder it was in.
+    pub sessions: bool,
+    /// Resume the conversation of a coding agent that ran in a tab
+    /// (`claude --resume <id>`, `codex resume --last`, …).
+    pub agents: bool,
+    /// Other programs started again in their tab when they were running,
+    /// by name, with the arguments they had. Only programs that are safe to
+    /// run twice belong here: a long job (a build, a training run) is
+    /// never started again unless it's listed.
+    pub programs: Vec<String>,
+}
+
+impl RestoreSettings {
+    /// Full-screen tools that only show things: starting them again changes nothing.
+    pub const PROGRAMS: &[&str] = &["btop", "gitui", "htop", "k9s", "lazydocker", "lazygit", "tig", "yazi"];
+}
+
+impl Default for RestoreSettings {
+    fn default() -> Self {
+        Self { sessions: true, agents: true, programs: Self::PROGRAMS.iter().map(|&p| p.into()).collect() }
+    }
+}
+
+/// Whether `name` can be in [`RestoreSettings::programs`]: a plain command
+/// name (no path, no spaces), as the program's process is called.
+pub fn is_program_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['-', '.'])
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
 }
 
 /// Ids of the user's snippets and expansions: lowercase letters, digits
@@ -368,6 +409,17 @@ impl Document for HostSettings {
                 None => self.shell.path.push(dir),
             }
         }
+        let programs = &mut self.restore.programs;
+        for name in std::mem::take(programs) {
+            let name = name.trim().to_string();
+            if is_program_name(&name) {
+                programs.push(name);
+            } else {
+                issues.push(Issue::new("restore.programs", format!("{name:?} ignored: not a program name")));
+            }
+        }
+        programs.sort();
+        programs.dedup();
         let skip = &mut self.shell.import.skip_vars;
         skip.retain(|n| !n.trim().is_empty());
         skip.sort();
@@ -671,6 +723,22 @@ mod tests {
         let json = crate::store::to_json(&loaded.value, &loaded.unknown);
         assert!(json.contains("\"icons\": \"always\"") && json.contains("\"zoxide\""), "{json}");
         assert!(crate::store::is_known_key::<HostSettings>("plugins.eza.settings.icons"));
+    }
+
+    #[test]
+    fn restore_programs_are_plain_names() {
+        let loaded = crate::store::parse::<HostSettings>(
+            r#"{"restore": {"agents": false, "programs": ["lazygit", " htop ", "/usr/bin/top", "rm -rf", "lazygit", "-x"]}}"#,
+        );
+        let r = &loaded.value.restore;
+        assert!(r.sessions && !r.agents);
+        assert_eq!(r.programs, ["htop", "lazygit"]);
+        assert_eq!(loaded.issues.len(), 3, "{:?}", loaded.issues);
+        let defaults = RestoreSettings::default();
+        let mut sorted = defaults.programs.clone();
+        sorted.sort();
+        assert_eq!(defaults.programs, sorted, "the defaults are what validation keeps");
+        assert!(defaults.programs.iter().all(|p| is_program_name(p)));
     }
 
     #[test]

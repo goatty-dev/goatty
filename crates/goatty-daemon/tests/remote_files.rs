@@ -48,6 +48,7 @@ fn start_daemon() -> TestDaemon {
         .env("HOME", &root)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
