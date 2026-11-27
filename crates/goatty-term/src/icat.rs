@@ -41,14 +41,14 @@ impl Geometry {
     /// Standard output's terminal; a typical cell size where it reports
     /// none (or isn't a terminal).
     fn of_stdout() -> Self {
+        let fallback = crate::TermSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 };
         #[cfg(unix)]
         let size = {
             use std::os::fd::AsFd;
-            crate::pty::window_size(std::io::stdout().as_fd())
+            crate::pty::window_size(std::io::stdout().as_fd()).unwrap_or(fallback)
         };
         #[cfg(not(unix))]
-        let size: Option<crate::TermSize> = None;
-        let size = size.unwrap_or(crate::TermSize { cols: 80, rows: 24, cell_width: 0, cell_height: 0 });
+        let size = fallback;
         let (cell_width, cell_height) =
             if size.cell_width > 0 && size.cell_height > 0 { (size.cell_width, size.cell_height) } else { (10, 20) };
         Self { cols: size.cols, rows: size.rows, cell_width, cell_height }

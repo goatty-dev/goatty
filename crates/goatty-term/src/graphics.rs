@@ -279,11 +279,47 @@ enum CacheKey {
     Atlas(u64),
 }
 
-/// Raw pixels a snapshot carries at most; images past it are left out.
-const MAX_SNAPSHOT_PIXELS: usize = 64 * 1024 * 1024;
+/// Encoded image bytes one snapshot carries at most (both screens); images
+/// past it are left out, with their placements. The snapshot travels in one
+/// frame (`goatty_proto::MAX_FRAME`, 64 MiB), and the rest of it (the rows)
+/// needs room too.
+const MAX_SNAPSHOT_IMAGES: usize = 40 * 1024 * 1024;
 
-/// Ids for sixel and iTerm2 images replayed as kitty images. Programs pick
-/// kitty ids at random, so a collision is unlikely, not impossible.
+/// What a snapshot may still spend on images, and the transmissions it
+/// encoded (they become the [`EncodeCache`] when it's done).
+pub(crate) struct Budget {
+    left: usize,
+    used: HashMap<CacheKey, Arc<str>>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self { left: MAX_SNAPSHOT_IMAGES, used: HashMap::new() }
+    }
+}
+
+impl Budget {
+    /// The transmission for `key`, encoded now unless a snapshot did
+    /// before; None when it doesn't fit in what's left.
+    fn take(&mut self, cache: &EncodeCache, key: CacheKey, encode: impl FnOnce() -> String) -> Option<Arc<str>> {
+        let command = match self.used.get(&key).or_else(|| cache.entries.get(&key)) {
+            Some(c) => c.clone(),
+            None => encode().into(),
+        };
+        // Kept even when it doesn't fit: the next snapshot won't encode it again.
+        self.used.insert(key, command.clone());
+        self.left = self.left.checked_sub(command.len())?;
+        Some(command)
+    }
+
+    /// Keep this snapshot's transmissions for the next one.
+    pub(crate) fn finish(&mut self, cache: &mut EncodeCache) {
+        cache.entries = std::mem::take(&mut self.used);
+    }
+}
+
+/// Ids for sixel and iTerm2 images replayed as kitty images, from here up,
+/// skipping the ids of the screen's kitty images.
 const ATLAS_REPLAY_ID: u32 = 0xFF00_0000;
 
 /// A screen's images for a snapshot: the transmissions and virtual
@@ -305,31 +341,28 @@ struct Place {
 impl Replay {
     /// The active screen's images. `first_line`: the topmost grid line the
     /// snapshot replays; placements starting above it are cropped to it.
-    pub(crate) fn build(t: &Term, store: &Store, cache: &mut EncodeCache, first_line: i32) -> Self {
+    pub(crate) fn build(t: &Term, store: &Store, cache: &EncodeCache, budget: &mut Budget, first_line: i32) -> Self {
         let mut replay = Replay::default();
         let Some((cw, ch)) = cell_px(t) else { return replay };
         let g = &t.graphics;
-        if g.kitty_placements.is_empty() && g.kitty_virtual_placements.is_empty() && g.atlas_placements.is_empty() {
+        if g.kitty_images.is_empty() && g.atlas_placements.is_empty() {
             return replay;
         }
-        let mut used = HashMap::new();
-        let mut budget = MAX_SNAPSHOT_PIXELS;
         let mut sent = HashSet::new();
 
-        let mut ids: Vec<u32> = g.kitty_placements.keys().chain(g.kitty_virtual_placements.keys()).map(|(id, _)| *id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        for id in ids {
+        // Placed images first, then the ones a program sent to place later.
+        let mut placed: Vec<u32> = g.kitty_placements.keys().chain(g.kitty_virtual_placements.keys()).map(|(id, _)| *id).collect();
+        placed.sort_unstable();
+        placed.dedup();
+        let mut unplaced: Vec<u32> = g.kitty_images.keys().filter(|id| placed.binary_search(id).is_err()).copied().collect();
+        unplaced.sort_unstable();
+        for id in placed.into_iter().chain(unplaced) {
             let Some(stored) = g.kitty_images.get(&id) else { continue };
             let data = &stored.data;
-            let Some(left) = budget.checked_sub(data.pixels.len()) else { continue };
-            budget = left;
             let format = if data.color_type == ColorType::Rgba { 32 } else { 24 };
             let key = CacheKey::Kitty(id, stored.transmission_time);
-            let command =
-                cache.entries.get(&key).cloned().unwrap_or_else(|| transmit(id, format, data.width, data.height, &data.pixels).into());
+            let Some(command) = budget.take(cache, key, || transmit(id, format, data.width, data.height, &data.pixels)) else { continue };
             replay.prelude.push_str(&command);
-            used.insert(key, command);
             sent.insert(id);
         }
         for v in g.kitty_virtual_placements.values().filter(|v| sent.contains(&v.image_id)) {
@@ -349,33 +382,29 @@ impl Replay {
             }
         }
 
-        let mut atlas_ids: HashMap<u64, u32> = HashMap::new();
+        let mut atlas_ids: HashMap<u64, Option<u32>> = HashMap::new();
+        let mut next_id = ATLAS_REPLAY_ID;
         for p in &g.atlas_placements {
             let Some(image) = store.images.get(&p.image_key) else { continue };
-            let id = match atlas_ids.get(&p.image_key) {
-                Some(id) => *id,
-                None => {
-                    let Some(left) = budget.checked_sub(image.rgba.len()) else { continue };
-                    budget = left;
-                    let id = ATLAS_REPLAY_ID + atlas_ids.len() as u32;
-                    let key = CacheKey::Atlas(image.id);
-                    let command =
-                        cache.entries.get(&key).cloned().unwrap_or_else(|| {
-                            transmit(ATLAS_REPLAY_ID, 32, image.width as usize, image.height as usize, &image.rgba).into()
-                        });
-                    // The cached command carries the base id; give it this one.
-                    replay.prelude.push_str(&command.replacen(&format!("i={ATLAS_REPLAY_ID},"), &format!("i={id},"), 1));
-                    used.insert(key, command);
-                    atlas_ids.insert(p.image_key, id);
-                    id
+            let id = *atlas_ids.entry(p.image_key).or_insert_with(|| {
+                let key = CacheKey::Atlas(image.id);
+                // Encoded with the base id (so the cache holds one form); given its own.
+                let command =
+                    budget.take(cache, key, || transmit(ATLAS_REPLAY_ID, 32, image.width as usize, image.height as usize, &image.rgba))?;
+                while g.kitty_images.contains_key(&next_id) {
+                    next_id = next_id.wrapping_add(1).max(ATLAS_REPLAY_ID);
                 }
-            };
+                let id = next_id;
+                next_id = next_id.wrapping_add(1).max(ATLAS_REPLAY_ID);
+                replay.prelude.push_str(&command.replacen(&format!("i={ATLAS_REPLAY_ID},"), &format!("i={id},"), 1));
+                Some(id)
+            });
+            let Some(id) = id else { continue };
             let line = (p.abs_row - base).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
             if let Some((line, command)) = place_atlas(p, image, id, line, first_line, cw, ch) {
                 replay.rows.entry(line).or_default().push(Place { col: p.col, command });
             }
         }
-        cache.entries = used;
         replay
     }
 
@@ -690,6 +719,47 @@ mod tests {
         c.feed(&t.reattach_snapshot());
         assert_eq!(rects(&frame(&c)), rects(&frame(&t)));
         assert_eq!(frame(&c).images[0].image.rgba[..4], [1, 1, 1, 255]);
+    }
+
+    /// Switching screens for the snapshot makes rio-vt queue the other
+    /// screen's image (same id, other pixels): the snapshot must not hold
+    /// the image lock then (the listener takes it).
+    #[test]
+    fn a_snapshot_with_one_id_on_both_screens_finishes() {
+        let (t, _ch) = term(true);
+        t.feed(format!("\x1b_Ga=T,f=32,s=10,v=20,i=1;{}\x1b\\", rgba(10, 20, [1, 1, 1, 255])).as_bytes());
+        t.feed(format!("\x1b[?1049h\x1b_Ga=T,f=32,s=10,v=20,i=1;{}\x1b\\", rgba(10, 20, [2, 2, 2, 255])).as_bytes());
+        let got = attached(&t);
+        assert_eq!(got.images[0].image.rgba[..4], [2, 2, 2, 255]);
+        assert_eq!(frame(&t).images[0].image.rgba[..4], [2, 2, 2, 255]);
+    }
+
+    #[test]
+    fn an_image_placed_after_attaching_shows() {
+        let (t, _ch) = term(true);
+        t.feed(format!("\x1b_Ga=t,q=2,f=32,s=10,v=20,i=5;{}\x1b\\", rgba(10, 20, [5, 5, 5, 255])).as_bytes());
+        let (c, _cch) = term(false);
+        c.feed(&t.reattach_snapshot());
+        let place = b"\x1b_Ga=p,q=2,i=5\x1b\\";
+        t.feed(place);
+        c.feed(place);
+        let (want, got) = (frame(&t), frame(&c));
+        assert_eq!(want.images.len(), 1);
+        assert_eq!(rects(&got), rects(&want));
+        assert_eq!(got.images[0].image.rgba[..4], [5, 5, 5, 255]);
+    }
+
+    #[test]
+    fn a_replayed_sixel_does_not_take_a_kitty_images_id() {
+        let (t, _ch) = term(true);
+        t.feed(format!("\x1b_Ga=T,f=32,s=10,v=20,i={ATLAS_REPLAY_ID};{}\x1b\\", rgba(10, 20, [1, 1, 1, 255])).as_bytes());
+        t.feed(b"\x1b[3;3H\x1bPq#1;2;0;100;0#1~~\x1b\\");
+        let want = frame(&t);
+        assert_eq!(want.images.len(), 2);
+        let got = attached(&t);
+        assert_eq!(rects(&got), rects(&want));
+        let px = |f: &Frame| f.images.iter().map(|i| i.image.rgba[..4].to_vec()).collect::<Vec<_>>();
+        assert_eq!(px(&got), px(&want));
     }
 
     #[test]

@@ -87,9 +87,20 @@ fn images(f: &Frame) -> Vec<String> {
     f.images
         .iter()
         .map(|i| {
+            // The pixels too (by hash: ids differ between terminals).
+            let mut h = std::hash::DefaultHasher::new();
+            std::hash::Hash::hash(&i.image.rgba, &mut h);
             format!(
-                "{}x{} at ({:.2},{:.2}) size {:.2}x{:.2} src {:?} {:?}",
-                i.image.width, i.image.height, i.x, i.y, i.width, i.height, i.source, i.layer
+                "{}x{} #{:016x} at ({:.2},{:.2}) size {:.2}x{:.2} src {:?} {:?}",
+                i.image.width,
+                i.image.height,
+                std::hash::Hasher::finish(&h),
+                i.x,
+                i.y,
+                i.width,
+                i.height,
+                i.source,
+                i.layer
             )
         })
         .collect()

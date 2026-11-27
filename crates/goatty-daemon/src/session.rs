@@ -929,12 +929,35 @@ pub(crate) fn to_size(ws: WinSize) -> TermSize {
 /// `goatty_term::media`).
 fn dispatch_output_chunk(s: &Session, media: &mut MediaRewriter, chunk: &[u8]) {
     let chunk = media.rewrite(chunk);
-    let chunk = &*chunk;
-    let n = chunk.len();
-    if n == 0 {
+    if chunk.is_empty() {
         return; // all of it is the start of a sequence that continues
     }
     s.poke_foreground();
+    // A rewritten image can be hundreds of MiB, past what one frame may
+    // carry: it goes out in pieces, each through flow control on its own.
+    for piece in chunk.chunks(MAX_OUTPUT_PIECE) {
+        broadcast_output(s, piece);
+    }
+    let mut cwd_changed = false;
+    for ev in s.ui_events.try_iter() {
+        if matches!(ev, UiEvent::CwdChanged) {
+            cwd_changed = true;
+        }
+    }
+    if cwd_changed && let Some(dir) = s.term.current_directory() {
+        s.set_osc_cwd(dir.to_string_lossy().into_owned());
+    }
+}
+
+/// Most output bytes in one `Output` frame (a PTY read is at most 64 KiB;
+/// only a rewritten image is larger).
+const MAX_OUTPUT_PIECE: usize = 1 << 20;
+
+/// Feed `chunk` to the authoritative terminal and send it to every
+/// subscriber that keeps up, under the subscriber lock (so the order is
+/// the same for all).
+fn broadcast_output(s: &Session, chunk: &[u8]) {
+    let n = chunk.len();
     {
         let mut subs = s.subs.lock();
         s.term.feed(chunk);
@@ -956,15 +979,6 @@ fn dispatch_output_chunk(s: &Session, media: &mut MediaRewriter, chunk: &[u8]) {
                 frame.get_or_insert_with(|| encode(&ServerMsg::Output { session: s.id, data: chunk.to_vec() }).expect("encode")).clone();
             sub.push(f, n)
         });
-    }
-    let mut cwd_changed = false;
-    for ev in s.ui_events.try_iter() {
-        if matches!(ev, UiEvent::CwdChanged) {
-            cwd_changed = true;
-        }
-    }
-    if cwd_changed && let Some(dir) = s.term.current_directory() {
-        s.set_osc_cwd(dir.to_string_lossy().into_owned());
     }
 }
 

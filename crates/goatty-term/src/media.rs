@@ -274,6 +274,17 @@ fn sensitive(path: &Path) -> bool {
     path.starts_with("/proc") || path.starts_with("/sys") || (path.starts_with("/dev") && !path.starts_with("/dev/shm"))
 }
 
+/// A Windows network path (`\\server\share`, `\\?\UNC\…`) or device
+/// (`\\.\pipe\…`): touching one would contact the server with the
+/// daemon user's credentials, or block on a pipe.
+fn remote(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..))
+    )
+}
+
 fn in_temp_dir(path: &Path) -> bool {
     let Some(dir) = path.parent() else { return false };
     let mut temps = vec![std::env::temp_dir(), "/tmp".into(), "/dev/shm".into()];
@@ -283,17 +294,24 @@ fn in_temp_dir(path: &Path) -> bool {
 
 fn read_file(path: &Path, offset: u64, size: u64, temporary: bool) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
-    if !path.is_absolute() {
+    // Checked before anything touches the path (canonicalize opens it).
+    if !path.is_absolute() || remote(path) {
         return None;
     }
     let real = path.canonicalize().ok()?;
-    if sensitive(path) || sensitive(&real) {
+    if sensitive(path) || sensitive(&real) || remote(&real) {
         return None;
     }
     if temporary && (!real.to_string_lossy().contains("tty-graphics-protocol") || !in_temp_dir(&real)) {
         return None;
     }
-    let mut file = std::fs::File::open(&real).ok()?;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    // A FIFO would block the open until a writer comes (and the session's
+    // output with it); non-blocking, it opens and fails `is_file` below.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let mut file = open.open(&real).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() {
         return None;
@@ -313,8 +331,8 @@ fn read_file(path: &Path, offset: u64, size: u64, temporary: bool) -> Option<Vec
 
 #[cfg(unix)]
 fn read_shm(name: &str, offset: u64, size: u64) -> Option<Vec<u8>> {
-    // A POSIX shared memory name: one leading slash, no other.
-    if name.is_empty() || name.len() > 255 || name[1..].contains('/') || name.contains('\0') {
+    // A POSIX shared memory name: a leading slash (or none), no other.
+    if name.is_empty() || name.len() > 255 || name.strip_prefix('/').unwrap_or(name).contains('/') || name.contains('\0') {
         return None;
     }
     let c_name = std::ffi::CString::new(name).ok()?;
@@ -323,38 +341,54 @@ fn read_shm(name: &str, offset: u64, size: u64) -> Option<Vec<u8>> {
     if fd < 0 {
         return None;
     }
-    let data = map_and_copy(fd, offset, size);
-    // SAFETY: `fd` is the descriptor shm_open returned, closed once here.
-    unsafe { libc::close(fd) };
+    // SAFETY: `fd` is a fresh descriptor from shm_open, owned by nobody else.
+    let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let data = copy_shm(&file, offset, size);
+    drop(file);
     // The protocol: the terminal removes the shared memory once read.
     // SAFETY: as above.
     unsafe { libc::shm_unlink(c_name.as_ptr()) };
     data
 }
 
+/// The requested bytes of a shared memory object, after checking them
+/// against its size.
 #[cfg(unix)]
-fn map_and_copy(fd: libc::c_int, offset: u64, size: u64) -> Option<Vec<u8>> {
-    // SAFETY: an all-zero `stat` is a valid value for fstat to fill.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` is open and `st` is writable.
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return None;
-    }
-    let total = u64::try_from(st.st_size).ok()?;
+fn copy_shm(file: &std::fs::File, offset: u64, size: u64) -> Option<Vec<u8>> {
+    let total = file.metadata().ok()?.len();
     let len = if size > 0 { size } else { total.saturating_sub(offset) };
     if len == 0 || len > MAX_DATA || offset.checked_add(len)? > total {
         return None;
     }
-    let map_len = usize::try_from(offset + len).ok()?;
+    read_shm_at(file, offset, len as usize)
+}
+
+/// Read through the descriptor, not a mapping: the producer may truncate
+/// the object meanwhile, and touching a mapping past its end is SIGBUS
+/// (the daemon would die). A short read fails instead.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_shm_at(file: &std::fs::File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut data = vec![0; len];
+    file.read_exact_at(&mut data, offset).ok()?;
+    Some(data)
+}
+
+/// macOS can't read() shared memory, only map it; it can't truncate it
+/// either (its size is set once), so the mapping stays valid.
+#[cfg(target_os = "macos")]
+fn read_shm_at(file: &std::fs::File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let map_len = usize::try_from(offset).ok()?.checked_add(len)?;
     // SAFETY: mapping `map_len` bytes of an open descriptor read-only; the
     // result is checked against MAP_FAILED before use.
-    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
     if ptr == libc::MAP_FAILED {
         return None;
     }
     // SAFETY: the mapping is `map_len` bytes long and readable, and
     // `offset + len == map_len`.
-    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(offset as usize), len as usize) }.to_vec();
+    let data = unsafe { std::slice::from_raw_parts((ptr as *const u8).add(offset as usize), len) }.to_vec();
     // SAFETY: unmapping exactly the mapping made above.
     unsafe { libc::munmap(ptr, map_len) };
     Some(data)
@@ -453,6 +487,23 @@ mod tests {
         let seq = format!("\x1b_Ga=T,t=t;{}\x1b\\", b64(path.to_str().unwrap().as_bytes()));
         assert_eq!(all(&mut r, &[seq.as_bytes()]), seq.as_bytes());
         assert!(path.exists());
+        // A shared memory name that isn't one (not even valid to slice).
+        let seq = format!("\x1b_Ga=T,t=s;{}\x1b\\", b64("é".as_bytes()));
+        assert_eq!(all(&mut r, &[seq.as_bytes()]), seq.as_bytes());
+    }
+
+    /// A FIFO passes through without blocking the output on its open.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_passes_through_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let seq = format!("\x1b_Ga=T,t=f;{}\x1b\\", b64(path.to_str().unwrap().as_bytes()));
+        let mut r = MediaRewriter::new();
+        assert_eq!(all(&mut r, &[seq.as_bytes()]), seq.as_bytes());
     }
 
     #[cfg(target_os = "linux")]

@@ -807,17 +807,18 @@ goatty-copy() {
 }
 # `copy` too, unless that name is already yours.
 if (( ! ${+commands[copy]} && ! ${+aliases[copy]} && ! ${+functions[copy]} && ! ${+builtins[copy]} )); then
-  copy() { goatty-copy "$@" }
+  function copy { goatty-copy "$@" }
   (( ${+functions[compdef]} )) && compdef _files copy
 fi
 (( ${+functions[compdef]} )) && compdef _files goatty-copy
 
 # `icat FILE…` shows images in the terminal (kitty graphics protocol, no
 # kitty tools needed): goattyd's, so it's there on every host goatty's shell
-# runs on. Unless that name is already yours, like `copy`.
+# runs on. Unless that name is already yours, like `copy`. (`function NAME`:
+# `NAME()` would expand a user alias of that name while this is parsed.)
 if (( ! ${+commands[icat]} && ! ${+aliases[icat]} && ! ${+functions[icat]} && ! ${+builtins[icat]} )) \
     && (( ${+commands[goattyd]} || ${+functions[goattyd]} )); then
-  icat() { goattyd icat "$@" }
+  function icat { goattyd icat "$@" }
   (( ${+functions[compdef]} )) && compdef _files icat
 fi
 

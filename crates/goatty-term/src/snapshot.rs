@@ -15,7 +15,7 @@
 //!   * what programs said about themselves (OSC 7501 records, the OSC 9;4
 //!     progress bar; see [`crate::status`]),
 //!   * images (kitty graphics, sixel, iTerm2; see [`crate::graphics`]):
-//!     each placed image once, then its placements, each written while the
+//!     each image once, then its placements, each written while the
 //!     row it starts on is replayed.
 
 use std::fmt::Write as _;
@@ -99,20 +99,31 @@ impl Terminal {
 }
 
 /// The image state a snapshot reads: the pixels of sixel/iTerm2 images and
-/// the transmissions encoded before. Locked after the terminal.
+/// the transmissions encoded before. Locked after the terminal, and only
+/// while a screen's images are read: switching screens can make rio-vt
+/// queue uploads, which the listener applies under the same lock.
 struct Images<'a> {
-    store: parking_lot::MutexGuard<'a, crate::graphics::Store>,
-    cache: parking_lot::MutexGuard<'a, crate::graphics::EncodeCache>,
+    term: &'a Terminal,
+    /// What the whole snapshot may still spend on images (both screens).
+    budget: crate::graphics::Budget,
 }
 
 impl<'a> Images<'a> {
     fn new(term: &'a Terminal) -> Self {
-        Self { store: term.inner.images.lock(), cache: term.inner.encoded.lock() }
+        Self { term, budget: crate::graphics::Budget::default() }
     }
 
     /// The active screen's images, for rows replayed from `first_line` on.
     fn replay(&mut self, t: &Term, first_line: i32) -> Replay {
-        Replay::build(t, &self.store, &mut self.cache, first_line)
+        let store = self.term.inner.images.lock();
+        let cache = self.term.inner.encoded.lock();
+        Replay::build(t, &store, &cache, &mut self.budget, first_line)
+    }
+}
+
+impl Drop for Images<'_> {
+    fn drop(&mut self) {
+        self.budget.finish(&mut self.term.inner.encoded.lock());
     }
 }
 

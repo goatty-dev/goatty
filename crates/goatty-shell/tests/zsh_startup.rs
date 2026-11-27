@@ -1031,10 +1031,14 @@ fn icat_is_goattyds_unless_the_name_is_yours() {
     let what = |sb: &Sandbox| stdout(&sb.run(&launch, "whence -c icat")).trim().to_string();
     assert!(what(&sb).contains("goattyd icat \"$@\""), "{}", what(&sb));
 
-    for (rc, want) in [("alias icat='echo mine'\n", "icat: aliased to echo mine"), ("icat() { echo mine }\n", "echo mine")] {
+    for (rc, want) in [("alias icat='echo mine' copy='echo mine'\n", "icat: aliased to echo mine"), ("icat() { echo mine }\n", "echo mine")]
+    {
         std::fs::create_dir_all(sb.dirs.user_zshrc().parent().unwrap()).unwrap();
         std::fs::write(sb.dirs.user_zshrc(), rc).unwrap();
         assert!(what(&sb).contains(want), "{rc:?}: {}", what(&sb));
+        // The rest of the startup still ran (an alias must not break parsing it).
+        let out = sb.run(&launch, "whence -w TRAPURG");
+        assert!(stdout(&out).contains("function"), "{rc:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
     std::fs::remove_file(sb.dirs.user_zshrc()).unwrap();
 
