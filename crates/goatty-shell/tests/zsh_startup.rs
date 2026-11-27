@@ -1421,6 +1421,38 @@ fn expansions_rewrite_words_on_space_and_enter() {
     let _ = sh.input.write(b"exit\r");
 }
 
+/// #341: Enter (goatty-expand-accept, with expansions on) clears the grey
+/// autosuggestion before the line is run, so it isn't left on the
+/// accepted command line above the output.
+#[test]
+fn enter_clears_the_autosuggestion() {
+    let Some(zsh) = zsh() else { return };
+    if !has_system_copy("autosuggestions") {
+        eprintln!("skipped: no system zsh-autosuggestions");
+        return;
+    }
+    let sb = Sandbox::new(zsh);
+    let launch = sb.launch_with(no_highlighting(), None);
+    let mut sh = PtyShell::start(&sb, &launch);
+    sh.run("echo suggest-me-later");
+    let start = sh.out.len();
+    sh.input.write(b"echo sugg").unwrap();
+    sh.wait_for_from(start, b"est-me-later");
+    sh.wait_for_idle();
+    sh.run("");
+
+    let size = TermSize::new(120, 40);
+    let (term, _ch) = goatty_term::Terminal::new(size, false, std::sync::Arc::new(goatty_term::Palette::default()));
+    term.feed(&sh.out);
+    let mut f = goatty_term::Frame::default();
+    term.snapshot_into(&mut f);
+    let rows: Vec<String> = (0..f.rows).map(|r| f.row(r).iter().map(|c| c.ch).collect::<String>().trim_end().to_string()).collect();
+    let screen = rows.join("\n");
+    assert_eq!(rows.iter().filter(|r| r.contains("suggest-me-later")).count(), 2, "first command and its output only:\n{screen}");
+    assert!(rows.iter().any(|r| r.ends_with("echo sugg")), "the accepted line is what was typed:\n{screen}");
+    let _ = sh.input.write(b"exit\r");
+}
+
 #[test]
 fn expansions_can_be_turned_off() {
     let Some(zsh) = zsh() else { return };

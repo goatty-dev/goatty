@@ -111,6 +111,20 @@ goatty-expand-backspace() {
 zle -N goatty-expand-space
 zle -N goatty-expand-accept
 zle -N goatty-expand-backspace
+
+# Enter is goatty-expand-accept, not accept-line, so zsh-autosuggestions
+# would treat it as a widget that edits the line and put the grey
+# suggestion back after the line was accepted, leaving it in the scrollback
+# above the output (#341). Have it clear the suggestion like accept-line.
+# The array exists only once the plugin is sourced (after this file); it
+# binds its widgets in its own precmd hook, which runs after this one.
+_goatty_exp_autosuggest() {
+  precmd_functions=(${precmd_functions:#_goatty_exp_autosuggest})
+  (( ${+ZSH_AUTOSUGGEST_CLEAR_WIDGETS} )) || return 0
+  (( ${ZSH_AUTOSUGGEST_CLEAR_WIDGETS[(Ie)goatty-expand-accept]} )) || ZSH_AUTOSUGGEST_CLEAR_WIDGETS+=(goatty-expand-accept)
+}
+precmd_functions+=(_goatty_exp_autosuggest)
+
 () {
   local km
   for km in emacs viins; do
