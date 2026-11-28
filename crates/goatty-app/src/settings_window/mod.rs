@@ -16,6 +16,7 @@ mod about;
 mod agent_hooks;
 mod aliases;
 mod appearance;
+pub(crate) use appearance::{THEME_CARD_BORDER, THEME_CARD_RADIUS};
 mod chrome;
 mod diagnostics;
 mod dotfiles;
