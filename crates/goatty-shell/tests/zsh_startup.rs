@@ -588,27 +588,39 @@ impl PtyShell {
 
     /// Wait until zsh has entered zle and is blocked reading input for the
     /// latest prompt, avoiding the brief window right after `133;B` where
-    /// `zlecore` resets `errflag` before reading.
+    /// `zlecore` resets `errflag` before reading. zle must also have put the
+    /// pty in raw mode: bytes written while it is still canonical go through
+    /// the kernel's line editing, where DEL erases the Esc of Esc+Backspace
+    /// before zle sees it (#360).
     fn wait_for_idle(&mut self) {
         let start = self.out.windows(7).rposition(|w| w == b"\x1b]133;B").unwrap_or(0);
         self.wait_for_from(start, b"\x1b[?2004h");
-        if let Some(pid) = self.pty.pid() {
-            let wchan = format!("/proc/{pid}/wchan");
-            if std::path::Path::new(&wchan).exists() {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while Instant::now() < deadline {
-                    if let Ok(w) = std::fs::read_to_string(&wchan) {
-                        let w = w.trim();
-                        if !w.is_empty() && w != "0" {
-                            return;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(2));
+        let wchan = self.pty.pid().map(|pid| format!("/proc/{pid}/wchan")).filter(|w| Path::new(w).exists());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let blocked = wchan.as_ref().is_none_or(|wchan| {
+                std::fs::read_to_string(wchan).is_ok_and(|w| {
+                    let w = w.trim();
+                    !w.is_empty() && w != "0"
+                })
+            });
+            if blocked && self.raw_mode() {
+                if wchan.is_none() {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
                 return;
             }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// Whether the pty is out of canonical mode (zle reads keys itself).
+    fn raw_mode(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: the master fd stays open for the borrow, and `t` is only
+        // read after `tcgetattr` reports that it filled it in.
+        unsafe { libc::tcgetattr(self.pty.master_fd().as_raw_fd(), t.as_mut_ptr()) == 0 && t.assume_init().c_lflag & libc::ICANON == 0 }
     }
 
     fn wait_for(&mut self, needle: &[u8]) {
