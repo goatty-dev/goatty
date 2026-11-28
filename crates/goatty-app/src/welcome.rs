@@ -23,29 +23,36 @@ use std::collections::BTreeSet;
 use goatty_config::{HostSettings, PromptStyle, ThemeEntry, store};
 use goatty_shell::setup::{self, Status, ToolLocation};
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyBinding, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, prelude::*,
-    px, rgb, size,
+    AnyElement, App, AppContext, Bounds, Context, ElementId, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyBinding,
+    ParentElement, Render, Role, ScrollHandle, SharedString, Styled, Subscription, Window, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
 };
 
 use crate::settings::AppSettings;
 // The settings window's building blocks, so this window looks the same.
-use crate::settings_window::kit::{choice_card as choice, row as settings_row, section as settings_section};
+use crate::settings_window::kit::{self, choice_card as choice, row as settings_row, section as settings_section};
 use crate::settings_window::{self, HostLink, HostLinkGlobal, Page};
 use crate::settings_window::{THEME_CARD_BORDER, THEME_CARD_RADIUS};
 use crate::shell_setup::{self, Progress};
 use crate::ui::brand;
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button, button_with, keycaps, stepper, toggle};
+use crate::ui::focus::{self, Ring, Scroller};
 use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
 
 const CONTEXT: &str = "Welcome";
 const TITLE: &str = "Welcome to goatty";
 
-actions!(welcome, [CloseWelcome]);
+actions!(welcome, [CloseWelcome, FocusNext, FocusPrev]);
 
 pub fn bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new("escape", CloseWelcome, Some(CONTEXT)), KeyBinding::new("ctrl-w", CloseWelcome, Some(CONTEXT))]
+    vec![
+        KeyBinding::new("escape", CloseWelcome, Some(CONTEXT)),
+        KeyBinding::new("ctrl-w", CloseWelcome, Some(CONTEXT)),
+        // Every control is a tab stop (`ui::focus`); Enter and Space press it.
+        KeyBinding::new("tab", FocusNext, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", FocusPrev, Some(CONTEXT)),
+    ]
 }
 
 struct OpenWindow(Option<WindowHandle<Welcome>>);
@@ -192,6 +199,10 @@ impl Step {
 
 pub struct Welcome {
     focus: FocusHandle,
+    /// The page's scroll area: a control reached with Tab scrolls into view.
+    scroll: ScrollHandle,
+    /// No dropdowns here, but the focus pool wants one.
+    menu_scroll: ScrollHandle,
     step: Step,
     /// The host whose shell step 2 sets up (the terminal window's).
     link: Option<HostLink>,
@@ -259,6 +270,8 @@ impl Welcome {
         ]);
         Self {
             focus,
+            scroll: ScrollHandle::new(),
+            menu_scroll: ScrollHandle::new(),
             step: Step::Look,
             link: cx.try_global::<HostLinkGlobal>().and_then(|g| g.0.clone()),
             status: None,
@@ -285,6 +298,14 @@ impl Welcome {
 
     fn close(&mut self, _: &CloseWelcome, window: &mut Window, _cx: &mut Context<'_, Self>) {
         window.remove_window();
+    }
+
+    fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<'_, Self>) {
+        window.focus_next(cx);
+    }
+
+    fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, cx: &mut Context<'_, Self>) {
+        window.focus_prev(cx);
     }
 
     fn go(&mut self, step: Step, cx: &mut Context<'_, Self>) {
@@ -423,7 +444,7 @@ impl Welcome {
                 notes.extend(s.changed.iter().skip(1).map(|c| format!("Also edited by hand: {c}")));
                 row.desc(format!("A goatty line was edited by hand ({at}). Remove or fix it in the file, then check again")).control(
                     button_with(
-                        "everywhere-check",
+                        "welcome-everywhere-check",
                         Some(Icon::Refresh),
                         "Check again",
                         ButtonKind::Ghost,
@@ -433,7 +454,7 @@ impl Welcome {
                 )
             }
             (State::Off, Some(why)) => {
-                row.desc(why.clone()).disabled(true).control(toggle("everywhere", false, ui, |_, _| {}).aria_label(LABEL))
+                row.desc(why.clone()).disabled(true).control(toggle("welcome-everywhere", false, ui, |_, _| {}).aria_label(LABEL))
             }
             (state, _) => {
                 if on {
@@ -456,7 +477,7 @@ impl Welcome {
                     ))))
                     .child(code_lines(
                         ui,
-                        "everywhere-lines",
+                        "welcome-everywhere-lines",
                         crate_mono(cx),
                         &s.lines,
                         copied,
@@ -469,7 +490,7 @@ impl Welcome {
                     .disabled(busy)
                     .control(
                         toggle(
-                            "everywhere",
+                            "welcome-everywhere",
                             on,
                             ui,
                             self.act(cx, move |v, cx| v.everywhere(if on { Action::Off } else { Action::On }, cx)),
@@ -616,7 +637,7 @@ impl Welcome {
         let on = s.enabled;
         let mut sec = settings_section(ui, "Your dotfiles").desc(format!("goatty found {}", found.join(", "))).child(
             settings_row(ui, format!("Use what {main} sets up")).desc(desc).control(toggle(
-                "import",
+                "welcome-import",
                 on,
                 ui,
                 self.act(cx, move |v, cx| v.set_import(!on, cx)),
@@ -759,7 +780,7 @@ impl Welcome {
                     .child(
                         settings_row(ui, "Follow the system")
                             .desc("A light theme by day, a dark one by night, as your desktop switches")
-                            .control(toggle("follow-system", theme.follow_system, ui, |_, cx| {
+                            .control(toggle("welcome-follow-system", theme.follow_system, ui, |_, cx| {
                                 AppSettings::update(cx, |s| s.theme.follow_system = !s.theme.follow_system)
                             })),
                     )
@@ -767,7 +788,7 @@ impl Welcome {
             )
             .child(settings_section(ui, "Text").child(settings_row(ui, "Size").desc("Ctrl+= and Ctrl+- change it in any window").control(
                 stepper(
-                    "font-size",
+                    "welcome-font-size",
                     format!("{font_size:.0} px"),
                     ui,
                     |_, cx| AppSettings::update(cx, |s| s.font.size = (s.font.size - 1.0).max(goatty_config::FontSettings::MIN_SIZE)),
@@ -780,8 +801,12 @@ impl Welcome {
         let col = t.colors;
         let c = |x: goatty_config::Color| -> gpui::Hsla { rgb(x.0).into() };
         let (id, dark) = (t.id.clone(), col.is_dark());
-        div()
-            .id(SharedString::from(format!("theme-{}", t.id)))
+        let el_id = ElementId::from(SharedString::from(format!("welcome-theme-{}", t.id)));
+        let el = div()
+            .id(el_id.clone())
+            .role(Role::RadioButton)
+            .aria_selected(selected)
+            .aria_label(SharedString::from(t.name.clone()))
             .w(px(128.))
             .flex()
             .flex_col()
@@ -833,7 +858,8 @@ impl Welcome {
                     (true, true) => s.theme.dark = id.clone(),
                     (true, false) => s.theme.light = id.clone(),
                 });
-            })
+            });
+        focus::tab(el, &el_id, ui, Ring::Inner, Scroller::Page)
     }
 
     fn shell(&self, ui: Ui, cx: &Context<'_, Self>) -> impl IntoElement {
@@ -852,7 +878,14 @@ impl Welcome {
         let Some(status) = &self.status else {
             return match &self.error {
                 Some(e) => page.child(banner(ui, Tone::Danger, "Couldn't check the shell", vec![e.clone()])).child(div().flex().child(
-                    button_with("retry", Some(Icon::Refresh), "Try again", ButtonKind::Normal, ui, self.act(cx, |v, cx| v.load(cx))),
+                    button_with(
+                        "welcome-retry",
+                        Some(Icon::Refresh),
+                        "Try again",
+                        ButtonKind::Normal,
+                        ui,
+                        self.act(cx, |v, cx| v.load(cx)),
+                    ),
                 )),
                 None => page.child(loading_card(ui, "Checking what's installed…")),
             };
@@ -890,7 +923,7 @@ impl Welcome {
                     r.desc(format!("{} · update {version} → {} · {}", t.summary, t.version, setup::size(t.download)))
                         .disabled(busy)
                         .control(toggle(
-                            SharedString::from(format!("tool-{}", t.id)),
+                            SharedString::from(format!("welcome-tool-{}", t.id)),
                             on,
                             ui,
                             self.act(cx, move |v, cx| {
@@ -907,7 +940,7 @@ impl Welcome {
                     let id = t.id.clone();
                     let extra = if t.default_install { "" } else { " · optional" };
                     r.desc(format!("{} · {}{extra}", t.summary, setup::size(t.download))).disabled(busy).control(toggle(
-                        SharedString::from(format!("tool-{}", t.id)),
+                        SharedString::from(format!("welcome-tool-{}", t.id)),
                         on,
                         ui,
                         self.act(cx, move |v, cx| {
@@ -962,7 +995,7 @@ impl Welcome {
                     .font(font.clone())
                     .text_size(px(12.))
                     .children(preview.prompt(crate::ui::prompt_preview::Moment::Fresh, div()));
-                choice(ui, SharedString::from(format!("prompt-{}", s.label())), s.label(), style == s, line)
+                choice(ui, SharedString::from(format!("welcome-prompt-{}", s.label())), s.label(), style == s, line)
                     .min_w(px(150.))
                     .on_click(cx.listener(move |v: &mut Self, _: &gpui::ClickEvent, _, cx| v.set_prompt(s, cx)))
             };
@@ -1015,7 +1048,7 @@ impl Welcome {
             .child(
                 settings_section(ui, "More")
                     .child(settings_row(ui, "Settings").icon(Icon::Sliders).desc("Fonts, tabs, prompt, history, plugins").on_click(
-                        "more-settings",
+                        "welcome-more-settings",
                         |_, window, cx| {
                             settings_window::open(cx);
                             window.remove_window();
@@ -1023,7 +1056,7 @@ impl Welcome {
                     ))
                     .child(
                         settings_row(ui, "Diagnostics").icon(Icon::Activity).desc("What the shell loads, and how fast it starts").on_click(
-                            "more-diagnostics",
+                            "welcome-more-diagnostics",
                             |_, window, cx| {
                                 settings_window::open_at(cx, Some(Page::Diagnostics));
                                 window.remove_window();
@@ -1040,10 +1073,10 @@ impl Welcome {
             Step::Ready => Some(Step::Shell),
         };
         let primary = match self.step {
-            Step::Look => button("next", "Continue", ButtonKind::Primary, ui, self.act(cx, |v, cx| v.go(Step::Shell, cx))),
+            Step::Look => button("welcome-next", "Continue", ButtonKind::Primary, ui, self.act(cx, |v, cx| v.go(Step::Shell, cx))),
             Step::Shell if self.installing() => {
                 let line = self.progress.as_ref().map(Progress::status_line).unwrap_or_default();
-                button_with("next", Some(Icon::Loader), line, ButtonKind::Primary, ui, |_, _| {}).opacity(0.7)
+                button_with("welcome-next", Some(Icon::Loader), line, ButtonKind::Primary, ui, |_, _| {}).opacity(0.7)
             }
             Step::Shell if !self.chosen.is_empty() && !self.installed() && self.status.as_ref().is_some_and(|s| s.managed) => {
                 let s = self.status.as_ref();
@@ -1058,10 +1091,10 @@ impl Welcome {
                     _ => "Install",
                 };
                 let label = format!("{verb} {n} {} · {}", if n == 1 { "tool" } else { "tools" }, setup::size(bytes));
-                button_with("next", Some(Icon::Download), label, ButtonKind::Primary, ui, self.act(cx, |v, cx| v.install(cx)))
+                button_with("welcome-next", Some(Icon::Download), label, ButtonKind::Primary, ui, self.act(cx, |v, cx| v.install(cx)))
             }
-            Step::Shell => button("next", "Continue", ButtonKind::Primary, ui, self.act(cx, |v, cx| v.go(Step::Ready, cx))),
-            Step::Ready => button("next", "Start using goatty", ButtonKind::Primary, ui, |window, _| window.remove_window()),
+            Step::Shell => button("welcome-next", "Continue", ButtonKind::Primary, ui, self.act(cx, |v, cx| v.go(Step::Ready, cx))),
+            Step::Ready => button("welcome-next", "Start using goatty", ButtonKind::Primary, ui, |window, _| window.remove_window()),
         };
         // "Not now" on the shell step: go on without installing.
         let skip_install = self.step == Step::Shell && !self.chosen.is_empty() && !self.installing() && !self.installed();
@@ -1075,12 +1108,14 @@ impl Welcome {
             .border_color(ui.divider)
             .bg(ui.sidebar)
             .when(self.step != Step::Ready, |d| {
-                d.child(button("skip", "Skip setup", ButtonKind::Ghost, ui, |window, _| window.remove_window()))
+                d.child(button("welcome-skip", "Skip setup", ButtonKind::Ghost, ui, |window, _| window.remove_window()))
             })
             .child(div().flex_1())
-            .when_some(back, |d, step| d.child(button("back", "Back", ButtonKind::Normal, ui, self.act(cx, move |v, cx| v.go(step, cx)))))
+            .when_some(back, |d, step| {
+                d.child(button("welcome-back", "Back", ButtonKind::Normal, ui, self.act(cx, move |v, cx| v.go(step, cx))))
+            })
             .when(skip_install, |d| {
-                d.child(button("not-now", "Not now", ButtonKind::Normal, ui, self.act(cx, |v, cx| v.go(Step::Ready, cx))))
+                d.child(button("welcome-not-now", "Not now", ButtonKind::Normal, ui, self.act(cx, |v, cx| v.go(Step::Ready, cx))))
             })
             .child(primary)
     }
@@ -1089,7 +1124,16 @@ impl Welcome {
 impl Render for Welcome {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
+        // Controls built from here to `focus::end` get tab stops.
+        focus::begin(cx, window, &self.scroll, &self.menu_scroll);
+        // Rows number their controls per frame: start again, or their ids
+        // change every frame and a click never completes.
+        kit::set_row_notes(window.window_handle().window_id(), Default::default());
         let content = self.content(ui, cx);
+        if focus::end() {
+            // Some controls had no focus handle: the next frame has more.
+            window.refresh();
+        }
         crate::workspace::secondary_window(self, TITLE, ui.bg, content, window, cx)
     }
 }
@@ -1103,6 +1147,7 @@ impl Welcome {
         };
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(ui.bg)
@@ -1111,6 +1156,14 @@ impl Welcome {
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::close))
+            .on_action(cx.listener(Self::focus_next))
+            .on_action(cx.listener(Self::focus_prev))
+            // After layout: a focused control that is gone (the step changed)
+            // gives its focus to the window, so keys keep working.
+            .child({
+                let root = self.focus.clone();
+                canvas(|_, _, _| (), move |_, _, window, cx| focus::rescue(&root, window, cx)).absolute().size_0()
+            })
             .child(
                 div()
                     .flex()
@@ -1124,7 +1177,7 @@ impl Welcome {
                     .child(self.steps(ui)),
             )
             .child(
-                div().id("welcome-page").flex_1().overflow_y_scroll().child(
+                div().id("welcome-page").flex_1().overflow_y_scroll().track_scroll(&self.scroll).child(
                     div().flex().justify_center().px(px(28.)).child(div().w_full().max_w(px(700.)).pt(px(12.)).pb(px(32.)).child(body)),
                 ),
             )

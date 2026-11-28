@@ -243,7 +243,10 @@ thread_local! {
     static ROW_SEQ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Before rendering a page in `window`: what its rows should say.
+/// Before rendering a page in `window`: what its rows should say. Every
+/// window that shows [`Row`]s calls this each frame (with no notes, if it
+/// has none): it also restarts the numbering of the rows' controls, whose
+/// ids would otherwise change from frame to frame and lose clicks.
 pub fn set_row_notes(window: gpui::WindowId, notes: HashMap<SharedString, RowNote>) {
     ROW_NOTES.with_borrow_mut(|n| *n = Some((window, notes)));
     ROW_SEQ.set(0);
