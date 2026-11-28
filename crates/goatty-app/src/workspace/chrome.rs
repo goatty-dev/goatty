@@ -249,6 +249,8 @@ fn window_button(button: WindowButton, maximized: bool, size: f32, c: Colors) ->
         .bg(c.ui.text.opacity(0.08))
         .hover(|s| s.bg(c.ui.text.opacity(0.16)))
         .tooltip(tooltip(tip))
+        .role(gpui::Role::Button)
+        .aria_label(tip)
         .child(icon.svg().size(px(size * 0.62)).text_color(c.ui.text))
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
