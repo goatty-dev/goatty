@@ -15,7 +15,7 @@ publish = false
 # protocol and iTerm2 images; rio-graphics (same version, pinned with it)
 # holds the image types.
 rio-vt = { version = "=0.5.29", default-features = false, features = ["graphics"] }
-rio-graphics = "=0.5.29"
+rio-graphics = "=0.5.32"
 portable-pty = "0.9.0"
 # GPUI: Longbridge's weekly crates.io snapshots of Zed main (`gpui-pre`),
 # pinned exactly. Bump deliberately: change both versions, then `just update-gpui`.
