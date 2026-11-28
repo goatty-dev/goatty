@@ -336,13 +336,25 @@ fn read_shm(name: &str, offset: u64, size: u64) -> Option<Vec<u8>> {
         return None;
     }
     let c_name = std::ffi::CString::new(name).ok()?;
+    // On Linux POSIX shared memory lives under /dev/shm, where a program can
+    // place a FIFO; open non-blocking so shm_open never stalls the output pump.
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::O_RDONLY;
     // SAFETY: `c_name` is a valid NUL-terminated string.
-    let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+    let fd = unsafe { libc::shm_open(c_name.as_ptr(), flags, 0) };
     if fd < 0 {
         return None;
     }
     // SAFETY: `fd` is a fresh descriptor from shm_open, owned by nobody else.
     let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    // Reject non-regular entries (such as a FIFO in /dev/shm) without unlinking
+    // them. macOS shm_open descriptors do not report S_IFREG, so keep Linux-only.
+    #[cfg(target_os = "linux")]
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let data = copy_shm(&file, offset, size);
     drop(file);
     // The protocol: the terminal removes the shared memory once read.
@@ -532,5 +544,32 @@ mod tests {
             fd < 0
         };
         assert!(gone, "the shared memory was unlinked");
+    }
+
+    /// A FIFO under /dev/shm passes through without blocking or being unlinked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shm_fifo_passes_through_without_blocking_or_unlinking() {
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let bare = format!("goatty-test-shm-fifo-{}", std::process::id());
+        let path = Path::new("/dev/shm").join(&bare);
+        let _ = std::fs::remove_file(&path);
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let _cleanup = RemoveOnDrop(path.clone());
+
+        let mut r = MediaRewriter::new();
+        for name in [format!("/{bare}"), bare] {
+            let seq = format!("\x1b_Ga=T,t=s;{}\x1b\\", b64(name.as_bytes()));
+            assert_eq!(all(&mut r, &[seq.as_bytes()]), seq.as_bytes(), "{name}");
+            assert!(path.exists(), "the FIFO under /dev/shm must not be unlinked ({name})");
+        }
     }
 }
