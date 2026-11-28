@@ -13,18 +13,19 @@
 //! 3. **Ready**: the few shortcuts worth knowing, links onward.
 //!
 //! It opens by itself once, on the very first start (no client settings
-//! file and no "shown" marker in goatty's state directory), and again from
-//! the command palette ("Welcome and setup"). While it's open, a tab
-//! connecting doesn't show the install toast (`crate::shell_setup`): this
-//! window asks instead.
+//! file and no "shown" marker in goatty's state directory), as a dialog
+//! in front of the terminal window, and again from the command palette
+//! ("Welcome and setup"). While it's open, a tab connecting doesn't show the
+//! install toast (`crate::shell_setup`): this window asks instead.
 
 use std::collections::BTreeSet;
 
 use goatty_config::{HostSettings, PromptStyle, ThemeEntry, store};
 use goatty_shell::setup::{self, Status, ToolLocation};
 use gpui::{
-    App, AppContext, Bounds, Context, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyBinding, ParentElement, Render,
-    SharedString, Styled, Subscription, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    AnyElement, App, AppContext, Bounds, Context, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyBinding, ParentElement,
+    Render, SharedString, Styled, Subscription, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions, div, prelude::*,
+    px, rgb, size,
 };
 
 use crate::settings::AppSettings;
@@ -39,6 +40,7 @@ use crate::ui::icons::Icon;
 use crate::ui::style::{Ui, radius, text};
 
 const CONTEXT: &str = "Welcome";
+const TITLE: &str = "Welcome to goatty";
 
 actions!(welcome, [CloseWelcome]);
 
@@ -82,16 +84,69 @@ pub fn check_first_run(cx: &mut App) {
     }
 }
 
-/// After the terminal window opened: show the welcome window on the first run.
+/// Waiting for the terminal window to become active, to open the welcome
+/// window attached to it.
+struct WaitForTerminal {
+    _activation: Subscription,
+}
+
+impl Global for WaitForTerminal {}
+
+/// How long to wait for the terminal window to become active before the
+/// welcome window opens on its own.
+const ACTIVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// After the terminal window opened: show the welcome window on the first
+/// run, as a dialog attached to the terminal window and in front of it
+/// until it's closed (#351). The desktop parents a dialog to the focused
+/// window, so this waits until the terminal window is active.
 pub fn open_if_first_run(cx: &mut App) {
+    if !cx.has_global::<FirstRun>() {
+        return;
+    }
+    let terminal = cx.windows().into_iter().find_map(|w| w.downcast::<crate::workspace::Workspace>());
+    let waiting = terminal.and_then(|t| {
+        t.update(cx, |_, window, cx| {
+            (!window.is_window_active()).then(|| {
+                cx.observe_window_activation(window, |_, window, cx| {
+                    if window.is_window_active() {
+                        cx.defer(open_first_run);
+                    }
+                })
+            })
+        })
+        .ok()
+        .flatten()
+    });
+    let Some(waiting) = waiting else {
+        open_first_run(cx);
+        return;
+    };
+    cx.set_global(WaitForTerminal { _activation: waiting });
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(ACTIVATION_TIMEOUT).await;
+        cx.update(open_first_run);
+    })
+    .detach();
+}
+
+fn open_first_run(cx: &mut App) {
+    if cx.has_global::<WaitForTerminal>() {
+        cx.remove_global::<WaitForTerminal>();
+    }
     if cx.has_global::<FirstRun>() {
-        open(cx);
+        // macOS shows a dialog as a sheet inside its parent: too small for this.
+        open_as(cx, if cfg!(target_os = "macos") { WindowKind::Normal } else { WindowKind::Dialog });
         cx.remove_global::<FirstRun>();
     }
 }
 
 /// Open the welcome window at its first step, or bring it to the front.
 pub fn open(cx: &mut App) {
+    open_as(cx, WindowKind::Normal);
+}
+
+fn open_as(cx: &mut App, kind: WindowKind) {
     if let Some(h) = cx.try_global::<OpenWindow>().and_then(|w| w.0)
         && h.update(cx, |_, window, _| window.activate_window()).is_ok()
     {
@@ -102,11 +157,11 @@ pub fn open(cx: &mut App) {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(540.))),
-            app_id: Some("dev.goatty.goatty".into()),
-            ..Default::default()
+            kind,
+            ..crate::workspace::secondary_window_options(TITLE, cx)
         },
         |window, cx| {
-            window.set_window_title("Welcome to goatty");
+            window.set_window_title(TITLE);
             cx.new(|cx| Welcome::new(window, cx))
         },
     );
@@ -167,7 +222,15 @@ pub struct Welcome {
     everywhere_error: Option<String>,
     /// The lines were copied (the Copy button shows a check).
     everywhere_copied: bool,
+    /// goatty's title bar and frame, when it draws them (GNOME).
+    chrome: crate::workspace::ChromeState,
     _subs: Vec<Subscription>,
+}
+
+impl crate::workspace::Chromed for Welcome {
+    fn chrome(&mut self) -> &mut crate::workspace::ChromeState {
+        &mut self.chrome
+    }
 }
 
 impl Focusable for Welcome {
@@ -180,7 +243,8 @@ impl Welcome {
     fn new(window: &mut Window, cx: &mut Context<'_, Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        let subs = vec![
+        let mut subs = crate::workspace::observe_chrome(window, cx);
+        subs.extend([
             cx.observe_global::<AppSettings>(|_, cx| cx.notify()),
             // The terminal window connects after this opens: pick its host up.
             cx.observe_global::<HostLinkGlobal>(|this, cx| {
@@ -192,7 +256,7 @@ impl Welcome {
                     cx.notify();
                 }
             }),
-        ];
+        ]);
         Self {
             focus,
             step: Step::Look,
@@ -214,6 +278,7 @@ impl Welcome {
             everywhere_busy: false,
             everywhere_error: None,
             everywhere_copied: false,
+            chrome: Default::default(),
             _subs: subs,
         }
     }
@@ -1022,9 +1087,15 @@ impl Welcome {
 }
 
 impl Render for Welcome {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
-        let cx: &Context<'_, Self> = cx;
+        let content = self.content(ui, cx);
+        crate::workspace::secondary_window(self, TITLE, ui.bg, content, window, cx)
+    }
+}
+
+impl Welcome {
+    fn content(&self, ui: Ui, cx: &Context<'_, Self>) -> AnyElement {
         let body = match self.step {
             Step::Look => self.look(ui, cx).into_any_element(),
             Step::Shell => self.shell(ui, cx).into_any_element(),
@@ -1058,6 +1129,7 @@ impl Render for Welcome {
                 ),
             )
             .child(self.footer(ui, cx))
+            .into_any_element()
     }
 }
 

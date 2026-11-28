@@ -640,6 +640,15 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let ui = Ui::get(cx);
+        let content = self.content(ui, window, cx);
+        crate::workspace::secondary_window(self, "goatty settings", ui.bg, content, window, cx)
+    }
+}
+
+impl SettingsWindow {
+    fn content(&mut self, ui: Ui, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
+        // goatty draws the title bar (GNOME): its close button replaces the page's.
+        let own_title_bar = window.window_decorations() != gpui::Decorations::Server;
         if std::mem::take(&mut self.focus_search_on_open) && f32::from(window.viewport_size().width) >= RAIL_BELOW {
             let search = self.search.focus_handle(cx);
             window.focus(&search, cx);
@@ -783,9 +792,14 @@ impl Render for SettingsWindow {
                             )
                             .child(self.toasts.clone()),
                     )
-                    .child(div().absolute().top(px(14.)).right(px(14.)).child(
-                        icon_button("close-window", Icon::Close, "Close  (Ctrl+W)", ui, |window, _| window.remove_window()).size(px(34.)),
-                    ))
+                    .when(!own_title_bar, |d| {
+                        d.child(
+                            div().absolute().top(px(14.)).right(px(14.)).child(
+                                icon_button("close-window", Icon::Close, "Close  (Ctrl+W)", ui, |window, _| window.remove_window())
+                                    .size(px(34.)),
+                            ),
+                        )
+                    })
                     .children(bar),
             )
             .children(drawer)
@@ -794,6 +808,6 @@ impl Render for SettingsWindow {
             // Some controls had no focus handle: the next frame has more.
             window.refresh();
         }
-        root
+        root.into_any_element()
     }
 }

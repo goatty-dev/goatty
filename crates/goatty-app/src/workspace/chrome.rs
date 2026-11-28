@@ -23,12 +23,16 @@
 //!   On Windows, DWM provides the native frame, shadow, Windows 11 rounded
 //!   corners, and resize borders automatically when `appears_transparent` is
 //!   set on `TitlebarOptions`.
+//!
+//! The settings and welcome windows get the same on Linux
+//! ([`secondary_window`]): a slim header with their title and the window
+//! buttons, in the same frame. On Windows and macOS the system draws theirs.
 
 use goatty_config::TitleBar;
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, Context, CursorStyle, Decorations, Hitbox, HitboxBehavior, InteractiveElement, IntoElement,
     MouseButton, ParentElement, Pixels, Point, ResizeEdge, Size, StatefulInteractiveElement, Styled, Tiling, TitlebarOptions, Window,
-    WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations, canvas, div, point, prelude::*, px, rgb,
+    WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations, WindowOptions, canvas, div, point, prelude::*, px, rgb,
 };
 
 use super::Workspace;
@@ -69,6 +73,20 @@ pub fn titlebar_options(title_bar: TitleBar) -> TitlebarOptions {
 
 fn titlebar_options_for(title_bar: TitleBar, windows: bool) -> TitlebarOptions {
     TitlebarOptions { title: Some("goatty".into()), appears_transparent: windows && title_bar == TitleBar::Goatty, ..Default::default() }
+}
+
+/// Options for a secondary window (settings, welcome): the decorations
+/// `window.title_bar` asks for. On Windows and macOS the system draws its
+/// title bar; on Linux, [`secondary_window`] draws one where the desktop
+/// leaves that to goatty.
+pub(crate) fn secondary_window_options(title: &'static str, cx: &App) -> WindowOptions {
+    let title_bar = cx.global::<AppSettings>().client.window.title_bar;
+    WindowOptions {
+        app_id: Some("dev.goatty.goatty".into()),
+        titlebar: Some(TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+        window_decorations: Some(requested(title_bar)),
+        ..Default::default()
+    }
 }
 
 /// How the window is tiled, when goatty draws its decorations; `None` when
@@ -231,6 +249,8 @@ fn window_button(button: WindowButton, maximized: bool, size: f32, c: Colors) ->
         .bg(c.ui.text.opacity(0.08))
         .hover(|s| s.bg(c.ui.text.opacity(0.16)))
         .tooltip(tooltip(tip))
+        .role(gpui::Role::Button)
+        .aria_label(tip)
         .child(icon.svg().size(px(size * 0.62)).text_color(c.ui.text))
         .on_click(move |_, window, cx| {
             cx.stop_propagation();
@@ -260,43 +280,136 @@ pub(super) fn round_top<E: Styled>(el: E, window: &Window) -> E {
     if !tiling.top && !tiling.right { el.rounded_tr(ROUNDING - BORDER) } else { el }
 }
 
+/// What goatty's title bar and frame keep between frames, in any window
+/// that draws them (the terminal window, the settings and welcome windows).
+#[derive(Default)]
+pub(crate) struct ChromeState {
+    /// The left button went down on the title bar's empty space: the next
+    /// move starts moving the window.
+    title_drag: bool,
+    /// The window edge under the pointer, when goatty draws the frame.
+    resize_edge: Option<ResizeEdge>,
+    /// The frame last told to the platform: goatty's (with the tiling) or none.
+    frame_applied: Option<Option<Tiling>>,
+}
+
+/// A view whose window may get goatty's title bar and frame.
+pub(crate) trait Chromed: 'static + Sized {
+    fn chrome(&mut self) -> &mut ChromeState;
+}
+
+/// Keep a window that may draw its own decorations current: re-ask the
+/// desktop when `window.title_bar` changes (not on Windows, where that needs
+/// a new window), and repaint when the desktop changes what it granted or
+/// where the window buttons go.
+pub(crate) fn observe<V: Chromed>(window: &mut Window, cx: &mut Context<'_, V>) -> Vec<gpui::Subscription> {
+    let mut title_bar = cx.global::<AppSettings>().client.window.title_bar;
+    vec![
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
+        cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()),
+        cx.observe_global_in::<AppSettings>(window, move |_, window, cx| {
+            let wanted = cx.global::<AppSettings>().client.window.title_bar;
+            if wanted != title_bar {
+                title_bar = wanted;
+                if !cfg!(target_os = "windows") {
+                    window.request_decorations(requested(wanted));
+                }
+            }
+        }),
+    ]
+}
+
+/// Make `el` the title bar's empty space: drag to move the window,
+/// double-click to maximize, right-click for the window menu.
+/// `windows_bar`: goatty's own title bar on Windows (DWM handles it all).
+pub(crate) fn title_bar_area<V: Chromed>(
+    el: gpui::Stateful<gpui::Div>,
+    windows_bar: bool,
+    window: &Window,
+    cx: &mut Context<'_, V>,
+) -> gpui::Stateful<gpui::Div> {
+    if windows_bar {
+        // On Windows, `WindowControlArea::Drag` returns `HTCAPTION` from
+        // `WM_NCHITTEST`, so Windows natively handles dragging, Aero Snap,
+        // double-click maximize/restore, and right-click system menu.
+        return el.window_control_area(WindowControlArea::Drag);
+    }
+    let controls = window.window_controls();
+    let zoom = controls.maximize && window.is_resizable();
+    el.on_mouse_down(MouseButton::Left, cx.listener(|this: &mut V, _, _, _| this.chrome().title_drag = true))
+        .on_mouse_up(MouseButton::Left, cx.listener(|this: &mut V, _, _, _| this.chrome().title_drag = false))
+        .on_mouse_up_out(MouseButton::Left, cx.listener(|this: &mut V, _, _, _| this.chrome().title_drag = false))
+        .on_mouse_move(cx.listener(|this: &mut V, ev: &gpui::MouseMoveEvent, window, _| {
+            // The compositor takes over: no mouse-up may follow.
+            if std::mem::take(&mut this.chrome().title_drag) && ev.dragging() {
+                window.start_window_move();
+            }
+        }))
+        .on_click(move |ev, window, _| {
+            if zoom && ev.click_count() == 2 {
+                window.zoom_window();
+            }
+        })
+        .when(controls.window_menu, |d| {
+            d.on_mouse_down(MouseButton::Right, |ev, window, cx| {
+                window.show_window_menu(ev.position);
+                cx.stop_propagation();
+            })
+        })
+}
+
+/// A secondary window's (settings, welcome) decorations when goatty draws
+/// them: a slim header with `title` and the window buttons above `content`,
+/// in goatty's frame. `content` as is when the desktop decorates the window.
+pub(crate) fn secondary_window<V: Chromed>(
+    view: &mut V,
+    title: &'static str,
+    bg: gpui::Hsla,
+    content: AnyElement,
+    window: &mut Window,
+    cx: &mut Context<'_, V>,
+) -> AnyElement {
+    if csd(window).is_none() {
+        return window_frame(view, content, window, cx);
+    }
+    let c = Colors::get(cx);
+    let area = div()
+        .id("title-header-drag")
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(8.))
+        .text_size(px(text::SMALL))
+        .text_color(c.ui.muted)
+        .child(div().min_w_0().truncate().child(title));
+    let area = title_bar_area(area, false, window, cx);
+    let header = div()
+        .id("title-header")
+        .flex_none()
+        .w_full()
+        .h(px(HEADER_HEIGHT))
+        .flex()
+        .bg(bg)
+        .font_family(cx.global::<AppSettings>().ui_font.clone())
+        .children(window_buttons(Side::Left, 22., false, c, window, cx))
+        .child(area)
+        .children(window_buttons(Side::Right, 22., false, c, window, cx));
+    let header = round_top(header, window);
+    let body = div().size_full().flex().flex_col().child(header).child(div().flex_1().min_h_0().child(content)).into_any_element();
+    window_frame(view, body, window, cx)
+}
+
 impl Workspace {
-    /// Make `el` the title bar's empty space: drag to move the window,
-    /// double-click to maximize, right-click for the window menu.
     pub(super) fn title_bar_area(
         &self,
         el: gpui::Stateful<gpui::Div>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.windows_custom_title_bar {
-            // On Windows, `WindowControlArea::Drag` returns `HTCAPTION` from
-            // `WM_NCHITTEST`, so Windows natively handles dragging, Aero Snap,
-            // double-click maximize/restore, and right-click system menu.
-            return el.window_control_area(WindowControlArea::Drag);
-        }
-        let controls = window.window_controls();
-        let zoom = controls.maximize && window.is_resizable();
-        el.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = true))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = false))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.title_drag = false))
-            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, _| {
-                // The compositor takes over: no mouse-up may follow.
-                if std::mem::take(&mut this.title_drag) && ev.dragging() {
-                    window.start_window_move();
-                }
-            }))
-            .on_click(move |ev, window, _| {
-                if zoom && ev.click_count() == 2 {
-                    window.zoom_window();
-                }
-            })
-            .when(controls.window_menu, |d| {
-                d.on_mouse_down(MouseButton::Right, |ev, window, cx| {
-                    window.show_window_menu(ev.position);
-                    cx.stop_propagation();
-                })
-            })
+        title_bar_area(el, self.windows_custom_title_bar, window, cx)
     }
 
     /// The header goatty draws when it draws the title bar but the tab bar
@@ -332,93 +445,93 @@ impl Workspace {
             .children(window_buttons(Side::Right, 22., win_bar, c, window, cx));
         round_top(header, window).into_any_element()
     }
+}
 
-    /// Wrap the window's content in the frame goatty draws with its own
-    /// decorations: room for the shadow, a hairline border, and edges that
-    /// resize the window. As is without them.
-    pub(super) fn window_frame(&mut self, content: AnyElement, window: &mut Window, cx: &mut Context<'_, Self>) -> AnyElement {
-        let tiling = csd(window);
-        // Tell the platform only when it changes (X11 sets a property).
-        if self.frame_applied != Some(tiling) {
-            self.frame_applied = Some(tiling);
-            let r = |round: bool| if round { ROUNDING } else { px(0.) };
-            let (inset, corners) = match tiling {
-                Some(t) => (
-                    SHADOW,
-                    gpui::Corners {
-                        top_left: r(!t.top && !t.left),
-                        top_right: r(!t.top && !t.right),
-                        bottom_left: px(0.),
-                        bottom_right: px(0.),
-                    },
-                ),
-                None => (px(0.), gpui::Corners::default()),
-            };
-            window.set_client_inset(inset);
-            window.set_client_corner_radii(corners);
-        }
-        let Some(tiling) = tiling else { return content };
-        let c = Colors::get(cx);
-        let resizable = window.is_resizable();
-        let inner = div()
-            .size_full()
-            .cursor(CursorStyle::Arrow)
-            .border_color(c.edge)
-            .when(!tiling.top, |d| d.border_t(BORDER))
-            .when(!tiling.bottom, |d| d.border_b(BORDER))
-            .when(!tiling.left, |d| d.border_l(BORDER))
-            .when(!tiling.right, |d| d.border_r(BORDER))
-            .when(!tiling.top && !tiling.left, |d| d.rounded_tl(ROUNDING))
-            .when(!tiling.top && !tiling.right, |d| d.rounded_tr(ROUNDING))
-            .when(!tiling.is_tiled(), |d| {
-                d.shadow(vec![BoxShadow {
-                    color: gpui::black().opacity(0.4),
-                    offset: point(px(0.), px(0.)),
-                    blur_radius: SHADOW / 2.,
-                    spread_radius: px(0.),
-                    inset: false,
-                }])
-            })
-            .child(content);
-        div()
-            .id("window-frame")
-            .size_full()
-            .when(!tiling.top, |d| d.pt(SHADOW))
-            .when(!tiling.bottom, |d| d.pb(SHADOW))
-            .when(!tiling.left, |d| d.pl(SHADOW))
-            .when(!tiling.right, |d| d.pr(SHADOW))
-            .child(inner)
-            .when(resizable, |d| {
-                d.on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, window, cx| {
-                    // Repaint when the pointer enters or leaves an edge (its cursor).
-                    let edge = resize_edge(ev.position, window.viewport_size(), tiling);
-                    if edge != this.resize_edge {
-                        this.resize_edge = edge;
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-                    if let Some(edge) = resize_edge(ev.position, window.viewport_size(), tiling) {
-                        window.start_window_resize(edge);
-                        cx.stop_propagation();
-                    }
-                })
-                .child(
-                    canvas(
-                        |_, window, _| window.insert_hitbox(Bounds::new(Point::default(), window.viewport_size()), HitboxBehavior::Normal),
-                        move |_, hitbox: Hitbox, window, _| {
-                            let size = window.viewport_size();
-                            if let Some(edge) = resize_edge(window.mouse_position(), size, tiling) {
-                                window.set_cursor_style(edge_cursor(edge), &hitbox);
-                            }
-                        },
-                    )
-                    .absolute()
-                    .size_full(),
-                )
-            })
-            .into_any_element()
+/// Wrap the window's content in the frame goatty draws with its own
+/// decorations: room for the shadow, a hairline border, and edges that
+/// resize the window. As is without them.
+pub(crate) fn window_frame<V: Chromed>(view: &mut V, content: AnyElement, window: &mut Window, cx: &mut Context<'_, V>) -> AnyElement {
+    let tiling = csd(window);
+    // Tell the platform only when it changes (X11 sets a property).
+    if view.chrome().frame_applied != Some(tiling) {
+        view.chrome().frame_applied = Some(tiling);
+        let r = |round: bool| if round { ROUNDING } else { px(0.) };
+        let (inset, corners) = match tiling {
+            Some(t) => (
+                SHADOW,
+                gpui::Corners {
+                    top_left: r(!t.top && !t.left),
+                    top_right: r(!t.top && !t.right),
+                    bottom_left: px(0.),
+                    bottom_right: px(0.),
+                },
+            ),
+            None => (px(0.), gpui::Corners::default()),
+        };
+        window.set_client_inset(inset);
+        window.set_client_corner_radii(corners);
     }
+    let Some(tiling) = tiling else { return content };
+    let c = Colors::get(cx);
+    let resizable = window.is_resizable();
+    let inner = div()
+        .size_full()
+        .cursor(CursorStyle::Arrow)
+        .border_color(c.edge)
+        .when(!tiling.top, |d| d.border_t(BORDER))
+        .when(!tiling.bottom, |d| d.border_b(BORDER))
+        .when(!tiling.left, |d| d.border_l(BORDER))
+        .when(!tiling.right, |d| d.border_r(BORDER))
+        .when(!tiling.top && !tiling.left, |d| d.rounded_tl(ROUNDING))
+        .when(!tiling.top && !tiling.right, |d| d.rounded_tr(ROUNDING))
+        .when(!tiling.is_tiled(), |d| {
+            d.shadow(vec![BoxShadow {
+                color: gpui::black().opacity(0.4),
+                offset: point(px(0.), px(0.)),
+                blur_radius: SHADOW / 2.,
+                spread_radius: px(0.),
+                inset: false,
+            }])
+        })
+        .child(content);
+    div()
+        .id("window-frame")
+        .size_full()
+        .when(!tiling.top, |d| d.pt(SHADOW))
+        .when(!tiling.bottom, |d| d.pb(SHADOW))
+        .when(!tiling.left, |d| d.pl(SHADOW))
+        .when(!tiling.right, |d| d.pr(SHADOW))
+        .child(inner)
+        .when(resizable, |d| {
+            d.on_mouse_move(cx.listener(move |this: &mut V, ev: &gpui::MouseMoveEvent, window, cx| {
+                // Repaint when the pointer enters or leaves an edge (its cursor).
+                let edge = resize_edge(ev.position, window.viewport_size(), tiling);
+                if edge != this.chrome().resize_edge {
+                    this.chrome().resize_edge = edge;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                if let Some(edge) = resize_edge(ev.position, window.viewport_size(), tiling) {
+                    window.start_window_resize(edge);
+                    cx.stop_propagation();
+                }
+            })
+            .child(
+                canvas(
+                    |_, window, _| window.insert_hitbox(Bounds::new(Point::default(), window.viewport_size()), HitboxBehavior::Normal),
+                    move |_, hitbox: Hitbox, window, _| {
+                        let size = window.viewport_size();
+                        if let Some(edge) = resize_edge(window.mouse_position(), size, tiling) {
+                            window.set_cursor_style(edge_cursor(edge), &hitbox);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+        })
+        .into_any_element()
 }
 
 fn edge_cursor(edge: ResizeEdge) -> CursorStyle {
