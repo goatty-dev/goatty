@@ -639,7 +639,7 @@ impl HostService {
         }
         let active = crate::zsh::hook_active(&host.value);
         let unavailable = if zsh.is_none() {
-            Some("zsh isn't installed on this host".to_owned())
+            Some(format!("zsh isn't installed on this host. {}", crate::launch::zsh_install_hint()))
         } else if !host.value.shell.managed {
             Some("Needs goatty's managed zsh, which is off".to_owned())
         } else if !active {

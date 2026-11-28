@@ -3,7 +3,7 @@
 schema = 1
 id = "starship"
 name = "Starship"
-version = "1.0.0"
+version = "1.0.1"
 summary = "A fast, informative prompt"
 description = """
 Starship shows the directory, the git branch and status, how long the last command took and more, without slowing the shell down. Its look follows goatty's prompt settings (Settings → Prompt) unless you prefer your own ~/.config/starship.toml. Turned off, goatty shows a small built-in prompt."""
@@ -29,6 +29,18 @@ target = "aarch64-linux"
 url = "https://github.com/starship/starship/releases/download/v1.27.0/starship-aarch64-unknown-linux-musl.tar.gz"
 sha256 = "341f5cbf24699fa0b27ec88965ad25f862ea09e15d35a543fd6ffdff1d2aa00d"
 size = 4776202
+
+[[package.asset]]
+target = "arm-linux"
+url = "https://github.com/starship/starship/releases/download/v1.27.0/starship-arm-unknown-linux-musleabihf.tar.gz"
+sha256 = "33531a104304e8f36e1f78657039246ebb730e4c53a7ccdf8c94c0e3630bf6b4"
+size = 4957085
+
+[[package.asset]]
+target = "riscv64-linux"
+url = "https://github.com/starship/starship/releases/download/v1.27.0/starship-riscv64gc-unknown-linux-musl.tar.gz"
+sha256 = "4cbf07f29f7610f4d031263bca5f5552b8bcbcf69c43e2ad225960b8082a0adb"
+size = 5079891
 
 [[package.asset]]
 target = "x86_64-macos"
