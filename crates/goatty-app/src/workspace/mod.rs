@@ -65,8 +65,10 @@ mod menu;
 mod notices;
 pub mod reopen;
 pub mod saved;
+pub(crate) use chrome::observe as observe_chrome;
 pub use chrome::requested as requested_decorations;
 pub use chrome::titlebar_options;
+pub(crate) use chrome::{ChromeState, Chromed, secondary_window, secondary_window_options};
 mod sidebar;
 mod switcher;
 mod sync;
@@ -281,16 +283,11 @@ pub struct Workspace {
     /// A dragged tab moved and the tabs haven't been laid out again: their
     /// bounds are from before the move.
     moved_unpainted: bool,
-    /// The left button went down on the title bar's empty space: the next
-    /// move starts moving the window (`chrome`).
-    title_drag: bool,
+    /// goatty's title bar and frame, when it draws them (`chrome`).
+    chrome: chrome::ChromeState,
     /// On Windows, `gpui_windows` decides whether to hide the system title bar
     /// when the window is created (`TitlebarOptions::appears_transparent`).
     windows_custom_title_bar: bool,
-    /// The window edge under the pointer, when goatty draws the frame.
-    resize_edge: Option<gpui::ResizeEdge>,
-    /// The frame last told to the platform: goatty's (with the tiling) or none.
-    frame_applied: Option<Option<gpui::Tiling>>,
     /// The vertical sidebar while its edge is being dragged (as it was when
     /// the drag started, and now); saved to the settings shortly after it
     /// stops and when the drag ends.
@@ -417,10 +414,8 @@ impl Workspace {
             wheel: WheelSwitch::default(),
             dragging: None,
             moved_unpainted: false,
-            title_drag: false,
+            chrome: chrome::ChromeState::default(),
             windows_custom_title_bar,
-            resize_edge: None,
-            frame_applied: None,
             sidebar_drag: None,
             save_sidebar: None,
             menu: None,
@@ -3016,6 +3011,12 @@ pub fn background_appearance(t: &goatty_config::TerminalSettings) -> gpui::Windo
     }
 }
 
+impl Chromed for Workspace {
+    fn chrome(&mut self) -> &mut ChromeState {
+        &mut self.chrome
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         // However a tab became the active one, it's being looked at now
@@ -3198,7 +3199,7 @@ impl Render for Workspace {
             .when_some(self.paste.as_ref(), |d, (dialog, _, _)| d.child(modal(dialog.clone())))
             .when_some(self.close.as_ref(), |d, (dialog, _, _)| d.child(modal(dialog.clone())))
             .into_any_element();
-        self.window_frame(root, window, cx)
+        chrome::window_frame(self, root, window, cx)
     }
 }
 

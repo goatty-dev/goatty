@@ -325,8 +325,7 @@ pub fn open_at(cx: &mut App, page: Option<Page>) {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(760.), px(520.))),
-            app_id: Some("dev.goatty.goatty".into()),
-            ..Default::default()
+            ..crate::workspace::secondary_window_options("goatty settings", cx)
         },
         |window, cx| {
             window.set_window_title("goatty settings");
@@ -644,7 +643,15 @@ pub struct SettingsWindow {
     /// Focus the search field on the first frame (once its width is known:
     /// a narrow window has it in the closed drawer, so the page keeps focus).
     focus_search_on_open: bool,
+    /// goatty's title bar and frame, when it draws them (GNOME).
+    chrome: crate::workspace::ChromeState,
     _subs: Vec<Subscription>,
+}
+
+impl crate::workspace::Chromed for SettingsWindow {
+    fn chrome(&mut self) -> &mut crate::workspace::ChromeState {
+        &mut self.chrome
+    }
 }
 
 impl Focusable for SettingsWindow {
@@ -835,7 +842,9 @@ impl SettingsWindow {
             gen_diff: None,
             toasts: cx.new(|cx| ToastLayer::secondary(window, cx)),
             focus_search_on_open: false,
+            chrome: Default::default(),
             _subs: {
+                subs.extend(crate::workspace::observe_chrome(window, cx));
                 subs.push(cx.observe_global::<crate::tailnet::TailnetList>(|_, cx| cx.notify()));
                 // An exchange brought news: pick the scope once, show what changed.
                 subs.push(cx.observe_global::<crate::shared_sync::Shared>(|this, cx| {
