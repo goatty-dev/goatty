@@ -31,8 +31,8 @@ pub(super) fn snap_opacity(v: f32) -> f32 {
 type Span = (&'static str, Hsla);
 
 /// Theme card outer radius and border width; the preview and name strip round to the difference.
-const THEME_CARD_RADIUS: f32 = 12.;
-const THEME_CARD_BORDER: f32 = 2.;
+pub(crate) const THEME_CARD_RADIUS: f32 = 12.;
+pub(crate) const THEME_CARD_BORDER: f32 = 2.;
 
 impl SettingsWindow {
     pub(super) fn appearance(&self, ui: Ui, window: &Window, cx: &Context<'_, Self>) -> AnyElement {

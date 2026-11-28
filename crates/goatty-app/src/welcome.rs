@@ -31,6 +31,7 @@ use crate::settings::AppSettings;
 // The settings window's building blocks, so this window looks the same.
 use crate::settings_window::kit::{choice_card as choice, row as settings_row, section as settings_section};
 use crate::settings_window::{self, HostLink, HostLinkGlobal, Page};
+use crate::settings_window::{THEME_CARD_BORDER, THEME_CARD_RADIUS};
 use crate::shell_setup::{self, Progress};
 use crate::ui::brand;
 use crate::ui::controls::{ButtonKind, Tone, badge, banner, button, button_with, keycaps, stepper, toggle};
@@ -719,15 +720,17 @@ impl Welcome {
             .w(px(128.))
             .flex()
             .flex_col()
-            .rounded(px(12.))
+            .rounded(px(THEME_CARD_RADIUS))
             .overflow_hidden()
-            .border_2()
+            .border(px(THEME_CARD_BORDER))
             .border_color(if selected { ui.accent } else { ui.divider })
             .cursor_pointer()
             .hover(|s| s.border_color(if selected { ui.accent } else { ui.border }))
             .child(
                 div()
                     .h(px(46.))
+                    // `overflow_hidden` clips to a rectangle, so the children round their own outer corners.
+                    .rounded_t(px(THEME_CARD_RADIUS - THEME_CARD_BORDER))
                     .bg(c(col.background))
                     .px(px(10.))
                     .py(px(8.))
@@ -751,6 +754,7 @@ impl Welcome {
                     .gap(px(5.))
                     .h(px(28.))
                     .px(px(9.))
+                    .rounded_b(px(THEME_CARD_RADIUS - THEME_CARD_BORDER))
                     .bg(ui.card)
                     .text_size(px(text::CAPTION))
                     .text_color(if selected { ui.accent_text } else { ui.text })
