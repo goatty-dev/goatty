@@ -1,11 +1,13 @@
 # Test the Windows release packages on a clean machine (release.yml's
 # test-windows job; it changes the user's PATH, Start Menu and goatty install,
 # so don't run it on your own computer):
-#   1. the portable .zip runs from wherever it's extracted;
+#   1. the portable .zip runs from wherever it's extracted and carries
+#      Microsoft's ConPTY (#356);
 #   2. the MSI upgrades an older install while that install's goattyd is
 #      running (it must stop it, without asking for a reboot) and replaces it
 #      instead of installing a second copy;
-#   3. the installed goatty works, is on PATH and has its Start Menu shortcut;
+#   3. the installed goatty works, has the bundled ConPTY, is on PATH and has
+#      its Start Menu shortcut;
 #   4. uninstalling removes all of it.
 param(
     [Parameter(Mandatory)] [string]$Packages,
@@ -19,6 +21,20 @@ $version = (Select-String -Path (Join-Path $root Cargo.toml) -Pattern '^version\
 $upgradeCode = "{DCFDA8F6-615A-4ABF-9125-1EE2ABE2A257}" # packaging/windows/goatty.wxs
 $dir = Join-Path $env:LOCALAPPDATA "Programs\goatty"
 $shortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\goatty.lnk"
+
+# scripts/fetch-conpty.ps1's files, beside goatty.exe and goattyd.exe.
+$conpty = "conpty.dll", "x64\OpenConsole.exe", "arm64\OpenConsole.exe", "LICENSE-ConPTY.txt"
+
+function Check-ConPty($in) {
+    foreach ($f in $conpty) {
+        if (-not (Test-Path (Join-Path $in $f))) { throw "no $f in $in" }
+    }
+    $sig = Get-AuthenticodeSignature (Join-Path $in "conpty.dll")
+    if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch 'CN=Microsoft Corporation') {
+        throw "conpty.dll in $in isn't signed by Microsoft: $($sig.Status) $($sig.SignerCertificate.Subject)"
+    }
+    Write-Output "${in}: bundled ConPTY ok"
+}
 
 function Step($text) { Write-Output "`n=== $text" }
 
@@ -79,6 +95,7 @@ Check-Version (Join-Path $pdir "goattyd.exe") goattyd
 foreach ($r in "goattyd-x86_64-linux", "goattyd-aarch64-linux") {
     if (-not (Test-Path (Join-Path $pdir "remote\$r"))) { throw "the archive has no remote\$r" }
 }
+Check-ConPty $pdir
 Check-Version (Get-ChildItem $Packages -Filter "goattyd-x86_64-windows.exe").FullName goattyd
 
 Step "install an older version and start its goattyd"
@@ -100,6 +117,7 @@ Check-Version (Join-Path $dir "goattyd.exe") goattyd
 foreach ($r in "goattyd-x86_64-linux", "goattyd-aarch64-linux") {
     if (-not (Test-Path (Join-Path $dir "remote\$r"))) { throw "no remote\$r installed" }
 }
+Check-ConPty $dir
 $completions = Run (Join-Path $dir "goatty.exe") completions powershell
 if ($completions -notmatch "Register-ArgumentCompleter") { throw "goatty completions powershell printed no completer" }
 

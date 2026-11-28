@@ -1,10 +1,12 @@
 //! PTYs: on Unix, `portable-pty` opens them and starts the child, after which
 //! goatty works on the master fd itself (enabling fd handoff across `execve`
-//! and systemd's fd store via [`Pty::adopt`]). On Windows, uses Win32 ConPTY
+//! and systemd's fd store via [`Pty::adopt`]). On Windows, uses ConPTY
 //! directly (`CreatePseudoConsole` + `CreateProcessW(CREATE_SUSPENDED)` +
 //! `AssignProcessToJobObject` before `ResumeThread`) so the entire process tree
 //! is assigned to a Job Object from instruction zero and `ClosePseudoConsole`
-//! can run concurrently with output draining when the child exits.
+//! can run concurrently with output draining when the child exits. The
+//! ConPTY is the bundled `conpty.dll` when it's beside the executable, else
+//! the one built into Windows (`pty/conpty.rs`).
 
 use std::path::PathBuf;
 
@@ -370,6 +372,9 @@ mod unix {
 pub use unix::{Pty, PtyInput, PtyReader, session_leader, set_cloexec, set_window_size, window_size};
 
 #[cfg(windows)]
+mod conpty;
+
+#[cfg(windows)]
 mod windows {
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
@@ -384,7 +389,7 @@ mod windows {
     use parking_lot::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE};
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
+    use windows_sys::Win32::System::Console::{COORD, HPCON};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
@@ -397,7 +402,7 @@ mod windows {
         WaitForSingleObject,
     };
 
-    use super::ShellCommand;
+    use super::{ShellCommand, conpty};
     use crate::TermSize;
 
     /// Output reader returned by [`Pty::spawn`].
@@ -589,9 +594,9 @@ mod windows {
 
     impl Drop for HpconGuard {
         fn drop(&mut self) {
-            // SAFETY: `self.0` is an open `HPCON` owned exclusively by `self`.
+            // SAFETY: `self.0` is an open `HPCON` from `conpty::create`, owned exclusively by `self`.
             unsafe {
-                ClosePseudoConsole(self.0);
+                conpty::close(self.0);
             }
         }
     }
@@ -601,12 +606,9 @@ mod windows {
 
     impl PseudoConsole {
         fn new(size: TermSize, input_read: HANDLE, output_write: HANDLE) -> Result<Self> {
-            let mut hpcon: HPCON = 0;
             // SAFETY: `input_read` and `output_write` are valid open pipe handles.
-            let hr = unsafe { CreatePseudoConsole(conpty_coord(size), input_read, output_write, 0, &raw mut hpcon) };
-            if hr < 0 {
-                bail!("CreatePseudoConsole failed (HRESULT 0x{:08x})", hr as u32);
-            }
+            let hpcon = unsafe { conpty::create(conpty_coord(size), input_read, output_write) }
+                .map_err(|hr| anyhow::anyhow!("CreatePseudoConsole failed (HRESULT 0x{:08x})", hr as u32))?;
             Ok(Self(Arc::new(Mutex::new(Some(HpconGuard(hpcon))))))
         }
 
@@ -620,7 +622,7 @@ mod windows {
                 return Ok(());
             };
             // SAFETY: `hpc.0` stays open while `guard` is held.
-            let hr = unsafe { ResizePseudoConsole(hpc.0, conpty_coord(size)) };
+            let hr = unsafe { conpty::resize(hpc.0, conpty_coord(size)) };
             if hr < 0 {
                 bail!("ResizePseudoConsole failed (HRESULT 0x{:08x})", hr as u32);
             }

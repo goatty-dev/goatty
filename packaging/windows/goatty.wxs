@@ -42,6 +42,13 @@
           <!-- Static goattyds that goatty uploads to Linux hosts over SSH
                (goatty_client::remote::find_bundled). -->
           <Directory Id="RemoteDir" Name="remote" />
+          <!-- Microsoft's ConPTY (scripts/fetch-conpty.ps1, #356): conpty.dll
+               starts OpenConsole.exe from the folder named after the
+               machine's architecture. -->
+          <?if $(sys.BUILDARCH) = x64 ?>
+          <Directory Id="ConPtyX64Dir" Name="x64" />
+          <?endif?>
+          <Directory Id="ConPtyArm64Dir" Name="arm64" />
         </Directory>
       </Directory>
     </StandardDirectory>
@@ -66,6 +73,27 @@
       <File Id="goattyd_x86_64_linux" Source="$(Source)\remote\goattyd-x86_64-linux" />
       <File Id="goattyd_aarch64_linux" Source="$(Source)\remote\goattyd-aarch64-linux" />
       <RemoveFolder Id="RemoveRemoteDir" On="uninstall" />
+    </Component>
+
+    <!-- Microsoft's binaries keep Microsoft's signatures: never re-sign them. -->
+    <Component Id="ConPty" Directory="INSTALLFOLDER" Guid="8F5BEA7C-6B97-4918-AF16-7C43787CA3C8">
+      <RegistryValue Root="HKCU" Key="Software\goatty" Name="ConPty" Type="integer" Value="1" KeyPath="yes" />
+      <File Id="conpty.dll" Source="$(Source)\conpty.dll" />
+      <File Id="LICENSE_ConPTY" Source="$(Source)\LICENSE-ConPTY.txt" />
+    </Component>
+
+    <?if $(sys.BUILDARCH) = x64 ?>
+    <Component Id="ConPtyX64" Directory="ConPtyX64Dir" Guid="BF4FF5F6-FF52-4FE9-BA68-87125B6CD1C6">
+      <RegistryValue Root="HKCU" Key="Software\goatty" Name="ConPtyX64" Type="integer" Value="1" KeyPath="yes" />
+      <File Id="OpenConsole_x64" Source="$(Source)\x64\OpenConsole.exe" />
+      <RemoveFolder Id="RemoveConPtyX64Dir" On="uninstall" />
+    </Component>
+    <?endif?>
+
+    <Component Id="ConPtyArm64" Directory="ConPtyArm64Dir" Guid="2C6DE77F-8005-4AAD-A05A-61716269E56D">
+      <RegistryValue Root="HKCU" Key="Software\goatty" Name="ConPtyArm64" Type="integer" Value="1" KeyPath="yes" />
+      <File Id="OpenConsole_arm64" Source="$(Source)\arm64\OpenConsole.exe" />
+      <RemoveFolder Id="RemoveConPtyArm64Dir" On="uninstall" />
     </Component>
 
     <!-- The App User Model ID must match the one goatty registers

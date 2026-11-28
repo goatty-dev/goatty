@@ -272,6 +272,9 @@ jobs:
             Write-Output $deps
             if ($deps -match '(?i)vcruntime|msvcp') { throw "$b.exe needs the Visual C++ runtime" }
           }
+      # Microsoft's ConPTY beside the binaries (#356): pinned, hash- and
+      # signature-checked.
+      - run: scripts/fetch-conpty.ps1 -OutDir target\dist
       - uses: actions/download-artifact@v8
         with:
           pattern: goattyd-*-linux

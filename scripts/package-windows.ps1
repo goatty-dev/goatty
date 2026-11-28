@@ -1,9 +1,13 @@
 # Package a Windows dist build into OutDir (default dist\): the portable
 # archive goatty-<version>-x86_64-windows.zip, the per-user installer
 # goatty-<version>-x86_64-windows.msi (packaging/windows/goatty.wxs) and
-# goattyd-x86_64-windows.exe for remote Windows hosts. release.yml runs this;
+# goattyd-x86_64-windows.exe for remote Windows hosts. The .zip and the MSI
+# carry Microsoft's ConPTY beside goatty.exe and goattyd.exe (#356); the
+# standalone goattyd doesn't, and uses the in-box ConPTY unless conpty.dll and
+# its OpenConsole.exe folders are put beside it. release.yml runs this;
 # locally (PowerShell 7, WiX 5 with the Util and UI extensions, see release.yml):
 #   cargo build --profile dist --locked -p goatty-app -p goatty-daemon
+#   pwsh scripts/fetch-conpty.ps1 -OutDir target\dist
 #   # static goattyds for remote hosts in remote\goattyd-<arch>-linux (see release.yml)
 #   pwsh scripts/package-windows.ps1
 # -MsiVersion builds only the MSI, with another version (release.yml's
@@ -37,6 +41,11 @@ foreach ($b in "goatty", "goattyd") {
     $got = (& $exe --version | Out-String).Trim()
     if ($got -ne "$b $version") { throw "$exe --version says '$got', expected '$b $version'" }
 }
+# What scripts/fetch-conpty.ps1 puts beside the binaries.
+$conpty = @("conpty.dll", "LICENSE-ConPTY.txt") + $(if ($arch -eq "x86_64") { "x64\OpenConsole.exe", "arm64\OpenConsole.exe" } else { "arm64\OpenConsole.exe" })
+foreach ($f in $conpty) {
+    if (-not (Test-Path (Join-Path $bin $f))) { throw "missing $bin\$f; fetch it with: pwsh scripts/fetch-conpty.ps1 -OutDir $bin" }
+}
 $remotes = @(Get-ChildItem remote -Filter "goattyd-*-linux" -ErrorAction SilentlyContinue)
 foreach ($r in "goattyd-x86_64-linux", "goattyd-aarch64-linux") {
     if (-not (Test-Path (Join-Path remote $r))) { throw "missing remote\$r (static goattyds for remote hosts)" }
@@ -51,6 +60,11 @@ New-Item -ItemType Directory -Force (Join-Path $dir "remote") | Out-Null
 try {
     Copy-Item "$bin\goatty.exe", "$bin\goattyd.exe", README.md, LICENSE-MIT, LICENSE-APACHE $dir
     Copy-Item $remotes.FullName (Join-Path $dir "remote")
+    foreach ($f in $conpty) {
+        $to = Join-Path $dir $f
+        New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
+        Copy-Item (Join-Path $bin $f) $to
+    }
 
     # MSI versions are numeric: a pre-release (0.3.0-rc.1) installs as 0.3.0.
     $numeric = if ($MsiVersion) { $MsiVersion } else { $version -replace '-.*$', '' }
