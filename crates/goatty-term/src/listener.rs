@@ -131,8 +131,9 @@ impl EventListener for Listener {
                 }
             }
             RioEvent::DesktopNotification { title, body } => {
-                // ConEmu's other numbered OSC 9 commands (`9;1;ms` sleeps,
-                // `9;12` marks a prompt…) aren't notifications.
+                // rio-vt drops multi-param ConEmu OSC 9 subcommands (`9;1;ms`, …),
+                // but bare numeric ones without a second `;` (like `9;12` prompt
+                // marks) and empty `9;` still arrive here.
                 if !(title.is_empty() && body.bytes().all(|b| b.is_ascii_digit())) {
                     let _ = self.ui.send(UiEvent::Notification { title, body });
                 }

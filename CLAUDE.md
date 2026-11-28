@@ -43,4 +43,4 @@ The issue list is the backlog, so only file issues that are worth reading.
 - **Use threads, not async**, until a QUIC transport needs tokio.
 - **Settings go through `goatty-config`.** Don't read `GOATTY_*` env vars anywhere else. The exceptions are `GOATTY_SOCKET` in `goatty_proto::socket_path` and `GOATTY_ASKPASS` in `goatty_client::askpass`.
 - Every `unsafe` block needs a `// SAFETY:` comment. Lints live in the root `[workspace.lints]`, and every crate has `[lints] workspace = true`.
-- rio-vt is pinned to an exact version. gpui is Longbridge's `gpui-pre` crates.io snapshot of Zed main (renamed to `gpui`/`gpui_platform` in the root `Cargo.toml`), pinned exactly: to bump it, change both versions on purpose, then run `just update-gpui`.
+- `rio-vt` and `rio-graphics` are pinned to the same exact version and must always be bumped together (both are ignored in `.github/dependabot.yml`). gpui is Longbridge's `gpui-pre` crates.io snapshot of Zed main (renamed to `gpui`/`gpui_platform` in the root `Cargo.toml`), pinned exactly: to bump it, change both versions on purpose, then run `just update-gpui`.
