@@ -759,13 +759,14 @@ impl Session {
     }
 
     /// Whether view `token` may set the session's size: the one that last
-    /// had focus, or any while none has claimed it.
+    /// got focus or came into view, or any while none has claimed it.
     pub fn may_resize(&self, token: u64) -> bool {
         let owner = self.size_owner.load(Ordering::Acquire);
         owner == 0 || owner == token
     }
 
-    /// View `token` sets the session's size from now on (it got focus).
+    /// View `token` sets the session's size from now on (it got focus, or
+    /// came into view in the window in use, #361).
     pub fn own_size(&self, token: u64) {
         self.size_owner.store(token, Ordering::Release);
     }

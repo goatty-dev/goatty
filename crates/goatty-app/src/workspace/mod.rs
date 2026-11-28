@@ -3040,7 +3040,11 @@ impl Render for Workspace {
                 // "Take over" chip. Once per tab shown or window activation,
                 // and only for the panes there then: a pane another window
                 // adds later stays sized by it.
-                if self.size_claimed != Some(tab.id) && tab.connecting.is_none() && !tab.panes.is_empty() {
+                if tab.connecting.is_some() || tab.panes.is_empty() {
+                    // Nothing to size yet: claim once its panes are there,
+                    // and again for the tab shown before when it's back.
+                    self.size_claimed = None;
+                } else if self.size_claimed != Some(tab.id) {
                     self.size_claimed = Some(tab.id);
                     for pane in tab.panes.iter().filter(|p| !zoomed || p.id == focused) {
                         pane.view.update(cx, |view, _| view.claim_size());
