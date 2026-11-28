@@ -366,6 +366,9 @@ pub struct TerminalView {
     /// propagate too lets Windows finish dead-key composition and clear its
     /// kernel dead-key state.
     dead_key_pending: bool,
+    /// The pane came into view ([`Self::claim_size`]): its next layout
+    /// takes the session's size from another client (#361).
+    claim_size: bool,
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -508,6 +511,7 @@ impl TerminalView {
             buttons_to_program: 0,
             preedit: String::new(),
             dead_key_pending: false,
+            claim_size: false,
         };
         view.apply_settings(&app);
         view
@@ -615,6 +619,14 @@ impl TerminalView {
 
     pub fn session(&self) -> &Arc<Session> {
         &self.session
+    }
+
+    /// The pane came into view in the window the user is in (its tab was
+    /// shown, or the window activated): once laid out, it takes the
+    /// session's size from another client that has it (#361). Set before
+    /// the view renders; the workspace calls it while rendering.
+    pub fn claim_size(&mut self) {
+        self.claim_size = true;
     }
 
     /// The pane went out of sight (its workspace was parked): another
@@ -2745,6 +2757,7 @@ impl Render for TerminalView {
                 preedit: self.preedit.clone().into(),
                 preedit_fg: self.session.terminal.palette().foreground,
                 focused,
+                claim_size: std::mem::take(&mut self.claim_size),
                 glyph_mode: self.glyph_mode,
                 glyphs: self.glyphs.clone(),
                 images: self.images.clone(),

@@ -246,6 +246,10 @@ pub struct Workspace {
     home: Option<Spawner>,
     tabs: Vec<Tab>,
     active: usize,
+    /// The tab whose panes took their sessions' size from other clients
+    /// when it came into view in the active window (#361); `None` makes
+    /// the next render do it again (the window was activated).
+    size_claimed: Option<u64>,
     next_id: u64,
     rename: Option<Rename>,
     palette: Option<(Entity<CommandPalette>, Subscription)>,
@@ -394,6 +398,7 @@ impl Workspace {
             home: None,
             tabs: Vec::new(),
             active: 0,
+            size_claimed: None,
             next_id: 1,
             rename: None,
             palette: None,
@@ -570,7 +575,8 @@ impl Workspace {
         // window never act on a host the user isn't looking at.
         let link = self.active_tab().and_then(|t| t.host.as_ref()).map(Spawner::host_link);
         crate::settings_window::set_host_link(cx, link);
-        // The active tab is being looked at again.
+        // The active tab is being looked at again: it's used here now.
+        self.size_claimed = None;
         self.notices_seen(window, cx);
         cx.notify();
     }
@@ -3028,6 +3034,21 @@ impl Render for Workspace {
                 let (zoomed, focused) = (tab.zoomed, tab.focused);
                 for pane in tab.panes.iter_mut().filter(|p| !zoomed || p.id == focused) {
                     pane.seen = pane.view.read(cx).program_status().latest;
+                }
+                // The window in use sizes the sessions it shows (#361): its
+                // panes take the size from another client, which keeps the
+                // "Take over" chip. Once per tab shown or window activation,
+                // and only for the panes there then: a pane another window
+                // adds later stays sized by it.
+                if tab.connecting.is_some() || tab.panes.is_empty() {
+                    // Nothing to size yet: claim once its panes are there,
+                    // and again for the tab shown before when it's back.
+                    self.size_claimed = None;
+                } else if self.size_claimed != Some(tab.id) {
+                    self.size_claimed = Some(tab.id);
+                    for pane in tab.panes.iter().filter(|p| !zoomed || p.id == focused) {
+                        pane.view.update(cx, |view, _| view.claim_size());
+                    }
                 }
             }
         }

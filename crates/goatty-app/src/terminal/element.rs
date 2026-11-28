@@ -120,6 +120,9 @@ pub struct TerminalElement {
     /// Space around the grid (top, right, bottom, left).
     pub padding: gpui::Edges<Pixels>,
     pub focused: bool,
+    /// The pane just came into view: take the session's size once it's
+    /// laid out (after its `Resize`, so the session takes the pane's size).
+    pub claim_size: bool,
     /// true: per-cell glyph cache (default). false: per-segment line shaping
     /// (supports ligatures, slower when many lines change).
     pub glyph_mode: bool,
@@ -280,8 +283,15 @@ impl Element for TerminalElement {
         let scale = window.scale_factor();
         let pane_size =
             TermSize { cols, rows, cell_width: (f32::from(cell_w) * scale) as u16, cell_height: (f32::from(line_height) * scale) as u16 };
+        if self.claim_size {
+            // Among this goatty's windows too: the pane in use sets the size.
+            self.session.own_size(self.token);
+        }
         if self.session.view_differs(pane_size) && self.session.may_resize(self.token) {
             self.session.resize(pane_size);
+        }
+        if self.claim_size {
+            self.session.claim_size();
         }
 
         let mut frame = self.frame.borrow_mut();
