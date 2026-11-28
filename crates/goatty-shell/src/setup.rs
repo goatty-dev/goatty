@@ -376,6 +376,8 @@ pub fn status(svc: &HostService) -> Result<Status> {
         let managed_name = if cfg!(windows) { "PowerShell" } else { "zsh" };
         s.unmanaged = Some(if !shell.managed {
             format!("Managed {managed_name} is off: sessions use your own configuration only.")
+        } else if !cfg!(windows) && shell.program.as_deref().is_none_or(str::is_empty) && crate::launch::which("zsh").is_none() {
+            format!("zsh isn't installed, so sessions start {} as is. {}", launch.program, crate::launch::zsh_install_hint())
         } else if crate::launch::is_managed_shell(&launch.program) {
             "goatty couldn't write its shell configuration (see goattyd's log): sessions use your own configuration only.".into()
         } else {

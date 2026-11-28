@@ -249,13 +249,13 @@ No sudo, nothing outside goatty's data directory. `goattyd shell uninstall NAMEâ
 
 | Built-in plugin     | Package (id)                               | Version | Builds                    | Load slot   | Installed by goatty-setup |
 |---------------------|--------------------------------------------|---------|---------------------------|-------------|---------------------------|
-| fzf                 | fzf (`fzf`)                                | 0.74.5  | x86_64/aarch64 Linux, macOS | line-editor | yes |
+| fzf                 | fzf (`fzf`)                                | 0.74.5  | x86_64/aarch64/arm/riscv64 Linux, macOS | line-editor | yes |
 | fzf-tab             | fzf-tab (`fzf-tab`)                        | 1.3.0   | source tarball            | line-editor (after fzf) | yes |
 | autosuggestions     | zsh-autosuggestions (`autosuggestions`)    | 0.7.1   | source tarball            | line-editor (after fzf, fzf-tab) | yes |
 | syntax-highlighting | zsh-syntax-highlighting (`syntax-highlighting`) | 0.8.0 | source tarball          | last        | yes |
-| starship            | Starship (`starship`)                      | 1.27.0  | x86_64/aarch64 Linux musl, macOS | prompt      | yes |
+| starship            | Starship (`starship`)                      | 1.27.0  | x86_64/aarch64/arm/riscv64 Linux musl, macOS | prompt      | yes |
 
-Pinned 2026-11-07 to releases at least two weeks old (fzf-tab 2026-11-13: v1.3.0 is from 2026-03-16; the macOS builds of the same fzf and Starship releases 2026-11-17). Checksums were computed from the downloads and matched upstream's published `.sha256`/checksums files where they exist (Starship, fzf); GitHub's source tarballs (fzf-tab, the zsh plugins) have none, so their checksum was taken from two separate downloads. fzf-tab's system copies: Arch's AUR `fzf-tab-git`, NixOS/Nix `zsh-fzf-tab`. The package ids are the tool ids from before #98, so managed installs made then (`tools/<id>/`, `bin/` and `plugins/` links) are used as they are. zsh itself isn't installed: if it's missing, goatty starts `$SHELL` and `goattyd shell status` says so.
+Pinned 2026-11-07 to releases at least two weeks old (fzf-tab 2026-11-13: v1.3.0 is from 2026-03-16; the macOS builds of the same fzf and Starship releases 2026-11-17, their 32-bit ARM (armv6 hard float, so armv7 too) and riscv64 Linux builds 2026-11-28). Checksums were computed from the downloads and matched upstream's published `.sha256`/checksums files where they exist (Starship, fzf); GitHub's source tarballs (fzf-tab, the zsh plugins) have none, so their checksum was taken from two separate downloads. fzf-tab's system copies: Arch's AUR `fzf-tab-git`, NixOS/Nix `zsh-fzf-tab`. The package ids are the tool ids from before #98, so managed installs made then (`tools/<id>/`, `bin/` and `plugins/` links) are used as they are. zsh itself isn't installed: if it's missing, goatty starts `$SHELL`, and `goattyd shell status` (and Diagnostics) says so and names the install command from `/etc/os-release` (pacman, apt, dnf, zypper, apk, xbps, emerge; NixOS's `programs.zsh.enable`; brew on macOS), which goatty never runs itself.
 
 ### Bumping a tool pin (#45)
 
@@ -334,6 +334,3 @@ Measured 2026-11-18 on the same dev machine (CachyOS, zsh 5.9.2, Starship 1.27.0
 
 Installed plugins (Stage 5, [`plugins.md`](plugins.md)) render into `plugins-early.zsh`, `plugins.zsh` and `plugins/<id>/` of each generation, so previews, `zsh -n` validation and rollback cover them like everything else. `goatty-status` lists them as `plugin:<id>`.
 
-## Not done yet
-
-Installs for other architectures and a distro-specific hint when zsh is missing (#42).

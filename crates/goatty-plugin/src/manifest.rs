@@ -21,8 +21,10 @@ pub const SCHEMA: u32 = 1;
 /// The file name of a manifest inside a plugin directory.
 pub const FILE: &str = "plugin.toml";
 
-/// Download targets goatty knows (`"<arch>-<os>"`).
-pub const TARGETS: &[&str] = &["x86_64-linux", "aarch64-linux", "x86_64-macos", "aarch64-macos", "x86_64-windows", "aarch64-windows"];
+/// Download targets goatty knows (`"<arch>-<os>"`, the arch as Rust names
+/// it: `arm` is 32-bit ARM with hard float, armv6 and up).
+pub const TARGETS: &[&str] =
+    &["x86_64-linux", "aarch64-linux", "arm-linux", "riscv64-linux", "x86_64-macos", "aarch64-macos", "x86_64-windows", "aarch64-windows"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

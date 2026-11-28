@@ -404,6 +404,46 @@ pub fn is_managed_shell(program: &str) -> bool {
     if cfg!(windows) { is_powershell(program) } else { is_zsh(program) }
 }
 
+/// How to install zsh on this host, as a sentence for when it's missing:
+/// "Install it with `sudo pacman -S zsh`." goatty only names the command
+/// and never runs it.
+pub fn zsh_install_hint() -> String {
+    let release = if cfg!(target_os = "linux") {
+        std::fs::read_to_string("/etc/os-release").or_else(|_| std::fs::read_to_string("/usr/lib/os-release")).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let cmd = if cfg!(target_os = "macos") { Some("brew install zsh") } else { zsh_install_command_for(&release) };
+    match cmd {
+        Some(c @ "programs.zsh.enable = true;") => format!("Enable it with `{c}` in your NixOS configuration."),
+        Some(c) => format!("Install it with `{c}`."),
+        None => "Install it with your package manager.".into(),
+    }
+}
+
+/// The command that installs zsh, for the contents of an `os-release` file: `ID`
+/// first, then each of `ID_LIKE`.
+fn zsh_install_command_for(os_release: &str) -> Option<&'static str> {
+    let field = |key: &str| {
+        os_release.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('=')).map(|v| v.trim().trim_matches(['"', '\'']).to_owned())
+    };
+    let ids = field("ID").into_iter().chain(field("ID_LIKE").unwrap_or_default().split_whitespace().map(str::to_owned).collect::<Vec<_>>());
+    ids.map(|id| id.to_ascii_lowercase()).find_map(|id| {
+        Some(match id.as_str() {
+            "arch" => "sudo pacman -S zsh",
+            "debian" | "ubuntu" => "sudo apt install zsh",
+            "fedora" | "rhel" | "centos" => "sudo dnf install zsh",
+            "suse" | "opensuse" => "sudo zypper install zsh",
+            "alpine" => "sudo apk add zsh",
+            "void" => "sudo xbps-install zsh",
+            "gentoo" => "sudo emerge app-shells/zsh",
+            "nixos" => "programs.zsh.enable = true;",
+            _ if id.starts_with("opensuse") => "sudo zypper install zsh",
+            _ => return None,
+        })
+    })
+}
+
 /// First `bin` in `$PATH`.
 pub fn which(bin: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
@@ -442,6 +482,18 @@ pub fn which(bin: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zsh_install_command_follows_os_release() {
+        let f = super::zsh_install_command_for;
+        assert_eq!(f("NAME=\"CachyOS Linux\"\nID=cachyos\nID_LIKE=arch\n"), Some("sudo pacman -S zsh"));
+        assert_eq!(f("ID=ubuntu\nID_LIKE=debian\n"), Some("sudo apt install zsh"));
+        assert_eq!(f("ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n"), Some("sudo dnf install zsh"));
+        assert_eq!(f("ID=\"opensuse-tumbleweed\"\nID_LIKE=\"opensuse suse\"\n"), Some("sudo zypper install zsh"));
+        assert_eq!(f("ID=alpine\n"), Some("sudo apk add zsh"));
+        assert_eq!(f("VERSION_ID=1\n"), None);
+        assert_eq!(f("ID=plan9\n"), None);
+    }
+
     use super::*;
 
     fn host(program: &str) -> HostSettings {

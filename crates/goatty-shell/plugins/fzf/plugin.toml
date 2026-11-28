@@ -3,7 +3,7 @@
 schema = 1
 id = "fzf"
 name = "fzf"
-version = "1.1.0"
+version = "1.1.1"
 summary = "Fuzzy search: Ctrl+R history, Ctrl+T files, Alt+C directories"
 description = """
 fzf filters any list as you type. Ctrl+R searches your whole history and puts the command you pick on the command line, Ctrl+T inserts files picked from the current directory, Alt+C changes into a directory picked the same way. Its colors come from goatty's theme. With fd installed it lists files faster (hidden ones included, .git left out); with bat and eza it shows a preview of the file or directory under the cursor. Tab completion in fzf is the fzf-tab plugin."""
@@ -28,6 +28,18 @@ target = "aarch64-linux"
 url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_arm64.tar.gz"
 sha256 = "cf058001da21724a469b714a29cf4aab9cbe860d218a0d6c1b5b661efad7784c"
 size = 2078357
+
+[[package.asset]]
+target = "arm-linux"
+url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_armv6.tar.gz"
+sha256 = "8615ce6e3eadcae3be9b38aaee8d432361a39c2983e0ab94cea6254492b70eaf"
+size = 2155367
+
+[[package.asset]]
+target = "riscv64-linux"
+url = "https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-linux_riscv64.tar.gz"
+sha256 = "6ca2259cd2002ea7dd23e53c484d966b10c759cf0dae022359c681234dc81e74"
+size = 2150796
 
 [[package.asset]]
 target = "x86_64-macos"

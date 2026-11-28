@@ -80,8 +80,10 @@ completions = ["eza", "--completions", "zsh"]   # optional: prints the completio
 #                                       # /opt/local/, /run/current-system/sw/, /nix/var/nix/profiles/
 
 [[package.asset]]
-target = "x86_64-linux"         # x86_64/aarch64 × linux/macos/windows, or "any" (Windows on ARM
-#                                 takes the x86_64-windows build when there's no aarch64 one: it runs emulated)
+target = "x86_64-linux"         # x86_64/aarch64 × linux/macos/windows, arm-linux (32-bit, armv6+ hard
+#                                 float), riscv64-linux, or "any" (Windows on ARM takes the x86_64-windows
+#                                 build when there's no aarch64 one: it runs emulated). Goatty 0.4.0 and
+#                                 older refuse the arm and riscv64 targets
 url = "https://github.com/…/eza_x86_64-unknown-linux-musl.tar.gz"   # https only
 sha256 = "e06eeb…"              # checked before anything is unpacked
 size = 1412332
