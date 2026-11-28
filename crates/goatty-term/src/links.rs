@@ -671,10 +671,10 @@ mod tests {
     #[test]
     fn osc8_hyperlinks_cover_their_cells() {
         let t = term(40, 3);
-        t.feed(b"see \x1b]8;;https://goatty.dev/docs\x1b\\the docs\x1b]8;;\x1b\\ now");
+        t.feed(b"see \x1b]8;;https://goatty.dev/docs;v=2\x1b\\the docs\x1b]8;;\x1b\\ now");
         let link = t.link_at(6, 0).expect("hyperlink");
         assert_eq!(link.kind, LinkKind::Hyperlink);
-        assert_eq!(link.target, "https://goatty.dev/docs");
+        assert_eq!(link.target, "https://goatty.dev/docs;v=2");
         assert_eq!(link.spans, [LinkSpan { row: 0, cols: 4..12 }]);
         assert_eq!(t.link_at(13, 0), None);
     }
@@ -705,5 +705,8 @@ mod tests {
             t.feed(b"\x1b]7;file://elsewhere.example/srv\x1b\\");
             assert_eq!(t.current_directory().as_ref(), Some(&expected), "another host's directory");
         }
+        // Empty OSC 7 clears stale CWD.
+        t.feed(b"\x1b]7;\x1b\\");
+        assert_eq!(t.current_directory(), None);
     }
 }

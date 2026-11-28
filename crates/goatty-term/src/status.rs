@@ -801,7 +801,7 @@ mod tests {
     fn terminal_reports_desktop_notifications() {
         use crate::UiEvent;
         let (t, ch) = terminal(false);
-        t.feed(b"\x1b]9;Build finished\x07\x1b]777;notify;Codex;Turn complete\x1b\\\x1b]9;1;500\x07\x1b]9;4;1;20\x07");
+        t.feed(b"\x1b]9;Build finished\x07\x1b]9;Build; 3 warnings\x07\x1b]777;notify;Codex;Turn complete\x1b\\\x1b]9;1;500\x07\x1b]9;12\x07\x1b]9;4;1;20\x07");
         let notes: Vec<(String, String)> = ch
             .ui
             .try_iter()
@@ -810,7 +810,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(notes, [(String::new(), "Build finished".into()), ("Codex".into(), "Turn complete".into())]);
+        assert_eq!(
+            notes,
+            [
+                (String::new(), "Build finished".into()),
+                (String::new(), "Build; 3 warnings".into()),
+                ("Codex".into(), "Turn complete".into())
+            ]
+        );
         assert_eq!(t.program_status().progress, Some(Progress { state: ProgressState::Normal, percent: Some(20) }));
     }
 

@@ -4,9 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # rio-vt and gpui are pinned on purpose (see Cargo.toml); bump them by hand.
+    # rio-vt, rio-graphics, and gpui are pinned on purpose (see Cargo.toml); bump them by hand.
     ignore:
       - dependency-name: rio-vt
+      - dependency-name: rio-graphics
       - dependency-name: gpui-pre
       - dependency-name: gpui-pre-platform
     groups:
