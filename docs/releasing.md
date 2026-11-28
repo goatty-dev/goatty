@@ -71,6 +71,8 @@ cd aur && git add PKGBUILD .SRCINFO && git commit -m "Update to <version>" && gi
 
 Windows can't replace a running `goattyd.exe`, and ConPTY sessions can't outlive their daemon. Before an upgrade or uninstall touches the files, the MSI runs the installed `goattyd.exe stop --force`, which ends its sessions. Uninstalling also runs `goattyd.exe service uninstall` to remove the Scheduled Task. goatty's settings and logs stay.
 
+The .zip and the MSI ship Microsoft's ConPTY (the MIT-licensed `Microsoft.Windows.Console.ConPTY` NuGet package from microsoft/terminal) beside `goatty.exe` and `goattyd.exe`: `conpty.dll`, `x64\OpenConsole.exe`, `arm64\OpenConsole.exe` and `LICENSE-ConPTY.txt` (#356). The ConPTY built into Windows 10/11 strips image protocols, breaks TUI screen restore and repaints over goatty's reflow on resize. `scripts/fetch-conpty.ps1` downloads the pinned version, checks its SHA-256 and Microsoft's Authenticode signatures, and stages the files; never re-sign them. To update it, change the version and hash at the top of that script (1.25.260930003 or later). goatty-term loads `conpty.dll` only from the executable's own folder and falls back to the in-box ConPTY without it (`crates/goatty-term/src/pty/conpty.rs`), so the standalone `goattyd-x86_64-windows.exe` that goatty installs on remote Windows hosts uses the in-box one unless the files are put beside it. For a dev build with the bundled ConPTY, run `pwsh scripts/fetch-conpty.ps1 -OutDir target\debug`.
+
 The icon, `packaging/windows/goatty.ico`, is made from `crates/goatty-app/assets/brand/goatty.svg` (16 to 48 px as bitmaps, 64 and 256 px as PNG). The `build.rs` of goatty-app and goatty-daemon embed it with the version info (`winresource`). GPUI uses that icon (resource ID 1) for the window. Regenerate the `.ico` when the logo changes.
 
 The Windows builds aren't code-signed yet, so SmartScreen warns about them, and they aren't in winget or Scoop yet.
@@ -79,6 +81,7 @@ To build the installer on a Windows machine: install the .NET SDK, then WiX and 
 
 ```powershell
 cargo build --profile dist --locked -p goatty-app -p goatty-daemon
+pwsh scripts/fetch-conpty.ps1 -OutDir target\dist
 pwsh scripts/package-windows.ps1
 ```
 

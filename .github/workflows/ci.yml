@@ -121,6 +121,13 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --locked --workspace --no-fail-fast -- -q
+      # The PTY tests again with Microsoft's ConPTY beside the test binaries,
+      # as the release ships it (#356); the run above used the in-box one.
+      - name: PTY tests with the bundled ConPTY
+        shell: pwsh
+        run: |
+          scripts/fetch-conpty.ps1 -OutDir target\debug\deps
+          cargo test --locked -p goatty-term --lib pty
 
   # The one-line installers (scripts/get-goatty.sh, get-goatty.ps1) that the
   # website links: each installs the latest published release and a pinned one.
