@@ -784,8 +784,10 @@ impl Session {
         }
     }
 
-    /// Input from the user (keys, pastes, mouse reports).
+    /// Input from the user (keys, pastes, mouse reports). The client the
+    /// user types into sizes the session (#361).
     pub fn write(&self, bytes: &[u8]) {
+        self.claim_size();
         self.predict(bytes);
         self.write_raw(bytes);
     }
@@ -908,6 +910,15 @@ impl Session {
         match &self.backend {
             Backend::Daemon { conn, id, .. } => conn.take_size(id.load(Ordering::Relaxed)),
             Backend::Local { .. } => false,
+        }
+    }
+
+    /// The user is using the session here (typing, or its pane came into
+    /// view): take its size from the client that has it, if another one
+    /// does (#361). That client keeps the "Take over" chip.
+    pub fn claim_size(&self) {
+        if self.watching() {
+            let _ = self.take_size();
         }
     }
 
